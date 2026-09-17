@@ -159,9 +159,42 @@ path, so the skill shows up however you loaded it. No runtime dependencies. Need
 `--experimental-strip-types`) because policies are TypeScript executed in a worker thread — on an older runtime
 you get that sentence instead of a broken worker.
 
+Nothing works until a task is configured, and *where* it is configured matters: every command and tool operates on
+`<cwd>/.dream-rsi/`, so `/dream-rsi run` in an unconfigured directory stops with
+`No Dream-RSI task in this project: …/task.json is missing.` See **First run** below.
+
 `/dream-rsi` alone prints help; `/dream-rsi status` prints state.
 
 ## First run
+
+There are two ways in, and they are not interchangeable:
+
+- **You, at the prompt.** `/dream-rsi` prints help, `/dream-rsi status` shows state, `/dream-rsi live|dream`
+  asks the agent for a single phase, `/dream-rsi run [n]` asks for `n` full cycles, `/dream-rsi off` leaves
+  Dream-RSI mode. These commands *drive the agent*: they turn mode on and hand it the instruction, so a cycle
+  actually starts.
+- **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` is the one that writes the configuration; the other
+  three do the work.
+
+**`live`, `dream`, and `run` need a configured task in the project you are in** — that is
+`<cwd>/.dream-rsi/task.json`, created by `dream_rsi_init`. Without it you get exactly this:
+
+```text
+No Dream-RSI task in this project: <cwd>/.dream-rsi/task.json is missing.
+Ask the agent to configure one (dream_rsi_init: seed workspace, candidate file, scoring command),
+or copy a task.json you configured elsewhere into <cwd>/.dream-rsi.
+Current directory: <cwd>
+```
+
+Which usually means one of two things: you are in the wrong directory (the task lives in the project you want to
+optimize, not in this one), or nobody has configured it yet. If it's the second, just say what you want
+optimized — the `dream-rsi` skill knows the questions:
+
+```text
+set up Dream-RSI: seed workspace task/seed, candidate file solution.cpp, scorer `node /abs/path/score.mjs`
+```
+
+Or drive the tools yourself:
 
 ```text
 dream_rsi_init   name="lasso-path" workspace="task/seed" eval_program="solution.cpp" \

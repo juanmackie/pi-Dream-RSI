@@ -7,9 +7,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { EXT, deployShippedPolicy, exists, jump, makeProject, readJson, writeTaskJson } from "./fixtures.mjs";
+
+const { copyWorkspace } = await jump("agent/runner.ts");
 
 const { runLiveEpisode } = await jump("engine/live.ts");
 const { runDreamPhase, planNextGrid, fallbackGrid } = await jump("engine/dream.ts");
@@ -39,6 +42,32 @@ async function liveCycle(project, iteration, extra = {}) {
   });
 }
 
+test("a workspace that contains the Dream-RSI root still copies, minus the tool's own state", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-copy-"));
+  // `workspace: "."`: the seed workspace *is* the project root, so the Dream-RSI root sits inside it.
+  const dreamRoot = path.join(dir, ".dream-rsi");
+  try {
+    fs.mkdirSync(path.join(dreamRoot, "work", "old"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "app.py"), "print(1)\n", "utf8");
+    fs.writeFileSync(path.join(dreamRoot, "work", "old", "score.json"), "{\"score\": 99}", "utf8");
+    fs.writeFileSync(path.join(dreamRoot, "task.json"), "{}", "utf8");
+
+    // The destination is a subdirectory of the source; this used to throw ERR_FS_CP_EINVAL.
+    const target = path.join(dreamRoot, "work", "b0a0");
+    copyWorkspace(dir, target, { exclude: [dreamRoot] });
+    assert.ok(exists(path.join(target, "app.py")), "the real workspace content is copied");
+    assert.equal(exists(path.join(target, ".dream-rsi")), false, "the tool's state dir is never copied");
+
+    // A refinement copies a workspace that already lives *inside* the excluded root: the exclusion
+    // must not swallow the copy.
+    const child = path.join(dreamRoot, "work", "b0a1");
+    copyWorkspace(target, child, { exclude: [dreamRoot] });
+    assert.ok(exists(path.join(child, "app.py")), "refinement copies still work");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("one live cycle records a discovery tree, workspaces, attempt records and the world", async () => {
   const project = makeProject();
   try {
@@ -67,7 +96,7 @@ test("one live cycle records a discovery tree, workspaces, attempt records and t
       assert.ok(exists(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${cell}`, "proposal.md")));
       assert.ok(exists(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${cell}`, "eval", "score.json")));
       assert.ok(exists(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${cell}`, "prompt.md")));
-      assert.ok(exists(path.join(project.dreamRoot, "work", cell, "solution.py")), "each attempt has its own workspace");
+      assert.ok(exists(path.join(project.dreamRoot, "work", "r0001", cell, "solution.py")), "each attempt has its own workspace");
     }
     // Cycle 1 doubles as the baseline floor.
     assert.ok(exists(path.join(project.dreamRoot, "history", "baseline", "score.json")));
@@ -110,7 +139,7 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
     assert.ok(prompts.some((line) => line.startsWith("development")), "the improvement prompt reached the agent");
     assert.equal(prompts.filter((line) => line.startsWith("development")).length, project.task.revisions - 1);
     assert.ok(
-      fs.readFileSync(path.join(project.dreamRoot, "work", "b0a0", "agent-prompts.log"), "utf8").startsWith("discovery"),
+      fs.readFileSync(path.join(project.dreamRoot, "work", "r0001", "b0a0", "agent-prompts.log"), "utf8").startsWith("discovery"),
       "the discovery prompt reached the attempt agent",
     );
 

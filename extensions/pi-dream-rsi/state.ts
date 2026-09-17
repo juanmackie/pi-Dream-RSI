@@ -135,14 +135,19 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
   ];
   const active = activeRuns(root);
   if (active.length > 0) lines.push(`  in flight: ${active.join("; ")}`);
+  const worlds = state.iterations.length;
+  lines.push(
+    worlds === 0
+      ? "  worlds:   none recorded yet — run dream_rsi_live first (dream_rsi_dream replays recorded worlds, it does not create them)"
+      : `  worlds:   ${worlds} recorded (t=${state.iterations.map((i) => i.iteration).join(",")}) — dream_rsi_dream can replay them now`,
+  );
   if (typeof options.sessionIteration === "number" && options.sessionIteration > 0) {
     lines.push(`  session iteration: ${options.sessionIteration}`);
   }
   if (state.iterations.length === 0) {
     lines.push("  no live cycles recorded yet — run dream_rsi_live to record the first world.");
     return lines.join("\n");
-  }
-  lines.push("  iterations (world t, best, beta, attempts, rounds):");
+  }  lines.push("  iterations (world t, best, beta, attempts, rounds):");
   for (const { iteration, manifest } of state.iterations) {
     if (!manifest) {
       lines.push(`    t=${iteration}: manifest missing`);

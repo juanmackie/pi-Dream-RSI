@@ -64,8 +64,14 @@ export function workRoot(dreamRoot: string): string {
   return path.join(dreamRoot, "work");
 }
 
-export function nodeWorkspace(dreamRoot: string, cell: string): string {
-  return path.join(workRoot(dreamRoot), cell);
+/**
+ * Attempt workspace for one node of one iteration.
+ *
+ * Scoped by iteration on purpose: cell ids restart at `b0a0` every cycle, so a flat `work/<cell>`
+ * would let cycle 2 overwrite cycle 1's candidate code — the only copy of what that attempt built.
+ */
+export function nodeWorkspace(dreamRoot: string, iteration: number, cell: string): string {
+  return path.join(workRoot(dreamRoot), `r${pad(iteration)}`, cell);
 }
 
 export function historyDir(dreamRoot: string): string {

@@ -258,7 +258,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       } catch (error) {
         return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
       }
-      const iteration = state.iteration + 1;
+      const iteration = Math.max(state.iteration, latestIteration(root)) + 1;
       const baseline = readBaselineScore(root);
       const previous = latestBest(root);
 
@@ -337,7 +337,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       } catch (error) {
         return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
       }
-      const iteration = Math.max(1, state.iteration || latestIteration(root));
+      const iteration = Math.max(state.iteration, latestIteration(root));
       if (!fs.existsSync(path.join(root, "trace_pool", `iter${String(iteration).padStart(4, "0")}`))) {
         return {
           content: [{ type: "text", text: "❌ no recorded world yet — run dream_rsi_live first (replay needs a live cycle)." }],
@@ -419,36 +419,72 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const root = dreamRoot(ctx);
       const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
       const verb = parts[0] ?? "help";
+      const configured = fs.existsSync(path.join(root, "task.json"));
+      const missingTask = (): void => {
+        ctx.ui.notify(
+          [
+            `No Dream-RSI task in this project: ${path.join(root, "task.json")} is missing.`,
+            `Ask the agent to configure one (dream_rsi_init: seed workspace, candidate file, scoring command),`,
+            `or copy a task.json you configured elsewhere into ${root}.`,
+            `Current directory: ${ctx.cwd}`,
+          ].join("\n"),
+          "error",
+        );
+      };
+
       if (verb === "off") {
         setMode(ctx, false);
         ctx.ui.notify("Dream-RSI mode off (state on disk is untouched).", "info");
         return;
       }
       if (verb === "status") {
-        ctx.ui.notify(fs.existsSync(path.join(root, "task.json")) ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`, "info");
+        ctx.ui.notify(configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`, "info");
         return;
       }
       if (verb === "run" || verb === "live" || verb === "dream") {
-        if (!fs.existsSync(path.join(root, "task.json"))) {
-          ctx.ui.notify("Configure a task first (dream_rsi_init).", "error");
+        if (!configured) {
+          missingTask();
+          return;
+        }
+        const state = stateFor(ctx);
+        if (state.running) {
+          ctx.ui.notify(`A Dream-RSI phase is already running: ${state.running}.`, "error");
           return;
         }
         setMode(ctx, true);
-        const cycles = verb === "live" ? "1 live" : verb === "dream" ? "1 dream" : `${parts[1] ?? 1} full`;
-        ctx.ui.notify(
-          `Dream-RSI mode active — ${cycles} cycle(s) requested. Ask the agent to run the loop (it calls dream_rsi_live / dream_rsi_dream), or run those tools directly.`,
-          "info",
-        );
+        const requested = parts[1];
+        if (verb === "run" && requested !== undefined) {
+          const parsed = Number(requested);
+          if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
+            ctx.ui.notify(`/dream-rsi run takes a cycle count between 1 and 100; got "${requested}".`, "error");
+            return;
+          }
+        }
+        const cycles = verb === "run" ? (requested === undefined ? 1 : Number(requested)) : 1;
+        const instruction =
+          verb === "live"
+            ? "Run one Dream-RSI online cycle (dream_rsi_live): report the planned grid and beta first, then the attempts, best score and where the records landed."
+            : verb === "dream"
+              ? "Run the Dream-RSI offline phase (dream_rsi_dream): report the V table, the beta sweep and which policy version was deployed."
+              : `Run ${cycles} full Dream-RSI cycle${cycles === 1 ? "" : "s"} in ${root}: for each one call dream_rsi_live, then dream_rsi_dream. Report the planned grid and beta before the first cycle, and after each pair the live score trend with the sweep's pareto.reward. Stop early and tell me why if the live best plateaus while the beta sweep stays flat.`;
+        // The command drives the agent rather than dead-ending in a notification: a human at the prompt
+        // cannot call tools, and "ask the agent to run the loop" is not an instruction that does anything.
+        const delivery = ctx.isIdle() ? {} : { deliverAs: "followUp" as const };
+        pi.sendUserMessage(instruction, delivery);
+        ctx.ui.notify(`Dream-RSI mode active — asked the agent to run ${verb === "run" ? `${cycles} cycle${cycles === 1 ? "" : "s"}` : verb}.`, "info");
         return;
       }
       ctx.ui.notify(
         [
           "Dream-RSI (arXiv 2609.14858)",
           "  /dream-rsi status        iterations, worlds, policy versions, last sweep",
-          "  /dream-rsi live          one online exploration cycle (gated tool)",
-          "  /dream-rsi dream         one offline policy-improvement phase (gated tool)",
-          "  /dream-rsi run [n]       n full cycles (live then dream)",
+          "  /dream-rsi live          ask the agent for one online exploration cycle",
+          "  /dream-rsi dream         ask the agent for one offline policy-improvement phase",
+          "  /dream-rsi run [n]       ask the agent for n full cycles (live then dream)",
           "  /dream-rsi off           leave Dream-RSI mode",
+          "",
+          `Everything except status/off/help needs a configured task: ${path.join(root, "task.json")}`,
+          "Ask the agent to configure one first (dream_rsi_init), in the project you want to optimize.",
           `  root: ${root}`,
         ].join("\n"),
         "info",
@@ -555,6 +591,9 @@ function latestBest(root: string): number | null {
 }
 
 function latestIteration(root: string): number {
+  // The audit trail on disk decides the next iteration, never session state: a fresh session in a
+  // project that already has recorded cycles must continue the history, not restart at t=1 and
+  // overwrite the attempt records and workspaces of the cycles before it.
   const dir = path.join(root, "trace_pool");
   if (!fs.existsSync(dir)) return 0;
   return fs

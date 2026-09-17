@@ -183,8 +183,65 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
 }
 
 /** Fresh workspace copy: the attempt resumes its parent's saved workspace state. */
-export function copyWorkspace(from: string, to: string): void {
+export interface CopyWorkspaceOptions {
+  /**
+   * Paths that must never appear inside the copy — typically the Dream-RSI root, so an attempt can
+   * never read sibling scores or the policy versions. Ignored when an entry contains the source
+   * itself (a refinement copies a workspace that already lives inside that root).
+   */
+  exclude?: string[];
+}
+
+function isInside(candidate: string, parent: string): boolean {
+  return candidate === parent || candidate.startsWith(parent + path.sep);
+}
+
+/**
+ * Recursive copy that can skip subtrees.
+ *
+ * `fs.cpSync` cannot do this job: it rejects a destination nested inside the source
+ * (`ERR_FS_CP_EINVAL: cannot copy to a subdirectory of self`) before any filter runs, and
+ * `workspace: "."` makes the attempt workspaces exactly that. Walking the tree explicitly also
+ * makes both rules obvious: never descend into the destination, never descend into an excluded root.
+ */
+function copyTree(from: string, to: string, skip: (resolved: string) => boolean): void {
+  const stats = fs.lstatSync(from);
+  if (stats.isDirectory()) {
+    fs.mkdirSync(to, { recursive: true });
+    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
+      const childFrom = path.join(from, entry.name);
+      const childTo = path.join(to, entry.name);
+      // Only the source side is tested: children of the destination are trivially "inside" it.
+      if (skip(path.resolve(childFrom))) continue;
+      copyTree(childFrom, childTo, skip);
+    }
+    return;
+  }
+  if (stats.isSymbolicLink()) {
+    const linkTarget = fs.readlinkSync(from);
+    try {
+      fs.symlinkSync(linkTarget, to);
+    } catch {
+      // No symlink privilege (typical on Windows without developer mode): copy what it points at.
+      const resolved = fs.statSync(from);
+      if (resolved.isDirectory()) copyTree(from, to, skip);
+      else fs.copyFileSync(fs.realpathSync(from), to);
+    }
+    return;
+  }
+  fs.copyFileSync(from, to);
+}
+
+export function copyWorkspace(from: string, to: string, options: CopyWorkspaceOptions = {}): void {
   fs.mkdirSync(path.dirname(to), { recursive: true });
   fs.rmSync(to, { recursive: true, force: true });
-  fs.cpSync(from, to, { recursive: true, dereference: false, force: true });
+  const source = path.resolve(from);
+  const destination = path.resolve(to);
+  const excluded = (options.exclude ?? [])
+    .map((entry) => path.resolve(entry))
+    .filter((entry) => !isInside(source, entry));
+  copyTree(from, to, (resolved) => {
+    if (isInside(resolved, destination)) return true;
+    return excluded.some((root) => isInside(resolved, root));
+  });
 }

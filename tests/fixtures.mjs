@@ -177,9 +177,13 @@ export function mockPi() {
     entries,
     statuses,
     notifications,
+    /** User messages the extension asked pi to send to the agent. */
+    sentMessages: [],
     activeTools: ["read", "write", "bash"],
     /** Entries of the current branch; tests can narrow it to simulate a rewired session tree. */
     branch: null,
+    /** Whether the agent counts as idle, for `sendUserMessage` delivery mode. */
+    idle: true,
   };
   const pi = {
     // Registered tools become active, as in pi; the extension then gates the expensive ones.
@@ -194,6 +198,7 @@ export function mockPi() {
     setActiveTools: (list) => {
       harness.activeTools = [...list];
     },
+    sendUserMessage: (content, options) => harness.sentMessages.push({ content, options }),
   };
   const context = {
     cwd: null,
@@ -206,7 +211,7 @@ export function mockPi() {
       notify: (message) => notifications.push(message),
       setStatus: (key, value) => statuses.push([key, value ?? null]),
     },
-    isIdle: () => true,
+    isIdle: () => harness.idle,
     hasPendingMessages: () => false,
   };
   return { pi, context, harness };

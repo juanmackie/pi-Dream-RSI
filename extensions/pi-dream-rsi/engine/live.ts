@@ -195,6 +195,17 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
   writeCurrentManifest(dreamRoot, manifest);
 
   const promptTemplate = loadPrompt("discovery-agent.md");
+  // The discovery prompt tells every attempt to read `$baseline_dir`. On the first cycle there is no
+  // baseline attempt yet, so say so where the agent will look instead of handing it a missing path.
+  const baseline = baselineDir(dreamRoot);
+  fs.mkdirSync(baseline, { recursive: true });
+  if (!fs.existsSync(path.join(baseline, "score.json"))) {
+    writeJson(path.join(baseline, "score.json"), {
+      score: null,
+      note:
+        "No baseline attempt yet: this is the first cycle. The best valid attempt of cycle 1 becomes the floor to beat.",
+    });
+  }
   const basePromptVars = {
     // Pure Dream-RSI: semantic direction guidance is deliberately empty (paper §4 ablation).
     direction_guidance: "",
@@ -216,13 +227,13 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     }
     const attempt = parent.meta.attempt + 1;
     const child = tree.addChild(cell, parent.meta.branch, attempt, ["refine"]);
-    return { cell: child.meta.cell_id, parentCell: cell, parentWorkspace: nodeWorkspace(dreamRoot, cell) };
+    return { cell: child.meta.cell_id, parentCell: cell, parentWorkspace: nodeWorkspace(dreamRoot, iteration, cell) };
   };
 
   /** Prepare the workspace and prompt for one attempt (I/O). */
   const materialize = (target: { cell: string; parentCell: string; parentWorkspace: string }, round: number): PreparedAttempt => {
-    const workspace = nodeWorkspace(dreamRoot, target.cell);
-    copyWorkspace(target.parentWorkspace, workspace);
+    const workspace = nodeWorkspace(dreamRoot, iteration, target.cell);
+    copyWorkspace(target.parentWorkspace, workspace, { exclude: [dreamRoot] });
     const parentProposal = target.parentCell === "root" ? null : tree.get(target.parentCell)?.proposal ?? null;
     if (parentProposal) {
       const from = path.join(projectDir, parentProposal);

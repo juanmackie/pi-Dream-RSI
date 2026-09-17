@@ -169,6 +169,120 @@ test("an explicit grid overrides plan_grid, and a malformed one falls back with 
   }
 });
 
+test("a fresh session continues the recorded history instead of overwriting cycle 1", async () => {
+  const project = makeProject();
+  try {
+    // Session A: cycle 1.
+    const first = await boot(project);
+    await first.harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, first.context);
+    await first.harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, first.context);
+    const cycle1Record = path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "proposal.md");
+    const cycle1Workspace = path.join(project.dreamRoot, "work", "r0001", "b0a0");
+    assert.ok(exists(cycle1Record), "cycle 1 archived its attempt record");
+    const cycle1Proposal = fs.readFileSync(cycle1Record, "utf8");
+
+    // Session B: a *new* session (fresh runtime, no entries) runs another cycle in the same project.
+    const second = await boot(project);
+    const live = await second.harness.tools.get("dream_rsi_live").execute("c1", {}, undefined, undefined, second.context);
+    assert.match(live.content[0].text, /Live cycle 2/, "the new session continues at t=2");
+
+    assert.ok(exists(path.join(project.dreamRoot, "trace_pool", "iter0002", "tree.json")), "world 2 recorded");
+    assert.ok(exists(path.join(project.dreamRoot, "history", "r0002_live")), "iteration-2 records are separate");
+    assert.equal(
+      fs.readFileSync(cycle1Record, "utf8"),
+      cycle1Proposal,
+      "cycle 1's attempt record must not be overwritten",
+    );
+    assert.ok(exists(cycle1Workspace), "cycle 1's workspace survives");
+    assert.ok(exists(path.join(project.dreamRoot, "work", "r0002", "b0a0")), "cycle 2 writes its own workspace");
+    assert.ok(exists(path.join(project.dreamRoot, "work", "r0002", "b0a0", "solution.py")));
+    const world2 = readJson(path.join(project.dreamRoot, "trace_pool", "iter0002", "live_cycle_manifest.json"));
+    assert.equal(world2.iteration, 2);
+    assert.equal(world2.previous_best_score, world2.baseline_score ?? world2.previous_best_score);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the command drives the agent, and says exactly what is missing when it cannot", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+
+    // Not configured: the message must name the file, the directory and the way out.
+    await harness.commands.get("dream-rsi").handler("run", context);
+    const complaint = harness.notifications.at(-1);
+    assert.match(complaint, /task\.json/);
+    assert.match(complaint, /dream_rsi_init/);
+    assert.match(complaint, /Current directory/);
+    assert.match(complaint, new RegExp(project.projectDir.replace(/\\/g, "\\\\")));
+    assert.equal(harness.sentMessages.length, 0, "nothing is asked of the agent without a task");
+
+    // The same command in a project where the task *is* configured asks the agent to run the loop.
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    await harness.commands.get("dream-rsi").handler("run 3", context);
+    assert.equal(harness.sentMessages.length, 1);
+    const instruction = harness.sentMessages[0].content;
+    assert.match(instruction, /Run 3 full Dream-RSI cycle/);
+    assert.match(instruction, /dream_rsi_live, then dream_rsi_dream/);
+    assert.match(instruction, /pareto\.reward/);
+    assert.deepEqual(harness.sentMessages[0].options, {}, "idle agent gets an immediate turn");
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), true, "mode is on before the agent starts");
+
+    // A busy agent gets a queued follow-up instead of an error, and live/dream are single-phase asks.
+    harness.idle = false;
+    await harness.commands.get("dream-rsi").handler("live", context);
+    assert.deepEqual(harness.sentMessages[1].options, { deliverAs: "followUp" });
+    assert.match(harness.sentMessages[1].content, /one Dream-RSI online cycle \(dream_rsi_live\)/);
+    await harness.commands.get("dream-rsi").handler("dream", context);
+    assert.match(harness.sentMessages[2].content, /offline phase \(dream_rsi_dream\)/);
+
+    // `run` validates its count instead of silently doing something else.
+    await harness.commands.get("dream-rsi").handler("run 2", context);
+    assert.match(harness.sentMessages[3].content, /Run 2 full Dream-RSI cycles/);
+    const before = harness.sentMessages.length;
+    await harness.commands.get("dream-rsi").handler("run banana", context);
+    assert.equal(harness.sentMessages.length, before, "a bad count asks for nothing");
+    assert.match(harness.notifications.at(-1), /cycle count between 1 and 100; got "banana"/);
+    await harness.commands.get("dream-rsi").handler("run 0", context);
+    assert.equal(harness.sentMessages.length, before);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("help explains the prerequisite instead of leaving you guessing", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.commands.get("dream-rsi").handler("", context);
+    const help = harness.notifications.at(-1);
+    assert.match(help, /arXiv 2609\.14858/);
+    assert.match(help, /needs a configured task/);
+    assert.match(help, /dream_rsi_init/);
+    assert.match(help, /task\.json/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("a phase already in flight is not started twice", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    harness.statuses.length = 0;
+    // Fake an in-flight phase the way a crashed cycle would leave one behind.
+    const iterationDir = path.join(project.dreamRoot, "trace_pool", "iter0001_current");
+    fs.mkdirSync(iterationDir, { recursive: true });
+    fs.writeFileSync(path.join(iterationDir, "live_cycle_manifest.json"), JSON.stringify({ iteration: 1, status: "running" }), "utf8");
+    await harness.commands.get("dream-rsi").handler("run", context);
+    assert.equal(harness.sentMessages.length, 1, "the in-flight mirror does not block a new run");
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("gated tools refuse to run before a task exists, and off-mode disables them again", async () => {
   const project = makeProject();
   try {
