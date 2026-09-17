@@ -82,6 +82,8 @@ need to run it — the runtime scores your workspace after every attempt.
 
 Correctness is non-negotiable: <what the gate checks>.
 In scope: `<eval_program>`. Off limits: the scorer, the corpus/fixtures, migrations, dependencies.
+Generalization: the workload is a sample of real use — don't special-case its exact inputs; state any
+trade-off the scorer cannot see in `proposal.md`.
 Baseline: the seed measures <X>. Beating it needs a real mechanism change, not a micro-tweak.
 ```
 
@@ -114,7 +116,9 @@ Once a cycle has run, every `dream_rsi_live`/`dream_rsi_dream` result ends with 
 `/dream-rsi suggest <goal>` reproduces it on demand (`fastest`, `safest`, `simplest`, or free text).
 
 Present the top pick with its score delta *and* its caveats — especially any `mentions:` that admit a trade
-the scorer cannot see (a staleness window, an approximation). Then ask whether to apply it. `dream_rsi_apply`
+the scorer cannot see (a staleness window, an approximation). If the project already has a second workload or
+held-out set, score the top pick on it before recommending — a win that survives a workload it was never fitted
+to is the one to take. Then ask whether to apply it. `dream_rsi_apply`
 copies the candidate's file over the user's code, with `confirm: true`, records it in `history/applied.jsonl`
 (so it is not offered again), and never commits.
 
@@ -123,6 +127,7 @@ copies the candidate's file over the user's code, with `confirm: true`, records 
 - A scorer inside the seed workspace (candidates can rewrite their own judge).
 - A scorer that returns a number for a broken candidate (step 3).
 - Timing a workload of identical queries, then believing the speedup (memoization wins, search does not).
+- A candidate that wins by detecting or special-casing the benchmark workload instead of improving the implementation.
 - Absolute paths handed to shell harnesses that parse `$0`.
 - Starting a paid cycle because the setup "looked fine"; probe first, ask first.
 - Recommending the top score without reading its proposal: the run that motivated this skill produced a

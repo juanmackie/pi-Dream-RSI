@@ -139,7 +139,8 @@ test("live then dream through the tools, with status reporting the recorded worl
     assert.match(status.content[0].text, /t=1: status=complete/);
     assert.match(status.content[0].text, /sweep pareto\.reward=/);
     assert.match(status.content[0].text, /pi_1: V=/);
-    assert.match(status.content[0].text, /policy\\method\.ts \(versions: v0000\.ts, v0001\.ts\)/);
+    // path.relative renders with the platform separator (backslash on Windows): normalize before matching.
+    assert.match(status.content[0].text.replaceAll("\\", "/"), /policy\/method\.ts \(versions: v0000\.ts, v0001\.ts\)/);
 
     // The system prompt carries the protocol note and the live status.
     const injected = await harness.handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context);
