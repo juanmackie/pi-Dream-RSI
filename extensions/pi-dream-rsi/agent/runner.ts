@@ -158,10 +158,24 @@ export interface AgentRun extends RunOptions {
   prompt: string;
 }
 
+/**
+ * Build the argument vector for one attempt (or one policy revision).
+ *
+ * `{model}` is substituted where present; when a model is configured but the arguments carry no
+ * placeholder, `--model <id>` is appended — otherwise the configured model is silently ignored and
+ * every attempt runs on whatever default the agent CLI happens to have.
+ */
+export function buildAgentArgs(agent: AgentConfig): string[] {
+  const hasPlaceholder = agent.args.some((arg) => arg.includes("{model}"));
+  const args = agent.args.map((arg) => arg.replaceAll("{model}", agent.model ?? ""));
+  if (agent.model && !hasPlaceholder) args.push("--model", agent.model);
+  return args;
+}
+
 /** Run one discovery attempt / policy revision. */
 export function runAgent(options: AgentRun): Promise<CommandResult> {
   const { agent } = options;
-  const args = agent.args.map((arg) => arg.replaceAll("{model}", agent.model ?? ""));
+  const args = buildAgentArgs(agent);
   const shell = process.platform === "win32";
   if (shell && agent.model && !MODEL_PATTERN.test(agent.model)) {
     return Promise.resolve({

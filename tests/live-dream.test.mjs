@@ -102,6 +102,14 @@ test("one live cycle records a discovery tree, workspaces, attempt records and t
     assert.ok(exists(path.join(project.dreamRoot, "history", "baseline", "score.json")));
     assert.equal(readJson(path.join(project.dreamRoot, "history", "baseline", "score.json")).score, episode.manifest.best_score);
 
+    // Bulk run state is self-ignored, while the useful record stays versionable.
+    const ignore = fs.readFileSync(path.join(project.dreamRoot, ".gitignore"), "utf8");
+    assert.match(ignore, /^work\/$/m);
+    assert.match(ignore, /^trace_pool\/$/m);
+    assert.doesNotMatch(ignore, /^history\/$/m, "history stays visible: it is the evidence");
+    assert.doesNotMatch(ignore, /^policy\/$/m);
+    assert.doesNotMatch(ignore, /^task\.json$/m);
+
     // The recorded world is complete enough to replay.
     const world = readTree(project.dreamRoot, 1);
     assert.equal(world.nNonRoot, 6);

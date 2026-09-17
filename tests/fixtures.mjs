@@ -179,6 +179,8 @@ export function mockPi() {
     notifications,
     /** User messages the extension asked pi to send to the agent. */
     sentMessages: [],
+    /** Custom (non-turn) messages injected into the session. */
+    injectedMessages: [],
     activeTools: ["read", "write", "bash"],
     /** Entries of the current branch; tests can narrow it to simulate a rewired session tree. */
     branch: null,
@@ -199,6 +201,7 @@ export function mockPi() {
       harness.activeTools = [...list];
     },
     sendUserMessage: (content, options) => harness.sentMessages.push({ content, options }),
+    sendMessage: (message, options) => harness.injectedMessages.push({ message, options }),
   };
   const context = {
     cwd: null,

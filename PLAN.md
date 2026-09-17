@@ -1,5 +1,9 @@
 # pi-dream-rsi — Dream-RSI (arXiv 2609.14858) as a pi package
 
+> **Historical document.** This is the plan the package was built from (initial build, before the create /
+> suggest / apply surface existed). It is kept as a record of the design decisions and their reasoning, not as
+> current documentation. For what the package does today, read `README.md` and `skills/*/SKILL.md`.
+
 ## Context
 
 `C:\Users\juanm\Documents\GitHub\pi Dream-RSI` is empty. We build a new pi package implementing

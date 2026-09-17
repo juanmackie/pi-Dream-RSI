@@ -26,6 +26,7 @@ import {
   appendJsonl,
   attemptDir,
   baselineDir,
+  ensureDreamIgnore,
   historyDir,
   liveMethodPath,
   nodeWorkspace,
@@ -194,6 +195,9 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
   };
   writeCurrentManifest(dreamRoot, manifest);
 
+  // First cycle in a project: make sure the bulky half of the state dir cannot be committed by accident.
+  ensureDreamIgnore(dreamRoot);
+
   const promptTemplate = loadPrompt("discovery-agent.md");
   // The discovery prompt tells every attempt to read `$baseline_dir`. On the first cycle there is no
   // baseline attempt yet, so say so where the agent will look instead of handing it a missing path.
@@ -323,7 +327,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
         timeoutMs: task.evaluator_timeout_ms,
         logPath: path.join(recordDir, "eval.log"),
       });
-      outcome = interpretEvaluation(task, evalRun, readScoreJson(prepared.workspace, task));
+      outcome = interpretEvaluation(task, evalRun, readScoreFile(prepared.workspace, task));
     }
     const errorPath = path.join(recordDir, "error.txt");
     if (outcome.error) fs.writeFileSync(errorPath, `${outcome.fail_class}: ${outcome.error}\n`, "utf8");
@@ -438,7 +442,8 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
   };
 }
 
-function readScoreJson(workspace: string, task: TaskConfig): Record<string, unknown> | null {
+/** Read the scorer's verdict file from a workspace (shared with the seed measurement). */
+export function readScoreFile(workspace: string, task: TaskConfig): Record<string, unknown> | null {
   const file = path.join(workspace, task.score_path);
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;

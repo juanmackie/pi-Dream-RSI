@@ -1,0 +1,282 @@
+/**
+ * Candidate ranking: ordering, preferences, evidence extraction, and the guarantee that it only reads.
+ *
+ * Built on a hand-made `.dream-rsi` state so the numbers are exact: two good candidates (one that admits
+ * a staleness trade, one that does not), one failed, one worse than the baseline.
+ */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import * as crypto from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+
+import { jump } from "./fixtures.mjs";
+
+const { rankCandidates, renderSuggestion, parsePreference, MIN_WIN_FRACTION } = await jump("engine/candidates.ts");
+const { DiscoveryTree } = await jump("engine/tree.ts");
+const { normalizeTask, writeTask } = await jump("engine/task.ts");
+const { writeJson } = await jump("engine/world.ts");
+const { buildAgentArgs } = await jump("agent/runner.ts");
+
+/** A project with a recorded cycle: baseline 100, best candidate 200. */
+function makeRankedProject() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-rank-"));
+  const projectDir = path.join(dir, "proj");
+  const dreamRoot = path.join(projectDir, ".dream-rsi");
+  const seed = path.join(projectDir, "seed");
+  fs.mkdirSync(seed, { recursive: true });
+  const task = normalizeTask({
+    name: "throughput",
+    workspace: "seed",
+    eval_program: "prog.py",
+    score_program: "node score.mjs", // never run by the ranker
+    problem_file: "PROBLEM.md",
+    workers: 2,
+    k1: 2,
+    k2: 2,
+    revisions: 1,
+  });
+  fs.writeFileSync(path.join(seed, "prog.py"), "print('seed')\n", "utf8");
+  fs.writeFileSync(path.join(projectDir, "PROBLEM.md"), "# Maximize recall throughput of the search loop\n", "utf8");
+  fs.writeFileSync(path.join(projectDir, "score.mjs"), "console.log('unused')\n", "utf8");
+  writeTask(dreamRoot, task);
+  fs.mkdirSync(path.join(dreamRoot, "trace_pool", "iter0001"), { recursive: true });
+  writeJson(path.join(dreamRoot, "history", "seed", "score.json"), {
+    score: 100,
+    raw_score: 100,
+    fail_class: "ok",
+    error: null,
+    measured_at: new Date(0).toISOString(),
+    workspace: "seed",
+    seconds: 0.1,
+  });
+
+  const tree = new DiscoveryTree({ baselineScore: null, branchCount: 2, refineCount: 2 });
+  tree.addBranchSlot(0);
+  tree.addBranchSlot(1);
+  const candidates = [
+    { cell: "b0a0", score: 200, mentions: "cache, stale, window" },
+    { cell: "b1a0", score: 196, mentions: "" },
+    { cell: "b1a1", parent: "b1a0", score: 120, mentions: "", fail: true },
+    { cell: "b0a1", parent: "b0a0", score: 80, mentions: "" },
+  ];
+  for (const candidate of candidates) {
+    if (candidate.parent) {
+      const branch = Number(/^b(\d+)/.exec(candidate.cell)[1]);
+      tree.addChild(candidate.parent, branch, 1);
+    }
+    const workspace = path.join(dreamRoot, "work", "r0001", candidate.cell);
+    fs.mkdirSync(workspace, { recursive: true });
+    fs.writeFileSync(path.join(workspace, "prog.py"), `print('${candidate.cell}')\n`, "utf8");
+    const record = path.join(dreamRoot, "history", "r0001_live", `attempt_${candidate.cell}`);
+    fs.mkdirSync(path.join(record, "eval"), { recursive: true });
+    fs.writeFileSync(
+      path.join(record, "proposal.md"),
+      `# Proposal: ${candidate.cell} mechanism\n\n${candidate.mentions ? `Admits: ${candidate.mentions}` : "No caveats."}\n`,
+      "utf8",
+    );
+    writeJson(path.join(record, "eval", "score.json"), {
+      score: candidate.score,
+      valid: true,
+      fail_class: candidate.fail ? "eval_error" : "ok",
+      error: candidate.fail ? "boom" : null,
+      p99_ms: 12.5,
+    });
+    tree.setOutcome(candidate.cell, {
+      evaluated: true,
+      valid: !candidate.fail,
+      fail_class: candidate.fail ? "eval_error" : "ok",
+      error: candidate.fail ? "boom" : null,
+      score: candidate.score,
+      raw_score: candidate.score,
+      workspace: path.relative(projectDir, workspace),
+      proposal: path.relative(projectDir, path.join(workspace, "proposal.md")),
+      duration_ms: 1000,
+    });
+  }
+  // A data file the scorer rewrites: differs, but is not a candidate edit.
+  fs.writeFileSync(path.join(dreamRoot, "work", "r0001", "b0a0", "corpus.db"), Buffer.from([0, 1, 2, 3, 0, 255]));
+  writeJson(path.join(dreamRoot, "trace_pool", "iter0001", "tree.json"), tree.toJSON());
+  writeJson(path.join(dreamRoot, "trace_pool", "iter0001", "live_cycle_manifest.json"), { iteration: 1, status: "complete" });
+  return { dir, projectDir, dreamRoot, seed, task };
+}
+
+function hashTree(root) {
+  const hash = crypto.createHash("sha1");
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(file);
+      else hash.update(entry.name).update(fs.readFileSync(file));
+    }
+  };
+  walk(root);
+  return hash.digest("hex");
+}
+
+test("rank order follows the score, the best candidate is the pending one, failures are excluded", () => {
+  const project = makeRankedProject();
+  try {
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    assert.deepEqual(
+      ranking.candidates.map((candidate) => candidate.cell),
+      ["b0a0", "b1a0", "b0a1"],
+      "failed candidate b1a1 is not a candidate",
+    );
+    assert.equal(ranking.pending.cell, "b0a0");
+    assert.equal(ranking.pending.delta_vs_seed, 100);
+    assert.equal(ranking.pending.gain_pct, 100);
+    assert.equal(ranking.candidates[1].delta_vs_seed, 96);
+    assert.equal(ranking.candidates.find((c) => c.cell === "b0a1").delta_vs_seed, -20);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("evidence comes from disk: secondary metrics, scoped files, admitted trades", () => {
+  const project = makeRankedProject();
+  try {
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    const best = ranking.candidates[0];
+    assert.equal(best.metrics.p99_ms, 12.5, "secondary metrics are read from the archived score.json");
+    assert.deepEqual(best.changed_files.map((file) => file.relative), ["prog.py"], "only code counts as a change");
+    assert.deepEqual(best.data_changed_files.map((file) => file.relative), ["corpus.db"], "data files are disclosed, not counted");
+    assert.deepEqual(best.out_of_scope_files, [], "a data file is not an out-of-scope edit");
+    assert.deepEqual(best.high_risk_mentions, ["stale", "window"], "the admitted trade is extracted from the proposal");
+    assert.equal(best.applicable, true);
+    assert.equal(best.already_applied, false);
+    assert.match(best.proposal_summary ?? "", /b0a0 mechanism/);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("preferences: fastest keeps the leader, safest buys less risk inside the win band", () => {
+  const project = makeRankedProject();
+  try {
+    const fastest = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "fastest" });
+    assert.equal(fastest.preference.kind, "score");
+    assert.equal(fastest.pending.cell, "b0a0");
+
+    // b1a0 gives up 4% of the win (96 vs 100) — inside the band — and admits nothing.
+    const safest = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "safest" });
+    assert.equal(safest.preference.kind, "safe");
+    assert.equal(safest.candidates[0].cell, "b1a0", "the candidate with less to take on wins inside the band");
+    assert.equal(safest.pending.cell, "b1a0");
+    assert.ok(safest.pending.high_risk_mentions.length === 0);
+    assert.ok(MIN_WIN_FRACTION <= 0.96, "the fixture stays inside the win band");
+
+    const unknown = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "make the widget nicer" });
+    assert.equal(unknown.preference.kind, null, "unknown goals do not filter candidates");
+    assert.equal(unknown.candidates.length, fastest.candidates.length);
+    assert.equal(unknown.relevance.aligned, false, "a goal with nothing in common with the task is flagged");
+    assert.match(unknown.relevance.taskSummary, /recall throughput/);
+
+    const aligned = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "improve recall throughput" });
+    assert.equal(aligned.relevance.aligned, true);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("an applied candidate stops being pending, and the renderer never invites an inferior pick", () => {
+  const project = makeRankedProject();
+  try {
+    fs.writeFileSync(
+      path.join(project.dreamRoot, "history", "applied.jsonl"),
+      `${JSON.stringify({ iteration: 1, cell: "b0a0", score: 200, applied_at: new Date(0).toISOString(), paths: ["prog.py"], target: "seed" })}\n`,
+      "utf8",
+    );
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    assert.equal(ranking.candidates[0].already_applied, true);
+    assert.equal(ranking.pending, null, "nothing on record beats what was applied");
+    assert.match(ranking.reason, /nothing beats the last applied candidate/);
+
+    const text = renderSuggestion(ranking);
+    assert.match(text, /Nothing to apply:/);
+    assert.doesNotMatch(text, /dream_rsi_apply/, "no apply command for a candidate that is not worth taking");
+    const compact = renderSuggestion(ranking, { compact: true });
+    assert.match(compact, /^Nothing to apply:/);
+    assert.doesNotMatch(compact, /dream_rsi_apply/);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("rendering a pending pick carries the numbers, the caveats and the apply call", () => {
+  const project = makeRankedProject();
+  try {
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "fastest" });
+    const text = renderSuggestion(ranking);
+    assert.match(text, /IMPROVEMENT READY — NOT APPLIED/);
+    assert.match(text, /TOP PICK  b0a0/);
+    assert.match(text, /score 200  vs your code 100/);
+    assert.match(text, /prog\.py \(2 → 2 lines\)/, "line counts come from the workspace files");
+    assert.match(text, /mentions: cache, stale, window/);
+    assert.match(text, /dream_rsi_apply cell=b0a0 confirm=true/);
+    assert.match(text, /runner-ups:/);
+    assert.match(text, /preference: fastest/);
+    assert.match(text, /data file the scorer rewrites \(corpus\.db\)/);
+    assert.match(renderSuggestion(ranking, { compact: true }), /^⚠️ IMPROVEMENT READY — NOT APPLIED\n/);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("an empty history says so instead of inventing a recommendation", () => {
+  const project = makeRankedProject();
+  try {
+    fs.rmSync(path.join(project.dreamRoot, "trace_pool", "iter0001"), { recursive: true, force: true });
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    assert.equal(ranking.candidates.length, 0);
+    assert.equal(ranking.pending, null);
+    assert.match(ranking.reason, /no successful candidate recorded yet/);
+    assert.match(renderSuggestion(ranking), /^Nothing to apply: no successful candidate/);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("ranking is deterministic and writes nothing", () => {
+  const project = makeRankedProject();
+  try {
+    const before = hashTree(project.projectDir);
+    const first = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "safest" });
+    const second = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "safest" });
+    assert.deepEqual(
+      first.candidates.map((candidate) => [candidate.cell, candidate.score]),
+      second.candidates.map((candidate) => [candidate.cell, candidate.score]),
+    );
+    renderSuggestion(first);
+    renderSuggestion(first, { compact: true });
+    assert.equal(hashTree(project.projectDir), before, "ranking and rendering never touch the project");
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("parsePreference maps words and stays silent about anything else", () => {
+  assert.equal(parsePreference("fastest").kind, "score");
+  assert.equal(parsePreference("give me the best one").kind, "score");
+  assert.equal(parsePreference("safest option").kind, "safe");
+  assert.equal(parsePreference("least invasive please").kind, "safe");
+  assert.equal(parsePreference("simplest change").kind, "simple");
+  assert.equal(parsePreference("fewest files").kind, "simple");
+  assert.equal(parsePreference("cut recall latency").kind, null);
+  assert.equal(parsePreference(null).kind, null);
+});
+
+test("the configured model is actually passed to attempts", () => {
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, prompt_via: "stdin" };
+  assert.deepEqual(buildAgentArgs(base), ["-p", "--no-session"], "no model, no flag");
+  assert.deepEqual(buildAgentArgs({ ...base, model: "opencode-go/deepseek-v4.1-flash" }), [
+    "-p",
+    "--no-session",
+    "--model",
+    "opencode-go/deepseek-v4.1-flash",
+  ], "a configured model is appended when the args carry no placeholder");
+  assert.deepEqual(buildAgentArgs({ ...base, args: ["-p", "--model", "{model}"], model: "x/y" }), ["-p", "--model", "x/y"], "placeholder wins");
+  assert.deepEqual(buildAgentArgs({ ...base, args: ["-p"], model: null }), ["-p"]);
+});

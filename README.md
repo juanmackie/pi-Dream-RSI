@@ -95,7 +95,11 @@ pipelines whose quality you can already measure automatically.
 
 ## How to run it well
 
-**1. Build the scorer before anything else.** It's the ground truth of the whole loop.
+**1. Let `create` run the interview, then build the scorer.** `/dream-rsi create <goal>` (or the goal in plain
+words) loads the `dream-rsi-create` skill, which asks for the seed workspace, candidate program, scorer,
+correctness gate and budgets — and refuses to start a cycle until the scorer has been verified. It prefers
+wrapping a benchmark that already exists in the repo over authoring one. The scorer is the ground truth of the
+whole loop:
 
 - Deterministic. Fixed instances, seeded randomness, no wall-clock thresholds.
 - Reports `score` **and** `valid`/`fail_class`, so a fast-but-wrong candidate can't win. A non-`ok` fail class
@@ -109,8 +113,10 @@ Then hand-test it on two or three candidates you already have opinions about: th
 fast-but-wrong one. If the ordering surprises you, you have a scorer problem, not a search problem. Fix it before
 you spend a cent on agent calls.
 
-**2. Start small.** `workers=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy
-revision per cycle. That's enough to see whether the proposals are real. Once they are, scale to the paper's
+**2. Probe the agent, then start small.** `create` runs the effective attempt command once (`pi -p … --model <id>
+"Reply with exactly: OK"`) so a bad model id or empty balance costs one small call instead of a cycle of failed
+attempts. `workers=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy revision
+per cycle. That's enough to see whether the proposals are real. Once they are, scale to the paper's
 shape: `W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, roughly five cycles, and `M` somewhere
 around 3–5 (the paper doesn't publish its value).
 
@@ -154,7 +160,8 @@ pi -e "/absolute/path/to/pi-dream-rsi"
 cp -r pi-dream-rsi .pi/extensions/pi-dream-rsi   # or ~/.pi/agent/extensions/pi-dream-rsi
 ```
 
-You get `/dream-rsi`, the `dream-rsi` skill, and the `dream_rsi_*` tools. The extension contributes its own skill
+You get `/dream-rsi` (with `create` and `suggest`), the `dream-rsi` and `dream-rsi-create` skills, and the
+`dream_rsi_*` tools. The extension contributes its own skill
 path, so the skill shows up however you loaded it. No runtime dependencies. Needs Node ≥ 22.18 (22.6+ with
 `--experimental-strip-types`) because policies are TypeScript executed in a worker thread — on an older runtime
 you get that sentence instead of a broken worker.
@@ -169,32 +176,41 @@ Nothing works until a task is configured, and *where* it is configured matters: 
 
 There are two ways in, and they are not interchangeable:
 
-- **You, at the prompt.** `/dream-rsi` prints help, `/dream-rsi status` shows state, `/dream-rsi live|dream`
-  asks the agent for a single phase, `/dream-rsi run [n]` asks for `n` full cycles, `/dream-rsi off` leaves
-  Dream-RSI mode. These commands *drive the agent*: they turn mode on and hand it the instruction, so a cycle
-  actually starts.
-- **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` is the one that writes the configuration; the other
-  three do the work.
+- **`/dream-rsi create <goal>`** — the on-ramp. In a project with no task it turns mode on and loads the
+  `dream-rsi-create` skill, which interviews you (objective, seed workspace, candidate program, scorer,
+  budgets, agent), wires up the task, measures your code as the baseline, probes the attempt agent, and stops
+  before spending a cycle. In a project that already has a task it skips the interview, prints the config, and
+  answers the actual question: **the best candidate for that goal**.
 
-**`live`, `dream`, and `run` need a configured task in the project you are in** — that is
-`<cwd>/.dream-rsi/task.json`, created by `dream_rsi_init`. Without it you get exactly this:
+- **You, at the prompt.** `/dream-rsi create [goal]` sets up or reports, `/dream-rsi suggest [goal]` ranks the
+  candidates, `/dream-rsi status` shows state, `/dream-rsi live|dream` asks the agent for a single phase,
+  `/dream-rsi run [n]` asks for `n` full cycles, `/dream-rsi off` leaves Dream-RSI mode. Anything else you type
+  is treated as a goal. The commands *drive the agent*: they turn mode on and hand it the instruction, so a
+  cycle actually starts.
+- **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` writes the configuration, `dream_rsi_live`/
+  `dream_rsi_dream` run the phases, `dream_rsi_apply` copies a candidate back, `dream_rsi_status` reports.
+
+**`create` and `suggest` route themselves**, and everything except `status`, `off`, and `help` needs a
+configured task in the project you are in — that is `<cwd>/.dream-rsi/task.json`. `/dream-rsi create <goal>` writes
+it (via the interview); the rest report this when it is missing:
 
 ```text
 No Dream-RSI task in this project: <cwd>/.dream-rsi/task.json is missing.
-Ask the agent to configure one (dream_rsi_init: seed workspace, candidate file, scoring command),
+Run /dream-rsi create <goal> to set one up here (the agent calls dream_rsi_init),
 or copy a task.json you configured elsewhere into <cwd>/.dream-rsi.
 Current directory: <cwd>
 ```
 
 Which usually means one of two things: you are in the wrong directory (the task lives in the project you want to
-optimize, not in this one), or nobody has configured it yet. If it's the second, just say what you want
-optimized — the `dream-rsi` skill knows the questions:
+optimize, not in this one), or nobody has configured it yet. If it's the second, `/dream-rsi create <goal>` — or
+just say what you want optimized and let the `dream-rsi-create` skill ask the questions:
 
 ```text
 set up Dream-RSI: seed workspace task/seed, candidate file solution.cpp, scorer `node /abs/path/score.mjs`
 ```
 
-Or drive the tools yourself:
+Or drive the tools yourself (budgets here are the paper's task shape; the shipped defaults are smaller — `W=4,
+K1=6, K2=8, M=3`):
 
 ```text
 dream_rsi_init   name="lasso-path" workspace="task/seed" eval_program="solution.cpp" \
@@ -208,9 +224,31 @@ dream_rsi_live     # cycle 2 with the better policy — a second world
 dream_rsi_dream    # now replaying against both
 ```
 
-`dream_rsi_live` and `dream_rsi_dream` are gated behind Dream-RSI mode (`/dream-rsi`, or automatically after
-`dream_rsi_init`) because they spend real agent time. Everything above is also in the `dream-rsi` skill, which the
-agent reads on its own.
+`dream_rsi_live`, `dream_rsi_dream` and `dream_rsi_apply` are gated behind Dream-RSI mode (`/dream-rsi`, or
+automatically after `dream_rsi_init`): the first two spend real agent time, and the third writes to your code.
+Everything above is also in the `dream-rsi` skill, which the agent reads on its own.
+
+## Surface at a glance
+
+| Tool | What it costs | What it does |
+|------|---------------|--------------|
+| `dream_rsi_init` | one scorer run | Writes `task.json`, seeds the policy, measures your code as the baseline candidates must beat. |
+| `dream_rsi_live` | `W × K1` agent calls | One online cycle: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world. |
+| `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over the recorded worlds, sweep beta, rewrite the policy, deploy the winner. |
+| `dream_rsi_apply` | nothing | Copies a candidate's `eval_program` over your code. Needs `confirm: true`; never commits. |
+| `dream_rsi_status` | nothing | Iterations, worlds, policy versions, last sweep, and whether something is waiting to be applied. |
+
+`dream_rsi_live`, `dream_rsi_dream` and `dream_rsi_apply` are gated: they only become callable in Dream-RSI mode.
+
+| Command | What it does |
+|---------|--------------|
+| `/dream-rsi create <goal>` | Interview (fresh project) or report the config and recommend the best candidate for `<goal>` (configured). |
+| `/dream-rsi suggest <goal>` | Rank the candidates on demand. `best` is an alias. Preferences: `fastest`, `safest`, `simplest`. |
+| `/dream-rsi status` | The same state `dream_rsi_status` shows. |
+| `/dream-rsi live` \| `dream` | Ask the agent for one phase. |
+| `/dream-rsi run [n]` | Ask the agent for `n` full cycles. |
+| `/dream-rsi off` | Leave Dream-RSI mode (state on disk is untouched). |
+| *anything else* | Treated as a goal: interview in a fresh project, suggestion in a configured one. |
 
 ## What you give it
 
@@ -247,6 +285,8 @@ Crashes, missing files, and timeouts get classified for you (`eval_error`, `time
   task.json                                       budgets, scorer contract, agent command
   policy/method.ts                                the deployed policy (+ api.ts beside it)
   policy/v0000.ts …                               every evaluated version, archived, immutable
+  history/seed/score.json                         what YOUR code measured (the reference point for candidates)
+  history/applied.jsonl                           candidates you have already applied (append-only)
   history/baseline/attempt_<cell>/                the floor to beat (best attempt of cycle 1)
   history/r0001_live/attempt_<cell>/              proposal.md, eval/score.json, error.txt, prompt.md, logs
   history/r0001_live/tree.json                    the recorded discovery tree T_1
@@ -256,8 +296,68 @@ Crashes, missing files, and timeouts get classified for you (`eval_error`, `time
       selection.json                              which version won, and the V table
   trace_pool/iter0001/{tree.json,live_cycle_manifest.json}     the replay world + its live sidecar
   trace_pool/iter0001_current/                    in-flight mirror, so a crashed cycle stays visible
-  work/<cellId>/                                  attempt workspaces — the agents' cwd
+  work/r0001/<cellId>/                            attempt workspaces — the agents' cwd (one copy per attempt)
+  .gitignore                                      written on the first cycle: ignores work/ + trace_pool/
+                                                  (bulk), leaves task.json, policy/ and history/ visible
 ```
+
+## Applying an improvement (nothing is automatic)
+
+**Dream-RSI never writes to your code.** Every candidate lives inside `.dream-rsi/work/r<iter>/<cell>/`, the
+scorer runs on that copy, and your own files keep their timestamps. What *is* automatic is the search policy
+(`.dream-rsi/policy/method.ts`, deployed only when it wins the replay comparison) — not your program.
+
+So the loop has to tell you when there is something worth taking, and *which* one. It does, in five places:
+
+- `dream_rsi_init` measures your code once (`history/seed/score.json`) — that measurement is the reference
+  point every candidate is compared against. Without it "better" would be a guess. Skip it with
+  `measure_seed: false` if your scorer is slow; run it later by re-running init.
+- After every `dream_rsi_live` and `dream_rsi_dream`, the result ends with either `Nothing to apply: …` (and
+  why) or a block that starts `⚠️ IMPROVEMENT READY — NOT APPLIED`, naming the cell, its score versus your
+  code, the percentage gain, and the candidate's path.
+- The agent is instructed to pass that on and ask you whether to proceed. It will not apply anything on its
+  own initiative — `dream_rsi_apply` is only allowed after you say yes.
+- `dream_rsi_status` repeats it, and the footer switches to `dream-rsi: improvement ready`.
+- `/dream-rsi suggest <goal>` (or `/dream-rsi create <goal>` on a configured project; `best` is an alias) ranks the whole field and
+  explains the pick: score vs your baseline, secondary metrics, changed files, and the `mentions:` that admit a
+  trade the scorer cannot see. The goal picks a preference — `fastest` (strict score), `safest` (within 5% of the
+  leader's win, less to take on first), `simplest` (fewest changed files) — and unrecognised text is context,
+  never a filter.
+
+On the mnemosyne run this is the difference between `fastest` (a memoization win that trades a 20 ms staleness
+window the assertions cannot see) and `safest` (a candidate that keeps freshness and gives up 1.5% of the win).
+
+A candidate is reported only if it beats your measured baseline (or the last thing you applied) by at least
+**1%** — noise-level differences stay quiet. The registry is append-only: `history/applied.jsonl` records what
+you took, so the same candidate is not offered twice.
+
+### Taking it
+
+```text
+dream_rsi_apply                          # without confirm: prints the files, line counts and the diff command
+dream_rsi_apply confirm=true             # copies the pending best candidate over your code
+dream_rsi_apply confirm=true cell=b1a1 paths=["src/lib/support.py"]   # extra files, if the task needs them
+```
+
+What it does and does not do:
+
+- Copies **only** the declared `eval_program` plus any paths you name, and only from the candidate workspace
+  into your seed workspace. Paths that are absolute, contain `..`, or escape either workspace are refused.
+- Refuses without `confirm: true`, so a misread tool call cannot rewrite your code.
+- **Never commits, never creates a branch, never runs your tests.** It prints the files it wrote and tells you
+  to review.
+- The candidate's `proposal.md` is *not* applied — reports are for reading, not for your repo.
+
+Or do it by hand, which is the same thing:
+
+```bash
+BEST=.dream-rsi/$(python3 -c "import json;t=json.load(open('.dream-rsi/trace_pool/iter0001/tree.json'));print(sorted([c for c in t['cells'] if c['fail_class']=='ok'],key=lambda c:-(c['score'] or 0))[0]['workspace'])")
+diff -u src/lib/storage.py "$BEST/src/lib/storage.py"   # read before you copy
+cp "$BEST/src/lib/storage.py" src/lib/storage.py
+```
+
+A score from one benchmark is not a correctness review. Read the diff, run your own checks, then commit — the
+tool deliberately stops one step short of your repository.
 
 ## The policy file
 
@@ -296,7 +396,7 @@ Read this before trusting a number.
 |------|------------------------------|
 | `beta1`, `beta2` (Eq. 1) | The paper gives the form, not the values. Defaults `0.01` / `0.01`, configurable per task. |
 | `lambda` (sweep ranking) | Same: default `1`, stored next to every sweep. |
-| Beta grid, `K1`, `K2`, `M` defaults | Not published. Grid `[0, .2, .4, .6, .8, 1]`, `K1=6`, `K2=8`, `M=3`. The paper's task shape (`W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, five rounds) is what the skill recommends. |
+| Beta grid, `K1`, `K2`, `M` defaults | Not published. Shipped defaults: `W=4`, `K1=6`, `K2=8`, `M=3`, grid `[0, .2, .4, .6, .8, 1]`, `beta1=beta2=0.01`, `default_beta=0.6`. The paper's task shape (`W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, five rounds) is what the create skill recommends. |
 | `pareto.auc` normalization | "High per-trace attainment with few total probes" is implemented as mean attainment over the probes actually taken, averaged across worlds, then trapezoidal over the beta→work curve. |
 | Grid vs. tree bookkeeping | The paper's trees branch by "opening a root". Here an unopened root is a **root slot** (`b<branch>a0`), so one batch can open several directions, as the prompt describes. Replay opens branches in creation order (the paper's root rule), so a policy that takes roots in `legal_roots()` order behaves exactly as written. |
 | Semantic direction guidance | Deliberately absent. The paper's §4 ablation found prompt-level semantic guidance over-constrains the search and hurts; `$direction_guidance` renders empty. |
@@ -304,19 +404,22 @@ Read this before trusting a number.
 ## Tests
 
 ```bash
-npm test    # 37 tests, no LLM, ~15s
+npm test    # 56 tests, no LLM, ~20s
 ```
 
 It covers `A(T)` and frontier rules, batch legality, replay transitions (root rule, unique recorded child, grid
 depth cap, `K2`, `Child(v)=∅`), Eq. 1 worked out by hand, AUC/penalty/frontier, determinism detection,
 `V* ≥ V_0`, prefix-only enforcement, a full two-cycle loop with stub agents (live → worlds → revisions → deploy →
 replay both worlds), every scorer diagnosis (`invalid_score`, `eval_error`, `no_proposal`, `agent_error`,
-`timeout`), and the extension surface (gating, status, session rebuild, branch-local state, crashed-cycle
-visibility, schema strictness, package vs. relocated-directory layouts).
+`timeout`), candidate ranking (score order, `fastest`/`safest`/`simplest`, the win band, applied exclusion,
+secondary metrics, scoped-vs-data files, determinism, and that ranking writes nothing), the agent-command
+builder (`--model` appended vs `{model}` substituted), and the extension surface (gating, `create`/`suggest`
+dispatch and routing, session rebuild, branch-local state, crashed-cycle visibility, schema strictness, package
+vs. relocated-directory layouts).
 
-What tests can't cover is your scorer and your model. For that: load it (`pi -e "/path/to/pi-dream-rsi"`), then
-walk **How to run it well** steps 1–5 on a scratch project. Step 3 tells you whether the task fits; step 5 tells
-you when to stop.
+What tests can't cover is your scorer and your model. For that, on a scratch project: `/dream-rsi create <goal>`
+to get set up (the skill interviews you and verifies the scorer), then **How to run it well** steps 3–5 — step 3
+tells you whether the task fits, step 5 tells you when to stop.
 
 ## What this is not
 

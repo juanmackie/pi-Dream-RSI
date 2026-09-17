@@ -132,6 +132,30 @@ export function readTree(root: string, iteration: number): DiscoveryTree | null 
   return json ? DiscoveryTree.fromJSON(json) : null;
 }
 
+/**
+ * Keep the bulky half of the run state out of git, in this project and in every future one.
+ *
+ * `work/` holds one full workspace copy per attempt and `trace_pool/` mirrors the recorded trees, so
+ * they are the parts that grow to megabytes. `task.json`, `policy/` and `history/` stay visible on
+ * purpose: they are the task definition, the artefact being improved, and the evidence — exactly the
+ * things a project may want to version. Delete this file to version everything.
+ */
+export function ensureDreamIgnore(root: string): string {
+  const file = path.join(root, ".gitignore");
+  if (!fs.existsSync(file)) {
+    fs.mkdirSync(root, { recursive: true });
+    fs.writeFileSync(
+      file,
+      "# Written by pi-dream-rsi: bulk run state stays out of git by default.\n" +
+        "# task.json, policy/ and history/ remain visible; delete this file to version everything.\n" +
+        "work/\n" +
+        "trace_pool/\n",
+      "utf8",
+    );
+  }
+  return file;
+}
+
 /** Write the live-cycle sidecar the cross-cycle beta rule reads (paper Listing 2). */
 export function writeManifest(root: string, manifest: LiveCycleManifest): string {
   const final = path.join(iterationDir(root, manifest.iteration), "live_cycle_manifest.json");
