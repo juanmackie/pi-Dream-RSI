@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DiscoveryTree } from "../engine/tree.ts";
+import { ensureWorkerRuntime } from "../engine/world.ts";
 import type { Decision, ProbeFn } from "./host.ts";
 import type { Budget, CellId, EpisodeResult, GridPlan, GridPlanningContext, PolicyConfig } from "./api.ts";
 
@@ -104,6 +105,26 @@ export function readPolicyViolations(policyPath: string): string[] {
   }
 }
 
+/**
+ * Where the worker entry runs from.
+ *
+ * An npm-installed package sits under `node_modules`, where Node refuses to strip TypeScript types — so the
+ * worker is mirrored into the project (`<dream-root>/runtime/`, imports and all) and spawned from there.
+ * Without a mirror (unpacked source, tests) the package copy is used directly.
+ */
+function workerEntryFor(policyPath: string, override?: string): string {
+  if (override) return override;
+  try {
+    const dreamRoot = path.dirname(path.dirname(path.resolve(policyPath)));
+    const extensionDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    const mirrored = ensureWorkerRuntime(dreamRoot, extensionDir);
+    if (mirrored) return mirrored;
+  } catch {
+    // fall through to the package copy
+  }
+  return WORKER_PATH;
+}
+
 
 /**
  * Policy code is TypeScript, so the worker needs a Node that can execute it. Checking up front turns a
@@ -127,7 +148,7 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
   const violations = readPolicyViolations(options.policyPath);
   if (violations.length > 0) return { ok: false, violations, error: violations.join("; "), durationMs: 0 };
 
-  const worker = new Worker(options.workerPath ?? WORKER_PATH, {
+  const worker = new Worker(workerEntryFor(options.policyPath, options.workerPath), {
     // Forward nothing from the parent: test runners and CLIs inject flags a worker rejects
     // (`--test`, `--input-type`, `--use-largepages`, …). The only flag a worker may need is the
     // TypeScript loader, and only on Node versions that strip types behind a flag.

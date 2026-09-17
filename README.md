@@ -297,8 +297,11 @@ Crashes, missing files, and timeouts get classified for you (`eval_error`, `time
   trace_pool/iter0001/{tree.json,live_cycle_manifest.json}     the replay world + its live sidecar
   trace_pool/iter0001_current/                    in-flight mirror, so a crashed cycle stays visible
   work/r0001/<cellId>/                            attempt workspaces — the agents' cwd (one copy per attempt)
-  .gitignore                                      written on the first cycle: ignores work/ + trace_pool/
-                                                  (bulk), leaves task.json, policy/ and history/ visible
+  runtime/                                        the policy worker + the modules it imports, mirrored out of
+                                                  node_modules so the worker can run (npm installs only)
+  .gitignore                                      written on the first cycle: ignores work/, trace_pool/ and
+                                                  runtime/ (bulk + generated), leaves task.json, policy/ and
+                                                  history/ visible
 ```
 
 ## Applying an improvement (nothing is automatic)

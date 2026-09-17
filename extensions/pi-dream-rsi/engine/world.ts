@@ -142,18 +142,53 @@ export function readTree(root: string, iteration: number): DiscoveryTree | null 
  */
 export function ensureDreamIgnore(root: string): string {
   const file = path.join(root, ".gitignore");
+  const lines = [
+    "# Written by pi-dream-rsi: bulk run state stays out of git by default.",
+    "# task.json, policy/ and history/ remain visible; delete this file to version everything.",
+    "work/",
+    "trace_pool/",
+    "runtime/",
+    "",
+  ].join("\n");
   if (!fs.existsSync(file)) {
     fs.mkdirSync(root, { recursive: true });
-    fs.writeFileSync(
-      file,
-      "# Written by pi-dream-rsi: bulk run state stays out of git by default.\n" +
-        "# task.json, policy/ and history/ remain visible; delete this file to version everything.\n" +
-        "work/\n" +
-        "trace_pool/\n",
-      "utf8",
-    );
+    fs.writeFileSync(file, lines, "utf8");
+    return file;
   }
+  // Older projects predate a line: keep the file authoritative instead of rewriting the user's choice.
+  const current = fs.readFileSync(file, "utf8");
+  const missing = ["work/", "trace_pool/", "runtime/"].filter((entry) => !new RegExp(`^${entry}$`, "m").test(current));
+  if (missing.length > 0) fs.writeFileSync(file, `${current.trimEnd()}\n${missing.join("\n")}\n`, "utf8");
   return file;
+}
+
+/**
+ * Copy the policy worker and the modules it imports into the project, preserving relative paths.
+ *
+ * Node refuses to strip TypeScript types for files under `node_modules`, and an npm-installed package
+ * lives exactly there — so the worker entry has to run from the project, not from the package. The
+ * closure is discovered by walking the worker's own imports, so it stays correct as the worker grows.
+ */
+export function ensureWorkerRuntime(dreamRoot: string, extensionDir: string): string | null {
+  const entry = path.join(extensionDir, "worker", "policy-worker.ts");
+  if (!fs.existsSync(entry)) return null;
+  const runtime = path.join(dreamRoot, "runtime");
+  const seen = new Set<string>();
+  const queue = [entry];
+  while (queue.length > 0) {
+    const file = queue.pop() as string;
+    if (seen.has(file) || !fs.existsSync(file)) continue;
+    seen.add(file);
+    const target = path.join(runtime, path.relative(extensionDir, file));
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const source = fs.readFileSync(file, "utf8");
+    fs.writeFileSync(target, source, "utf8");
+    for (const match of source.matchAll(/from\s+"(\.{1,2}\/[^"]+\.ts)"/g)) {
+      const next = path.resolve(path.dirname(file), match[1]);
+      if (next.startsWith(extensionDir)) queue.push(next);
+    }
+  }
+  return path.join(runtime, "worker", "policy-worker.ts");
 }
 
 /** Write the live-cycle sidecar the cross-cycle beta rule reads (paper Listing 2). */

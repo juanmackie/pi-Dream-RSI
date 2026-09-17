@@ -280,3 +280,66 @@ test("the configured model is actually passed to attempts", () => {
   assert.deepEqual(buildAgentArgs({ ...base, args: ["-p", "--model", "{model}"], model: "x/y" }), ["-p", "--model", "x/y"], "placeholder wins");
   assert.deepEqual(buildAgentArgs({ ...base, args: ["-p"], model: null }), ["-p"]);
 });
+
+test("an npm-installed package runs its worker from the project, not from node_modules", async () => {
+  // Node refuses to strip TypeScript types under node_modules, and that is exactly where npm puts the
+  // package. The worker entry must therefore be mirrored into the project before it is spawned.
+  const { runPolicyChecked } = await jump("policy/runner.ts");
+  const { ensurePolicyRuntime, deployPolicy, ensureWorkerRuntime } = await jump("engine/world.ts");
+  const { EXT } = await import("./fixtures.mjs");
+  const path = await import("node:path");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-npmlayout-"));
+  try {
+    // A faithful npm layout: the extension inside node_modules/pi-dream-rsi/extensions/pi-dream-rsi.
+    const installRoot = path.join(dir, "consumer", "node_modules", "pi-dream-rsi");
+    fs.mkdirSync(installRoot, { recursive: true });
+    for (const entry of ["extensions", "prompts", "skills", "package.json"]) {
+      fs.cpSync(path.join(EXT, "..", "..", entry), path.join(installRoot, entry), { recursive: true });
+    }
+    const installedExt = path.join(installRoot, "extensions", "pi-dream-rsi");
+
+    // Deploy that copy's policy into a project the way dream_rsi_init does.
+    const dreamRoot = path.join(dir, "consumer", ".dream-rsi");
+    fs.mkdirSync(path.join(dir, "consumer", "seed"), { recursive: true });
+    ensurePolicyRuntime(dreamRoot, path.join(installedExt, "policy"));
+    deployPolicy(dreamRoot, fs.readFileSync(path.join(installedExt, "policy", "method.ts"), "utf8"));
+
+    // Spawning the package copy directly is what used to happen, and it throws.
+    const { Worker } = await import("node:worker_threads");
+    const spawnPackageWorker = () =>
+      new Promise((_resolve, reject) => {
+        const worker = new Worker(path.join(installedExt, "worker", "policy-worker.ts"), {
+          execArgv: process.features?.typescript ? [] : ["--experimental-strip-types"],
+          workerData: { policyPath: path.join(dreamRoot, "policy", "method.ts"), mode: "grid", maxParallelism: 1, config: {} },
+        });
+        worker.on("error", reject);
+        worker.on("exit", () => _resolve(undefined));
+      });
+    await assert.rejects(spawnPackageWorker(), /node_modules/);
+
+    // Mirrored into the project, the same policy runs.
+    const mirrored = ensureWorkerRuntime(dreamRoot, installedExt);
+    assert.ok(mirrored && fs.existsSync(mirrored), "the worker is mirrored into the project");
+    assert.ok(mirrored.includes(`${path.sep}.dream-rsi${path.sep}runtime${path.sep}`));
+    for (const relative of ["worker/policy-worker.ts", "engine/tree.ts", "engine/replay.ts", "policy/host.ts", "policy/api.ts"]) {
+      assert.ok(fs.existsSync(path.join(dreamRoot, "runtime", relative)), `${relative} came along`);
+    }
+
+    const tree = new DiscoveryTree({ baselineScore: 0, branchCount: 1, refineCount: 1 });
+    tree.addBranchSlot(0);
+    const run = await runPolicyChecked({
+      policyPath: path.join(dreamRoot, "policy", "method.ts"),
+      mode: "replay",
+      maxParallelism: 1,
+      world: tree,
+      maxRounds: 2,
+      verifyDeterminism: true,
+    });
+    assert.equal(run.ok, true, run.error ?? "");
+    assert.equal(run.deterministic, true, "and the mirrored worker is deterministic");
+    assert.ok(!mirrored.includes("node_modules"), "never spawns from node_modules");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

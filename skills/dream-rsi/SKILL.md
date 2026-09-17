@@ -135,7 +135,7 @@ also ends with "here is what to take". Goal words pick the preference: `fastest`
 ```
 .dream-rsi/
   task.json                                  budgets, scorer contract, agent command
-  .gitignore                                 written on the first cycle: work/ + trace_pool/ stay out of git
+  .gitignore                                 written on the first cycle: work/ + trace_pool/ + runtime/ stay out of git
   policy/method.ts                           deployed policy (EVOLVE-BLOCK), with api.ts next to it
   policy/v0000.ts …                          every evaluated version, archived
   history/seed/score.json                    what the user's own code measured — the reference point
@@ -147,6 +147,8 @@ also ends with "here is what to take". Goal words pick the preference: `fastest`
   trace_pool/iter0001/{tree.json,live_cycle_manifest.json}     replay world + live sidecar
   trace_pool/iter0001_current/                in-flight mirror
   work/r0001/<cellId>/                        attempt workspaces (agent cwd), one copy per attempt
+  runtime/                                    the policy worker + its imports, mirrored out of node_modules
+                                              (npm installs), so the worker entry can actually run
 ```
 
 Ranks are computed from `.dream-rsi` alone (no agent calls, no scorer runs): scores from `trace_pool`, secondary
