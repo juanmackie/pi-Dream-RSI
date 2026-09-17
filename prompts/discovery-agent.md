@@ -34,6 +34,15 @@ targeted fix to a specific bug found in step 2 -- never a repeat or rename of so
 Implement it in `$eval_program`. Don't claim it compiles, is correct, or beats SOTA until it's actually
 evaluated.
 
+## Honest wins only
+
+The scorer, the workload it measures, and their fixtures are ground truth and off-limits: never modify or wrap
+them, and never tailor your solution to the exact inputs you can see — no hard-coded outputs, no branching on
+benchmark-specific inputs, no weakened or disabled checks. Solve the problem, not the benchmark: your change
+must keep working on inputs this workload does not contain. If your approach accepts a trade-off the scorer
+cannot see (a staleness window, an approximation, a cache that can serve an old value), state it explicitly in
+`proposal.md`; undeclared trade-offs are grounds for rejection.
+
 ## Files
 
 Write only `$node_dir/proposal.md` (mechanism, evidence from history, why it's not a repeat, expected
