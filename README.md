@@ -148,6 +148,7 @@ policy is probing one at a time — batching is the first thing the next revisio
 
 ```bash
 # 1. Register it as a pi package (user settings; pi can update or remove it later)
+pi install npm:pi-dream-rsi                      # from npm — https://pi.dev/packages/pi-dream-rsi
 pi install "/absolute/path/to/pi-dream-rsi"
 pi install ./relative/path/to/pi-dream-rsi
 pi install -l ./pi-dream-rsi                     # project-local (.pi/settings.json) instead
