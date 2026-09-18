@@ -29,7 +29,7 @@ export function dreamRootFor(cwd: string): string {
 export function saveTaskEntry(
   pi: { appendEntry: (type: string, data: unknown) => void },
   root: string,
-  data: { task?: string; policy?: string; iteration?: number },
+  data: { task?: string; policy?: string; iteration?: number; model?: string | null },
 ): void {
   pi.appendEntry(LIVE_MANIFEST_ENTRY, { version: 1, root, ...data });
 }

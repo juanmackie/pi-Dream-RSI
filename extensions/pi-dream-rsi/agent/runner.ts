@@ -176,8 +176,7 @@ export function buildAgentArgs(agent: AgentConfig): string[] {
 export function runAgent(options: AgentRun): Promise<CommandResult> {
   const { agent } = options;
   const args = buildAgentArgs(agent);
-  const shell = process.platform === "win32";
-  if (shell && agent.model && !MODEL_PATTERN.test(agent.model)) {
+  if (agent.model && !MODEL_PATTERN.test(agent.model)) {
     return Promise.resolve({
       ok: false,
       code: null,
@@ -190,6 +189,7 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
       logPath: options.logPath ?? null,
     });
   }
+  const shell = process.platform === "win32";
   if (agent.prompt_via === "arg") {
     return collect(agent.command, [...args, options.prompt], { ...options, shell });
   }
