@@ -225,3 +225,5 @@ serial probes. Before finishing, verify trajectory-based ranking, the stated suc
 non-automatic zero-valid closure, deterministic recovery competition, and portfolio-level stop.
 
 Report back with: the mechanism you changed, and the `reason` for your grid plan.
+
+--- Note --- `plan_grid` must return non-None `GridPlan`. `default_beta` selected by cross-cycle rule. Prefix-only observations enforced.

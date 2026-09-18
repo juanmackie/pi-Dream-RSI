@@ -116,6 +116,7 @@ you spend a cent on agent calls.
 **2. Probe the agent, then start small.** `create` runs the effective attempt command once (`pi -p … --model <id>
 "Reply with exactly: OK"`) so a bad model id or empty balance costs one small call instead of a cycle of failed
 attempts. `workers=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy revision
+- `agent.model` reads `PI_MODEL` from the session environment; shown in output and session entry.`
 per cycle. That's enough to see whether the proposals are real. Once they are, scale to the paper's
 shape: `W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, roughly five cycles, and `M` somewhere
 around 3–5 (the paper doesn't publish its value).
@@ -449,3 +450,5 @@ from it here.
 ## License
 
 MIT © Juan Mackie — [juanmackie.com](https://juanmackie.com). See [LICENSE](LICENSE).
+
+--- Related: https://pi.dev/packages ---

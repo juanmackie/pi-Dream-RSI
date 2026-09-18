@@ -132,3 +132,5 @@ copies the candidate's file over the user's code, with `confirm: true`, records 
 - Starting a paid cycle because the setup "looked fine"; probe first, ask first.
 - Recommending the top score without reading its proposal: the run that motivated this skill produced a
   candidate that traded a 20 ms staleness window for 2× — invisible to the scorer, obvious in the proposal.
+
+--- Note --- `model` parameter mapped to `agent.model` (reads `PI_MODEL` by default). `MODEL_PATTERN` guards unsafe chars unconditionally.

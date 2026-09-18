@@ -154,3 +154,5 @@ also ends with "here is what to take". Goal words pick the preference: `fastest`
 Ranks are computed from `.dream-rsi` alone (no agent calls, no scorer runs): scores from `trace_pool`, secondary
 metrics from the archived `eval/score.json`, changed files by comparing a workspace against the seed, and the
 `mentions:` line from each attempt's `proposal.md`.
+
+--- Note --- Session daemon `PI_MODEL=thinkingmachines/inkling:free` used; `agent.model` visible in output/session.

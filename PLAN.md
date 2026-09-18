@@ -214,3 +214,9 @@ Purpose-built checks, all runnable with `npm test` (`node --test tests/*.test.mj
    continues; killed agent process ⇒ node failure, batch still completes.
 10. **Manual smoke (documented, user-run)** — real task with a real model: 2 iterations, inspect `dream_rsi_status`
     and the `V_m` table; confirm `trace_pool` growth and that the deployed policy differs from `v0001`.
+
+--- Updates (post-implementation) ---
+- `agent.model` reads `PI_MODEL` from session env; visible in `dream_rsi_init` output and `TASK_ENTRY` session state.
+- `MODEL_PATTERN` validation applies unconditionally (not only on Windows `shell` mode).
+- Cross-cycle default-beta selection (`crossCycleBeta`) implements the paper's explicit rule (raise/lower by 0.1–0.2 based on live trend and sweep evidence).
+- No user-facing commands, skills, or archive paths removed.
