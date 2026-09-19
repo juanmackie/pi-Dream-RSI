@@ -34,6 +34,8 @@ export interface SeedMeasurement {
   measured_at: string;
   /** The workspace the measurement ran in, relative to the project when possible. */
   workspace: string;
+  /** The scorer this measurement came from; absent in files written before it was recorded. */
+  score_program?: string;
   seconds: number;
 }
 
@@ -119,9 +121,22 @@ export async function measureSeed(options: {
       error: outcome.error,
       measured_at: new Date().toISOString(),
       workspace: path.relative(projectDir, seed) || seed,
+      score_program: task.score_program,
       seconds: Math.round((Date.now() - started) / 100) / 10,
     };
-    writeJson(seedScorePath(dreamRoot), measurement);
+    // The reference point is overwritten by definition, so keep the previous one. Re-running init after a
+    // candidate was applied would otherwise move the goalposts instead of leaving the old number behind.
+    const file = seedScorePath(dreamRoot);
+    const previous = readSeedMeasurement(dreamRoot);
+    if (previous) {
+      const stamp = (previous.measured_at ?? measurement.measured_at).replace(/[:.]/g, "-");
+      const kept = path.join(historyDir(dreamRoot), "seed", `score.${stamp}.json`);
+      if (kept !== file) {
+        fs.copyFileSync(file, kept);
+        log(`[seed] previous reference kept at ${path.relative(dreamRoot, kept)}`);
+      }
+    }
+    writeJson(file, measurement);
     log(
       `[seed] your code measures ${outcome.raw_score ?? "n/a"} (${outcome.fail_class}) in ${measurement.seconds}s — the reference point for every candidate`,
     );

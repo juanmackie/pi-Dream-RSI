@@ -30,11 +30,12 @@ import {
   statusSummary,
   type DreamState,
 } from "./state.ts";
-import { ensurePolicyRuntime } from "./engine/world.ts";
+import { ensureDreamIgnore, ensurePolicyRuntime } from "./engine/world.ts";
 import {
   findCandidate,
   improvements,
   measureSeed,
+  readSeedMeasurement,
   recordApplied,
 } from "./engine/improvements.ts";
 import { rankCandidates, renderSuggestion, type Ranking } from "./engine/candidates.ts";
@@ -73,6 +74,11 @@ const taskParams = {
     measure_seed: {
       type: "boolean",
       description: "Run the scorer once on your own code to record the baseline candidates must beat (default true; set false for a slow scorer).",
+    },
+    remeasure_seed: {
+      type: "boolean",
+      description:
+        "Re-run the scorer on the seed even though a reference measurement already exists (default false; a changed workspace or scorer re-measures automatically, and the old measurement is kept).",
     },
   },
   required: ["name", "workspace", "eval_program", "score_program"],
@@ -223,6 +229,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Call dream_rsi_init before dream_rsi_live: it writes .dream-rsi/task.json and seeds the exploration policy.",
       "dream_rsi_init does not run anything expensive; it only writes configuration and validates that the workspace and problem file exist.",
+      "Reconfiguring keeps the recorded baseline unless the workspace or the scorer changed; call dream_rsi_init with remeasure_seed=true only when the user wants the current code measured as the new reference point.",
     ],
     parameters: taskParams,
     async execute(_id, params, _signal, onUpdate, ctx) {
@@ -268,11 +275,26 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       writeTask(root, task);
       const seeded = fs.existsSync(path.join(root, "policy", "method.ts"));
       const policyPath = seedPolicy(root, task, !seeded || params.reset === true);
-      // Measure your own code once. Without it "the loop found something better" has no reference point.
+      // Measure your own code once. Without it "the loop found something better" has no reference point —
+      // but re-running init must not silently move that reference point: a re-interview after a candidate
+      // was applied would adopt the improved code as the baseline and retire every past win. Re-measure only
+      // when the thing being measured changed, or when explicitly asked.
+      const recorded = readSeedMeasurement(root);
+      const remeasure =
+        params.remeasure_seed === true ||
+        recorded === null ||
+        recorded.workspace !== task.workspace ||
+        recorded.score_program !== task.score_program;
       const measurement =
-        params.measure_seed === false
+        params.measure_seed === false || !remeasure
           ? null
           : await measureSeed({ dreamRoot: root, projectDir: projectDir(ctx), task, log: (m) => onUpdate?.({ content: [{ type: "text", text: m }] }) });
+      const baselineNote =
+        measurement !== null
+          ? `  baseline:   your code measures ${measurement.raw_score ?? "n/a"} (${measurement.fail_class}) — every candidate is compared against it`
+          : recorded === null
+            ? "  baseline:   not measured (scorer not run on your code yet)"
+            : `  baseline:   kept ${recorded.raw_score ?? "n/a"} (${recorded.fail_class}), measured ${recorded.measured_at} — pass remeasure_seed=true to measure the current code instead`;
       saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: task.agent.model });
       setMode(ctx, true);
       return {
@@ -288,15 +310,13 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} beta_grid=[${task.beta_grid.join(", ")}]`,
               `  agent:      ${task.agent.command} ${task.agent.args.join(" ")}${task.agent.model ? ` --model ${task.agent.model}` : ""}`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
-              measurement === null
-                ? "  baseline:   not measured (scorer not run on your code yet)"
-                : `  baseline:   your code measures ${measurement.raw_score ?? "n/a"} (${measurement.fail_class}) — every candidate is compared against it`,
+              baselineNote,
               `Next: dream_rsi_live to run one online rollout.`,
               `Nothing is ever written to your code: candidates land in .dream-rsi/work/, and applying one is a separate, explicit step (dream_rsi_apply).`,
             ].join("\n"),
           },
         ],
-        details: { task, policy: policyPath, baseline: measurement },
+        details: { task, policy: policyPath, baseline: measurement ?? recorded, remeasured: measurement !== null },
       };
     },
   });
@@ -608,7 +628,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: create [goal] | suggest [goal] | status | run [n] | live | dream | off",
+    description: "Dream-RSI: create [goal] [--reconfigure|--fresh] | suggest [goal] | status | run [n] | live | dream | off",
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
       const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
@@ -665,15 +685,60 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       }
       if (verb === "create") {
         if (configured) {
-          // Already set up: report it, then answer the actual question — what is best for this goal.
-          const ranking = suggestionFor(ctx, rest || null);
+          const task = readTask(root);
+          // "Set up" and "what is best" are different jobs, and guessing between them is what stranded
+          // returning users: `create` used to skip the interview forever. `--reconfigure` / `--fresh` are
+          // the non-interactive path — hosts without a TUI answer `undefined` to `select`.
+          const flag = /^--(reconfigure|fresh)\b/.exec(rest);
+          const goal = flag ? rest.slice(flag[0].length).trim() : rest;
+          const choice = flag
+            ? flag[1] === "reconfigure"
+              ? CREATE_RECONFIGURE
+              : CREATE_FRESH
+            : await ctx.ui.select(`/dream-rsi create — this project already has a task (${task.name})`, [
+                goal ? `Show the best candidate for "${goal}"` : "Show the best candidate",
+                CREATE_RECONFIGURE,
+                CREATE_FRESH,
+                CREATE_CANCEL,
+              ]);
+          if (choice === CREATE_FRESH) {
+            const running = activeRuns(root);
+            if (running.length > 0) {
+              ctx.ui.notify(`Refusing to start a fresh task while a phase is in flight: ${running.join("; ")}.`, "error");
+              return;
+            }
+            if (
+              await ctx.ui.confirm(
+                "Start a fresh Dream-RSI task?",
+                `The current task's state is archived under ${path.join(root, "archive")}/<timestamp>/ — nothing is deleted.`,
+              )
+            ) {
+              const archived = archiveDreamRoot(root);
+              setMode(ctx, true);
+              ctx.ui.notify(`Archived the previous task to ${archived} — loading the dream-rsi-create skill for a fresh one`, "info");
+              sendWhenReady(`/skill:dream-rsi-create fresh ${goal}`.replace(/\s+/g, " ").trim());
+              return;
+            }
+            // Declined: fall through to the report rather than leaving the command silent.
+          }
+          if (choice === CREATE_RECONFIGURE) {
+            setMode(ctx, true);
+            ctx.ui.notify("Dream-RSI mode ON — loading the dream-rsi-create skill to reconfigure this task", "info");
+            sendWhenReady(`/skill:dream-rsi-create reconfigure ${goal}`.replace(/\s+/g, " ").trim());
+            return;
+          }
+          // Show (the default, an unavailable dialog, or Cancel): report the config and rank the field.
+          // Mode is turned on here too — it used to stay off, so "apply the improvement" reached a tool
+          // that was not registered.
+          setMode(ctx, true);
+          const ranking = suggestionFor(ctx, goal || null);
           setStatus(ctx, ranking);
           const text = [
             renderExistingConfig(root, ctx.cwd, stateFor(ctx).iteration),
             "",
             renderSuggestion(ranking),
             "",
-            "Next: /dream-rsi run 2 to keep searching, or dream_rsi_init reset=true to re-seed the policy.",
+            "Next: /dream-rsi run 2 to keep searching, /dream-rsi create --reconfigure to change this task, or /dream-rsi create --fresh to start an unrelated one.",
           ].join("\n");
           ctx.ui.notify(text, "info");
           pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { deliverAs: "nextTurn" });
@@ -795,6 +860,33 @@ function normalizePathArg(value: string): string {
   return value.startsWith("@") ? value.slice(1) : value;
 }
 
+/**
+ * The answers `/dream-rsi create` offers on a configured project. Labels are matched by the handler and
+ * the tests, so they live in one place.
+ */
+const CREATE_RECONFIGURE = "Reconfigure this task (re-interview)";
+const CREATE_FRESH = "Start a fresh task (archives current .dream-rsi)";
+const CREATE_CANCEL = "Cancel";
+
+/** The state a fresh task replaces. Archived by rename, never deleted. */
+const ARCHIVE_ENTRIES = ["task.json", "policy", "policy_versions", "history", "trace_pool", "work", "runtime"];
+
+/**
+ * Move the current task's state aside so a fresh one can be configured without losing the old one.
+ * Renames only, into `.dream-rsi/archive/<timestamp>/`, which inherits the gitignore that keeps the bulk
+ * run state (`work/`, `trace_pool/`, `runtime/`) out of version control.
+ */
+function archiveDreamRoot(root: string): string {
+  const dir = path.join(root, "archive", new Date().toISOString().replace(/[:.]/g, "-"));
+  fs.mkdirSync(dir, { recursive: true });
+  for (const name of ARCHIVE_ENTRIES) {
+    const from = path.join(root, name);
+    if (fs.existsSync(from)) fs.renameSync(from, path.join(dir, name));
+  }
+  ensureDreamIgnore(dir);
+  return dir;
+}
+
 /** The existing configuration, so `/dream-rsi create` on a configured project answers instead of interrogating. */
 function renderExistingConfig(root: string, cwd: string, sessionIteration: number): string {
   let summary: string;
@@ -810,7 +902,10 @@ function renderExistingConfig(root: string, cwd: string, sessionIteration: numbe
 function renderCommandHelp(root: string, configured: boolean): string {
   return [
     "Dream-RSI (arXiv 2609.14858)",
-    "  /dream-rsi create [goal]    set up a task here (loads the dream-rsi-create skill), or report the existing one",
+    "  /dream-rsi create [goal]    set up a task here (loads the dream-rsi-create skill); on a configured",
+    "                              project, ask whether to report, reconfigure or start fresh",
+    "  /dream-rsi create --reconfigure | --fresh",
+    "                              the same choice without the dialog (print/scripted use)",
     "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest",
     "  /dream-rsi status           iterations, worlds, policy versions, last sweep",
     "  /dream-rsi live             ask the agent for one online exploration cycle",

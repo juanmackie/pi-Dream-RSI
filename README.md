@@ -98,8 +98,9 @@ pipelines whose quality you can already measure automatically.
 **1. Let `create` run the interview, then build the scorer.** `/dream-rsi create <goal>` (or the goal in plain
 words) loads the `dream-rsi-create` skill, which asks for the seed workspace, candidate program, scorer,
 correctness gate and budgets — and refuses to start a cycle until the scorer has been verified. It prefers
-wrapping a benchmark that already exists in the repo over authoring one. The scorer is the ground truth of the
-whole loop:
+wrapping a benchmark that already exists in the repo over authoring one. Once a task exists, the same command
+asks whether you meant the ranking, a reconfigure (`--reconfigure`), or a fresh task (`--fresh`). The scorer is
+the ground truth of the whole loop:
 
 - Deterministic. Fixed instances, seeded randomness, no wall-clock thresholds.
 - Reports `score` **and** `valid`/`fail_class`, so a fast-but-wrong candidate can't win. A non-`ok` fail class
@@ -181,14 +182,16 @@ There are two ways in, and they are not interchangeable:
 - **`/dream-rsi create <goal>`** — the on-ramp. In a project with no task it turns mode on and loads the
   `dream-rsi-create` skill, which interviews you (objective, seed workspace, candidate program, scorer,
   budgets, agent), wires up the task, measures your code as the baseline, probes the attempt agent, and stops
-  before spending a cycle. In a project that already has a task it skips the interview, prints the config, and
-  answers the actual question: **the best candidate for that goal**.
+  before spending a cycle. In a project that already has a task it asks what you meant — show the config and
+  **the best candidate for that goal**, reconfigure the task through a fresh interview, or start an unrelated
+  task (the old state is archived, not deleted). `--reconfigure` and `--fresh` answer that question without the
+  dialog, for print/scripted use.
 
-- **You, at the prompt.** `/dream-rsi create [goal]` sets up or reports, `/dream-rsi suggest [goal]` ranks the
-  candidates, `/dream-rsi status` shows state, `/dream-rsi live|dream` asks the agent for a single phase,
-  `/dream-rsi run [n]` asks for `n` full cycles, `/dream-rsi off` leaves Dream-RSI mode. Anything else you type
-  is treated as a goal. The commands *drive the agent*: they turn mode on and hand it the instruction, so a
-  cycle actually starts.
+- **You, at the prompt.** `/dream-rsi create [goal] [--reconfigure|--fresh]` sets up, reconfigures or reports,
+  `/dream-rsi suggest [goal]` ranks the candidates, `/dream-rsi status` shows state, `/dream-rsi live|dream` asks
+  the agent for a single phase, `/dream-rsi run [n]` asks for `n` full cycles, `/dream-rsi off` leaves Dream-RSI
+  mode. Anything else you type is treated as a goal. The commands *drive the agent*: they turn mode on and hand
+  it the instruction, so a cycle actually starts.
 - **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` writes the configuration, `dream_rsi_live`/
   `dream_rsi_dream` run the phases, `dream_rsi_apply` copies a candidate back, `dream_rsi_status` reports.
 
@@ -234,7 +237,7 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 
 | Tool | What it costs | What it does |
 |------|---------------|--------------|
-| `dream_rsi_init` | one scorer run | Writes `task.json`, seeds the policy, measures your code as the baseline candidates must beat. |
+| `dream_rsi_init` | one scorer run | Writes `task.json`, seeds the policy, measures your code as the baseline candidates must beat. Reconfiguring keeps that measurement unless the workspace or the scorer changed (`remeasure_seed=true` forces it, and the old number is kept as `history/seed/score.<timestamp>.json`). |
 | `dream_rsi_live` | `W × K1` agent calls | One online cycle: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world. |
 | `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over the recorded worlds, sweep beta, rewrite the policy, deploy the winner. |
 | `dream_rsi_apply` | nothing | Copies a candidate's `eval_program` over your code. Needs `confirm: true`; never commits. |
@@ -244,13 +247,19 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 
 | Command | What it does |
 |---------|--------------|
-| `/dream-rsi create <goal>` | Interview (fresh project) or report the config and recommend the best candidate for `<goal>` (configured). |
+| `/dream-rsi create <goal>` | Interview (fresh project), or on a configured project ask: report + best candidate for `<goal>`, reconfigure, or start fresh. `--reconfigure` / `--fresh` skip the dialog. |
 | `/dream-rsi suggest <goal>` | Rank the candidates on demand. `best` is an alias. Preferences: `fastest`, `safest`, `simplest`. |
 | `/dream-rsi status` | The same state `dream_rsi_status` shows. |
 | `/dream-rsi live` \| `dream` | Ask the agent for one phase. |
 | `/dream-rsi run [n]` | Ask the agent for `n` full cycles. |
 | `/dream-rsi off` | Leave Dream-RSI mode (state on disk is untouched). |
 | *anything else* | Treated as a goal: interview in a fresh project, suggestion in a configured one. |
+
+Starting a fresh task archives the current one instead of deleting it: `task.json`, `policy/`,
+`policy_versions/`, `history/`, `trace_pool/`, `work/` and `runtime/` are renamed into
+`.dream-rsi/archive/<timestamp>/` (which gets the same `.gitignore` treatment, so archived `work/` and
+`trace_pool/` stay out of version control). Reconfiguring touches none of it — it only rewrites the fields you
+change.
 
 ## What you give it
 
@@ -316,14 +325,17 @@ So the loop has to tell you when there is something worth taking, and *which* on
 
 - `dream_rsi_init` measures your code once (`history/seed/score.json`) — that measurement is the reference
   point every candidate is compared against. Without it "better" would be a guess. Skip it with
-  `measure_seed: false` if your scorer is slow; run it later by re-running init.
+  `measure_seed: false` if your scorer is slow; run it later by re-running init. Reconfiguring keeps the
+  recorded number unless the workspace or the scorer changed (the old one is kept as
+  `history/seed/score.<timestamp>.json`); `remeasure_seed: true` re-measures on purpose.
 - After every `dream_rsi_live` and `dream_rsi_dream`, the result ends with either `Nothing to apply: …` (and
   why) or a block that starts `⚠️ IMPROVEMENT READY — NOT APPLIED`, naming the cell, its score versus your
   code, the percentage gain, and the candidate's path.
 - The agent is instructed to pass that on and ask you whether to proceed. It will not apply anything on its
   own initiative — `dream_rsi_apply` is only allowed after you say yes.
 - `dream_rsi_status` repeats it, and the footer switches to `dream-rsi: improvement ready`.
-- `/dream-rsi suggest <goal>` (or `/dream-rsi create <goal>` on a configured project; `best` is an alias) ranks the whole field and
+- `/dream-rsi suggest <goal>` (or `/dream-rsi create <goal>` on a configured project, choosing the report;
+  `best` is an alias) ranks the whole field and
   explains the pick: score vs your baseline, secondary metrics, changed files, and the `mentions:` that admit a
   trade the scorer cannot see. The goal picks a preference — `fastest` (strict score), `safest` (within 5% of the
   leader's win, less to take on first), `simplest` (fewest changed files) — and unrecognised text is context,
@@ -419,7 +431,8 @@ replay both worlds), every scorer diagnosis (`invalid_score`, `eval_error`, `no_
 `timeout`), candidate ranking (score order, `fastest`/`safest`/`simplest`, the win band, applied exclusion,
 secondary metrics, scoped-vs-data files, determinism, and that ranking writes nothing), the agent-command
 builder (`--model` appended vs `{model}` substituted), and the extension surface (gating, `create`/`suggest`
-dispatch and routing, session rebuild, branch-local state, crashed-cycle visibility, schema strictness, package
+dispatch and routing, the configured-project choice dialog, archive-on-fresh, baseline retention across
+reconfigures, session rebuild, branch-local state, crashed-cycle visibility, schema strictness, package
 vs. relocated-directory layouts).
 
 What tests can't cover is your scorer and your model. For that, on a scratch project: `/dream-rsi create <goal>`

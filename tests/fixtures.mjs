@@ -186,6 +186,10 @@ export function mockPi() {
     branch: null,
     /** Whether the agent counts as idle, for `sendUserMessage` delivery mode. */
     idle: true,
+    /** Scripted answers for `ctx.ui.select` / `ctx.ui.confirm`; an empty queue means "no dialog". */
+    uiAnswers: { select: [], confirm: [] },
+    /** Dialogs the extension opened, so a test can assert the choice was offered at all. */
+    uiPrompts: [],
   };
   const pi = {
     // Registered tools become active, as in pi; the extension then gates the expensive ones.
@@ -213,6 +217,16 @@ export function mockPi() {
     ui: {
       notify: (message) => notifications.push(message),
       setStatus: (key, value) => statuses.push([key, value ?? null]),
+      // A host without a TUI (print mode, RPC without a client) answers undefined/false, which must land
+      // on the same path as "Cancel"; so does a test that scripts nothing.
+      select: async (title, options) => {
+        harness.uiPrompts.push({ kind: "select", title, options });
+        return harness.uiAnswers.select.shift();
+      },
+      confirm: async (title, message) => {
+        harness.uiPrompts.push({ kind: "confirm", title, message });
+        return harness.uiAnswers.confirm.shift() ?? false;
+      },
     },
     isIdle: () => harness.idle,
     hasPendingMessages: () => false,

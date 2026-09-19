@@ -310,23 +310,159 @@ test("create sets up a fresh project through the skill, and answers instead when
     assert.equal(harness.activeTools.includes("dream_rsi_live"), true, "mode is on, so init is callable");
     assert.ok(harness.notifications.some((n) => /loading the dream-rsi-create skill/.test(n)));
 
-    // Configured: report the existing task and answer the goal — no interview, nothing dispatched.
+    // Configured: ask which job is meant, then report the existing task and answer the goal.
     await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
     await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
     harness.sentMessages.length = 0;
     harness.notifications.length = 0;
     await harness.commands.get("dream-rsi").handler("create fastest", context);
     assert.equal(harness.sentMessages.length, 0, "an existing task is not re-interviewed");
+    const asked = harness.uiPrompts.at(-1);
+    assert.equal(asked.kind, "select", "a configured project asks which of the three jobs is meant");
+    assert.equal(asked.options[0], 'Show the best candidate for "fastest"');
+    assert.ok(asked.options.includes("Reconfigure this task (re-interview)"));
+    assert.ok(asked.options.includes("Start a fresh task (archives current .dream-rsi)"));
+    assert.ok(asked.options.includes("Cancel"));
     const report = harness.notifications.at(-1);
     assert.match(report, /Already configured here/);
     assert.match(report, /IMPROVEMENT READY — NOT APPLIED/);
     assert.match(report, /dream_rsi_apply cell=\w+ confirm=true/);
     assert.match(report, /preference: fastest/);
     assert.match(report, /Next: \/dream-rsi run 2/);
+    assert.match(report, /\/dream-rsi create --reconfigure/);
     assert.equal(harness.injectedMessages.length, 1, "the suggestion is injected into the session, not just toasted");
     assert.equal(harness.injectedMessages[0].message.customType, "dream-rsi/suggestion");
     assert.match(harness.injectedMessages[0].message.content, /IMPROVEMENT READY/);
     assert.deepEqual(harness.injectedMessages[0].options, { deliverAs: "nextTurn" });
+    assert.equal(harness.activeTools.includes("dream_rsi_apply"), true, "reporting leaves the loop usable");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("create offers a way back into setup, and reconfiguring keeps the history", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+    const worlds = fs.readdirSync(path.join(project.dreamRoot, "trace_pool")).filter((name) => /^iter\d+$/.test(name));
+
+    // The user left the mode: the old report promised an improvement while `apply` stayed unregistered.
+    await harness.commands.get("dream-rsi").handler("off", context);
+    assert.equal(harness.activeTools.includes("dream_rsi_apply"), false);
+
+    harness.sentMessages.length = 0;
+    harness.notifications.length = 0;
+    harness.uiAnswers.select.push("Reconfigure this task (re-interview)");
+    await harness.commands.get("dream-rsi").handler("create smaller p99", context);
+    assert.equal(harness.sentMessages.length, 1);
+    assert.match(harness.sentMessages[0].content, /^\/skill:dream-rsi-create reconfigure smaller p99$/);
+    assert.deepEqual(harness.sentMessages[0].options, { expandPromptTemplates: true });
+    assert.equal(harness.activeTools.includes("dream_rsi_apply"), true, "reconfigure leaves the loop usable");
+    assert.deepEqual(
+      fs.readdirSync(path.join(project.dreamRoot, "trace_pool")).filter((name) => /^iter\d+$/.test(name)),
+      worlds,
+      "reconfiguring archives nothing",
+    );
+    assert.equal(exists(path.join(project.dreamRoot, "archive")), false, "no archive without the fresh answer");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("create --fresh archives the old task by rename and re-interviews", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+
+    harness.sentMessages.length = 0;
+    harness.notifications.length = 0;
+    harness.uiAnswers.confirm.push(true);
+    await harness.commands.get("dream-rsi").handler("create --fresh a different job", context);
+
+    assert.equal(harness.sentMessages.length, 1);
+    assert.match(harness.sentMessages[0].content, /^\/skill:dream-rsi-create fresh a different job$/);
+    assert.equal(exists(path.join(project.dreamRoot, "task.json")), false, "the fresh task starts unconfigured");
+    const stamped = fs.readdirSync(path.join(project.dreamRoot, "archive"));
+    assert.equal(stamped.length, 1, "one archive per fresh start");
+    const archived = path.join(project.dreamRoot, "archive", stamped[0]);
+    assert.ok(exists(path.join(archived, "task.json")), "the old task definition is kept");
+    assert.ok(exists(path.join(archived, "history", "seed", "score.json")), "the old evidence is kept");
+    assert.ok(fs.readdirSync(path.join(archived, "trace_pool")).some((name) => /^iter\d+$/.test(name)));
+    assert.match(fs.readFileSync(path.join(archived, ".gitignore"), "utf8"), /trace_pool\//, "bulk state stays out of git");
+    assert.ok(harness.notifications.some((n) => n.includes(archived)), "the archive path is reported");
+    assert.equal(harness.activeTools.includes("dream_rsi_apply"), true);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("create --fresh refuses while a phase is in flight, and a declined confirm changes nothing", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    const iterationDir = path.join(project.dreamRoot, "trace_pool", "iter0001_current");
+    fs.mkdirSync(iterationDir, { recursive: true });
+    fs.writeFileSync(path.join(iterationDir, "live_cycle_manifest.json"), JSON.stringify({ iteration: 1, status: "running" }), "utf8");
+
+    harness.sentMessages.length = 0;
+    harness.notifications.length = 0;
+    await harness.commands.get("dream-rsi").handler("create --fresh", context);
+    assert.match(harness.notifications.at(-1), /Refusing to start a fresh task while a phase is in flight/);
+    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(exists(path.join(project.dreamRoot, "task.json")), true);
+    assert.equal(harness.uiPrompts.some((p) => p.kind === "confirm"), false, "the in-flight guard runs before the confirm");
+
+    // Declining the confirm falls back to the report instead of silently doing nothing.
+    fs.rmSync(iterationDir, { recursive: true, force: true });
+    harness.notifications.length = 0;
+    harness.uiAnswers.select.push("Start a fresh task (archives current .dream-rsi)");
+    await harness.commands.get("dream-rsi").handler("create", context);
+    assert.equal(harness.uiPrompts.at(-1).kind, "confirm");
+    assert.equal(harness.sentMessages.length, 0);
+    assert.match(harness.notifications.at(-1), /Already configured here/);
+    assert.equal(exists(path.join(project.dreamRoot, "archive")), false);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("re-running init keeps the recorded baseline instead of moving the goalposts", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const init = (extra = {}) =>
+      harness.tools.get("dream_rsi_init").execute("c", initParams(project, extra), undefined, undefined, context);
+    const seedDir = path.join(project.dreamRoot, "history", "seed");
+
+    const first = await init();
+    assert.match(first.content[0].text, /baseline:   your code measures/);
+    const measured = readJson(path.join(seedDir, "score.json"));
+
+    // Same workspace and scorer: the reference point stays put, so past candidates keep counting as wins.
+    const again = await init();
+    assert.match(again.content[0].text, /baseline:   kept/);
+    assert.equal(readJson(path.join(seedDir, "score.json")).measured_at, measured.measured_at);
+    assert.equal(again.details.remeasured, false);
+    assert.equal(again.details.baseline.measured_at, measured.measured_at);
+
+    // A changed workspace is a different thing to measure — and the old number is archived, not discarded.
+    fs.mkdirSync(path.join(project.projectDir, "seed2"), { recursive: true });
+    fs.writeFileSync(path.join(project.projectDir, "seed2", "solution.py"), 'print("seed2")\n', "utf8");
+    const changed = await init({ workspace: "seed2" });
+    assert.match(changed.content[0].text, /baseline:   your code measures/);
+    const kept = fs.readdirSync(seedDir).filter((name) => /^score\..+\.json$/.test(name));
+    assert.equal(kept.length, 1, "the previous reference is kept");
+    assert.equal(readJson(path.join(seedDir, kept[0])).measured_at, measured.measured_at);
+
+    // An explicit request re-measures even when nothing about the task changed.
+    const forced = await init({ workspace: "seed2", remeasure_seed: true });
+    assert.equal(forced.details.remeasured, true);
+    assert.equal(fs.readdirSync(seedDir).filter((name) => /^score\..+\.json$/.test(name)).length, 2);
   } finally {
     project.cleanup();
   }

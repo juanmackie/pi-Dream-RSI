@@ -220,3 +220,18 @@ Purpose-built checks, all runnable with `npm test` (`node --test tests/*.test.mj
 - `MODEL_PATTERN` validation applies unconditionally (not only on Windows `shell` mode).
 - Cross-cycle default-beta selection (`crossCycleBeta`) implements the paper's explicit rule (raise/lower by 0.1–0.2 based on live trend and sweep evidence).
 - No user-facing commands, skills, or archive paths removed.
+- `/dream-rsi create` on a configured project asks which job is meant — report the best candidate, reconfigure the
+  task (re-interview; history and the recorded baseline are kept), or start an unrelated task — instead of
+  silently skipping the interview forever; it also enables Dream-RSI mode, so the "apply it" it prints is
+  callable. `--reconfigure` / `--fresh` answer the same question without the dialog (print/RPC hosts have no
+  `select`). A fresh task renames the previous state into `.dream-rsi/archive/<timestamp>/` instead of deleting it.
+- `dream_rsi_init` keeps an existing `history/seed/score.json` unless the workspace or the scorer changed, or
+  `remeasure_seed=true` is passed, and archives the superseded number as `history/seed/score.<timestamp>.json`.
+
+--- Known gaps (found while implementing the above) ---
+- `state.ts:saveTaskEntry` appends `pi-dream-rsi/live`, but `index.ts:reconstruct` only reads `pi-dream-rsi/task`,
+  which nothing writes — so `DreamState.iteration` is always 0 and the `session iteration:` line in
+  `statusSummary` is unreachable. Harmless today (`Math.max` over an empty set), but the intended "resume the loop
+  in a session" behaviour is not actually restored.
+- `/dream-rsi suggest` does not enable Dream-RSI mode, so on that path a printed `dream_rsi_apply` can still be
+  gated off; `create` does enable it.

@@ -1,6 +1,6 @@
 ---
 name: dream-rsi-create
-description: Set up a Dream-RSI task in this project and recommend the best candidate for the goal. Use when asked to "set up dream-rsi", "create a dream-rsi task", "start a dream-rsi loop", "optimize X with dream-rsi", or when `/dream-rsi create <goal>` was invoked and no task.json exists yet.
+description: Set up a Dream-RSI task in this project and recommend the best candidate for the goal. Use when asked to "set up dream-rsi", "create a dream-rsi task", "start a dream-rsi loop", "optimize X with dream-rsi", to reconfigure an existing task (`/dream-rsi create --reconfigure`), or when `/dream-rsi create <goal>` was invoked and no task.json exists yet.
 ---
 
 # Setting up a Dream-RSI task
@@ -11,6 +11,23 @@ scored how) and a **trustworthy scorer**. Your job here is to produce both, veri
 before spending a cycle.
 
 Read `skills/dream-rsi/SKILL.md` for the loop itself. This skill is only the on-ramp.
+
+## Modes
+
+The prompt that invoked you starts with `reconfigure` or `fresh`; with neither, this is a first-time setup.
+
+- **reconfigure** — a task already exists and the user wants it changed. Read `.dream-rsi/task.json` and
+  `.dream-rsi/history/seed/score.json`, present the current values as the defaults, and ask only about what
+  should change. Call `dream_rsi_init` with just those fields: it keeps the history, the trace pool and the
+  deployed policy, and it keeps the recorded baseline unless the workspace or the scorer changed. Never pass
+  `remeasure_seed=true` unless the user asks for the current code to become the new reference point, and
+  re-probe the attempt agent only if the agent command or model changed.
+- **fresh** — the extension has already archived the previous task under `.dream-rsi/archive/<timestamp>/`
+  and `task.json` is gone. Tell the user where the old state went, then treat everything below as a
+  first-time setup.
+
+`reset=true` re-seeds the policy to the shipped default and discards every offline improvement so far. It is
+not a way to change a workspace or a scorer. Never pass it unless the user explicitly asks for that loss.
 
 ## 1. Interview (ask, or infer from the repo — but never invent)
 
@@ -129,6 +146,8 @@ copies the candidate's file over the user's code, with `confirm: true`, records 
 - Timing a workload of identical queries, then believing the speedup (memoization wins, search does not).
 - A candidate that wins by detecting or special-casing the benchmark workload instead of improving the implementation.
 - Absolute paths handed to shell harnesses that parse `$0`.
+- `dream_rsi_init reset=true` used to "change" a task: it discards the improved policy, and re-measuring the
+  seed on top of it moves the reference point every candidate is compared against.
 - Starting a paid cycle because the setup "looked fine"; probe first, ask first.
 - Recommending the top score without reading its proposal: the run that motivated this skill produced a
   candidate that traded a 20 ms staleness window for 2× — invisible to the scorer, obvious in the proposal.

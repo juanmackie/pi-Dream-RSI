@@ -30,23 +30,29 @@ offline replay of candidate policies against worlds recorded from real runs.
 
 | Tool | What it does |
 |------|--------------|
-| `dream_rsi_init` | Write `.dream-rsi/task.json`, seed `.dream-rsi/policy/method.ts` from the shipped parallel-refine baseline, validate the workspace/problem file, and measure your own code into `history/seed/score.json`. Cheap. |
+| `dream_rsi_init` | Write `.dream-rsi/task.json`, seed `.dream-rsi/policy/method.ts` from the shipped parallel-refine baseline, validate the workspace/problem file, and measure your own code into `history/seed/score.json`. Cheap. Reconfiguring keeps an existing measurement unless the workspace or the scorer changed; the previous number is kept as `history/seed/score.<timestamp>.json`. |
 | `dream_rsi_live` | One online cycle: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records world `t`. Expensive (real agent time). |
 | `dream_rsi_dream` | Offline phase: replay `M` policy versions over all recorded worlds, sweep the beta grid, revision-agent rewrites the policy between revisions, select argmax `V`, deploy the winner. Moderately expensive (M−1 agent calls). |
 | `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true`, copies only the declared program (plus paths the user names), never commits. |
 | `dream_rsi_status` | Iterations with best score + baked beta, worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), and the best candidate on record. |
 
 `dream_rsi_live`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
-mode (`/dream-rsi`, or automatically after `dream_rsi_init`). Commands: `/dream-rsi create [goal]`,
-`/dream-rsi suggest [goal]` (alias `best`), `/dream-rsi status | live | dream | run [n] | off`. Free text is
-treated as a goal.
+mode (`/dream-rsi`, or automatically after `dream_rsi_init`). Commands: `/dream-rsi create [goal]
+[--reconfigure|--fresh]`, `/dream-rsi suggest [goal]` (alias `best`), `/dream-rsi status | live | dream | run [n]
+| off`. Free text is treated as a goal.
 
 ## Setup (ask, don't guess)
 
-**Setting up is a separate job with its own skill.** `/dream-rsi create <goal>` loads `dream-rsi-create`, which
-interviews the user, prefers wrapping an existing benchmark as the scorer, verifies that scorer on known-good /
-broken / fast-but-wrong candidates, writes the problem file, calls `dream_rsi_init`, probes the attempt agent,
-and **stops before spending a cycle**. Use that skill rather than improvising a setup.
+**Setting up is a separate job with its own skill.** On a project with no task, `/dream-rsi create <goal>` loads
+`dream-rsi-create`, which interviews the user, prefers wrapping an existing benchmark as the scorer, verifies
+that scorer on known-good / broken / fast-but-wrong candidates, writes the problem file, calls `dream_rsi_init`,
+probes the attempt agent, and **stops before spending a cycle**. Use that skill rather than improvising a setup.
+
+On a project that already has a task, the same command asks which of three jobs is meant — report the best
+candidate for the goal, reconfigure the task through the same interview (history and the recorded baseline are
+kept), or start an unrelated task (the old state is archived under `.dream-rsi/archive/<timestamp>/`, never
+deleted). The answer arrives as the first word of the skill prompt (`reconfigure` or `fresh`); `--reconfigure` and
+`--fresh` are the same choice without the dialog.
 
 What good setup looks like, in short:
 
@@ -106,9 +112,10 @@ candidates, and `/dream-rsi suggest <goal>` reproduces that ranking on demand. P
    runs tests. Applying is the user's decision, every time — never call it on your own initiative, and never
    present it as already done.
 
-`/dream-rsi create <goal>` on a configured project does the same thing, so a user who starts with "set this up"
-also ends with "here is what to take". Goal words pick the preference: `fastest` (strict score), `safest` (keeps
-≥95% of the best win, less to take on first), `simplest` (fewest changed files).
+`/dream-rsi create <goal>` on a configured project ends the same way — it asks first, and the report branch is
+this same ranking — so a user who starts with "set this up" also ends with "here is what to take". Goal words pick
+the preference: `fastest` (strict score), `safest` (keeps ≥95% of the best win, less to take on first),
+`simplest` (fewest changed files).
 
 ## Guardrails
 
