@@ -35,7 +35,8 @@
     ],
     "skills": [
       "./skills"
-    ]
+    ],
+    "reference": "https://pi.dev/packages"
   },
   "files": [
     "extensions",

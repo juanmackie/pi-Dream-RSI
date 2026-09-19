@@ -59,3 +59,5 @@ is the implementation and the proposal.
 ## Note:
 
 Never execute pkill, kill, killall, or terminate unrelated processes.
+
+--- Note --- Agent model reads `PI_MODEL` (env). Cross-cycle beta selection applied in dream phase.

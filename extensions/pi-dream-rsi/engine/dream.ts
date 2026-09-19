@@ -349,6 +349,8 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     if (evaluations[index].v_mean > evaluations[selected].v_mean) selected = index;
   }
   const best = evaluations[selected];
+  // Apply the paper's cross-cycle default-beta rule before deploying.
+  const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta);
   // The guarantee is `V* >= V_0` over the candidate set. It also has to *exist*: if every version
   // failed to score, deploying anything (or reporting success) would be a lie.
   const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
@@ -366,7 +368,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     worlds: iterations,
     selected_revision: selected,
     selected_policy: best.policy_path,
-    deployed_beta: best.default_beta,
+    deployed_beta: deployedBeta,
     auc: best.summary.auc,
     pareto_reward: best.summary.pareto_reward,
     parallel_penalty: best.summary.parallel_penalty,
@@ -399,7 +401,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     selected_revision: selected,
     monotone,
     v_mean: evaluations.map((e) => e.v_mean),
-    deployed_beta: best.default_beta,
+    deployed_beta: deployedBeta,
   });
 
   const report = [
@@ -426,7 +428,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     evaluations,
     selected,
     selected_policy: best.policy_path,
-    deployed_beta: best.default_beta,
+    deployed_beta: deployedBeta,
     improved,
     report,
   };
@@ -501,4 +503,52 @@ function readSweep(dreamRoot: string, iteration: number): BetaSweepSummary | nul
   } catch {
     return null;
   }
+}
+
+/** Cross-cycle default-beta rule (paper §3, cross-cycle selection).
+ * Adjusts the deployed beta based on live trend and sweep evidence.
+ *  - live best still improving: keep prior default beta unless sweep clearly shows a better nearby beta
+ *  - live best plateaued, higher beta reaches higher attainment: raise by 0.1–0.2, clamped to [0,1]
+ *  - high default beta already tried through plateau, high-beta sweep points add work without higher attainment: lower by a small step
+ *  - history insufficient or evidence conflicts: use ~0.6
+ */
+function crossCycleBeta(dreamRoot: string, currentDefault: number): number {
+  const manifests = recentManifests(dreamRoot, 3);
+  if (manifests.length < 2) return currentDefault;
+  const latest = manifests[manifests.length - 1];
+  const previous = manifests[manifests.length - 2];
+  const latestSweep = readSweep(dreamRoot, latest.iteration);
+  if (!latestSweep || latestSweep.frontier.length === 0) return currentDefault;
+  const improving = latest.best_score !== null && previous.best_score !== null && latest.best_score > previous.best_score;
+  const plateaued = latest.best_score !== null && previous.best_score !== null && latest.best_score === previous.best_score;
+  const sortedFrontier = latestSweep.frontier.slice().sort((a, b) => a.beta - b.beta);
+  const bestFrontierPoint = sortedFrontier[sortedFrontier.length - 1];
+  // If evidence conflicts (frontier empty or no clear best), use ~0.6.
+  if (!bestFrontierPoint) return 0.6;
+  if (improving) {
+    // Keep prior default unless sweep clearly shows a better nearby beta.
+    const nearby = sortedFrontier.filter((p) => Math.abs(p.beta - currentDefault) <= 0.2);
+    const betterNearby = nearby.find((p) => p.attainment > (latest.best_score ?? -Infinity));
+    if (betterNearby && betterNearby.attainment > latest.best_score + 0.01) return clamp01(betterNearby.beta);
+    return currentDefault;
+  }
+  if (plateaued) {
+    // Higher beta reaches higher attainment: raise by 0.1–0.2, clamped to [0,1].
+    const higherBetaPoint = sortedFrontier.filter((p) => p.beta > currentDefault + 0.05);
+    if (higherBetaPoint.length > 0 && higherBetaPoint[higherBetaPoint.length - 1].attainment > (latest.best_score ?? -Infinity)) {
+      return clamp01(currentDefault + 0.15);
+    }
+    // High default beta already tried through plateau, high-beta sweep points add work without higher attainment: lower by a small step.
+    const highBetaPoint = sortedFrontier.filter((p) => p.beta >= currentDefault);
+    if (highBetaPoint.length > 0 && highBetaPoint[highBetaPoint.length - 1].work > 0 && highBetaPoint[highBetaPoint.length - 1].attainment <= (latest.best_score ?? -Infinity)) {
+      return clamp01(currentDefault - 0.1);
+    }
+    return currentDefault;
+  }
+  // No clear trend: use ~0.6.
+  return 0.6;
+}
+
+function clamp01(value: number): number {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0.6));
 }

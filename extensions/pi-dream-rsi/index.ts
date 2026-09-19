@@ -273,7 +273,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         params.measure_seed === false
           ? null
           : await measureSeed({ dreamRoot: root, projectDir: projectDir(ctx), task, log: (m) => onUpdate?.({ content: [{ type: "text", text: m }] }) });
-      saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0 });
+      saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: task.agent.model });
       setMode(ctx, true);
       return {
         content: [
@@ -286,7 +286,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  candidate:  ${task.eval_program}`,
               `  scorer:     ${task.score_program}`,
               `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} beta_grid=[${task.beta_grid.join(", ")}]`,
-              `  agent:      ${task.agent.command} ${task.agent.args.join(" ")}`,
+              `  agent:      ${task.agent.command} ${task.agent.args.join(" ")}${task.agent.model ? ` --model ${task.agent.model}` : ""}`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
               measurement === null
                 ? "  baseline:   not measured (scorer not run on your code yet)"
@@ -356,7 +356,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
         });
         state.iteration = iteration;
-        saveTaskEntry(pi, root, { task: task.name, policy: episode.manifest.policy_version, iteration });
+        saveTaskEntry(pi, root, { task: task.name, policy: episode.manifest.policy_version, iteration, model: task.agent.model });
         const report = iterationReport(root, iteration, episode.manifest);
         const ranking = reportImprovements(ctx);
         return {

@@ -86,7 +86,7 @@ export function defaultTask(name = "task"): TaskConfig {
     agent: {
       command: "pi",
       args: ["-p", "--no-session", "-na", "--no-extensions", "--no-skills", "--no-prompt-templates"],
-      model: null,
+      model: process.env.PI_MODEL || null,
       prompt_via: "stdin",
     },
   };
