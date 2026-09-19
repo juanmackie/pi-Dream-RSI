@@ -468,6 +468,40 @@ test("re-running init keeps the recorded baseline instead of moving the goalpost
   }
 });
 
+test("the session iteration is restored from the entries, and --fresh resets it", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+    await harness.tools.get("dream_rsi_live").execute("c3", {}, undefined, undefined, context);
+    const status = await harness.tools.get("dream_rsi_status").execute("c4", {}, undefined, undefined, context);
+    assert.match(status.content[0].text, /session iteration: 2/);
+
+    // A fresh runtime (as after /reload or resume) brings the count back from the session entries.
+    const resumed = mockPi();
+    dreamRsi(resumed.pi);
+    resumed.context.cwd = project.projectDir;
+    resumed.harness.entries.push(...harness.entries);
+    await resumed.harness.handlers.get("session_start")({}, resumed.context);
+    const before = await resumed.harness.tools.get("dream_rsi_status").execute("c5", {}, undefined, undefined, resumed.context);
+    assert.match(before.content[0].text, /session iteration: 2/);
+
+    // Starting a fresh task in this session must not continue that count: the archived cycles are gone, so
+    // the new task's first cycle is t=1 again, both now and after another reload.
+    resumed.harness.uiAnswers.confirm.push(true);
+    await resumed.harness.commands.get("dream-rsi").handler("create --fresh", resumed.context);
+    await resumed.harness.handlers.get("session_start")({}, resumed.context);
+    await resumed.harness.tools.get("dream_rsi_init").execute("c6", initParams(project), undefined, undefined, resumed.context);
+    const live = await resumed.harness.tools.get("dream_rsi_live").execute("c7", {}, undefined, undefined, resumed.context);
+    assert.equal(live.details.iteration, 1, "the fresh task starts at t=1, not after the archived cycles");
+    const after = await resumed.harness.tools.get("dream_rsi_status").execute("c8", {}, undefined, undefined, resumed.context);
+    assert.match(after.content[0].text, /session iteration: 1/);
+  } finally {
+    project.cleanup();
+  }
+});
+
 test("suggest ranks on demand, honours a preference, and refuses without a task", async () => {
   const project = makeProject();
   try {

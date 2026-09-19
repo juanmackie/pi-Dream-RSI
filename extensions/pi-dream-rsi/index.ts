@@ -26,6 +26,7 @@ import {
   activeRuns,
   dreamRootFor,
   iterationReport,
+  LIVE_MANIFEST_ENTRY,
   saveTaskEntry,
   statusSummary,
   type DreamState,
@@ -42,7 +43,6 @@ import { rankCandidates, renderSuggestion, type Ranking } from "./engine/candida
 import { BUNDLED_POLICY_DIR, SKILLS_DIR } from "./layout.ts";
 
 
-const TASK_ENTRY = "pi-dream-rsi/task";
 const MODE_ENTRY = "pi-dream-rsi/mode";
 
 /** Tools that spend real agent time — gated so they cannot fire by accident. `apply` writes to the user's
@@ -176,9 +176,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const data = entry.data as { project?: string; active?: boolean };
         if (data?.project === dreamRoot(ctx)) state.mode = data.active === true;
       }
-      if (entry.customType === TASK_ENTRY) {
-        const data = entry.data as { iteration?: number };
-        if (typeof data?.iteration === "number") state.iteration = Math.max(state.iteration, data.iteration);
+      if (entry.customType === LIVE_MANIFEST_ENTRY) {
+        const data = entry.data as { root?: string; iteration?: number; reset?: boolean };
+        // Entries name the root they belong to: a session resumed in another project must not inherit its
+        // iteration count. `reset` (a fresh task in this session) zeroes the count, and later entries — the
+        // live cycles of the new task — raise it again from there.
+        if (data?.root === dreamRoot(ctx)) {
+          if (data.reset === true) state.iteration = 0;
+          if (typeof data.iteration === "number") state.iteration = Math.max(state.iteration, data.iteration);
+        }
       }
     }
     runtimes.set(ctx.sessionManager.getSessionId(), state);
@@ -715,6 +721,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
             ) {
               const archived = archiveDreamRoot(root);
               setMode(ctx, true);
+              // The new task must not continue the old one's iteration count: without this, the first live
+              // cycle of a fresh task in this session would be numbered after the archived cycles. The entry
+              // carries the reset for a later reload; the in-memory state needs it now.
+              saveTaskEntry(pi, root, { iteration: 0, reset: true });
+              stateFor(ctx).iteration = 0;
               ctx.ui.notify(`Archived the previous task to ${archived} — loading the dream-rsi-create skill for a fresh one`, "info");
               sendWhenReady(`/skill:dream-rsi-create fresh ${goal}`.replace(/\s+/g, " ").trim());
               return;

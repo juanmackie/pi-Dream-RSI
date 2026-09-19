@@ -2,8 +2,9 @@
  * Session state and human-readable reporting.
  *
  * Session state is intentionally thin: the *durable* state is the on-disk layout under `.dream-rsi/`
- * (task, policy, history, trace pool). Session entries only record which iteration the session
- * reached and whether Dream-RSI mode is active, so a resumed session can pick the loop back up.
+ * (task, policy, history, trace pool). Session entries only record which iteration the session reached and
+ * whether Dream-RSI mode is active, so a resumed session can pick the loop back up. They are read back by
+ * `reconstruct` in the extension, which is why the entry type written here has to match the one read there.
  */
 
 import * as fs from "node:fs";
@@ -29,7 +30,7 @@ export function dreamRootFor(cwd: string): string {
 export function saveTaskEntry(
   pi: { appendEntry: (type: string, data: unknown) => void },
   root: string,
-  data: { task?: string; policy?: string; iteration?: number; model?: string | null },
+  data: { task?: string; policy?: string; iteration?: number; model?: string | null; reset?: boolean },
 ): void {
   pi.appendEntry(LIVE_MANIFEST_ENTRY, { version: 1, root, ...data });
 }

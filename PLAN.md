@@ -227,11 +227,12 @@ Purpose-built checks, all runnable with `npm test` (`node --test tests/*.test.mj
   `select`). A fresh task renames the previous state into `.dream-rsi/archive/<timestamp>/` instead of deleting it.
 - `dream_rsi_init` keeps an existing `history/seed/score.json` unless the workspace or the scorer changed, or
   `remeasure_seed=true` is passed, and archives the superseded number as `history/seed/score.<timestamp>.json`.
+- Session iteration is actually restored: `reconstruct` now reads the entry type `saveTaskEntry` writes
+  (`pi-dream-rsi/live`; it read the never-written `pi-dream-rsi/task` before, so the count was always 0). The read
+  is scoped to the entry's root, so a session resumed in another project cannot inherit a count. `/dream-rsi
+  create --fresh` records a reset entry *and* zeroes the in-memory count, so a fresh task's first cycle is `t=1`
+  instead of continuing after the archived cycles.
 
 --- Known gaps (found while implementing the above) ---
-- `state.ts:saveTaskEntry` appends `pi-dream-rsi/live`, but `index.ts:reconstruct` only reads `pi-dream-rsi/task`,
-  which nothing writes — so `DreamState.iteration` is always 0 and the `session iteration:` line in
-  `statusSummary` is unreachable. Harmless today (`Math.max` over an empty set), but the intended "resume the loop
-  in a session" behaviour is not actually restored.
 - `/dream-rsi suggest` does not enable Dream-RSI mode, so on that path a printed `dream_rsi_apply` can still be
   gated off; `create` does enable it.
