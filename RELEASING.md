@@ -33,8 +33,8 @@ npm publish
 # 5. Verify npm is live before tagging, so the tag never points at an unpublished commit.
 npm view pi-dream-rsi version dist.tarball
 
-# 6. Tag that commit and push.
-git tag "v$(node -p "require('./package.json').version")"
+# 6. Tag that commit and push. Annotated (-a): `--follow-tags` only pushes annotated tags.
+git tag -a "v$(node -p "require('./package.json').version")" -m "release v$(node -p "require('./package.json').version")"
 git push origin main --follow-tags
 
 # 7. Verify the gallery picked it up (it lags npm by a few minutes; 404 here means not listed).
