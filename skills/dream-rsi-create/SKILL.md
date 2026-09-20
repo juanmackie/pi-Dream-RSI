@@ -21,7 +21,8 @@ The prompt that invoked you starts with `reconfigure` or `fresh`; with neither, 
   should change. Call `dream_rsi_init` with just those fields: it keeps the history, the trace pool and the
   deployed policy, and it keeps the recorded baseline unless the workspace or the scorer changed. Never pass
   `remeasure_seed=true` unless the user asks for the current code to become the new reference point, and
-  re-probe the attempt agent only if the agent command or model changed.
+  re-probe the attempt agent only if the agent command changed (attempts use the active session's model
+  and thinking level, so a model change needs no reconfigure).
 - **fresh** — the extension has already archived the previous task under `.dream-rsi/archive/<timestamp>/`
   and `task.json` is gone. Tell the user where the old state went, then treat everything below as a
   first-time setup.
@@ -42,7 +43,7 @@ Collect these; ask the user for anything you cannot find evidence for:
 | **Correctness gate** | What must set `fail_class != "ok"`. | The repo's own checks: its test suite, its assertions, its validity rules. |
 | **Problem file** | A short doc every attempt reads: objective, in-scope files, off-limits, correctness, the baseline. | Write it (step 4). |
 | **Budgets** | `workers`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, K1=3, K2=4, M=2`. The paper's shape (`W=10, K1=11`) is hours per cycle. |
-| **Attempt agent** | `agent_command`, `agent_args`, `model`. | The CLI that will edit code in the copy. Confirm the model exists and is billable — step 6. |
+| **Attempt agent** | `agent_command`, `agent_args`, optionally `model`. | The CLI that will edit code in the copy. Attempts inherit the active session's model and thinking level, so `model` is only a fallback; confirm the session model exists and is billable — step 6. |
 
 Ask in one batch. If the user says "just infer it", infer from the repo and **say what you inferred**, so a
 wrong guess is visible before it costs anything.
@@ -109,7 +110,8 @@ Baseline: the seed measures <X>. Beating it needs a real mechanism change, not a
 Call `dream_rsi_init` with the interview results. It writes `.dream-rsi/task.json`, seeds the policy, and
 measures the user's own code into `history/seed/score.json` — that measurement is the reference point every
 candidate is compared against. Report the measured baseline, then confirm the effective attempt command it
-prints (`… --model <id>`); if the model is missing there, the attempts will silently run on the CLI default.
+prints. It shows the active session's model and thinking level (`… --model <provider/id> --thinking <level>`),
+which is what the attempts run on; `model=` would only set a fallback for hosts without a session model.
 
 Skip the measurement with `measure_seed: false` only if the scorer is slow, and say that the baseline is missing.
 
@@ -118,7 +120,7 @@ Skip the measurement with `measure_seed: false` only if the scorer is slow, and 
 Run the effective attempt command once, outside the task, with a trivial prompt:
 
 ```bash
-pi -p --no-session -na --no-extensions --no-skills --model <id> "Reply with exactly: OK"
+pi -p --no-session -na --no-extensions --no-skills --model <session model> --thinking <session level> "Reply with exactly: OK"
 ```
 
 A bad model id, missing auth, or an empty balance surfaces here for the price of one small call instead of
@@ -151,5 +153,3 @@ copies the candidate's file over the user's code, with `confirm: true`, records 
 - Starting a paid cycle because the setup "looked fine"; probe first, ask first.
 - Recommending the top score without reading its proposal: the run that motivated this skill produced a
   candidate that traded a 20 ms staleness window for 2× — invisible to the scorer, obvious in the proposal.
-
---- Note --- `model` parameter mapped to `agent.model` (reads `PI_MODEL` by default). `MODEL_PATTERN` guards unsafe chars unconditionally.

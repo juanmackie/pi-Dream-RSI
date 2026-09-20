@@ -10,7 +10,7 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { AgentConfig } from "../engine/task.ts";
+import { THINKING_LEVELS, type AgentConfig } from "../engine/task.ts";
 
 const TAIL_BYTES = 64 * 1024;
 
@@ -166,34 +166,79 @@ export interface AgentRun extends RunOptions {
  * every attempt runs on whatever default the agent CLI happens to have.
  */
 export function buildAgentArgs(agent: AgentConfig): string[] {
-  const hasPlaceholder = agent.args.some((arg) => arg.includes("{model}"));
-  const args = agent.args.map((arg) => arg.replaceAll("{model}", agent.model ?? ""));
-  if (agent.model && !hasPlaceholder) args.push("--model", agent.model);
+  const hasModelPlaceholder = agent.args.some((arg) => arg.includes("{model}"));
+  const hasThinkingPlaceholder = agent.args.some((arg) => arg.includes("{thinking}"));
+  const args = agent.args.map((arg) =>
+    arg.replaceAll("{model}", agent.model ?? "").replaceAll("{thinking}", agent.thinking ?? ""),
+  );
+  if (agent.model && !hasModelPlaceholder) args.push("--model", agent.model);
+  // Same rule as the model: an explicit `--thinking` in `args` wins, a placeholder is already filled.
+  if (agent.thinking && !hasThinkingPlaceholder && !args.includes("--thinking")) {
+    args.push("--thinking", agent.thinking);
+  }
   return args;
+}
+
+/**
+ * The invocation that re-runs the pi CLI hosting this extension.
+ *
+ * A bare `pi` depends on PATH/shim resolution and fails when pi is not on the child's PATH (or is only a
+ * shell shim on Windows). Resolve the running executable instead — node/bun + the running cli.js, or the
+ * compiled pi binary — mirroring pi's own subagent example. Returns null when not running inside pi so a
+ * caller (SDK host, tests) falls back to `pi`.
+ */
+export interface PiSelfOptions {
+  argv1?: string;
+  execPath?: string;
+  insidePi?: boolean;
+  exists?: (candidate: string) => boolean;
+}
+
+export function piSelfInvocation(options: PiSelfOptions = {}): { command: string; args: string[] } | null {
+  const insidePi =
+    options.insidePi ?? (process.env.PI_CODING_AGENT === "true" || process.env.AI_AGENT === "pi");
+  if (!insidePi) return null;
+  const argv1 = options.argv1 ?? process.argv[1];
+  const execPath = options.execPath ?? process.execPath;
+  const exists = options.exists ?? fs.existsSync;
+  const isBunVirtualScript = typeof argv1 === "string" && argv1.startsWith("/$bunfs/root/");
+  if (typeof argv1 === "string" && argv1 !== "" && !isBunVirtualScript && exists(argv1)) {
+    return { command: execPath, args: [argv1] };
+  }
+  const execName = path.basename(execPath).toLowerCase();
+  if (!/^(node|bun)(\.exe)?$/.test(execName)) return { command: execPath, args: [] };
+  return null;
 }
 
 /** Run one discovery attempt / policy revision. */
 export function runAgent(options: AgentRun): Promise<CommandResult> {
   const { agent } = options;
   const args = buildAgentArgs(agent);
-  if (agent.model && !MODEL_PATTERN.test(agent.model)) {
+  const unsafeModel = Boolean(agent.model && !MODEL_PATTERN.test(agent.model));
+  const unsafeThinking = Boolean(agent.thinking && !THINKING_LEVELS.includes(agent.thinking));
+  if (unsafeModel || unsafeThinking) {
     return Promise.resolve({
       ok: false,
       code: null,
       signal: null,
       timedOut: false,
-      spawnError: `unsafe characters in agent.model: ${agent.model}`,
+      spawnError: unsafeThinking ? `unsafe agent.thinking: ${agent.thinking}` : `unsafe characters in agent.model: ${agent.model}`,
       durationMs: 0,
       stdoutTail: "",
       stderrTail: "",
       logPath: options.logPath ?? null,
     });
   }
-  const shell = process.platform === "win32";
+  // The default `pi` agent re-spawns the running pi invocation, so it never depends on PATH. A custom
+  // command keeps the platform shell so Windows .cmd/.bat shims still resolve.
+  const self = agent.command === "pi" ? piSelfInvocation() : null;
+  const command = self ? self.command : agent.command;
+  const invocationArgs = self ? [...self.args, ...args] : args;
+  const shell = self ? false : process.platform === "win32";
   if (agent.prompt_via === "arg") {
-    return collect(agent.command, [...args, options.prompt], { ...options, shell });
+    return collect(command, [...invocationArgs, options.prompt], { ...options, shell });
   }
-  return collect(agent.command, args, { ...options, shell, stdin: options.prompt });
+  return collect(command, invocationArgs, { ...options, shell, stdin: options.prompt });
 }
 
 /** Fresh workspace copy: the attempt resumes its parent's saved workspace state. */

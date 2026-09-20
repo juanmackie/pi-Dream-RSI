@@ -67,9 +67,10 @@ What good setup looks like, in short:
 5. **Budgets** — `workers` (W), `k1` (K1), `k2` (K2), `revisions` (M), `beta_grid`, `beta1`, `beta2`.
    Start at `W=2, K1=3, K2=4, M=2`; the paper's shape is `W=10, K1=11` (strong model) or `W=32, K1=20` (fast
    model) over ~5 rounds.
-6. **Agent command** — default `pi -p --no-session -na --no-extensions --no-skills`, prompt over stdin. A
-   configured `model` is passed as `--model <id>` unless `args` already contains `{model}`; `dream_rsi_init`
-   prints the effective command line — check it.
+6. **Agent command** — default `pi -p --no-session -na --no-extensions --no-skills`, prompt over stdin. Each
+   run inherits the active session's model and thinking level as `--model`/`--thinking` (unless `args`
+   already carries `{model}`/`{thinking}`); `agent.model`/`agent.thinking` in `task.json` are only fallbacks.
+   `dream_rsi_init` prints the effective command line — check it.
 
 Before spending agent time, confirm the scorer distinguishes success from failure. A broken scorer turns the
 whole loop into noise, and the cost is paid in agent calls, not in seconds.
@@ -161,5 +162,3 @@ the preference: `fastest` (strict score), `safest` (keeps ≥95% of the best win
 Ranks are computed from `.dream-rsi` alone (no agent calls, no scorer runs): scores from `trace_pool`, secondary
 metrics from the archived `eval/score.json`, changed files by comparing a workspace against the seed, and the
 `mentions:` line from each attempt's `proposal.md`.
-
---- Note --- Session daemon `PI_MODEL=thinkingmachines/inkling:free` used; `agent.model` visible in output/session.

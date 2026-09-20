@@ -26,6 +26,7 @@ import {
   activeRuns,
   dreamRootFor,
   iterationReport,
+  recoverInterruptedRuns,
   LIVE_MANIFEST_ENTRY,
   saveTaskEntry,
   statusSummary,
@@ -138,6 +139,20 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
   const projectDir = (ctx: ExtensionContext): string => ctx.cwd;
   const dreamRoot = (ctx: ExtensionContext): string => dreamRootFor(ctx.cwd);
+
+  /**
+   * Session-scoped agent settings. The active session wins at run time; task.json's agent is only the
+   * fallback for a host with no model (SDK/CI). This is why a model switch takes effect on the next cycle.
+   */
+  const sessionModelId = (ctx: ExtensionContext): string | null =>
+    ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+  const sessionThinking = (ctx: ExtensionContext): TaskConfig["agent"]["thinking"] =>
+    (ctx.thinkingLevel as TaskConfig["agent"]["thinking"] | undefined) ?? null;
+  const runAgentConfig = (ctx: ExtensionContext, agent: TaskConfig["agent"]): TaskConfig["agent"] => ({
+    ...agent,
+    model: sessionModelId(ctx) ?? agent.model,
+    thinking: sessionThinking(ctx) ?? agent.thinking,
+  });
 
   const stateFor = (ctx: ExtensionContext): DreamState => {
     const key = ctx.sessionManager.getSessionId();
@@ -301,7 +316,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           : recorded === null
             ? "  baseline:   not measured (scorer not run on your code yet)"
             : `  baseline:   kept ${recorded.raw_score ?? "n/a"} (${recorded.fail_class}), measured ${recorded.measured_at} — pass remeasure_seed=true to measure the current code instead`;
-      saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: task.agent.model });
+      // Show — and record — the settings a run will actually use (the session model wins over the fallback).
+      const configuredAgent = runAgentConfig(ctx, task.agent);
+      saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: configuredAgent.model });
       setMode(ctx, true);
       return {
         content: [
@@ -314,7 +331,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  candidate:  ${task.eval_program}`,
               `  scorer:     ${task.score_program}`,
               `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} beta_grid=[${task.beta_grid.join(", ")}]`,
-              `  agent:      ${task.agent.command} ${task.agent.args.join(" ")}${task.agent.model ? ` --model ${task.agent.model}` : ""}`,
+              `  agent:      ${configuredAgent.command} ${configuredAgent.args.join(" ")}${configuredAgent.model ? ` --model ${configuredAgent.model}` : ""}${configuredAgent.thinking ? ` --thinking ${configuredAgent.thinking}` : ""}`,
+              `  (attempts follow the active session model/thinking level; pass model= only to set the fallback)`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
               baselineNote,
               `Next: dream_rsi_live to run one online rollout.`,
@@ -322,7 +340,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
             ].join("\n"),
           },
         ],
-        details: { task, policy: policyPath, baseline: measurement ?? recorded, remeasured: measurement !== null },
+        details: { task, agent: configuredAgent, policy: policyPath, baseline: measurement ?? recorded, remeasured: measurement !== null },
       };
     },
   });
@@ -350,11 +368,21 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       } catch (error) {
         return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
       }
+      // A run marked running while nothing is running in this session was interrupted; clear it so the
+      // next cycle restarts cleanly instead of the project looking permanently stuck.
+      const recovered = recoverInterruptedRuns(root);
+      if (recovered.length > 0) {
+        onUpdate?.({
+          content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
+        });
+      }
       const iteration = Math.max(state.iteration, latestIteration(root)) + 1;
       const baseline = readBaselineScore(root);
       const previous = latestBest(root);
+      // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
+      const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
 
-      const planned = await planNextGrid(root, task, iteration, baseline);
+      const planned = await planNextGrid(root, runTask, iteration, baseline);
       const grid = params.grid ? parseGrid(String(params.grid), planned.plan) : planned.plan;
       const bakedBeta = typeof planned.beta === "number" ? planned.beta : task.default_beta;
 
@@ -372,7 +400,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const episode = await runLiveEpisode({
           dreamRoot: root,
           projectDir: projectDir(ctx),
-          task,
+          task: runTask,
           iteration,
           policyPath: path.join(root, "policy", "method.ts"),
           bakedBeta,
@@ -382,7 +410,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
         });
         state.iteration = iteration;
-        saveTaskEntry(pi, root, { task: task.name, policy: episode.manifest.policy_version, iteration, model: task.agent.model });
+        saveTaskEntry(pi, root, { task: task.name, policy: episode.manifest.policy_version, iteration, model: runTask.agent.model });
         const report = iterationReport(root, iteration, episode.manifest);
         const ranking = reportImprovements(ctx);
         return {
@@ -443,10 +471,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       state.running = `dream phase ${iteration}`;
       ctx.ui.setStatus("dream-rsi", `dream-rsi: dreaming ${iteration}`);
       try {
+        const runTask: TaskConfig = {
+          ...task,
+          revisions: typeof params.revision === "number" ? params.revision : task.revisions,
+          agent: runAgentConfig(ctx, task.agent),
+        };
         const result = await runDreamPhase({
           dreamRoot: root,
           projectDir: projectDir(ctx),
-          task: { ...task, revisions: typeof params.revision === "number" ? params.revision : task.revisions },
+          task: runTask,
           iteration,
           evaluateOnly: params.evaluate_only === true,
           log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),

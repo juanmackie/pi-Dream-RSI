@@ -18,7 +18,7 @@ const { rankCandidates, renderSuggestion, parsePreference, MIN_WIN_FRACTION } = 
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, writeTask } = await jump("engine/task.ts");
 const { writeJson } = await jump("engine/world.ts");
-const { buildAgentArgs } = await jump("agent/runner.ts");
+const { buildAgentArgs, piSelfInvocation } = await jump("agent/runner.ts");
 
 /** A project with a recorded cycle: baseline 100, best candidate 200. */
 function makeRankedProject() {
@@ -269,7 +269,7 @@ test("parsePreference maps words and stays silent about anything else", () => {
 });
 
 test("the configured model is actually passed to attempts", () => {
-  const base = { command: "pi", args: ["-p", "--no-session"], model: null, prompt_via: "stdin" };
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin" };
   assert.deepEqual(buildAgentArgs(base), ["-p", "--no-session"], "no model, no flag");
   assert.deepEqual(buildAgentArgs({ ...base, model: "opencode-go/deepseek-v4.1-flash" }), [
     "-p",
@@ -279,6 +279,54 @@ test("the configured model is actually passed to attempts", () => {
   ], "a configured model is appended when the args carry no placeholder");
   assert.deepEqual(buildAgentArgs({ ...base, args: ["-p", "--model", "{model}"], model: "x/y" }), ["-p", "--model", "x/y"], "placeholder wins");
   assert.deepEqual(buildAgentArgs({ ...base, args: ["-p"], model: null }), ["-p"]);
+});
+
+test("the session thinking level is passed to attempts", () => {
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin" };
+  assert.deepEqual(buildAgentArgs({ ...base, thinking: "high" }), ["-p", "--no-session", "--thinking", "high"]);
+  assert.deepEqual(
+    buildAgentArgs({ ...base, args: ["-p", "--thinking={thinking}"], thinking: "low" }),
+    ["-p", "--thinking=low"],
+    "placeholder wins",
+  );
+  assert.deepEqual(
+    buildAgentArgs({ ...base, args: ["-p", "--thinking", "max"], thinking: "low" }),
+    ["-p", "--thinking", "max"],
+    "an explicit --thinking wins",
+  );
+  assert.deepEqual(buildAgentArgs({ ...base, model: "x/y", thinking: "high" }), [
+    "-p",
+    "--no-session",
+    "--model",
+    "x/y",
+    "--thinking",
+    "high",
+  ], "model and thinking travel together");
+});
+
+test("the default pi agent re-spawns the running pi instead of trusting PATH", () => {
+  const argv1 = "/opt/pi/dist/bundle/cli.js";
+  const exists = (candidate) => candidate === argv1;
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1, execPath: "/usr/bin/node", exists }),
+    { command: "/usr/bin/node", args: [argv1] },
+    "node + the running cli.js is PATH-independent",
+  );
+  assert.equal(
+    piSelfInvocation({ insidePi: false, argv1, execPath: "/usr/bin/node", exists }),
+    null,
+    "outside pi (SDK host, tests) the caller falls back to `pi`",
+  );
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1: "/$bunfs/root/cli.js", execPath: "/usr/local/bin/pi", exists: () => true }),
+    { command: "/usr/local/bin/pi", args: [] },
+    "a bun virtual script is not a real path; the compiled binary is re-run directly",
+  );
+  assert.equal(
+    piSelfInvocation({ insidePi: true, argv1: "/no/such/cli.js", execPath: "/usr/bin/node", exists: () => false }),
+    null,
+    "generic runtime with no real script falls back to `pi`",
+  );
 });
 
 test("an npm-installed package runs its worker from the project, not from node_modules", async () => {

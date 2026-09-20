@@ -12,7 +12,7 @@ import { EXT, exists, jump, makeProject, mockPi, readJson } from "./fixtures.mjs
 
 const { default: dreamRsi } = await jump("index.ts");
 const { normalizeTask } = await jump("engine/task.ts");
-const { activeRuns } = await jump("state.ts");
+const { activeRuns, recoverInterruptedRuns } = await jump("state.ts");
 
 async function boot(project) {
   const { pi, context, harness } = mockPi();
@@ -749,12 +749,57 @@ test("task normalization fills defaults and rejects nonsense", () => {
   assert.equal(normalized.higher_is_better, true);
   assert.equal(normalized.agent.command, "pi");
   assert.ok(normalized.agent.args.includes("-p"));
+  assert.equal(normalized.agent.model, null, "no session snapshot is baked into task.json");
+  assert.equal(normalized.agent.thinking, null);
   assert.deepEqual(normalized.beta_grid, [0, 0.2, 0.4, 0.6, 0.8, 1]);
 
   assert.throws(() => normalizeTask({ name: "x", workspace: "", eval_program: "p", score_program: "c" }), /workspace must be a non-empty path/);
   assert.throws(() => normalizeTask({ name: "", workspace: "s", eval_program: "p", score_program: "c" }), /name must be a non-empty string/);
   assert.throws(() => normalizeTask({ name: "x", workspace: "s", eval_program: "p", score_program: "c", beta_grid: [] }), /beta_grid/);
   assert.throws(() => normalizeTask({ name: "x", workspace: "s", eval_program: "p", score_program: "c", k2: -1 }), /k2/);
+  assert.throws(
+    () => normalizeTask({ name: "x", workspace: "s", eval_program: "p", score_program: "c", agent: { command: "pi", args: [], thinking: "purple", prompt_via: "stdin" } }),
+    /agent\.thinking/,
+  );
+});
+
+test("an interrupted run is recovered so it stops looking in flight", () => {
+  const project = makeProject();
+  try {
+    const dir = path.join(project.dreamRoot, "trace_pool", "iter0001_current");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "live_cycle_manifest.json"),
+      JSON.stringify({ iteration: 1, status: "running", created_at: new Date().toISOString() }),
+    );
+    assert.equal(activeRuns(project.dreamRoot).length, 1, "the interrupted run is visible as in flight");
+    assert.deepEqual(recoverInterruptedRuns(project.dreamRoot), [1]);
+    assert.deepEqual(activeRuns(project.dreamRoot), [], "recovered, so it no longer blocks the next cycle");
+    const manifest = readJson(path.join(dir, "live_cycle_manifest.json"));
+    assert.equal(manifest.status, "failed");
+    assert.match(manifest.error, /interrupted/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("attempts use the active session model and thinking level", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.model = { provider: "opencode-go", id: "deepseek-v4.1-flash" };
+    context.thinkingLevel = "high";
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    const initEntry = harness.entries.filter((entry) => entry.customType === "pi-dream-rsi/live").at(-1);
+    assert.equal(initEntry.data.model, "opencode-go/deepseek-v4.1-flash", "init reports the effective session model");
+
+    const live = await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+    assert.match(live.content[0].text, /Live cycle/);
+    const liveEntry = harness.entries.filter((entry) => entry.customType === "pi-dream-rsi/live").at(-1);
+    assert.equal(liveEntry.data.model, "opencode-go/deepseek-v4.1-flash", "the cycle records the session model it ran on");
+  } finally {
+    project.cleanup();
+  }
 });
 
 test("a policy that reaches outside the prefix is blocked before it runs", async () => {

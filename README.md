@@ -117,8 +117,8 @@ you spend a cent on agent calls.
 **2. Probe the agent, then start small.** `create` runs the effective attempt command once (`pi -p … --model <id>
 "Reply with exactly: OK"`) so a bad model id or empty balance costs one small call instead of a cycle of failed
 attempts. `workers=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy revision
-- `agent.model` reads `PI_MODEL` from the session environment; shown in output and session entry.`
-per cycle. That's enough to see whether the proposals are real. Once they are, scale to the paper's
+per cycle. Every attempt runs on the **active session's model and thinking level**, so switching model with
+`/model` changes the next cycle's attempts. That's enough to see whether the proposals are real. Once they are, scale to the paper's
 shape: `W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, roughly five cycles, and `M` somewhere
 around 3–5 (the paper doesn't publish its value).
 
@@ -221,8 +221,8 @@ K1=6, K2=8, M=3`):
 dream_rsi_init   name="lasso-path" workspace="task/seed" eval_program="solution.cpp" \
                  score_program="node /abs/task/score.mjs" problem_file="task/PROBLEM.md" \
                  workers=10 k1=11 k2=8 revisions=4 \
-                 agent_command="pi" agent_args=["-p","--no-session","-na","--no-extensions","--no-skills"] \
-                 model="<provider/model>"
+                 agent_command="pi" agent_args=["-p","--no-session","-na","--no-extensions","--no-skills"]
+                 # model="<provider/model>"   (optional fallback; attempts use the active session model)
 dream_rsi_live     # cycle 1 — also drops its best attempt in history/baseline as the floor to beat
 dream_rsi_dream    # replay it, rewrite the policy, deploy the winner
 dream_rsi_live     # cycle 2 with the better policy — a second world
@@ -275,7 +275,7 @@ change.
 | `problem_file` | Problem statement handed to every attempt (optional). |
 | `workers`, `k1`, `k2`, `revisions` | `W`, `K1`, `K2`, `M`. |
 | `beta1`, `beta2`, `beta_grid`, `default_beta` | Reward shaping and the swept beta grid. |
-| `agent` | The command spawned per attempt and per policy revision; the prompt goes over stdin. |
+| `agent` | The command spawned per attempt and per policy revision; the prompt goes over stdin. `agent.command` decides the CLI (the default `pi` is re-spawned as the running pi, so it does not depend on PATH); `agent.model`/`agent.thinking` in `task.json` are only fallbacks — a run uses the active session's model and thinking level. |
 
 Your scorer writes this:
 

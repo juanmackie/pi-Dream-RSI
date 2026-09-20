@@ -9,13 +9,19 @@ import * as path from "node:path";
 /** Root of all Dream-RSI state, relative to the project directory. */
 export const DREAM_DIR = ".dream-rsi";
 
+/** Reasoning levels supported by the pi CLI's `--thinking` flag. */
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
 export interface AgentConfig {
   /** Executable to spawn for one attempt (one generation-evaluation request). */
   command: string;
-  /** Arguments; `{model}` is substituted when present. */
+  /** Arguments; `{model}` and `{thinking}` are substituted when present. */
   args: string[];
-  /** Model id passed to the agent, if the command takes one. */
+  /** Model id passed to the agent, if the command takes one. Fallback for a run without a session model. */
   model: string | null;
+  /** Reasoning level passed via `--thinking`, if the command takes one. Fallback for a run without a session level. */
+  thinking: ThinkingLevel | null;
   /** How the prompt reaches the agent. `stdin` avoids argv limits and shell quoting entirely. */
   prompt_via: "stdin" | "arg";
 }
@@ -86,7 +92,11 @@ export function defaultTask(name = "task"): TaskConfig {
     agent: {
       command: "pi",
       args: ["-p", "--no-session", "-na", "--no-extensions", "--no-skills", "--no-prompt-templates"],
-      model: process.env.PI_MODEL || null,
+      // A run resolves the *active session* model/thinking level (ctx.model, ctx.thinkingLevel); these are
+      // only fallbacks for when no session model is available (SDK/CI). PI_MODEL is not usable here: pi
+      // injects it into shell-tool commands, never into the extension process.
+      model: null,
+      thinking: null,
       prompt_via: "stdin",
     },
   };
@@ -136,6 +146,9 @@ export function validateTask(raw: unknown): string[] {
   }
   if (agent && (!Array.isArray(agent.args) || agent.args.some((a) => typeof a !== "string"))) {
     errors.push("agent.args must be an array of strings");
+  }
+  if (agent && agent.thinking != null && !THINKING_LEVELS.includes(agent.thinking)) {
+    errors.push(`agent.thinking must be one of ${THINKING_LEVELS.join(", ")} or null`);
   }
   if (agent && agent.prompt_via !== "stdin" && agent.prompt_via !== "arg") {
     errors.push('agent.prompt_via must be "stdin" or "arg"');

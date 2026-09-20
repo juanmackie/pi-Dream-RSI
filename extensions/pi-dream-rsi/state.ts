@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DREAM_DIR, readTask, type TaskConfig } from "./engine/task.ts";
-import { listIterations, readManifest, historyDir, liveMethodPath, policyDir, tracePoolDir, type LiveCycleManifest } from "./engine/world.ts";
+import { listIterations, readJson, readManifest, historyDir, liveMethodPath, policyDir, tracePoolDir, type LiveCycleManifest } from "./engine/world.ts";
 
 export const LIVE_MANIFEST_ENTRY = "pi-dream-rsi/live";
 
@@ -53,6 +53,36 @@ export function activeRuns(root: string): string[] {
     }
   }
   return out;
+}
+
+/**
+ * A run left `running` on disk while no phase is active in this session was interrupted (crash, killed
+ * process). Dream-RSI runs one phase at a time, so it is safe to mark those failed — otherwise the
+ * interrupted cycle looks permanently in flight and blocks the next one from being trusted.
+ *
+ * Only the in-flight mirror is touched, not the final sidecar: the interrupted iteration had no completed
+ * world, so the next live cycle restarts that iteration number with a clean tree.
+ */
+export function recoverInterruptedRuns(root: string): number[] {
+  const dir = tracePoolDir(root);
+  if (!fs.existsSync(dir)) return [];
+  const recovered: number[] = [];
+  for (const entry of fs.readdirSync(dir)) {
+    const match = /^iter(\d+)_current$/.exec(entry);
+    if (!match) continue;
+    const file = path.join(dir, entry, "live_cycle_manifest.json");
+    const manifest = readJson<LiveCycleManifest>(file);
+    if (!manifest || manifest.status !== "running") continue;
+    const updated: LiveCycleManifest = {
+      ...manifest,
+      status: "failed",
+      completed_at: new Date().toISOString(),
+      error: manifest.error ?? "interrupted — the previous run did not finish",
+    };
+    fs.writeFileSync(file, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
+    recovered.push(Number(match[1]));
+  }
+  return recovered.sort((a, b) => a - b);
 }
 
 export interface LoadedState {
