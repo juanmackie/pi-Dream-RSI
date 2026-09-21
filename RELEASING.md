@@ -21,7 +21,7 @@ require a publish. Publishing is for users, not for dogfooding — see [Developm
 ```bash
 # 1. Everything the tarball ships must be committed — publish the repo, not the working tree.
 git status --short                     # expect no surprises
-npm test                               # 62 tests; also runs via prepublishOnly
+npm test                               # 70 tests; also runs via prepublishOnly
 
 # 2. Version bump (keep the surfaces in step).
 npm version patch --no-git-tag-version # 0.1.1 -> 0.1.2
