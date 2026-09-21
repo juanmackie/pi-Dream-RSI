@@ -18,7 +18,7 @@ const { rankCandidates, renderSuggestion, parsePreference, MIN_WIN_FRACTION } = 
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, writeTask } = await jump("engine/task.ts");
 const { writeJson } = await jump("engine/world.ts");
-const { buildAgentArgs, piSelfInvocation } = await jump("agent/runner.ts");
+const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
 
 /** A project with a recorded cycle: baseline 100, best candidate 200. */
 function makeRankedProject() {
@@ -327,6 +327,56 @@ test("the default pi agent re-spawns the running pi instead of trusting PATH", (
     null,
     "generic runtime with no real script falls back to `pi`",
   );
+});
+
+test("only a real pi entry point is re-spawned, never the host process that inherited pi's markers", () => {
+  // pi sets PI_CODING_AGENT/AI_AGENT on its CLI and RPC entries and every child inherits them, so a host
+  // app that embeds pi (or anything launched from inside pi) is `insidePi` while argv1 is its own entry.
+  // Re-running that argv1 spawns the host as the "agent": it writes nothing, and the attempt dies 30
+  // minutes later as a silent `timeout` with an empty agent.log.
+  const exists = () => true;
+  for (const host of ["/srv/pi-web/server.js", "/opt/web/sessiond.mjs", "/app/index.cjs", "/app/worker.ts"]) {
+    assert.equal(
+      piSelfInvocation({ insidePi: true, argv1: host, execPath: "/usr/bin/node", exists }),
+      null,
+      `${host} is not pi, so it must not be spawned as the discovery agent`,
+    );
+  }
+  for (const entry of [
+    "/opt/pi/dist/cli.js",
+    "/opt/pi/dist/bundle/cli.js",
+    "/opt/pi/dist/bundle/cli-runtime.js",
+    "/opt/pi/dist/rpc-entry.js",
+    "/src/cli.ts",
+  ]) {
+    assert.deepEqual(
+      piSelfInvocation({ insidePi: true, argv1: entry, execPath: "/usr/bin/node", exists }),
+      { command: "/usr/bin/node", args: [entry] },
+      `${entry} is pi's own entry point`,
+    );
+  }
+});
+
+test("a missing agent CLI reports the command and the fix instead of a bare ENOENT", async () => {
+  const enoent = Object.assign(new Error("spawn pi ENOENT"), { code: "ENOENT" });
+  assert.match(describeSpawnError(enoent, true), /spawn pi ENOENT/);
+  assert.doesNotMatch(describeSpawnError(enoent, true), /agent\.command/, "a shell already named the command");
+  assert.match(describeSpawnError(enoent, false), /spawn pi ENOENT/);
+  assert.match(describeSpawnError(enoent, false), /agent\.command/, "a shell-free miss says how to pin the CLI");
+  const other = Object.assign(new Error("spawn pi EPERM"), { code: "EPERM" });
+  assert.equal(describeSpawnError(other, false), "spawn pi EPERM", "only a miss gets the hint");
+
+  // POSIX-only wiring check: a custom command spawns without a shell there, so a missing CLI raises ENOENT.
+  if (process.platform === "win32") return;
+  const result = await runAgent({
+    agent: { command: "/nonexistent/dream-rsi-agent", args: [], prompt_via: "stdin" },
+    cwd: os.tmpdir(),
+    prompt: "propose something",
+    timeoutMs: 10_000,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, false, "a missing CLI fails immediately, it must not look like a hang");
+  assert.match(result.spawnError, /agent\.command/);
 });
 
 test("an npm-installed package runs its worker from the project, not from node_modules", async () => {

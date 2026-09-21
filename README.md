@@ -286,7 +286,7 @@ change.
 | `problem_file` | Problem statement handed to every attempt (optional). |
 | `workers`, `k1`, `k2`, `revisions` | `W`, `K1`, `K2`, `M`. |
 | `beta1`, `beta2`, `beta_grid`, `default_beta` | Reward shaping and the swept beta grid. |
-| `agent` | The command spawned per attempt and per policy revision; the prompt goes over stdin. `agent.command` decides the CLI (the default `pi` is re-spawned as the running pi, so it does not depend on PATH); `agent.model`/`agent.thinking` in `task.json` are only fallbacks — a run uses the active session's model and thinking level. |
+| `agent` | The command spawned per attempt and per policy revision; the prompt goes over stdin. `agent.command` decides the CLI. The default `pi` re-spawns the running pi (`process.execPath` + its `cli.js`/`cli-runtime.js`/`rpc-entry.js`), so it does not depend on PATH — but only when that entry point really is pi's: inside a host that embeds pi (or any process merely started from inside pi, which inherits `PI_CODING_AGENT`), the fallback is a PATH lookup of `agent.command`, and a bare `pi` that is not on this process's PATH fails fast with `agent_error` naming the command. `agent.model`/`agent.thinking` in `task.json` are only fallbacks — a run uses the active session's model and thinking level. |
 
 Your scorer writes this:
 

@@ -129,7 +129,9 @@ async function collect(
       killTree(child);
     }, options.timeoutMs);
 
-    child.on("error", (error) => finish({ spawnError: error.message }));
+    // A missing agent CLI must not read as a silent hang: say which command was not found and how the
+    // task can pin it, because the runner resolves `pi` itself and only falls back to PATH otherwise.
+    child.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
     child.stdout?.on("data", (chunk: Buffer) => {      const text = chunk.toString();
       stdoutTail = append(stdoutTail, text);
       logStream?.write(text);
@@ -141,6 +143,9 @@ async function collect(
     });
     child.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut, code, signal }));
 
+    // An agent that exits before reading its prompt closes the pipe; the EPIPE is an outcome of the
+    // attempt (recorded from its exit code), never a reason to take down the host running the loop.
+    child.stdin?.on("error", () => {});
     if (child.stdin) {
       if (options.stdin !== undefined) child.stdin.end(options.stdin);
       else child.stdin.end();
@@ -180,12 +185,26 @@ export function buildAgentArgs(agent: AgentConfig): string[] {
 }
 
 /**
+ * Entry-point file names the pi CLI is launched from under node/bun: `dist/cli.js`, the bundled
+ * `dist/bundle/cli.js` / `cli-runtime.js`, the RPC entry, or their TypeScript sources in a checkout.
+ * `argv1` is pi's own entry point only when it carries one of these names.
+ */
+const PI_ENTRY_BASENAME = /^(cli|cli-runtime|rpc-entry)\.(js|cjs|mjs|ts|tsx)$/i;
+
+/**
  * The invocation that re-runs the pi CLI hosting this extension.
  *
  * A bare `pi` depends on PATH/shim resolution and fails when pi is not on the child's PATH (or is only a
  * shell shim on Windows). Resolve the running executable instead — node/bun + the running cli.js, or the
  * compiled pi binary — mirroring pi's own subagent example. Returns null when not running inside pi so a
  * caller (SDK host, tests) falls back to `pi`.
+ *
+ * `PI_CODING_AGENT`/`AI_AGENT` only prove that pi is *somewhere* up the process tree: pi sets them on the
+ * CLI and RPC entries and every child inherits them. `argv1` alone therefore does not prove this process
+ * *is* pi, so it is only re-run when it is a pi entry point (`PI_ENTRY_BASENAME`). Without that check an
+ * embedding host (a web/session daemon, a test runner, anything started from inside pi) would be spawned
+ * as the discovery agent, sit there producing no output, and burn the whole attempt timeout as a silent
+ * `timeout` with an empty `agent.log`.
  */
 export interface PiSelfOptions {
   argv1?: string;
@@ -202,7 +221,9 @@ export function piSelfInvocation(options: PiSelfOptions = {}): { command: string
   const execPath = options.execPath ?? process.execPath;
   const exists = options.exists ?? fs.existsSync;
   const isBunVirtualScript = typeof argv1 === "string" && argv1.startsWith("/$bunfs/root/");
-  if (typeof argv1 === "string" && argv1 !== "" && !isBunVirtualScript && exists(argv1)) {
+  const isPiEntry =
+    typeof argv1 === "string" && argv1 !== "" && PI_ENTRY_BASENAME.test(path.basename(argv1));
+  if (isPiEntry && !isBunVirtualScript && exists(argv1)) {
     return { command: execPath, args: [argv1] };
   }
   const execName = path.basename(execPath).toLowerCase();
@@ -239,6 +260,18 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
     return collect(command, [...invocationArgs, options.prompt], { ...options, shell });
   }
   return collect(command, invocationArgs, { ...options, shell, stdin: options.prompt });
+}
+
+/**
+ * Turn a spawn failure into something the operator can act on.
+ *
+ * With `shell: false` the command was resolved by the runner or by PATH, so `ENOENT` means the agent CLI
+ * is genuinely unreachable — the state where a bare `spawn pi ENOENT` in `error.txt` reads as "Dream-RSI
+ * is broken" instead of "pin the agent command". With a shell the message already names the command.
+ */
+export function describeSpawnError(error: NodeJS.ErrnoException, shell: boolean): string {
+  if (error.code !== "ENOENT" || shell) return error.message;
+  return `${error.message} — the agent CLI is not on this process's PATH; set agent.command to an absolute path in .dream-rsi/task.json`;
 }
 
 /** Fresh workspace copy: the attempt resumes its parent's saved workspace state. */
