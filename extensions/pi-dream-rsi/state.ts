@@ -11,16 +11,36 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DREAM_DIR, readTask, type TaskConfig } from "./engine/task.ts";
-import { listIterations, readJson, readManifest, historyDir, liveMethodPath, policyDir, tracePoolDir, type LiveCycleManifest } from "./engine/world.ts";
+import {
+  listIterations,
+  readJson,
+  readManifest,
+  historyDir,
+  liveMethodPath,
+  policyDir,
+  tracePoolDir,
+  writeCurrentManifest,
+  type LiveCycleManifest,
+} from "./engine/world.ts";
 
 export const LIVE_MANIFEST_ENTRY = "pi-dream-rsi/live";
+
+export interface RunningPhase {
+  /** Human label, also shown on the status line. */
+  label: string;
+  /** Iterations this phase has claimed (live cycles only; empty for a dream phase). */
+  iterations: number[];
+}
 
 export interface DreamState {
   mode: boolean;
   /** Highest iteration this session reached (never decreases). */
   iteration: number;
-  /** Human label of the phase currently running, if any. */
-  running: string | null;
+  /**
+   * Phases in flight for this session, oldest first. Live cycles may overlap (parallel worlds); a dream
+   * phase runs alone, because it replays a frozen history and rewrites the deployed policy.
+   */
+  running: RunningPhase[];
 }
 
 export function dreamRootFor(cwd: string): string {
@@ -55,21 +75,86 @@ export function activeRuns(root: string): string[] {
   return out;
 }
 
+/** Iterations whose in-flight mirror still says `running` — worlds claimed but not finished. */
+export function runningIterations(root: string): number[] {
+  const dir = tracePoolDir(root);
+  if (!fs.existsSync(dir)) return [];
+  const out: number[] = [];
+  for (const entry of fs.readdirSync(dir)) {
+    const match = /^iter(\d+)_current$/.exec(entry);
+    if (!match) continue;
+    const manifest = readJson<LiveCycleManifest>(path.join(dir, entry, "live_cycle_manifest.json"));
+    if (manifest?.status === "running") out.push(Number(match[1]));
+  }
+  return out.sort((a, b) => a - b);
+}
+
+/**
+ * The next free iteration number. Recorded worlds and in-flight claims both count, so two live calls in
+ * one session can never be handed the same number. A claim that was recovered as failed stops counting,
+ * which is what lets an interrupted cycle restart its number instead of leaving a permanent hole.
+ */
+export function nextIteration(root: string): number {
+  const recorded = listIterations(root);
+  const claimed = runningIterations(root);
+  return [...recorded, ...claimed].reduce((best, value) => Math.max(best, value), 0) + 1;
+}
+
+/**
+ * Claim `count` consecutive iterations for episodes that are about to start, and return them.
+ *
+ * Synchronous on purpose: the caller reserves before its first `await`, so a second tool call in the same
+ * session cannot squeeze into the same numbers. The claim is the ordinary in-flight mirror the engine
+ * already writes, so an interrupted episode is cleaned up by `recoverInterruptedRuns` like any other.
+ */
+export function reserveIterations(root: string, count: number, minBase = 1): number[] {
+  const base = Math.max(nextIteration(root), minBase);
+  const reserved: number[] = [];
+  for (let offset = 0; offset < count; offset += 1) {
+    const iteration = base + offset;
+    writeCurrentManifest(root, {
+      iteration,
+      status: "running",
+      created_at: new Date().toISOString(),
+      completed_at: null,
+      baked_beta: 0,
+      policy_version: "",
+      policy_name: null,
+      grid: { branch_count: 0, refine_count: 0 },
+      decision_rounds: 0,
+      attempts: 0,
+      baseline_score: null,
+      best_score: null,
+      previous_best_score: null,
+      stopped: null,
+      error: null,
+      note: "reserved: this episode is allocated but has not started yet",
+    });
+    reserved.push(iteration);
+  }
+  return reserved;
+}
+
 /**
  * A run left `running` on disk while no phase is active in this session was interrupted (crash, killed
  * process). Dream-RSI runs one phase at a time, so it is safe to mark those failed — otherwise the
  * interrupted cycle looks permanently in flight and blocks the next one from being trusted.
  *
+ * `except` names the iterations this session is still running: concurrent live calls each own their
+ * claims, and one of them finishing must not mark a sibling's world as interrupted.
+ *
  * Only the in-flight mirror is touched, not the final sidecar: the interrupted iteration had no completed
  * world, so the next live cycle restarts that iteration number with a clean tree.
  */
-export function recoverInterruptedRuns(root: string): number[] {
+export function recoverInterruptedRuns(root: string, except: number[] = []): number[] {
   const dir = tracePoolDir(root);
   if (!fs.existsSync(dir)) return [];
   const recovered: number[] = [];
   for (const entry of fs.readdirSync(dir)) {
     const match = /^iter(\d+)_current$/.exec(entry);
     if (!match) continue;
+    const iteration = Number(match[1]);
+    if (except.includes(iteration)) continue;
     const file = path.join(dir, entry, "live_cycle_manifest.json");
     const manifest = readJson<LiveCycleManifest>(file);
     if (!manifest || manifest.status !== "running") continue;
@@ -80,7 +165,7 @@ export function recoverInterruptedRuns(root: string): number[] {
       error: manifest.error ?? "interrupted — the previous run did not finish",
     };
     fs.writeFileSync(file, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
-    recovered.push(Number(match[1]));
+    recovered.push(iteration);
   }
   return recovered.sort((a, b) => a - b);
 }
@@ -160,7 +245,7 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
   const lines = [
     `Dream-RSI — ${task.name}`,
     `  root:     ${root}`,
-    `  budgets:  W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} beta_grid=[${task.beta_grid.join(", ")}]`,
+    `  budgets:  W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} loops<=${task.max_loops} beta_grid=[${task.beta_grid.join(", ")}]`,
     `  scoring:  ${task.score_program} -> ${task.score_path}.${task.score_field} (${task.higher_is_better ? "higher" : "lower"} is better)`,
     `  policy:   ${path.relative(root, state.policy)} (versions: ${state.policyVersions.length === 0 ? "none archived" : state.policyVersions.join(", ")})`,
   ];

@@ -19,7 +19,9 @@ offline replay of candidate policies against worlds recorded from real runs.
 
 - **Online (K1 rounds, W workers):** the policy picks a batch of eligible nodes (`|batch| ≤ W`) each round;
   every selected node runs one attempt that resumes its parent's saved workspace. The task's fixed scorer
-  gives each node a score `s_v`.
+  gives each node a score `s_v`. **Worlds can be produced in parallel:** `dream_rsi_live` takes `loops=n`
+  (and several calls may run side by side), so `n` episodes of the *same* policy record `n` worlds at once
+  before one dream replays all of them.
 - **Replay (K2 rounds):** revealing a node returns its *recorded* outcome. No new generation ever happens,
   so replay is deterministic and cheap.
 - **Reward:** selection uses Eq. 1, `V = max s_v − β1·N + β2·N/max(1, k*)` (quality, execution cost,
@@ -31,8 +33,8 @@ offline replay of candidate policies against worlds recorded from real runs.
 | Tool | What it does |
 |------|--------------|
 | `dream_rsi_init` | Write `.dream-rsi/task.json`, seed `.dream-rsi/policy/method.ts` from the shipped parallel-refine baseline, validate the workspace/problem file, and measure your own code into `history/seed/score.json`. Cheap. Reconfiguring keeps an existing measurement unless the workspace or the scorer changed; the previous number is kept as `history/seed/score.<timestamp>.json`. |
-| `dream_rsi_live` | One online cycle: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records world `t`. Expensive (real agent time). |
-| `dream_rsi_dream` | Offline phase: replay `M` policy versions over all recorded worlds, sweep the beta grid, revision-agent rewrites the policy between revisions, select argmax `V`, deploy the winner. Moderately expensive (M−1 agent calls). |
+| `dream_rsi_live` | One or more online cycles: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records one world per episode. Pass `loops=n` (clamped to `task.json`'s `max_loops`, default 2) or start several `dream_rsi_live` calls at once to record `n` worlds of the same policy in parallel; the cap is shared across everything in flight. Expensive (real agent time: `loops x W` attempts at once). |
+| `dream_rsi_dream` | Offline phase: replay `M` policy versions over all recorded worlds, sweep the beta grid, revision-agent rewrites the policy between revisions, select argmax `V`, deploy the winner. Refuses while any world is still in flight — the history has to be frozen. Moderately expensive (M−1 agent calls, independent of how many worlds are being replayed). |
 | `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true`, copies only the declared program (plus paths the user names), never commits. |
 | `dream_rsi_status` | Iterations with best score + baked beta, worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), and the best candidate on record. |
 
@@ -77,16 +79,24 @@ whole loop into noise, and the cost is paid in agent calls, not in seconds.
 
 ## The loop
 
-1. `dream_rsi_live` → world `t`. Cycle 1 doubles as the baseline: its best attempt is copied to
+1. `dream_rsi_live` → world `t` (or worlds `t..t+n-1` with `loops=n`). Cycle 1 doubles as the baseline: its best attempt is copied to
    `history/baseline/` and becomes the floor every later attempt must read and beat.
 2. `dream_rsi_dream` → versions `v0000..v000M-1`, beta sweep, winner deployed to `policy/method.ts`.
+   It replays every recorded world, so a batch of `n` worlds costs one dream, not `n`.
 3. Every cycle result ends with the ranked candidates (see *Recommending and applying*), and that ranking is
    what the user acts on. Repeat live → dream for as many rounds as the budget allows.
+
+**Batching worlds is the throughput lever.** `loops x W` agents run at once, so the wall clock approaches one
+cycle for the batch; the price is that every world in the batch reflects the *same* policy version, so the
+policy improves `n` worlds later than it would one-at-a-time. Reach for it when the provider and the disk can
+absorb the fan-out, keep the batch modest (`max_loops` defaults to 2) and raise `max_loops` deliberately.
 
 Between cycles, read `dream_rsi_status` (and `history/r####_dream/proposal_results/beta_sweep.json`):
 
 - **live trend** — best score still rising? Keep width. Plateaued? Narrow and go deeper (that is exactly
-  what the shipped `plan_grid` does, and what the improvement agent should refine).
+  what the shipped `plan_grid` does, and what the improvement agent should refine). After a parallel batch the
+  last two manifests are siblings of the same policy, so the trend is comparing like with like and a
+  "plateau" there means the batch did not beat it — not that the policy stopped improving.
 - **sweep non-degeneracy** — if every beta gives the same attainment/work, beta buys nothing yet; do not
   pretend it does. `pareto.reward`, AUC, and parallel penalty are the three numbers to compare.
 - **default beta rule** (paper Appendix B): improving → keep the previous beta unless the sweep clearly

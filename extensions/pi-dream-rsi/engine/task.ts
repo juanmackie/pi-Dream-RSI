@@ -48,6 +48,11 @@ export interface TaskConfig {
   higher_is_better: boolean;
   /** W — attempts that may run in parallel. */
   workers: number;
+  /**
+   * Cap on how many online episodes `dream_rsi_live` may run at once (parallel worlds).
+   * Real fan-out is `loops x workers` agent processes, so keep it near what the provider allows.
+   */
+  max_loops: number;
   /** K1 — online decision rounds per live episode. */
   k1: number;
   /** K2 — replay decision rounds per policy-world evaluation. */
@@ -80,6 +85,7 @@ export function defaultTask(name = "task"): TaskConfig {
     error_field: "error",
     higher_is_better: true,
     workers: 4,
+    max_loops: 2,
     k1: 6,
     k2: 8,
     revisions: 3,
@@ -120,6 +126,7 @@ export function validateTask(raw: unknown): string[] {
   }
   const numbers: [keyof TaskConfig, number, number][] = [
     ["workers", 1, 256],
+    ["max_loops", 1, 8],
     ["k1", 1, 10_000],
     ["k2", 0, 10_000],
     ["revisions", 0, 100],

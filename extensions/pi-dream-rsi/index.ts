@@ -27,10 +27,13 @@ import {
   dreamRootFor,
   iterationReport,
   recoverInterruptedRuns,
+  reserveIterations,
+  runningIterations,
   LIVE_MANIFEST_ENTRY,
   saveTaskEntry,
   statusSummary,
   type DreamState,
+  type RunningPhase,
 } from "./state.ts";
 import { ensureDreamIgnore, ensurePolicyRuntime } from "./engine/world.ts";
 import {
@@ -46,10 +49,6 @@ import { BUNDLED_POLICY_DIR, SKILLS_DIR } from "./layout.ts";
 
 const MODE_ENTRY = "pi-dream-rsi/mode";
 
-/** Tools that spend real agent time — gated so they cannot fire by accident. `apply` writes to the user's
- * own source tree, so it is gated too. */
-const GATED_TOOLS = ["dream_rsi_live", "dream_rsi_dream", "dream_rsi_apply"];
-
 // Plain JSON-Schema parameter objects (what pi validates against), so the package needs no runtime deps.
 const taskParams = {
   type: "object",
@@ -60,6 +59,10 @@ const taskParams = {
     score_program: { type: "string", description: "Fixed scoring command run in an attempt workspace; must write eval/score.json." },
     problem_file: { type: "string", description: "Optional problem statement file shown to attempts." },
     workers: { type: "number", description: "W — parallel attempts (default 4)." },
+    max_loops: {
+      type: "number",
+      description: "Cap on parallel online episodes per dream_rsi_live call (default 2, max 8); real fan-out is max_loops x workers agents.",
+    },
     k1: { type: "number", description: "K1 — online decision rounds per live episode (default 6)." },
     k2: { type: "number", description: "K2 — replay decision rounds per evaluation (default 8)." },
     revisions: { type: "number", description: "M — policy revisions per offline phase (default 3)." },
@@ -90,6 +93,11 @@ const liveParams = {
   type: "object",
   properties: {
     grid: { type: "string", description: "Optional explicit grid as 'branches x refinements' (e.g. '4x6'); default: plan_grid from the policy." },
+    loops: {
+      type: "number",
+      description:
+        "How many online episodes to run at once, each on its own iteration (parallel worlds). Clamped to max_loops in task.json (default 2); default 1.",
+    },
     note: { type: "string", description: "Free-form note recorded in the live-cycle manifest." },
   },
   additionalProperties: false,
@@ -140,6 +148,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   const projectDir = (ctx: ExtensionContext): string => ctx.cwd;
   const dreamRoot = (ctx: ExtensionContext): string => dreamRootFor(ctx.cwd);
 
+  /** Iterations owned by phases still in flight — the claims an interruption cleanup must not touch. */
+  const claimedBy = (phases: RunningPhase[]): number[] => phases.flatMap((phase) => phase.iterations);
+
   /**
    * Session-scoped agent settings. The active session wins at run time; task.json's agent is only the
    * fallback for a host with no model (SDK/CI). This is why a model switch takes effect on the next cycle.
@@ -158,7 +169,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     const key = ctx.sessionManager.getSessionId();
     let state = runtimes.get(key);
     if (!state) {
-      state = { mode: false, iteration: 0, running: null };
+      state = { mode: false, iteration: 0, running: [] };
       runtimes.set(key, state);
     }
     return state;
@@ -182,7 +193,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   };
 
   const reconstruct = (ctx: ExtensionContext): void => {
-    const state = { mode: false, iteration: 0, running: null } as DreamState;
+    const state = { mode: false, iteration: 0, running: [] } as DreamState;
     // `getBranch()` (not `getEntries()`): a mode or iteration recorded on another branch must not
     // leak back in when the session tree is rewired.
     for (const entry of ctx.sessionManager.getBranch() as CustomEntry[]) {
@@ -234,6 +245,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     return ranking;
   };
 
+  /** Tools that spend real agent time or write to the user's tree are gated: only callable in Dream-RSI mode. */
   const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
     gatedNames.add(tool.name);
     pi.registerTool(tool);
@@ -245,7 +257,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_init",
     label: "Dream-RSI Init",
     description:
-      "Configure a Dream-RSI task: seed workspace, candidate program, fixed scoring command, budgets (W, K1, K2, M), beta grid and the agent command used for discovery attempts. Writes <project>/.dream-rsi/task.json and seeds .dream-rsi/policy/method.ts from the shipped parallel-refine policy.",
+      "Configure a Dream-RSI task: seed workspace, candidate program, fixed scoring command, budgets (W, loops, K1, K2, M), beta grid and the agent command used for discovery attempts. Writes <project>/.dream-rsi/task.json and seeds .dream-rsi/policy/method.ts from the shipped parallel-refine policy.",
     promptSnippet: "Configure the Dream-RSI task (workspace, eval_program, score_program, budgets, agent).",
     promptGuidelines: [
       "Call dream_rsi_init before dream_rsi_live: it writes .dream-rsi/task.json and seeds the exploration policy.",
@@ -267,6 +279,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           ? { problem_file: params.problem_file ? normalizePathArg(String(params.problem_file)) : null }
           : {}),
         ...(typeof params.workers === "number" ? { workers: params.workers } : {}),
+        ...(typeof params.max_loops === "number" ? { max_loops: params.max_loops } : {}),
         ...(typeof params.k1 === "number" ? { k1: params.k1 } : {}),
         ...(typeof params.k2 === "number" ? { k2: params.k2 } : {}),
         ...(typeof params.revisions === "number" ? { revisions: params.revisions } : {}),
@@ -330,7 +343,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  workspace:  ${workspacePath}`,
               `  candidate:  ${task.eval_program}`,
               `  scorer:     ${task.score_program}`,
-              `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} beta_grid=[${task.beta_grid.join(", ")}]`,
+              `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} loops<=${task.max_loops} beta_grid=[${task.beta_grid.join(", ")}]`,
               `  agent:      ${configuredAgent.command} ${configuredAgent.args.join(" ")}${configuredAgent.model ? ` --model ${configuredAgent.model}` : ""}${configuredAgent.thinking ? ` --thinking ${configuredAgent.thinking}` : ""}`,
               `  (attempts follow the active session model/thinking level; pass model= only to set the fallback)`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
@@ -349,90 +362,170 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_live",
     label: "Dream-RSI Live Cycle",
     description:
-      "Run one online exploration episode with the current policy: plan_grid decides the branch x refinement grid, the policy batches up to W nodes per decision round (<= K1 rounds), each selected node runs one discovery attempt, and the task's scorer evaluates it. Records the discovery tree as a replay world and appends it to the history.",
-    promptSnippet: "Run one Dream-RSI online exploration cycle (policy pi_t, W workers, <= K1 rounds).",
+      "Run one or more online exploration episodes with the current policy: plan_grid decides the branch x refinement grid, the policy batches up to W nodes per decision round (<= K1 rounds), each selected node runs one discovery attempt, and the task's scorer evaluates it. Each episode records its discovery tree as a replay world; pass loops>1 to run several episodes at once (parallel worlds).",
+    promptSnippet: "Run Dream-RSI online exploration cycle(s) (policy pi_t, W workers, <= K1 rounds); loops>1 for parallel worlds.",
     promptGuidelines: [
-      "Use dream_rsi_live to collect one discovery tree; it spends real agent time (W attempts per round), so report the plan and budgets before running it.",
-      "After dream_rsi_live, run dream_rsi_dream to improve the exploration policy from the newly recorded world.",
+      "Use dream_rsi_live to collect discovery trees; it spends real agent time (loops x W attempts per round), so report the plan and budgets before running it.",
+      "dream_rsi_live loops=N records N worlds of the same policy in parallel — one dream then replays all of them. Real fan-out is loops x W agent processes (clamped to task.json's max_loops, default 2), so raise it only when the attempt model and the disk can take it.",
+      "Start several dream_rsi_live calls in one turn to run independent cycles side by side: they share the max_loops budget, and dream_rsi_dream replays whatever worlds they recorded once they have finished.",
+      "After dream_rsi_live, run dream_rsi_dream to improve the exploration policy from the newly recorded world(s).",
     ],
     parameters: liveParams,
     async execute(_id, params, _signal, onUpdate, ctx) {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
-      if (state.running) {
-        return { content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${state.running}` }], details: {} };
+      // Live cycles may overlap each other (parallel worlds), but never a dream phase: that one rewrites the
+      // deployed policy and must replay a frozen history.
+      const exclusive = state.running.filter((phase) => !phase.label.startsWith("live"));
+      if (exclusive.length > 0) {
+        return {
+          content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${exclusive.map((p) => p.label).join(", ")}` }],
+          details: {},
+        };
       }
-      let task: TaskConfig;
+      let mine: RunningPhase | null = null;
       try {
-        task = readTask(root);
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
-      }
-      // A run marked running while nothing is running in this session was interrupted; clear it so the
-      // next cycle restarts cleanly instead of the project looking permanently stuck.
-      const recovered = recoverInterruptedRuns(root);
-      if (recovered.length > 0) {
-        onUpdate?.({
-          content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
-        });
-      }
-      const iteration = Math.max(state.iteration, latestIteration(root)) + 1;
-      const baseline = readBaselineScore(root);
-      const previous = latestBest(root);
-      // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
-      const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
+        let task: TaskConfig;
+        try {
+          task = readTask(root);
+        } catch (error) {
+          return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
+        }
+        // A run marked running while no phase owns it was interrupted; clear it so the next cycle restarts
+        // cleanly instead of the project looking permanently stuck. Sibling live calls keep their claims.
+        const recovered = recoverInterruptedRuns(root, claimedBy(state.running));
+        if (recovered.length > 0) {
+          onUpdate?.({
+            content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
+          });
+        }
+        // The world cap is shared by every live call in flight, not per call.
+        const claimed = runningIterations(root).length;
+        const remaining = task.max_loops - claimed;
+        if (remaining <= 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `❌ ${claimed} live cycle(s) already in flight and max_loops=${task.max_loops} — let one finish (dream_rsi_dream waits for all of them) or raise max_loops in task.json.`,
+              },
+            ],
+            details: { in_flight: claimed, max_loops: task.max_loops },
+          };
+        }
+        const requested = typeof params.loops === "number" ? Math.floor(params.loops) : 1;
+        const want = Math.max(1, Number.isFinite(requested) ? requested : 1);
+        const loops = Math.min(want, remaining);
+        const clampNote =
+          want > loops
+            ? ` (asked for ${want} loop(s), running ${loops}: max_loops=${task.max_loops}${claimed > 0 ? ` with ${claimed} already in flight` : ""})`
+            : "";
+        // Claim the numbers before planning: allocation must not interleave with another call's.
+        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1);
+        const iteration = iterations[0];
+        mine = { label: loops === 1 ? `live cycle ${iteration}` : `live cycles ${iterations.join(", ")}`, iterations };
+        state.running.push(mine);
+        const baseline = readBaselineScore(root);
+        const previous = latestBest(root);
+        // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
+        const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
 
-      const planned = await planNextGrid(root, runTask, iteration, baseline);
-      const grid = params.grid ? parseGrid(String(params.grid), planned.plan) : planned.plan;
-      const bakedBeta = typeof planned.beta === "number" ? planned.beta : task.default_beta;
+        const planned = await planNextGrid(root, runTask, iteration, baseline);
+        const grid = params.grid ? parseGrid(String(params.grid), planned.plan) : planned.plan;
+        const bakedBeta = typeof planned.beta === "number" ? planned.beta : task.default_beta;
 
-      state.running = `live cycle ${iteration}`;
-      ctx.ui.setStatus("dream-rsi", `dream-rsi: live ${iteration} (${grid.branch_count}x${grid.refine_count})`);
-      onUpdate?.({
-        content: [
-          {
-            type: "text",
-            text: `Live cycle ${iteration}: grid ${grid.branch_count} branches x ${grid.refine_count} refinements, W=${task.workers}, K1=${task.k1}, beta=${bakedBeta}\n${grid.reason}`,
-          },
-        ],
-      });
-      try {
-        const episode = await runLiveEpisode({
-          dreamRoot: root,
-          projectDir: projectDir(ctx),
-          task: runTask,
-          iteration,
-          policyPath: path.join(root, "policy", "method.ts"),
-          bakedBeta,
-          grid: { branch_count: grid.branch_count, refine_count: grid.refine_count },
-          baselineScore: baseline,
-          previousBestScore: previous,
-          log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
-        });
-        state.iteration = iteration;
-        saveTaskEntry(pi, root, { task: task.name, policy: episode.manifest.policy_version, iteration, model: runTask.agent.model });
-        const report = iterationReport(root, iteration, episode.manifest);
+        ctx.ui.setStatus(
+          "dream-rsi",
+          iterations.length === 1
+            ? `dream-rsi: live ${iteration} (${grid.branch_count}x${grid.refine_count})`
+            : `dream-rsi: live x${iterations.length} (${grid.branch_count}x${grid.refine_count} each)`,
+        );
+        const header =
+          iterations.length === 1
+            ? `Live cycle ${iteration}: grid ${grid.branch_count} branches x ${grid.refine_count} refinements, W=${task.workers}, K1=${task.k1}, beta=${bakedBeta}`
+            : `${iterations.length} online cycles in parallel (worlds ${iterations.join(", ")}): grid ${grid.branch_count} branches x ${grid.refine_count} refinements each, W=${task.workers} each (${iterations.length * task.workers} attempts at once), K1=${task.k1}, beta=${bakedBeta}${clampNote}`;
+        onUpdate?.({ content: [{ type: "text", text: `${header}\n${grid.reason}` }] });
+
+        // One episode failing must not discard its siblings: collect per-world outcomes instead of rejecting.
+        const outcomes = await Promise.all(
+          iterations.map(async (world) => {
+            try {
+              const episode = await runLiveEpisode({
+                dreamRoot: root,
+                projectDir: projectDir(ctx),
+                task: runTask,
+                iteration: world,
+                policyPath: path.join(root, "policy", "method.ts"),
+                bakedBeta,
+                grid: { branch_count: grid.branch_count, refine_count: grid.refine_count },
+                baselineScore: baseline,
+                previousBestScore: previous,
+                log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
+              });
+              return { iteration: world, episode, error: episode.error };
+            } catch (error) {
+              return { iteration: world, episode: null, error: (error as Error).message };
+            }
+          }),
+        );
+        for (const outcome of outcomes) {
+          if (!outcome.episode) onUpdate?.({ content: [{ type: "text", text: `⚠️ live cycle ${outcome.iteration} failed: ${outcome.error}` }] });
+        }
+
+        const last = iterations[iterations.length - 1];
+        const policyVersion = outcomes.find((o) => o.episode)?.episode?.manifest.policy_version ?? null;
+        state.iteration = Math.max(state.iteration, last);
+        saveTaskEntry(pi, root, { task: task.name, policy: policyVersion, iteration: last, model: runTask.agent.model });
+        const reports = outcomes.map((outcome) =>
+          outcome.episode
+            ? iterationReport(root, outcome.iteration, outcome.episode.manifest)
+            : `⚠️ Live cycle ${outcome.iteration} FAILED: ${outcome.error}`,
+        );
         const ranking = reportImprovements(ctx);
         return {
-          content: [{ type: "text", text: `${report}\n\n${renderSuggestion(ranking)}` }],
+          content: [{ type: "text", text: `${header}\n${grid.reason}\n\n${reports.join("\n\n")}\n\n${renderSuggestion(ranking)}` }],
           details: {
-            ok: episode.ok,
-            iteration,
+            ok: outcomes.every((o) => o.episode?.ok === true),
+            iteration: last,
+            iterations,
+            loops: iterations.length,
             grid,
             beta: bakedBeta,
-            attempts: episode.tree.nNonRoot,
-            rounds: episode.manifest.decision_rounds,
-            best: episode.manifest.best_score,
+            worlds: outcomes
+              .filter((o) => o.episode)
+              .map((o) => ({
+                iteration: o.iteration,
+                ok: o.episode?.ok === true,
+                attempts: o.episode?.tree.nNonRoot ?? 0,
+                rounds: o.episode?.manifest.decision_rounds ?? 0,
+                best: o.episode?.manifest.best_score ?? null,
+              })),
+            attempts: outcomes.reduce((sum, o) => sum + (o.episode?.tree.nNonRoot ?? 0), 0),
+            rounds: outcomes.reduce((most, o) => Math.max(most, o.episode?.manifest.decision_rounds ?? 0), 0),
+            best: outcomes.reduce<number | null>((best, o) => {
+              const score = o.episode?.manifest.best_score;
+              return typeof score === "number" && (best === null || score > best) ? score : best;
+            }, null),
             pending_improvement: ranking.pending,
             ranking: ranking.candidates.slice(0, 5),
-            error: episode.error,
+            error: outcomes.find((o) => o.episode?.error)?.error ?? outcomes.find((o) => !o.episode)?.error ?? null,
           },
         };
       } catch (error) {
         return { content: [{ type: "text", text: `❌ live cycle failed: ${(error as Error).message}` }], details: {} };
       } finally {
-        state.running = null;
-        ctx.ui.setStatus("dream-rsi", state.mode ? "dream-rsi: active" : undefined);
+        // Whatever is still marked running is this call's own failure; releasing it frees the number too.
+        // Siblings keep theirs, so a finishing live call never kills a concurrent one.
+        const others = state.running.filter((phase) => phase !== mine);
+        const leftover = recoverInterruptedRuns(root, claimedBy(others));
+        if (leftover.length > 0) {
+          onUpdate?.({ content: [{ type: "text", text: `Marked unfinished cycle(s) failed: ${leftover.join(", ")}.` }] });
+        }
+        state.running = others;
+        ctx.ui.setStatus(
+          "dream-rsi",
+          others.length > 0 ? `dream-rsi: ${others.map((p) => p.label).join(", ")}` : state.mode ? "dream-rsi: active" : undefined,
+        );
       }
     },
   });
@@ -446,19 +539,37 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use dream_rsi_dream after dream_rsi_live; it spends agent time only on policy revisions, and replay itself is deterministic and cheap.",
       "dream_rsi_dream asserts V* >= V_0: a reported failure means the policy was non-deterministic or non-prefix-only, so its result must not be trusted.",
+      "dream_rsi_dream refuses while any online episode is still in flight, and it replays every recorded world — so batch the live cycles you want replayed, then dream once.",
     ],
     parameters: dreamParams,
     async execute(_id, params, _signal, onUpdate, ctx) {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
-      if (state.running) {
-        return { content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${state.running}` }], details: {} };
+      if (state.running.length > 0) {
+        return {
+          content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}` }],
+          details: {},
+        };
       }
       let task: TaskConfig;
       try {
         task = readTask(root);
       } catch (error) {
         return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
+      }
+      // Replay needs *finished* worlds: an in-flight episode has no tree yet, so dreaming now would silently
+      // replay fewer worlds than the report claims.
+      const inFlight = activeRuns(root);
+      if (inFlight.length > 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `❌ a live cycle is still in flight — let it finish before dreaming: ${inFlight.join("; ")}`,
+            },
+          ],
+          details: { in_flight: inFlight },
+        };
       }
       const iteration = Math.max(state.iteration, latestIteration(root));
       if (!fs.existsSync(path.join(root, "trace_pool", `iter${String(iteration).padStart(4, "0")}`))) {
@@ -468,7 +579,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         };
       }
 
-      state.running = `dream phase ${iteration}`;
+      const phase: RunningPhase = { label: `dream phase ${iteration}`, iterations: [] };
+      state.running = [phase];
       ctx.ui.setStatus("dream-rsi", `dream-rsi: dreaming ${iteration}`);
       try {
         const runTask: TaskConfig = {
@@ -516,7 +628,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       } catch (error) {
         return { content: [{ type: "text", text: `❌ dream phase failed: ${(error as Error).message}` }], details: {} };
       } finally {
-        state.running = null;
+        state.running = state.running.filter((running) => running !== phase);
         ctx.ui.setStatus("dream-rsi", state.mode ? "dream-rsi: active" : undefined);
       }
     },
@@ -807,26 +919,34 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           return;
         }
         const state = stateFor(ctx);
-        if (state.running) {
-          ctx.ui.notify(`A Dream-RSI phase is already running: ${state.running}.`, "error");
+        if (state.running.length > 0) {
+          ctx.ui.notify(`A Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}.`, "error");
           return;
         }
         setMode(ctx, true);
         const requested = parts[1];
-        if (verb === "run" && requested !== undefined) {
+        if ((verb === "run" || verb === "live") && requested !== undefined) {
           const parsed = Number(requested);
-          if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) {
-            ctx.ui.notify(`/dream-rsi run takes a cycle count between 1 and 100; got "${requested}".`, "error");
+          const limit = verb === "run" ? 100 : 8;
+          if (!Number.isInteger(parsed) || parsed < 1 || parsed > limit) {
+            ctx.ui.notify(
+              verb === "run"
+                ? `/dream-rsi run takes a cycle count between 1 and 100; got "${requested}".`
+                : `/dream-rsi live takes a loop count between 1 and 8; got "${requested}".`,
+              "error",
+            );
             return;
           }
         }
         const cycles = verb === "run" ? (requested === undefined ? 1 : Number(requested)) : 1;
         const instruction =
           verb === "live"
-            ? "Run one Dream-RSI online cycle (dream_rsi_live): report the planned grid and beta first, then the attempts, best score and where the records landed."
+            ? requested === undefined
+              ? "Run one Dream-RSI online cycle (dream_rsi_live): report the planned grid and beta first, then the attempts, best score and where the records landed."
+              : `Run ${requested} Dream-RSI online cycle${Number(requested) === 1 ? "" : "s"} in parallel (dream_rsi_live loops=${requested}): one world each from the same policy, then report the shared grid and beta, every world's best score, and where the records landed. Then dream_rsi_dream replays all of them at once.`
             : verb === "dream"
               ? "Run the Dream-RSI offline phase (dream_rsi_dream): report the V table, the beta sweep and which policy version was deployed."
-              : `Run ${cycles} full Dream-RSI cycle${cycles === 1 ? "" : "s"} in ${root}: for each one call dream_rsi_live, then dream_rsi_dream. Report the planned grid and beta before the first cycle, and after each pair the live score trend with the sweep's pareto.reward and the current best candidate. Stop early and tell me why if the live best plateaus while the beta sweep stays flat.`;
+              : `Run ${cycles} full Dream-RSI cycle${cycles === 1 ? "" : "s"} in ${root}: for each one call dream_rsi_live, then dream_rsi_dream. Pass dream_rsi_live loops=<n> (up to task.json's max_loops) when the goal is throughput: n worlds of the same policy in parallel, one dream replaying all of them. Report the planned grid and beta before the first cycle, and after each pair the live score trend with the sweep's pareto.reward and the current best candidate. Stop early and tell me why if the live best plateaus while the beta sweep stays flat.`;
         // The command drives the agent rather than dead-ending in a notification: a human at the prompt
         // cannot call tools, and "ask the agent to run the loop" is not an instruction that does anything.
         sendWhenReady(instruction);
@@ -866,6 +986,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "\n\n## Dream-RSI Mode (ACTIVE)" +
       `\nRoot: ${root} (task.json, policy/method.ts, history/, trace_pool/).` +
       "\nThe loop is: dream_rsi_live (one online exploration cycle -> discovery tree T_t) then dream_rsi_dream (replay every candidate policy version over the frozen history, revise, select argmax V, deploy)." +
+      "\ndream_rsi_live takes loops=<n> (clamped to task.json's max_loops) to record n worlds of the same policy in parallel, and you may start several dream_rsi_live calls in one turn when cycles are independent — they share that cap. One dream then replays all of them, so prefer wider batches over many narrow cycles when the attempt model and the disk can take the fan-out (loops x W agents at once)." +
       "\nRead the task problem statement and .dream-rsi/history/baseline before proposing a first cycle, and report grid/budget before spending agent time." +
       "\nPolicy code is prefix-only and deterministic; replay is deterministic, so a V* >= V_0 violation means the policy is unsound — do not deploy it.";
     const status = statusSummary(root, { sessionIteration: state.iteration });
@@ -878,7 +999,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     const runs = activeRuns(dreamRoot(ctx));
     if (runs.length === 0) return;
     const state = stateFor(ctx);
-    ctx.ui.setStatus("dream-rsi", `dream-rsi: ${state.running ?? runs[runs.length - 1]}`);
+    const labels = state.running.map((phase) => phase.label).join(", ");
+    ctx.ui.setStatus("dream-rsi", `dream-rsi: ${labels || runs[runs.length - 1]}`);
   });
 }
 
@@ -952,7 +1074,7 @@ function renderCommandHelp(root: string, configured: boolean): string {
     "                              the same choice without the dialog (print/scripted use)",
     "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest",
     "  /dream-rsi status           iterations, worlds, policy versions, last sweep",
-    "  /dream-rsi live             ask the agent for one online exploration cycle",
+    "  /dream-rsi live [n]         ask the agent for one online exploration cycle, or n of them in parallel",
     "  /dream-rsi dream            ask the agent for one offline policy-improvement phase",
     "  /dream-rsi run [n]          ask the agent for n full cycles (live then dream)",
     "  /dream-rsi off              leave Dream-RSI mode",

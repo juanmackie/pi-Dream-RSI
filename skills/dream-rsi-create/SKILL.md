@@ -42,7 +42,7 @@ Collect these; ask the user for anything you cannot find evidence for:
 | **Scorer** | A command that prints a number (`score_program`) plus a pass/fail verdict. | Look for an existing harness first — see step 2. |
 | **Correctness gate** | What must set `fail_class != "ok"`. | The repo's own checks: its test suite, its assertions, its validity rules. |
 | **Problem file** | A short doc every attempt reads: objective, in-scope files, off-limits, correctness, the baseline. | Write it (step 4). |
-| **Budgets** | `workers`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, K1=3, K2=4, M=2`. The paper's shape (`W=10, K1=11`) is hours per cycle. |
+| **Budgets** | `workers`, `max_loops`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, max_loops=2, K1=3, K2=4, M=2`. `max_loops` is how many online episodes may record worlds at once (`loops x W` agents in flight, shared by every live call); raise it only when the provider and the disk can take it. The paper's shape (`W=10, K1=11`) is hours per cycle. |
 | **Attempt agent** | `agent_command`, `agent_args`, optionally `model`. | The CLI that will edit code in the copy. Attempts inherit the active session's model and thinking level, so `model` is only a fallback; confirm the session model exists and is billable — step 6. |
 
 Ask in one batch. If the user says "just infer it", infer from the repo and **say what you inferred**, so a

@@ -12,7 +12,8 @@ import { EXT, exists, jump, makeProject, mockPi, readJson } from "./fixtures.mjs
 
 const { default: dreamRsi } = await jump("index.ts");
 const { normalizeTask } = await jump("engine/task.ts");
-const { activeRuns, recoverInterruptedRuns } = await jump("state.ts");
+const { activeRuns, recoverInterruptedRuns, nextIteration, reserveIterations, runningIterations } = await jump("state.ts");
+const { listIterations } = await jump("engine/world.ts");
 
 async function boot(project) {
   const { pi, context, harness } = mockPi();
@@ -818,6 +819,108 @@ test("a policy that reaches outside the prefix is blocked before it runs", async
     const manifest = readJson(path.join(project.dreamRoot, "trace_pool", "iter0001", "live_cycle_manifest.json"));
     assert.equal(manifest.status, "failed");
     assert.match(manifest.note, /node:fs/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("loops records several worlds at once, and one dream replays all of them", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project, { max_loops: 3 }), undefined, undefined, context);
+    assert.equal(readJson(path.join(project.dreamRoot, "task.json")).max_loops, 3, "max_loops is written to task.json");
+
+    const live = await harness.tools.get("dream_rsi_live").execute("c2", { loops: 3 }, undefined, undefined, context);
+    assert.deepEqual(live.details.iterations, [1, 2, 3], "three episodes, three iteration numbers");
+    assert.equal(live.details.loops, 3);
+    assert.equal(live.details.attempts, 18, "six attempts (2 branches x 3 refinements) per world");
+    assert.equal(live.details.ok, true);
+    assert.match(live.content[0].text, /3 online cycles in parallel \(worlds 1, 2, 3\)/);
+    for (const world of [1, 2, 3]) {
+      const dir = path.join(project.dreamRoot, "trace_pool", `iter000${world}`);
+      assert.ok(exists(path.join(dir, "tree.json")), `world ${world} was recorded`);
+      assert.equal(readJson(path.join(dir, "live_cycle_manifest.json")).status, "complete");
+      assert.ok(exists(path.join(project.dreamRoot, "work", `r000${world}`)), `world ${world} keeps its own attempt workspaces`);
+    }
+    assert.deepEqual(activeRuns(project.dreamRoot), [], "a finished batch leaves nothing in flight");
+    assert.equal(nextIteration(project.dreamRoot), 4, "the next cycle continues past the batch");
+
+    const dream = await harness.tools.get("dream_rsi_dream").execute("c3", {}, undefined, undefined, context);
+    assert.equal(dream.details.worlds, 3, "one dream replays the whole batch");
+    assert.equal(dream.details.ok, true);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("concurrent live calls share the world cap and clamp a wider request", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+
+    // Two calls in the same turn, as an agent would start them: max_loops=2 allows one world each.
+    const [first, second] = await Promise.all([
+      harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context),
+      harness.tools.get("dream_rsi_live").execute("c3", {}, undefined, undefined, context),
+    ]);
+    const claimed = [...first.details.iterations, ...second.details.iterations].sort((a, b) => a - b);
+    assert.deepEqual(claimed, [1, 2], "each call recorded its own world");
+    assert.equal(first.details.ok, true);
+    assert.equal(second.details.ok, true);
+
+    // Over-asking is clamped to max_loops, and the clamp is reported rather than silent.
+    const wide = await harness.tools.get("dream_rsi_live").execute("c4", { loops: 99 }, undefined, undefined, context);
+    assert.equal(wide.details.loops, 2, "clamped to task.json's max_loops");
+    assert.match(wide.content[0].text, /asked for 99 loop\(s\), running 2: max_loops=2/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("dreaming refuses while a world is still in flight", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    const dir = path.join(project.dreamRoot, "trace_pool", "iter0001_current");
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, "live_cycle_manifest.json"),
+      JSON.stringify({ iteration: 1, status: "running", baked_beta: 0.6 }),
+      "utf8",
+    );
+
+    const dream = await harness.tools.get("dream_rsi_dream").execute("c2", {}, undefined, undefined, context);
+    assert.match(dream.content[0].text, /still in flight/);
+    assert.deepEqual(dream.details.in_flight, ["live cycle 0001 (in flight)"]);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("iteration claims: a sibling's world survives, a recovered number is reusable", () => {
+  const project = makeProject();
+  try {
+    fs.mkdirSync(path.join(project.dreamRoot, "trace_pool"), { recursive: true });
+    assert.equal(nextIteration(project.dreamRoot), 1);
+    assert.deepEqual(reserveIterations(project.dreamRoot, 2), [1, 2]);
+    assert.deepEqual(runningIterations(project.dreamRoot), [1, 2]);
+    assert.equal(nextIteration(project.dreamRoot), 3, "claimed numbers count as occupied");
+
+    // One claim is owned by a live call that is still running: recovery must leave it alone.
+    assert.deepEqual(recoverInterruptedRuns(project.dreamRoot, [1]), [2], "only the unowned claim is recovered");
+    assert.deepEqual(runningIterations(project.dreamRoot), [1]);
+    assert.equal(nextIteration(project.dreamRoot), 2, "the recovered number is free again");
+
+    // A recorded world holds its number for good, even once its claim is gone.
+    const recorded = path.join(project.dreamRoot, "trace_pool", "iter0001");
+    fs.mkdirSync(recorded, { recursive: true });
+    fs.writeFileSync(path.join(recorded, "tree.json"), "{}", "utf8");
+    assert.deepEqual(listIterations(project.dreamRoot), [1]);
+    recoverInterruptedRuns(project.dreamRoot);
+    assert.equal(nextIteration(project.dreamRoot), 2, "a recorded world keeps its iteration occupied");
   } finally {
     project.cleanup();
   }

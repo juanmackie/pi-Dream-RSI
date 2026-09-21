@@ -29,8 +29,14 @@ candidate; your scorer grades it. Repeat for at most `K1` rounds. What you get i
 workspace), branches for the independent directions, a chain of refinements hanging off each one. That tree is
 then frozen as a **replay world**.
 
-**The offline phase** (`dream_rsi_dream`). Nothing new is generated. The whole recorded history gets replayed by
-`M` candidate policy versions, and replay is deterministic — revealing a node returns the outcome that was
+**Cycles can also run in parallel.** Pass `loops=n`, or start several `dream_rsi_live` calls at once, and `n`
+episodes of the *same* policy run side by side, each recording its own world. The fan-out is `loops × W` agents
+at once (the cap `max_loops` is shared by everything in flight, default 2), so a batch of worlds costs roughly
+one cycle of wall clock instead of `n`.
+
+**The offline phase** (`dream_rsi_dream`). Nothing new is generated. The whole recorded history — every world,
+including a whole parallel batch — gets replayed by `M` candidate policy versions, and replay is deterministic —
+revealing a node returns the outcome that was
 recorded, so a version can be scored on a world in milliseconds. Versions that make good decisions score well:
 
 ```
@@ -60,12 +66,16 @@ not just *what* it has found.
   layout. The method rewards diverse directions in parallel.
 - **Attempts can run in parallel.** `W` agents per round, each in its own workspace copy. If they'd have to
   serialize on one shared resource, the reward stops making sense.
+- **You want more worlds than wall clock.** `loops=n` (or several `dream_rsi_live` calls at once) records `n`
+  worlds of one policy concurrently and one dream replays them all. The policy then improves `n` worlds later,
+  so use it for throughput, not for the first exploratory cycle.
 - **Scoring is cheap.** It runs `W × K1` times per cycle. Seconds to minutes is comfortable. Hours is not.
 - **You'll run more than one cycle.** Cycle one is just parallel refining — that's Dream-RSI's own baseline. The
   improving starts at cycle two, when the first world can be replayed.
 - **Failures are allowed to be ordinary.** Compile errors and shape mismatches are treated as recoverable
   evidence, not dead ends.
-- **You can pay for it.** `W × K1` agent calls per cycle, plus `M − 1` for policy revisions. The paper's task
+- **You can pay for it.** `W × K1` agent calls per cycle (`loops × W` at once when you batch worlds), plus
+  `M − 1` for policy revisions per dream, however many worlds that dream replays. The paper's task
   shape (`W=10, K1=11`) is ~110 attempts *per cycle*.
 - **Your seed workspace is small.** Every attempt copies its parent's copy. A 2 GB monorepo means you'll spend
   your day copying, not discovering.
@@ -116,8 +126,9 @@ you spend a cent on agent calls.
 
 **2. Probe the agent, then start small.** `create` runs the effective attempt command once (`pi -p … --model <id>
 "Reply with exactly: OK"`) so a bad model id or empty balance costs one small call instead of a cycle of failed
-attempts. `workers=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy revision
-per cycle. Every attempt runs on the **active session's model and thinking level**, so switching model with
+attempts. `workers=2, max_loops=2, k1=3, k2=4, revisions=2` on a cheap model is about six attempts and one policy revision
+per cycle (`max_loops` is how many cycles may record worlds at once — `loops × W` agents in flight, shared by
+every live call). Every attempt runs on the **active session's model and thinking level**, so switching model with
 `/model` changes the next cycle's attempts. That's enough to see whether the proposals are real. Once they are, scale to the paper's
 shape: `W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, roughly five cycles, and `M` somewhere
 around 3–5 (the paper doesn't publish its value).
@@ -238,8 +249,8 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 | Tool | What it costs | What it does |
 |------|---------------|--------------|
 | `dream_rsi_init` | one scorer run | Writes `task.json`, seeds the policy, measures your code as the baseline candidates must beat. Reconfiguring keeps that measurement unless the workspace or the scorer changed (`remeasure_seed=true` forces it, and the old number is kept as `history/seed/score.<timestamp>.json`). |
-| `dream_rsi_live` | `W × K1` agent calls | One online cycle: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world. |
-| `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over the recorded worlds, sweep beta, rewrite the policy, deploy the winner. |
+| `dream_rsi_live` | `W × K1` agent calls per episode | One or more online cycles: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world per episode. `loops=n` (or several calls) records `n` worlds of the same policy in parallel; `max_loops` caps everything in flight. |
+| `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over the recorded worlds, sweep beta, rewrite the policy, deploy the winner. Refuses while a world is still in flight; cost does not grow with the number of worlds. |
 | `dream_rsi_apply` | nothing | Copies a candidate's `eval_program` over your code. Needs `confirm: true`; never commits. |
 | `dream_rsi_status` | nothing | Iterations, worlds, policy versions, last sweep, and whether something is waiting to be applied. |
 
@@ -250,7 +261,7 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 | `/dream-rsi create <goal>` | Interview (fresh project), or on a configured project ask: report + best candidate for `<goal>`, reconfigure, or start fresh. `--reconfigure` / `--fresh` skip the dialog. |
 | `/dream-rsi suggest <goal>` | Rank the candidates on demand. `best` is an alias. Preferences: `fastest`, `safest`, `simplest`. |
 | `/dream-rsi status` | The same state `dream_rsi_status` shows. |
-| `/dream-rsi live` \| `dream` | Ask the agent for one phase. |
+| `/dream-rsi live [n]` \| `dream` | Ask the agent for one phase — `n` online cycles in parallel for `live`. |
 | `/dream-rsi run [n]` | Ask the agent for `n` full cycles. |
 | `/dream-rsi off` | Leave Dream-RSI mode (state on disk is untouched). |
 | *anything else* | Treated as a goal: interview in a fresh project, suggestion in a configured one. |
