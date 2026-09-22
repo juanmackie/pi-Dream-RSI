@@ -1,6 +1,6 @@
 {
   "name": "pi-dream-rsi",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "type": "module",
   "description": "Dream-RSI for pi — recursive self-improvement of executable exploration policies over discovery trees (arXiv 2609.14858)",
   "keywords": [
