@@ -16,9 +16,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { DiscoveryTree, type TreeJSON } from "./tree.ts";
-import { attemptDir, iterationDir, readJson } from "./world.ts";
-import { appliedLogPath, readApplied, readSeedMeasurement, type SeedMeasurement } from "./improvements.ts";
-import { readTask, type TaskConfig } from "./task.ts";
+import { attemptDir, iterationDir, readJson, readManifest } from "./world.ts";
+import {
+  appliedLogPath,
+  readApplied,
+  readSeedMeasurement,
+  seedMatchesTask,
+  type SeedMeasurement,
+} from "./improvements.ts";
+import { readTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 
 /** A candidate has to beat the reference by this much before it is worth recommending. */
 export const MIN_IMPROVEMENT_RATIO = 0.01;
@@ -333,8 +339,15 @@ export function rankCandidates(options: {
   const projectDir = options.projectDir;
   const goal = options.goal?.trim() ? options.goal.trim() : null;
   const preference = parsePreference(goal);
-  const seed = readSeedMeasurement(options.dreamRoot);
-  const appliedRecords = readApplied(options.dreamRoot);
+  const rawSeed = readSeedMeasurement(options.dreamRoot);
+  // A baseline from another scoring contract is not a reference point for this one: report it as
+  // absent, so candidates are never ranked as "better than your code" against an unrelated number.
+  const seed = rawSeed && seedMatchesTask(rawSeed, task) ? rawSeed : null;
+  const staleBaseline = rawSeed !== null && seed === null;
+  const fingerprint = scoringFingerprint(task);
+  const appliedRecords = readApplied(options.dreamRoot).filter(
+    (record) => record.fingerprint === undefined || record.fingerprint === fingerprint,
+  );
   const appliedCells = new Set(appliedRecords.map((record) => `${record.iteration}:${record.cell}`));
   const appliedBest =
     appliedRecords.map((record) => record.score).filter((score): score is number => typeof score === "number").length > 0
@@ -354,12 +367,19 @@ export function rankCandidates(options: {
 
   const candidates: RankedCandidate[] = [];
   for (const iteration of iterations) {
+    // Worlds recorded under a different scoring contract are not comparable with this task: their
+    // scores are on another scale (in the report, an old positive +79 outranked the new -54).
+    const manifest = readManifest(options.dreamRoot, iteration);
+    if (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint) continue;
     const json = readJson<TreeJSON>(path.join(iterationDir(options.dreamRoot, iteration), "tree.json"));
     if (!json) continue;
     const tree = DiscoveryTree.fromJSON(json);
     for (const node of tree.list()) {
       if (typeof node.score !== "number") continue;
       if (node.error !== null || node.fail_class !== "ok") continue;
+      // Same direction check for worlds recorded before manifests carried a fingerprint: a stored
+      // score that is not `higher ? raw : -raw` under the current task came from a flipped direction.
+      if (!scoreMatchesDirection(task, node.score, node.raw_score)) continue;
       const workspace = node.workspace ? path.resolve(projectDir, node.workspace) : null;
       const program = workspace ? path.join(workspace, task.eval_program) : null;
       const record = fs.existsSync(attemptDir(options.dreamRoot, iteration, node.meta.cell_id))
@@ -380,7 +400,7 @@ export function rankCandidates(options: {
         program: program && fs.existsSync(program) ? program : null,
         record,
         delta_vs_seed: delta,
-        gain_pct: delta === null || reference === 0 ? null : Math.round(((delta / Math.abs(reference)) * 100) * 10) / 10,
+        gain_pct: delta === null || reference === null || reference === 0 ? null : Math.round(((delta / Math.abs(reference)) * 100) * 10) / 10,
         already_applied: appliedCells.has(`${iteration}:${node.meta.cell_id}`),
         applicable: Boolean(program && fs.existsSync(program)),
         metrics: readMetrics(record),
@@ -407,11 +427,13 @@ export function rankCandidates(options: {
   const reason =
     candidates.length === 0
       ? "no successful candidate recorded yet — the suggestion appears automatically after the first cycle"
-      : threshold === null
-        ? "your own code has not been measured yet, so there is no reference point (run dream_rsi_init)"
-        : pending === null
-          ? `nothing beats ${appliedBest !== null && appliedBest > (seed?.score ?? 0) ? "the last applied candidate" : "your measured code"} by ${MIN_IMPROVEMENT_RATIO * 100}%`
-          : "improvement pending";
+      : staleBaseline
+        ? "the recorded baseline was measured under a different scoring configuration — run dream_rsi_init to re-measure your code"
+        : threshold === null
+          ? "your own code has not been measured yet, so there is no reference point (run dream_rsi_init)"
+          : pending === null
+            ? `nothing beats ${appliedBest !== null && appliedBest > (seed?.score ?? 0) ? "the last applied candidate" : "your measured code"} by ${MIN_IMPROVEMENT_RATIO * 100}%`
+            : "improvement pending";
 
   return {
     goal,

@@ -16,7 +16,8 @@ import { jump } from "./fixtures.mjs";
 
 const { rankCandidates, renderSuggestion, parsePreference, MIN_WIN_FRACTION } = await jump("engine/candidates.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
-const { normalizeTask, writeTask } = await jump("engine/task.ts");
+const { normalizeTask, writeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
+const { improvements, seedMatchesTask } = await jump("engine/improvements.ts");
 const { writeJson } = await jump("engine/world.ts");
 const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
 
@@ -346,7 +347,6 @@ test("only a real pi entry point is re-spawned, never the host process that inhe
     "/opt/pi/dist/cli.js",
     "/opt/pi/dist/bundle/cli.js",
     "/opt/pi/dist/bundle/cli-runtime.js",
-    "/opt/pi/dist/rpc-entry.js",
     "/src/cli.ts",
   ]) {
     assert.deepEqual(
@@ -355,6 +355,27 @@ test("only a real pi entry point is re-spawned, never the host process that inhe
       `${entry} is pi's own entry point`,
     );
   }
+});
+
+test("rpc-entry re-spawns as its sibling CLI, never as an RPC server that ignores -p", () => {
+  // rpc-entry.js hardcodes `--mode rpc`, which wins over our `-p`: spawned as the agent it waits
+  // for JSON-RPC frames, writes nothing, and burns the attempt as a silent timeout with an empty log.
+  // Paths go through path.join, so build expectations with the platform's separators.
+  const distDir = path.dirname("/opt/pi/dist/rpc-entry.js");
+  const siblingCli = path.join(distDir, "cli.js");
+  const rpcEntry = path.join(distDir, "rpc-entry.js");
+  const realDist = (candidate) => candidate === siblingCli || candidate === rpcEntry;
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1: rpcEntry, execPath: "/usr/bin/node", exists: realDist }),
+    { command: "/usr/bin/node", args: [siblingCli] },
+    "the CLI entry beside rpc-entry runs print mode",
+  );
+  // No sibling CLI on disk: fall back to PATH resolution instead of spawning an RPC server.
+  assert.equal(
+    piSelfInvocation({ insidePi: true, argv1: rpcEntry, execPath: "/usr/bin/node", exists: (c) => c === rpcEntry }),
+    null,
+    "without a sibling CLI the caller falls back to `pi` rather than spawning rpc mode",
+  );
 });
 
 test("a missing agent CLI reports the command and the fix instead of a bare ENOENT", async () => {
@@ -438,6 +459,130 @@ test("an npm-installed package runs its worker from the project, not from node_m
     assert.equal(run.deterministic, true, "and the mirrored worker is deterministic");
     assert.ok(!mirrored.includes("node_modules"), "never spawns from node_modules");
   } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the scoring fingerprint follows the contract, not the budgets", () => {
+  const base = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const budgetOnly = normalizeTask({ ...base, workers: 8, k1: 2, revisions: 5, default_beta: 0.2, max_loops: 4 });
+  assert.equal(scoringFingerprint(base), scoringFingerprint(budgetOnly), "budgets never invalidate recorded scores");
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, higher_is_better: false })));
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, score_program: "node other.mjs" })));
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, workspace: "seed2" })));
+});
+
+test("a stored score that contradicts the current direction is recognized", () => {
+  const higher = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const lower = normalizeTask({ ...higher, higher_is_better: false });
+  assert.equal(scoreMatchesDirection(higher, 79, 79), true);
+  assert.equal(scoreMatchesDirection(higher, -79, 79), false);
+  assert.equal(scoreMatchesDirection(lower, -79, 79), true);
+  // The bug report's mix: an old +79 candidate and new -54 candidates cannot both be "best".
+  assert.equal(scoreMatchesDirection(lower, 79, 79), false);
+  assert.equal(scoreMatchesDirection(lower, -54, 54), true);
+  assert.equal(scoreMatchesDirection(lower, -79, null), true, "an unknown raw score cannot be judged");
+});
+
+test("candidates recorded under another scoring contract are not ranked", () => {
+  const project = makeRankedProject();
+  try {
+    // A world recorded under a previous objective, with a score that would otherwise win outright.
+    const foreign = path.join(project.dreamRoot, "trace_pool", "iter0002");
+    fs.mkdirSync(foreign, { recursive: true });
+    const tree = new DiscoveryTree({ baselineScore: null, branchCount: 1, refineCount: 1 });
+    tree.addBranchSlot(0);
+    tree.setOutcome("b0a0", { evaluated: true, valid: true, fail_class: "ok", error: null, score: 999, raw_score: 999 });
+    writeJson(path.join(foreign, "tree.json"), tree.toJSON());
+    writeJson(path.join(foreign, "live_cycle_manifest.json"), {
+      iteration: 2,
+      status: "complete",
+      task_fingerprint: "deadbeef",
+    });
+
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    assert.ok(ranking.candidates.length > 0, "same-contract candidates stay");
+    assert.ok(!ranking.candidates.some((candidate) => candidate.iteration === 2), "the foreign world is skipped");
+    assert.notEqual(ranking.pending.cell, "b0a1");
+
+    // A direction flip invalidates the same-contract world too: every stored score is now the wrong sign.
+    const flipped = normalizeTask({ ...project.task, higher_is_better: false });
+    writeTask(project.dreamRoot, flipped);
+    const afterFlip = rankCandidates({ dreamRoot: project.dreamRoot, task: flipped, projectDir: project.projectDir });
+    assert.deepEqual(afterFlip.candidates, [], "worlds recorded under the opposite direction are excluded");
+    assert.equal(afterFlip.pending, null);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("a baseline from another contract is reported as stale instead of used as a reference", () => {
+  const project = makeRankedProject();
+  try {
+    writeJson(path.join(project.dreamRoot, "history", "seed", "score.json"), {
+      score: 79,
+      raw_score: 79,
+      fail_class: "ok",
+      error: null,
+      measured_at: new Date(0).toISOString(),
+      workspace: "seed",
+      fingerprint: "deadbeef",
+      seconds: 0.1,
+    });
+    const foreignSeed = { fingerprint: "deadbeef", score: 79, raw_score: 79, fail_class: "ok", error: null, measured_at: "", workspace: "seed", seconds: 0.1 };
+    assert.equal(seedMatchesTask(foreignSeed, project.task), false, "a foreign fingerprint never matches");
+
+    const report = improvements(project.dreamRoot, project.task, project.projectDir);
+    assert.equal(report.seed, null, "an incomparable baseline is not a reference point");
+    assert.equal(report.pending, null);
+    assert.match(report.reason, /different scoring configuration/);
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
+test("a spawned agent does not inherit the host session identity", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-env-"));
+  const script = path.join(dir, "env-probe.mjs");
+  fs.writeFileSync(
+    script,
+    `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync("env.json", JSON.stringify({\n` +
+      `  sid: process.env.PI_SESSION_ID ?? null,\n` +
+      `  file: process.env.PI_SESSION_FILE ?? null,\n` +
+      `  web: process.env.PI_WEB_SESSION ?? null,\n` +
+      `  keep: process.env.DREAM_TEST_KEEP ?? null,\n` +
+      `}));\n`,
+    "utf8",
+  );
+  const sessionVars = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_WEB_SESSION"];
+  const saved = new Map(sessionVars.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_ID = "parent-session";
+  process.env.PI_SESSION_FILE = "/tmp/parent-session.jsonl";
+  process.env.PI_WEB_SESSION = "1";
+  const agent = { command: "node", args: [script], model: null, thinking: null, prompt_via: "stdin" };
+  try {
+    const first = await runAgent({ agent, cwd: dir, prompt: "hello", timeoutMs: 10_000 });
+    assert.equal(first.ok, true, first.spawnError ?? first.stderrTail);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "env.json"), "utf8")), {
+      sid: null,
+      file: null,
+      web: null,
+      keep: null,
+    });
+
+    // A task that genuinely needs one can put it back via `agent.env` (task.json's documented escape hatch).
+    const withEnv = { ...agent, env: { PI_SESSION_FILE: "explicit" } };
+    const second = await runAgent({ agent: withEnv, cwd: dir, prompt: "hello", timeoutMs: 10_000 });
+    assert.equal(second.ok, true, second.spawnError ?? second.stderrTail);
+    const seen = JSON.parse(fs.readFileSync(path.join(dir, "env.json"), "utf8"));
+    assert.equal(seen.file, "explicit");
+    assert.equal(seen.sid, null, "stripping is per variable");
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

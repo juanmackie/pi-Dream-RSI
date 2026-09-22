@@ -18,7 +18,7 @@ import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-work
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { readTask, validateTask, writeTask, defaultTask, type TaskConfig } from "./engine/task.ts";
+import { readTask, validateTask, writeTask, defaultTask, programFingerprint, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import { runLiveEpisode } from "./engine/live.ts";
 import { planNextGrid, runDreamPhase } from "./engine/dream.ts";
 import { loadPrompt } from "./engine/prompt.ts";
@@ -42,6 +42,7 @@ import {
   measureSeed,
   readSeedMeasurement,
   recordApplied,
+  seedMatchesTask,
 } from "./engine/improvements.ts";
 import { rankCandidates, renderSuggestion, type Ranking } from "./engine/candidates.ts";
 import { BUNDLED_POLICY_DIR, SKILLS_DIR } from "./layout.ts";
@@ -262,7 +263,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Call dream_rsi_init before dream_rsi_live: it writes .dream-rsi/task.json and seeds the exploration policy.",
       "dream_rsi_init does not run anything expensive; it only writes configuration and validates that the workspace and problem file exist.",
-      "Reconfiguring keeps the recorded baseline unless the workspace or the scorer changed; call dream_rsi_init with remeasure_seed=true only when the user wants the current code measured as the new reference point.",
+      "dream_rsi_init keeps the recorded baseline only while the scoring configuration still matches it — a changed workspace, scorer or score direction re-measures automatically (the old measurement is kept, not deleted); pass remeasure_seed=true to measure unchanged code on demand.",
     ],
     parameters: taskParams,
     async execute(_id, params, _signal, onUpdate, ctx) {
@@ -314,15 +315,27 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       // was applied would adopt the improved code as the baseline and retire every past win. Re-measure only
       // when the thing being measured changed, or when explicitly asked.
       const recorded = readSeedMeasurement(root);
+      // Re-measure when the recorded reference no longer describes *this* configuration: a different
+      // workspace/scorer/score direction (or a stored score inconsistent with the current direction)
+      // makes the old number incomparable — keeping it was how a C(16,5,3) baseline kept ranking
+      // C(25,15,5) candidates. Budgets/agents are not part of the contract and never force a re-run.
       const remeasure =
         params.remeasure_seed === true ||
         recorded === null ||
+        !seedMatchesTask(recorded, task) ||
         recorded.workspace !== task.workspace ||
         recorded.score_program !== task.score_program;
       const measurement =
         params.measure_seed === false || !remeasure
           ? null
           : await measureSeed({ dreamRoot: root, projectDir: projectDir(ctx), task, log: (m) => onUpdate?.({ content: [{ type: "text", text: m }] }) });
+      const programNow = programFingerprint(projectDir(ctx), task);
+      const programChanged =
+        !remeasure &&
+        recorded !== null &&
+        recorded.program_fingerprint !== undefined &&
+        programNow !== null &&
+        recorded.program_fingerprint !== programNow;
       const baselineNote =
         measurement !== null
           ? `  baseline:   your code measures ${measurement.raw_score ?? "n/a"} (${measurement.fail_class}) — every candidate is compared against it`
@@ -333,6 +346,17 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const configuredAgent = runAgentConfig(ctx, task.agent);
       saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: configuredAgent.model });
       setMode(ctx, true);
+      const programNote = programChanged
+        ? [`  note:      ${task.eval_program} changed since the baseline was measured — pass remeasure_seed=true to measure the new code (the old measurement is kept until then).`]
+        : [];
+      // measure_seed=false with a changed contract: the kept number is not a reference point for this
+      // objective, and every comparison against it is suppressed until the code is re-measured.
+      const staleNote =
+        remeasure && measurement === null && recorded !== null
+          ? [
+              "  note:      the recorded baseline belongs to the previous scoring configuration — it will not be used (candidates are not compared against it) until your code is re-measured; drop measure_seed=false or pass remeasure_seed=true.",
+            ]
+          : [];
       return {
         content: [
           {
@@ -348,6 +372,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  (attempts follow the active session model/thinking level; pass model= only to set the fallback)`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
               baselineNote,
+              ...programNote,
+              ...staleNote,
               `Next: dream_rsi_live to run one online rollout.`,
               `Nothing is ever written to your code: candidates land in .dream-rsi/work/, and applying one is a separate, explicit step (dream_rsi_apply).`,
             ].join("\n"),
@@ -425,8 +451,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const iteration = iterations[0];
         mine = { label: loops === 1 ? `live cycle ${iteration}` : `live cycles ${iterations.join(", ")}`, iterations };
         state.running.push(mine);
-        const baseline = readBaselineScore(root);
-        const previous = latestBest(root);
+        const baseline = readBaselineScore(root, task);
+        const previous = latestBest(root, task);
         // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
         const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
 
@@ -539,7 +565,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "Use dream_rsi_dream after dream_rsi_live; it spends agent time only on policy revisions, and replay itself is deterministic and cheap.",
       "dream_rsi_dream asserts V* >= V_0: a reported failure means the policy was non-deterministic or non-prefix-only, so its result must not be trusted.",
-      "dream_rsi_dream refuses while any online episode is still in flight, and it replays every recorded world — so batch the live cycles you want replayed, then dream once.",
+      "dream_rsi_dream recovers interrupted cycle claims first, then refuses only while a world is genuinely in flight or its manifest is unreadable — it replays every recorded world, so batch the live cycles you want replayed, then dream once.",
     ],
     parameters: dreamParams,
     async execute(_id, params, _signal, onUpdate, ctx) {
@@ -558,7 +584,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
       }
       // Replay needs *finished* worlds: an in-flight episode has no tree yet, so dreaming now would silently
-      // replay fewer worlds than the report claims.
+      // replay fewer worlds than the report claims. A run left `running` on disk while no phase in this
+      // session owns it was interrupted (crashed session, killed host) — recover it the same way
+      // dream_rsi_live does, or one dead cycle blocks dreaming forever.
+      const recovered = recoverInterruptedRuns(root, claimedBy(state.running));
+      if (recovered.length > 0) {
+        onUpdate?.({
+          content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
+        });
+      }
       const inFlight = activeRuns(root);
       if (inFlight.length > 0) {
         return {
@@ -729,6 +763,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         iteration: wanted.iteration,
         cell: wanted.cell,
         score: wanted.score,
+        fingerprint: scoringFingerprint(task),
         applied_at: new Date().toISOString(),
         paths: files.map((file) => file.relative),
         target: path.relative(projectDir(ctx), seedRoot) || seedRoot,
@@ -1096,18 +1131,23 @@ function parseGrid(value: string, fallback: { branch_count: number; refine_count
   };
 }
 
-function readBaselineScore(root: string): number | null {
+function readBaselineScore(root: string, task: TaskConfig): number | null {
   const file = path.join(root, "history", "baseline", "score.json");
   if (!fs.existsSync(file)) return null;
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as { score?: number };
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      score?: number;
+      task_fingerprint?: string;
+    };
+    // A baseline recorded under another scoring contract is a floor for a different game.
+    if (parsed.task_fingerprint !== undefined && parsed.task_fingerprint !== scoringFingerprint(task)) return null;
     return typeof parsed.score === "number" ? parsed.score : null;
   } catch {
     return null;
   }
 }
 
-function latestBest(root: string): number | null {
+function latestBest(root: string, task: TaskConfig): number | null {
   const dir = path.join(root, "trace_pool");
   if (!fs.existsSync(dir)) return null;
   const iterations = fs
@@ -1121,7 +1161,9 @@ function latestBest(root: string): number | null {
   try {
     const manifest = JSON.parse(fs.readFileSync(path.join(dir, `iter${String(last).padStart(4, "0")}`, "live_cycle_manifest.json"), "utf8")) as {
       best_score?: number | null;
+      task_fingerprint?: string;
     };
+    if (manifest.task_fingerprint !== undefined && manifest.task_fingerprint !== scoringFingerprint(task)) return null;
     return typeof manifest.best_score === "number" ? manifest.best_score : null;
   } catch {
     return null;

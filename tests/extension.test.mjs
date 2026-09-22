@@ -286,6 +286,7 @@ test("apply refuses without confirmation, then copies only the declared program"
     const log = fs.readFileSync(path.join(project.dreamRoot, "history", "applied.jsonl"), "utf8").trim().split("\n");
     assert.equal(log.length, 1);
     assert.equal(JSON.parse(log[0]).cell, candidate.cell);
+    assert.equal(typeof JSON.parse(log[0]).fingerprint, "string", "the apply record is bound to the scoring contract");
     // Only the declared program was copied: the seed workspace is otherwise untouched.
     assert.equal(exists(path.join(project.seed, "proposal.md")), false, "reports are not applied");
 
@@ -464,6 +465,42 @@ test("re-running init keeps the recorded baseline instead of moving the goalpost
     const forced = await init({ workspace: "seed2", remeasure_seed: true });
     assert.equal(forced.details.remeasured, true);
     assert.equal(fs.readdirSync(seedDir).filter((name) => /^score\..+\.json$/.test(name)).length, 2);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("a changed scoring contract re-measures the baseline instead of keeping an incomparable one", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const init = (extra = {}) =>
+      harness.tools.get("dream_rsi_init").execute("c", initParams(project, extra), undefined, undefined, context);
+    const seedDir = path.join(project.dreamRoot, "history", "seed");
+
+    const first = await init();
+    assert.match(first.content[0].text, /baseline:   your code measures/);
+    const measured = readJson(path.join(seedDir, "score.json"));
+    assert.equal(typeof measured.fingerprint, "string", "the measurement is bound to the scoring contract");
+
+    // Same configuration keeps the reference point (the existing contract, unchanged).
+    const again = await init();
+    assert.equal(again.details.remeasured, false);
+
+    // Flipping the score direction changes what a score means: keeping +79 as the reference for a
+    // minimize task is exactly the bug report's failure, so this re-measures.
+    const flipped = await init({ higher_is_better: false });
+    assert.equal(flipped.details.remeasured, true);
+    assert.match(flipped.content[0].text, /baseline:   your code measures/);
+    const after = readJson(path.join(seedDir, "score.json"));
+    assert.notEqual(after.measured_at, measured.measured_at);
+    assert.notEqual(after.fingerprint, measured.fingerprint);
+
+    // Replacing the candidate program at the same path is surfaced, not silently adopted.
+    fs.writeFileSync(path.join(project.seed, "solution.py"), 'print("seed")\nprint("more")\n', "utf8");
+    const bumped = await init({ higher_is_better: false });
+    assert.equal(bumped.details.remeasured, false, "contents alone do not move the reference point");
+    assert.match(bumped.content[0].text, /changed since the baseline was measured/);
   } finally {
     project.cleanup();
   }
@@ -879,7 +916,7 @@ test("concurrent live calls share the world cap and clamp a wider request", asyn
   }
 });
 
-test("dreaming refuses while a world is still in flight", async () => {
+test("dreaming recovers an interrupted claim instead of blocking on it forever", async () => {
   const project = makeProject();
   try {
     const { context, harness } = await boot(project);
@@ -892,9 +929,23 @@ test("dreaming refuses while a world is still in flight", async () => {
       "utf8",
     );
 
-    const dream = await harness.tools.get("dream_rsi_dream").execute("c2", {}, undefined, undefined, context);
-    assert.match(dream.content[0].text, /still in flight/);
-    assert.deepEqual(dream.details.in_flight, ["live cycle 0001 (in flight)"]);
+    // No phase in this session owns the claim: it was left by a crashed/closed session, so dream
+    // recovers it (exactly like dream_rsi_live does) instead of refusing forever.
+    const updates = [];
+    const dream = await harness.tools
+      .get("dream_rsi_dream")
+      .execute("c2", {}, undefined, (u) => updates.push(u.content[0].text), context);
+    assert.ok(updates.some((text) => /Recovered interrupted cycle\(s\): 1/.test(text)), "the stale claim is reported as recovered");
+    assert.equal(readJson(path.join(dir, "live_cycle_manifest.json")).status, "failed");
+    assert.match(dream.content[0].text, /no recorded world yet/);
+
+    // An unreadable claim cannot be proven finished, so it still blocks with the in-flight message.
+    const broken = path.join(project.dreamRoot, "trace_pool", "iter0002_current");
+    fs.mkdirSync(broken, { recursive: true });
+    fs.writeFileSync(path.join(broken, "live_cycle_manifest.json"), "{ not json", "utf8");
+    const dream2 = await harness.tools.get("dream_rsi_dream").execute("c3", {}, undefined, undefined, context);
+    assert.match(dream2.content[0].text, /still in flight/);
+    assert.deepEqual(dream2.details.in_flight, ["live cycle 0002 (unreadable manifest)"]);
   } finally {
     project.cleanup();
   }

@@ -20,7 +20,7 @@ import { runPolicy } from "../policy/runner.ts";
 import type { EpisodeResult } from "../policy/api.ts";
 import type { ProbeFn, RevealedNode } from "../policy/host.ts";
 import type { TaskConfig } from "./task.ts";
-import { normalizeTask } from "./task.ts";
+import { normalizeTask, scoringFingerprint } from "./task.ts";
 import {
   archiveAttempt,
   appendJsonl,
@@ -192,6 +192,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     stopped: null,
     error: null,
     note: null,
+    task_fingerprint: scoringFingerprint(task),
   };
   writeCurrentManifest(dreamRoot, manifest);
 
@@ -300,7 +301,17 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     let outcome: ScoreOutcome;
     let evalRun: CommandResult | null = null;
     if (agentRun.timedOut) {
-      outcome = { score: null, raw_score: null, valid: false, fail_class: "timeout", error: "discovery agent timed out" };
+      // Say how long it ran and whether it ever printed: a silent timeout with an empty agent.log is a
+      // different diagnosis (blocked before startup: session/daemon, provider queue) from a slow one.
+      const seconds = Math.round(agentRun.durationMs / 100) / 10;
+      const silent = (agentRun.stdoutTail + agentRun.stderrTail).trim() === "";
+      outcome = {
+        score: null,
+        raw_score: null,
+        valid: false,
+        fail_class: "timeout",
+        error: `discovery agent timed out after ${seconds}s${silent ? " with no output at all (empty agent.log)" : ""}`,
+      };
     } else if (agentRun.spawnError) {
       outcome = { score: null, raw_score: null, valid: false, fail_class: "agent_error", error: agentRun.spawnError };
     } else if (!agentRun.ok) {
@@ -424,7 +435,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     );
   }
   if (iteration === 1 && tree.nNonRoot > 0) {
-    seedBaseline(dreamRoot, iteration, tree);
+    seedBaseline(dreamRoot, iteration, tree, scoringFingerprint(task));
   }
   fs.mkdirSync(workRoot(dreamRoot), { recursive: true });
   log(

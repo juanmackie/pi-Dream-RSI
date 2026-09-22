@@ -10,7 +10,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { DREAM_DIR, readTask, type TaskConfig } from "./engine/task.ts";
+import { DREAM_DIR, readTask, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import {
   listIterations,
   readJson,
@@ -242,6 +242,7 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
     return `Dream-RSI state unreadable: ${(error as Error).message}`;
   }
   const { task } = state;
+  const fingerprint = scoringFingerprint(task);
   const lines = [
     `Dream-RSI — ${task.name}`,
     `  root:     ${root}`,
@@ -270,9 +271,11 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
       continue;
     }
     const sweep = state.sweeps.find((s) => s.iteration === iteration);
+    const foreignContract = manifest.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint;
     lines.push(
       `    t=${iteration}: status=${manifest.status} best=${manifest.best_score ?? "n/a"} beta=${manifest.baked_beta}` +
         ` attempts=${manifest.attempts} rounds=${manifest.decision_rounds}` +
+        (foreignContract ? " [different scoring config — not comparable]" : "") +
         (sweep ? ` | sweep pareto.reward=${sweep.pareto_reward.toFixed(3)} auc=${sweep.auc.toFixed(3)} penalty=${sweep.parallel_penalty.toFixed(3)}` : ""),
     );
   }

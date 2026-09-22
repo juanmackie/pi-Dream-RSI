@@ -16,9 +16,9 @@ const { copyWorkspace } = await jump("agent/runner.ts");
 
 const { runLiveEpisode } = await jump("engine/live.ts");
 const { runDreamPhase, planNextGrid, fallbackGrid } = await jump("engine/dream.ts");
-const { readTree, listIterations, readManifest, liveMethodPath, iterationDir } = await jump("engine/world.ts");
+const { readTree, listIterations, readManifest, liveMethodPath, iterationDir, writeJson } = await jump("engine/world.ts");
 const { interpretEvaluation } = await jump("engine/live.ts");
-const { normalizeTask } = await jump("engine/task.ts");
+const { normalizeTask, scoringFingerprint } = await jump("engine/task.ts");
 const { runPolicyChecked } = await jump("policy/runner.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 
@@ -312,9 +312,50 @@ test("missing score file, missing proposal, agent failure and agent timeout all 
       const classes = new Set(episode.tree.list().map((n) => n.fail_class));
       assert.deepEqual([...classes], [scenario.fail], `${scenario.agent} should fail as ${scenario.fail}`);
       assert.equal(episode.manifest.best_score, null);
+      if (scenario.fail === "timeout") {
+        // The error has to carry the evidence (duration, and that nothing was printed): an empty
+        // agent.log plus a bare "timed out" is what made the original report guess for an hour.
+        const node = episode.tree.list().find((n) => n.fail_class === "timeout");
+        assert.match(node.error, /timed out after \d+(\.\d+)?s/);
+        assert.match(node.error, /no output at all/);
+      }
     } finally {
       project.cleanup();
     }
+  }
+});
+
+test("dreaming replays only worlds recorded under the current scoring contract", async () => {
+  const project = makeProject({ agent: "agent-router.mjs" });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const first = await liveCycle(project, 1);
+    assert.equal(first.ok, true, first.error ?? "");
+
+    // Pretend the recorded world came from a previous objective: it must not enter this V table.
+    const manifestPath = path.join(iterationDir(project.dreamRoot, 1), "live_cycle_manifest.json");
+    const manifest = readJson(manifestPath);
+    manifest.task_fingerprint = "deadbeef";
+    writeJson(manifestPath, manifest);
+
+    await assert.rejects(
+      runDreamPhase({ dreamRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task, iteration: 1 }),
+      /different scoring configuration/,
+    );
+
+    // With the fingerprint the task actually has, the world replays as usual.
+    manifest.task_fingerprint = scoringFingerprint(normalizeTask(project.task));
+    writeJson(manifestPath, manifest);
+    const dream = await runDreamPhase({
+      dreamRoot: project.dreamRoot,
+      projectDir: project.projectDir,
+      task: project.task,
+      iteration: 1,
+    });
+    assert.equal(dream.ok, true, dream.error ?? "");
+  } finally {
+    project.cleanup();
   }
 });
 

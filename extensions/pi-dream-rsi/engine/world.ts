@@ -38,6 +38,12 @@ export interface LiveCycleManifest {
   stopped: string | null;
   error: string | null;
   note: string | null;
+  /**
+   * Scoring-contract fingerprint (`scoringFingerprint`) of the task this world was recorded under.
+   * Absent in worlds written before it existed; when present and different from the current task,
+   * the world's scores are on a different scale and must not be replayed or ranked together.
+   */
+  task_fingerprint?: string;
 }
 
 export function pad(index: number, width = 4): string {
@@ -249,7 +255,7 @@ export function archiveAttempt(
 }
 
 /** Seed `history/baseline/` from the best valid attempt of the first live round. */
-export function seedBaseline(root: string, iteration: number, tree: DiscoveryTree): string | null {
+export function seedBaseline(root: string, iteration: number, tree: DiscoveryTree, taskFingerprint?: string): string | null {
   const valid = tree.list().filter((n) => n.valid && typeof n.score === "number");
   if (valid.length === 0) return null;
   const best = valid.reduce((a, b) => ((b.score ?? -Infinity) > (a.score ?? -Infinity) ? b : a));
@@ -265,8 +271,10 @@ export function seedBaseline(root: string, iteration: number, tree: DiscoveryTre
   }
   writeJson(path.join(baselineDir(root), "score.json"), {
     score: best.score,
+    raw_score: best.raw_score,
     cell: best.meta.cell_id,
     iteration,
+    ...(taskFingerprint ? { task_fingerprint: taskFingerprint } : {}),
     note: "parallel-refine floor to beat: best valid attempt of the first live cycle (paper Listing 2)",
   });
   return target;

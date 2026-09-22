@@ -17,13 +17,13 @@ import * as path from "node:path";
 
 import { runAgent } from "../agent/runner.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
-import { readTree } from "./world.ts";
+import { readManifest, readTree } from "./world.ts";
 import { replayEpisode } from "./replay.ts";
 import { sweepSummary, type BetaSweepPoint } from "./reward.ts";
 import { planGrid } from "../policy/runner.ts";
 import type { BetaSweepSummary, GridPlan, GridPlanningContext } from "../policy/api.ts";
 import type { DiscoveryTree } from "./tree.ts";
-import { normalizeTask, type TaskConfig } from "./task.ts";
+import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 import { BUNDLED_POLICY_DIR } from "../layout.ts";
 import {
   appendJsonl,
@@ -122,15 +122,37 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
   if (!fs.existsSync(currentPolicy)) throw new Error(`no policy to improve at ${currentPolicy}`);
 
   // --- fixed history ------------------------------------------------------
+  // Only worlds recorded under the current scoring contract may be replayed: a world from a previous
+  // objective puts scores on another scale into every V estimate the beta sweep is based on.
+  const fingerprint = scoringFingerprint(task);
   const iterations: number[] = [];
   const worlds: DiscoveryTree[] = [];
+  let skippedStale = 0;
   for (let t = 1; t <= iteration; t += 1) {
     const tree = readTree(dreamRoot, t);
     if (!tree) continue;
+    const manifest = readManifest(dreamRoot, t);
+    const fromOtherContract =
+      (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint) ||
+      // Pre-fingerprint worlds: a stored score that is not `higher ? raw : -raw` under the current
+      // task was normalized under a flipped `higher_is_better`.
+      tree
+        .list()
+        .some((node) => typeof node.score === "number" && !scoreMatchesDirection(task, node.score, node.raw_score));
+    if (fromOtherContract) {
+      skippedStale += 1;
+      continue;
+    }
     iterations.push(t);
     worlds.push(tree);
   }
-  if (worlds.length === 0) throw new Error("no recorded worlds to replay; run a live cycle first");
+  if (worlds.length === 0) {
+    throw new Error(
+      skippedStale > 0
+        ? `every recorded world (${skippedStale}) belongs to a different scoring configuration — run dream_rsi_live to record a world for this task`
+        : "no recorded worlds to replay; run a live cycle first",
+    );
+  }
 
   const rewardConfig = {
     maxParallelism: task.workers,
@@ -350,7 +372,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
   }
   const best = evaluations[selected];
   // Apply the paper's cross-cycle default-beta rule before deploying.
-  const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta);
+  const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta, fingerprint);
   // The guarantee is `V* >= V_0` over the candidate set. It also has to *exist*: if every version
   // failed to score, deploying anything (or reporting success) would be a lie.
   const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
@@ -446,7 +468,9 @@ export async function planNextGrid(
   baselineScore: number | null,
   policyPath?: string,
 ): Promise<{ plan: GridPlan; beta: number | null; error: string | null }> {
-  const history = recentManifests(dreamRoot, 3).map((manifest: LiveCycleManifest) => {
+  const history = recentManifests(dreamRoot, 3)
+    .filter((manifest) => manifest.task_fingerprint === undefined || manifest.task_fingerprint === scoringFingerprint(task))
+    .map((manifest: LiveCycleManifest) => {
     const sweep = readSweep(dreamRoot, manifest.iteration);
     return {
       iteration: manifest.iteration,
@@ -512,8 +536,10 @@ function readSweep(dreamRoot: string, iteration: number): BetaSweepSummary | nul
  *  - high default beta already tried through plateau, high-beta sweep points add work without higher attainment: lower by a small step
  *  - history insufficient or evidence conflicts: use ~0.6
  */
-function crossCycleBeta(dreamRoot: string, currentDefault: number): number {
-  const manifests = recentManifests(dreamRoot, 3);
+function crossCycleBeta(dreamRoot: string, currentDefault: number, fingerprint: string): number {
+  const manifests = recentManifests(dreamRoot, 3).filter(
+    (manifest) => manifest.task_fingerprint === undefined || manifest.task_fingerprint === fingerprint,
+  );
   if (manifests.length < 2) return currentDefault;
   const latest = manifests[manifests.length - 1];
   const previous = manifests[manifests.length - 2];

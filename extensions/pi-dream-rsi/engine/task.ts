@@ -4,6 +4,7 @@
  */
 
 import * as fs from "node:fs";
+import * as crypto from "node:crypto";
 import * as path from "node:path";
 
 /** Root of all Dream-RSI state, relative to the project directory. */
@@ -24,6 +25,12 @@ export interface AgentConfig {
   thinking: ThinkingLevel | null;
   /** How the prompt reaches the agent. `stdin` avoids argv limits and shell quoting entirely. */
   prompt_via: "stdin" | "arg";
+  /**
+   * Extra environment for the spawned attempt. Session-identity variables (`PI_SESSION_ID`,
+   * `PI_SESSION_FILE`, `PI_WEB_SESSION`) are stripped by default; anything listed here is set on top,
+   * which is the supported way to hand an agent a variable it genuinely needs.
+   */
+  env?: Record<string, string>;
 }
 
 export interface TaskConfig {
@@ -160,11 +167,61 @@ export function validateTask(raw: unknown): string[] {
   if (agent && agent.prompt_via !== "stdin" && agent.prompt_via !== "arg") {
     errors.push('agent.prompt_via must be "stdin" or "arg"');
   }
+  if (agent && agent.env !== undefined) {
+    const entries = agent.env && typeof agent.env === "object" && !Array.isArray(agent.env) ? Object.entries(agent.env) : null;
+    if (!entries) errors.push("agent.env must be an object of string values");
+    else if (entries.some(([key, value]) => key.trim() === "" || typeof value !== "string")) {
+      errors.push("agent.env must be an object of string values");
+    }
+  }
   return errors;
 }
 
 export function taskPath(dreamRoot: string): string {
   return path.join(dreamRoot, "task.json");
+}
+
+/**
+ * Fingerprint of the *scoring contract*: everything that decides what a score means. Candidates,
+ * baselines, applied records and replay worlds recorded under a different fingerprint are not
+ * comparable — reconfiguring the task (new scorer, new objective, flipped direction) must not let
+ * the old task's numbers keep ranking, replaying, or serving as the reference point.
+ */
+export function scoringFingerprint(task: TaskConfig): string {
+  const contract = {
+    workspace: task.workspace,
+    eval_program: task.eval_program,
+    score_program: task.score_program,
+    score_path: task.score_path,
+    score_field: task.score_field,
+    valid_field: task.valid_field,
+    fail_class_field: task.fail_class_field,
+    error_field: task.error_field,
+    higher_is_better: task.higher_is_better,
+  };
+  return crypto.createHash("sha256").update(JSON.stringify(contract)).digest("hex").slice(0, 16);
+}
+
+/**
+ * Did this recorded score come out of the contract's current direction? `interpretEvaluation`
+ * normalizes to `score = higher ? raw : -raw`, so a node whose score matches the *other* sign was
+ * recorded before a `higher_is_better` flip (or under a different task) and must not be ranked
+ * against scores normalized this way. Unknown raw scores cannot be judged and pass.
+ */
+export function scoreMatchesDirection(task: TaskConfig, score: number, rawScore: number | null): boolean {
+  if (rawScore === null) return true;
+  const expected = task.higher_is_better ? rawScore : -rawScore;
+  return Math.abs(score - expected) < 1e-9;
+}
+
+/** Content hash of the declared candidate program, so replacing it at the same path is noticed. */
+export function programFingerprint(projectDir: string, task: TaskConfig): string | null {
+  const file = path.resolve(projectDir, task.workspace, task.eval_program);
+  try {
+    return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex").slice(0, 16);
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -192,5 +249,13 @@ export function writeTask(dreamRoot: string, task: TaskConfig): void {
 export function readTask(dreamRoot: string): TaskConfig {
   const file = taskPath(dreamRoot);
   if (!fs.existsSync(file)) throw new Error(`no task.json at ${file}; run dream_rsi_init first`);
-  return normalizeTask(JSON.parse(fs.readFileSync(file, "utf8")) as Partial<TaskConfig>);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (error) {
+    // Still throws — but names the file and the parse error instead of a bare SyntaxError from a
+    // line the operator never sees.
+    throw new Error(`invalid JSON in ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return normalizeTask(raw as Partial<TaskConfig>);
 }

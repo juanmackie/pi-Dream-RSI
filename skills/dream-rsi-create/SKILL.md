@@ -19,10 +19,17 @@ The prompt that invoked you starts with `reconfigure` or `fresh`; with neither, 
 - **reconfigure** — a task already exists and the user wants it changed. Read `.dream-rsi/task.json` and
   `.dream-rsi/history/seed/score.json`, present the current values as the defaults, and ask only about what
   should change. Call `dream_rsi_init` with just those fields: it keeps the history, the trace pool and the
-  deployed policy, and it keeps the recorded baseline unless the workspace or the scorer changed. Never pass
-  `remeasure_seed=true` unless the user asks for the current code to become the new reference point, and
-  re-probe the attempt agent only if the agent command changed (attempts use the active session's model
-  and thinking level, so a model change needs no reconfigure).
+  deployed policy. The recorded baseline is kept while the scoring contract still matches (workspace,
+  candidate program, scorer, score field, score direction); when it no longer does, `dream_rsi_init`
+  re-measures automatically — the old number is archived, and candidates/worlds recorded under the old
+  contract stop being ranked, applied and replayed. Never pass `remeasure_seed=true` unless the user asks
+  for unchanged code to be re-measured, and re-probe the attempt agent only if the agent command changed
+  (attempts use the active session's model and thinking level, so a model change needs no reconfigure).
+- **reconfigure leaves other tools stale** — `.dream-rsi/` is not the only loop in a project. If an
+  autoresearch loop exists (`.auto/prompt.md`, `.auto/measure.sh`, score wrappers), it still describes the
+  old objective and the old scorer: update or delete those files in the same breath, or that loop keeps
+  measuring the previous task against the new workspace. `dream_rsi_init` writes `task.json` and touches
+  nothing else outside `.dream-rsi/`.
 - **fresh** — the extension has already archived the previous task under `.dream-rsi/archive/<timestamp>/`
   and `task.json` is gone. Tell the user where the old state went, then treat everything below as a
   first-time setup.

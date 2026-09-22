@@ -36,6 +36,18 @@ export interface RunOptions {
   killTree?: boolean;
 }
 
+/**
+ * Session-identity variables a spawned attempt must not inherit.
+ *
+ * A discovery agent is a fresh, headless process: inheriting the parent session's id/file (or
+ * pi-web's `PI_WEB_SESSION`) makes a nested pi attach to the session it runs inside instead of
+ * processing its own prompt — several parallel attempts then serialize on that identity (or wait
+ * on it forever) and burn the attempt as a silent `timeout` with an empty `agent.log`, while the
+ * same command probed alone succeeds instantly. `RunOptions.env` can re-add a variable when a
+ * task genuinely needs one.
+ */
+export const STRIPPED_SESSION_ENV = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_WEB_SESSION"];
+
 /** Model ids are embedded in a shell command line when `shell` is used: allow only inert characters. */
 export const MODEL_PATTERN = /^[A-Za-z0-9._:@/\-]+$/;
 
@@ -49,10 +61,16 @@ function killTree(child: ChildProcess): void {
       // fall through to the plain kill below
     }
   }
+  // POSIX: the child is spawned detached (its own process group), so signal the whole group —
+  // grandchildren keep the stdio pipes open and would otherwise outlive the timeout.
   try {
-    child.kill("SIGKILL");
+    process.kill(-child.pid, "SIGKILL");
   } catch {
-    // already gone
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
   }
 }
 
@@ -86,11 +104,13 @@ async function collect(
     let settled = false;
     let timedOut = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let grace: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (result: Partial<CommandResult>): void => {
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
+      if (grace) clearTimeout(grace);
       logStream?.end();
       resolve({
         ok: false,
@@ -107,6 +127,11 @@ async function collect(
     };
 
     try {
+      // Session identity is stripped unless the caller re-adds it: a nested attempt must not
+      // attach to the session it was spawned from (see STRIPPED_SESSION_ENV).
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of STRIPPED_SESSION_ENV) delete env[key];
+      Object.assign(env, options.env ?? {});
       // With a shell we pass one pre-quoted command line: Node would otherwise concatenate `args`
       // unescaped (and warn about it). `command` is never quoted (it may itself be a command line).
       const argv = options.shell
@@ -116,7 +141,9 @@ async function collect(
         cwd: options.cwd,
         shell: options.shell,
         windowsHide: true,
-        env: { ...process.env, ...(options.env ?? {}) },
+        env,
+        // Own process group off Windows, so a timeout kills grandchildren too.
+        detached: process.platform !== "win32",
         stdio: ["pipe", "pipe", "pipe"],
       });
     } catch (error) {
@@ -127,19 +154,25 @@ async function collect(
     timer = setTimeout(() => {
       timedOut = true;
       killTree(child);
+      // 'close' waits for the stdio pipes, and a grandchild that inherited them can keep them
+      // open forever after the agent itself is gone — settle after a grace period instead of
+      // hanging the whole episode (which is how a timed-out attempt used to leave its live cycle
+      // stuck `running` and block dreaming indefinitely).
+      grace = setTimeout(() => finish({}), 2000);
     }, options.timeoutMs);
 
     // A missing agent CLI must not read as a silent hang: say which command was not found and how the
     // task can pin it, because the runner resolves `pi` itself and only falls back to PATH otherwise.
     child.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
-    child.stdout?.on("data", (chunk: Buffer) => {      const text = chunk.toString();
+    child.stdout?.on("data", (chunk: Buffer) => {
+      const text = chunk.toString();
       stdoutTail = append(stdoutTail, text);
-      logStream?.write(text);
+      if (logStream && logStream.writable) logStream.write(text);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stderrTail = append(stderrTail, text);
-      logStream?.write(text);
+      if (logStream && logStream.writable) logStream.write(text);
     });
     child.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut, code, signal }));
 
@@ -147,8 +180,8 @@ async function collect(
     // attempt (recorded from its exit code), never a reason to take down the host running the loop.
     child.stdin?.on("error", () => {});
     if (child.stdin) {
-      if (options.stdin !== undefined) child.stdin.end(options.stdin);
-      else child.stdin.end();
+      if (options.stdin === undefined) child.stdin.end();
+      else child.stdin.end(options.stdin);
     }
   });
 }
@@ -224,6 +257,18 @@ export function piSelfInvocation(options: PiSelfOptions = {}): { command: string
   const isPiEntry =
     typeof argv1 === "string" && argv1 !== "" && PI_ENTRY_BASENAME.test(path.basename(argv1));
   if (isPiEntry && !isBunVirtualScript && exists(argv1)) {
+    // rpc-entry hardcodes `--mode rpc` ahead of our `-p`, and rpc mode wins over print mode —
+    // spawned that way the "agent" waits for JSON-RPC frames on stdin, writes nothing, and burns
+    // the attempt as a silent timeout with an empty agent.log. Re-run the CLI entry next to it
+    // (dist/cli.js sits beside rpc-entry.js) so the prompt is actually processed.
+    if (/^rpc-entry\./i.test(path.basename(argv1))) {
+      const ext = path.extname(argv1);
+      for (const name of ["cli", "cli-runtime"]) {
+        const sibling = path.join(path.dirname(argv1), `${name}${ext}`);
+        if (exists(sibling)) return { command: execPath, args: [sibling] };
+      }
+      return null;
+    }
     return { command: execPath, args: [argv1] };
   }
   const execName = path.basename(execPath).toLowerCase();
@@ -231,7 +276,10 @@ export function piSelfInvocation(options: PiSelfOptions = {}): { command: string
   return null;
 }
 
-/** Run one discovery attempt / policy revision. */
+/**
+ * Run one discovery attempt / policy revision. `agent.env` (task.json's `agent.env`) is merged over the
+ * stripped inherited environment, so a task can hand the agent a variable it genuinely needs.
+ */
 export function runAgent(options: AgentRun): Promise<CommandResult> {
   const { agent } = options;
   const args = buildAgentArgs(agent);
@@ -256,10 +304,11 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
   const command = self ? self.command : agent.command;
   const invocationArgs = self ? [...self.args, ...args] : args;
   const shell = self ? false : process.platform === "win32";
+  const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
   if (agent.prompt_via === "arg") {
-    return collect(command, [...invocationArgs, options.prompt], { ...options, shell });
+    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, env });
   }
-  return collect(command, invocationArgs, { ...options, shell, stdin: options.prompt });
+  return collect(command, invocationArgs, { ...options, shell, env, stdin: options.prompt });
 }
 
 /**

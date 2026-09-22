@@ -18,9 +18,9 @@ import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
 import { DiscoveryTree, type TreeNode } from "./tree.ts";
-import { historyDir, iterationDir, readJson, workRoot, writeJson } from "./world.ts";
+import { historyDir, iterationDir, readJson, readManifest, workRoot, writeJson } from "./world.ts";
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
-import { readTask, type TaskConfig } from "./task.ts";
+import { programFingerprint, readTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 
 /** A candidate has to beat the recorded baseline by this much (relative) before it is worth reporting. */
 export const MIN_IMPROVEMENT_RATIO = 0.01;
@@ -36,13 +36,24 @@ export interface SeedMeasurement {
   workspace: string;
   /** The scorer this measurement came from; absent in files written before it was recorded. */
   score_program?: string;
+  /**
+   * Scoring-contract fingerprint of the task at measure time (`scoringFingerprint`), plus a hash of
+   * the measured program's contents. Absent in files written before they were recorded. A mismatch
+   * against the current task means this baseline describes a different objective — it cannot serve
+   * as the reference point and `dream_rsi_init` re-measures instead of keeping it.
+   */
+  fingerprint?: string;
+  program_fingerprint?: string;
   seconds: number;
 }
 
 export interface AppliedRecord {
   iteration: number;
   cell: string;
+  /** Normalized score at apply time (higher is better under the then-current contract). */
   score: number | null;
+  /** Scoring-contract fingerprint at apply time; absent in records written before it existed. */
+  fingerprint?: string;
   applied_at: string;
   paths: string[];
   target: string;
@@ -122,6 +133,8 @@ export async function measureSeed(options: {
       measured_at: new Date().toISOString(),
       workspace: path.relative(projectDir, seed) || seed,
       score_program: task.score_program,
+      fingerprint: scoringFingerprint(task),
+      program_fingerprint: programFingerprint(projectDir, task) ?? undefined,
       seconds: Math.round((Date.now() - started) / 100) / 10,
     };
     // The reference point is overwritten by definition, so keep the previous one. Re-running init after a
@@ -175,8 +188,31 @@ export function recordApplied(dreamRoot: string, record: AppliedRecord): void {
   fs.appendFileSync(appliedLogPath(dreamRoot), `${JSON.stringify(record)}\n`, "utf8");
 }
 
-/** Best successful candidate of one recorded iteration. */
+/**
+ * Does this recorded baseline describe the task as it is configured *now*? A missing fingerprint
+ * falls back to the pre-fingerprint rule (workspace path + scorer) so older projects keep behaving
+ * as they did; a present-but-different one means the objective changed and the number is not a
+ * reference point for it.
+ */
+export function seedMatchesTask(seed: SeedMeasurement, task: TaskConfig): boolean {
+  if (seed.fingerprint !== undefined) {
+    return seed.fingerprint === scoringFingerprint(task);
+  }
+  // Pre-fingerprint files: the recorded score must still be consistent with the current direction
+  // (a `higher_is_better` flip silently inverts every stored reference), then fall back to the
+  // workspace/scorer rule.
+  if (seed.score !== null && seed.raw_score !== null && !scoreMatchesDirection(task, seed.score, seed.raw_score)) {
+    return false;
+  }
+  return seed.workspace === task.workspace && (seed.score_program ?? task.score_program) === task.score_program;
+}
+
+/** The best valid candidate of one recorded iteration, ignoring scores from another contract. */
 function bestOfIteration(dreamRoot: string, iteration: number, task: TaskConfig, projectDir: string): Candidate | null {
+  const manifest = readManifest(dreamRoot, iteration);
+  if (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== scoringFingerprint(task)) {
+    return null; // recorded under a different scoring contract: not comparable with this task
+  }
   const file = path.join(iterationDir(dreamRoot, iteration), "tree.json");
   const json = readJson<import("./tree.ts").TreeJSON>(file);
   if (!json) return null;
@@ -185,6 +221,7 @@ function bestOfIteration(dreamRoot: string, iteration: number, task: TaskConfig,
   for (const node of tree.list()) {
     if (typeof node.score !== "number") continue;
     if (node.error !== null || node.fail_class !== "ok") continue;
+    if (!scoreMatchesDirection(task, node.score, node.raw_score)) continue;
     if (!best || node.score > (best.score ?? Number.NEGATIVE_INFINITY)) best = node;
   }
   if (!best) return null;
@@ -219,8 +256,15 @@ function recordedIterations(dreamRoot: string): number[] {
 export function improvements(dreamRoot: string, task?: TaskConfig, projectDir?: string): ImprovementReport {
   const resolvedTask = task ?? readTask(dreamRoot);
   const project = projectDir ?? path.dirname(dreamRoot);
-  const seed = readSeedMeasurement(dreamRoot);
-  const appliedRecords = readApplied(dreamRoot);
+  const rawSeed = readSeedMeasurement(dreamRoot);
+  // A baseline measured under another contract is reported as absent: comparing candidates of this
+  // objective against it would invent improvements that do not exist (the C(25,15,5) bug report).
+  const seed = rawSeed && seedMatchesTask(rawSeed, resolvedTask) ? rawSeed : null;
+  const staleBaseline = rawSeed !== null && seed === null;
+  const fingerprint = scoringFingerprint(resolvedTask);
+  const appliedRecords = readApplied(dreamRoot).filter(
+    (record) => record.fingerprint === undefined || record.fingerprint === fingerprint,
+  );
   const appliedScores = appliedRecords.map((record) => record.score).filter((score): score is number => typeof score === "number");
   const appliedBest = appliedScores.length > 0 ? Math.max(...appliedScores) : null;
 
@@ -250,7 +294,9 @@ export function improvements(dreamRoot: string, task?: TaskConfig, projectDir?: 
       applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length },
       best,
       pending: null,
-      reason: "your own code has not been measured yet, so there is no reference point (run dream_rsi_init)",
+      reason: staleBaseline
+        ? "the recorded baseline was measured under a different scoring configuration — run dream_rsi_init to re-measure your code"
+        : "your own code has not been measured yet, so there is no reference point (run dream_rsi_init)",
     };
   }
 
