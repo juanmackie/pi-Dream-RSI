@@ -24,6 +24,11 @@ export interface LiveCycleManifest {
   status: "running" | "complete" | "failed";
   created_at: string;
   completed_at: string | null;
+  /**
+   * Who claimed this iteration. Recovery may only reclaim a claim whose owner is confirmed dead, so a
+   * second session sharing the project cannot mark a genuinely running cycle as interrupted.
+   */
+  owner?: PhaseOwner;
   /** The one scalar baked into the policy for this live episode. */
   baked_beta: number;
   policy_version: string;
@@ -50,6 +55,13 @@ export function pad(index: number, width = 4): string {
   return String(index).padStart(width, "0");
 }
 
+/** Owner of an in-flight iteration, recorded so cross-session recovery can tell live from dead. */
+export interface PhaseOwner {
+  session_id: string;
+  pid: number;
+  claimed_at: string;
+}
+
 export function policyDir(dreamRoot: string): string {
   return path.join(dreamRoot, "policy");
 }
@@ -60,10 +72,35 @@ export function liveMethodPath(dreamRoot: string): string {
 
 /**
  * Candidate policy versions live beside the deployed policy and its API files, so a version can keep
- * importing `./api.ts` wherever it is archived.
+ * importing `./api.ts` wherever it is archived. The iteration is part of the name on purpose: every
+ * dream restarts revision numbering at `v0000`, so `r0002_v0000.ts` cannot overwrite the
+ * `r0001_v0000.ts` an older evaluation still references.
  */
-export function versionedPolicyPath(dreamRoot: string, revision: number): string {
-  return path.join(policyDir(dreamRoot), `v${pad(revision)}.ts`);
+export function versionedPolicyPath(dreamRoot: string, iteration: number, revision: number): string {
+  return path.join(policyDir(dreamRoot), `r${pad(iteration)}_v${pad(revision)}.ts`);
+}
+
+/** The archived policy-version file name, for status listings. */
+export function policyVersionName(iteration: number, revision: number): string {
+  return `r${pad(iteration)}_v${pad(revision)}.ts`;
+}
+
+/** Staging file the policy-development agent edits; the deployed policy is replaced only on success. */
+export function stagingPolicyPath(dreamRoot: string): string {
+  return path.join(policyDir(dreamRoot), "staging.ts");
+}
+
+/** Records the beta the next live episode will actually use (the cross-cycle adjusted beta). */
+export function deployedBetaPath(dreamRoot: string): string {
+  return path.join(policyDir(dreamRoot), "deployed_beta.json");
+}
+
+/** Write a file atomically (same directory, then rename), so a crash cannot leave a half-written policy. */
+export function writeFileAtomic(file: string, contents: string): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}`;
+  fs.writeFileSync(tmp, contents, "utf8");
+  fs.renameSync(tmp, file);
 }
 
 export function workRoot(dreamRoot: string): string {
@@ -127,6 +164,12 @@ export function appendJsonl(file: string, records: unknown[]): void {
   fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
 }
 
+/** Overwrite a JSONL file with the full record set (idempotent partial writes for a live reader). */
+export function writeJsonl(file: string, records: unknown[]): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, records.length === 0 ? "" : records.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
+}
+
 export function writeTree(root: string, iteration: number, tree: DiscoveryTree, current = false): string {
   const file = path.join(iterationDir(root, iteration, current), "tree.json");
   writeJson(file, tree.toJSON());
@@ -188,13 +231,43 @@ export function ensureWorkerRuntime(dreamRoot: string, extensionDir: string): st
     const target = path.join(runtime, path.relative(extensionDir, file));
     fs.mkdirSync(path.dirname(target), { recursive: true });
     const source = fs.readFileSync(file, "utf8");
-    fs.writeFileSync(target, source, "utf8");
+    // Rewriting unchanged runtime files on every policy run is pure overhead (and a race between
+    // concurrent replay workers); only write when the content actually differs.
+    let current: string | null = null;
+    try {
+      current = fs.readFileSync(target, "utf8");
+    } catch {
+      current = null;
+    }
+    if (current !== source) fs.writeFileSync(target, source, "utf8");
     for (const match of source.matchAll(/from\s+"(\.{1,2}\/[^"]+\.ts)"/g)) {
       const next = path.resolve(path.dirname(file), match[1]);
       if (next.startsWith(extensionDir)) queue.push(next);
     }
   }
   return path.join(runtime, "worker", "policy-worker.ts");
+}
+
+/** In-flight mirror path for one iteration (the claim recovery inspects). */
+export function currentManifestPath(root: string, iteration: number): string {
+  return path.join(iterationDir(root, iteration, true), "live_cycle_manifest.json");
+}
+
+/**
+ * Atomically claim an iteration by exclusively creating its in-flight mirror (`wx`). Two sessions or
+ * processes sharing a project cannot reserve the same number: the loser gets EEXIST and retries.
+ * Returns false when the number is already claimed.
+ */
+export function claimCurrentManifest(root: string, manifest: LiveCycleManifest): boolean {
+  const file = currentManifestPath(root, manifest.iteration);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    fs.writeFileSync(file, `${JSON.stringify(manifest, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
 }
 
 /** Write the live-cycle sidecar the cross-cycle beta rule reads (paper Listing 2). */
@@ -280,18 +353,39 @@ export function seedBaseline(root: string, iteration: number, tree: DiscoveryTre
   return target;
 }
 
+/**
+ * Keep only the newest `keep` iteration directories under `work/`. Attempt workspaces are the bulky
+ * half of the state dir; retention bounds growth without touching recorded trees or attempt records.
+ * The iteration currently being prepared is never pruned.
+ */
+export function pruneWorkspaces(root: string, keep: number, currentIteration?: number): number[] {
+  const dir = workRoot(root);
+  if (!fs.existsSync(dir)) return [];
+  const entries = fs
+    .readdirSync(dir)
+    .map((name) => /^r(\d+)$/.exec(name))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => ({ name: match[0], iteration: Number(match[1]) }))
+    .sort((a, b) => b.iteration - a.iteration);
+  const removed: number[] = [];
+  for (const entry of entries.slice(Math.max(1, keep))) {
+    if (entry.iteration === currentIteration) continue;
+    fs.rmSync(path.join(dir, entry.name), { recursive: true, force: true });
+    removed.push(entry.iteration);
+  }
+  return removed;
+}
+
 /** Archive a candidate policy version; every revision keeps its own file so it can be re-imported. */
-export function archivePolicyVersion(root: string, revision: number, source: string): string {
-  const target = versionedPolicyPath(root, revision);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, source, "utf8");
+export function archivePolicyVersion(root: string, iteration: number, revision: number, source: string): string {
+  const target = versionedPolicyPath(root, iteration, revision);
+  writeFileAtomic(target, source);
   return target;
 }
 
 export function deployPolicy(root: string, source: string): string {
   const target = liveMethodPath(root);
-  fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, source, "utf8");
+  writeFileAtomic(target, source);
   return target;
 }
 
@@ -314,7 +408,14 @@ export function ensurePolicyRuntime(root: string, packagePolicyDir: string): str
     const from = path.join(packagePolicyDir, name);
     if (!fs.existsSync(from)) continue;
     const to = path.join(target, name);
-    fs.copyFileSync(from, to);
+    const source = fs.readFileSync(from, "utf8");
+    let current: string | null = null;
+    try {
+      current = fs.readFileSync(to, "utf8");
+    } catch {
+      current = null;
+    }
+    if (current !== source) fs.writeFileSync(to, source, "utf8");
     copied.push(to);
   }
   return copied;

@@ -1,11 +1,11 @@
 #!/usr/bin/env node
 /** Synthetic replay scorer for Dream-RSI: evaluates workspace policy file directly. */
-import { createRequire } from "node:module";
-const require = createRequire(import.meta.url);
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { pathToFileURL } from "node:url";
 
 const workspace = process.argv[2] || ".";
+const workspaceAbs = path.resolve(workspace);
 const policyPath = path.join(workspace, "extensions/pi-dream-rsi/policy/method.ts");
 const outputPath = path.join(workspace, "eval", "score.json");
 fs.mkdirSync(path.dirname(outputPath), { recursive: true });
@@ -16,9 +16,8 @@ let score = 50; // base synthetic score
 
 // 1. Correctness gate: policy file must exist and be importable (syntax + contract).
 try {
-  const workspaceAbs = path.resolve(workspace);
-  const policyUrlStr = "file://" + workspaceAbs.replace(/\\/g, "/") + "/extensions/pi-dream-rsi/policy/method.ts";
-  await import(policyUrlStr);
+  const policyUrl = pathToFileURL(path.join(workspaceAbs, "extensions/pi-dream-rsi/policy/method.ts"));
+  await import(policyUrl.href);
   score += 30; // import succeeded
 } catch (e) {
   failClass = "syntax_error";
@@ -30,11 +29,9 @@ try {
 // We import the runner directly (it is .ts and importable in this env).
 if (failClass === "ok") {
   try {
-    const workspaceAbs = path.resolve(workspace);
-    const runnerUrlStr = "file://" + workspaceAbs.replace(/\\/g, "/") + "/extensions/pi-dream-rsi/policy/runner.ts";
-    const { readPolicyViolations } = await import(runnerUrlStr);
-    const rawSource = fs.readFileSync(policyPath, "utf8");
-    const violations = readPolicyViolations ? readPolicyViolations(policyPath) : [];
+    const runnerUrl = pathToFileURL(path.join(workspaceAbs, "extensions/pi-dream-rsi/policy/runner.ts"));
+    const { readPolicyViolations } = await import(runnerUrl.href);
+    const violations = readPolicyViolations(policyPath);
     if (violations && violations.length > 0) {
       failClass = "guardrail_failure";
       errors.push(`Guardrail violations: ${violations.join(", ")}`);
@@ -68,5 +65,5 @@ if (failClass === "ok") {
 const durationMs = Date.now() - process.env.SCORE_START_MS ? 0 : 0; // not used; we just clamp.
 score = Math.max(0, score);
 
-fs.writeFileSync(outputPath, JSON.stringify({ score, fail_class: failClass, errors }, null, 2));
+fs.writeFileSync(outputPath, JSON.stringify({ score, valid: failClass === "ok", fail_class: failClass, errors }, null, 2));
 console.log(`score=${score} fail_class=${failClass}`);

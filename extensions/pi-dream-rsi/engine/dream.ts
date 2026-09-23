@@ -26,18 +26,22 @@ import type { DiscoveryTree } from "./tree.ts";
 import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 import { BUNDLED_POLICY_DIR } from "../layout.ts";
 import {
-  appendJsonl,
   archivePolicyVersion,
   baselineDir,
   deployPolicy,
+  deployedBetaPath,
   ensurePolicyRuntime,
   historyDir,
   liveMethodPath,
   proposalResultsDir,
+  readJson,
   recentManifests,
   roundDir,
+  stagingPolicyPath,
   tracePoolDir,
+  writeFileAtomic,
   writeJson,
+  writeJsonl,
   type LiveCycleManifest,
 } from "./world.ts";
 
@@ -54,6 +58,8 @@ export interface DreamOptions {
   developmentTimeoutMs?: number;
   /** Skip the policy-development agent (revision 0 only) — useful for smoke tests. */
   evaluateOnly?: boolean;
+  /** Cancellation: stops replay workers and the development agent, and blocks deployment. */
+  signal?: AbortSignal;
 }
 
 export interface VersionEvaluation {
@@ -102,7 +108,9 @@ export interface DreamResult {
 function developmentPrompt(options: DreamOptions, worldCount: number): string {
   const template = loadPrompt("policy-improvement.md");
   return renderPrompt(template, {
-    method_file: liveMethodPath(options.dreamRoot),
+    // The agent edits the *staging* copy; the deployed policy is replaced only after the winner is
+    // selected, so a failed or interrupted revision cannot leave an unevaluated policy active.
+    method_file: stagingPolicyPath(options.dreamRoot),
     history_dir: historyDir(options.dreamRoot),
     trace_pool: tracePoolDir(options.dreamRoot),
     baseline_dir: baselineDir(options.dreamRoot),
@@ -111,12 +119,33 @@ function developmentPrompt(options: DreamOptions, worldCount: number): string {
   });
 }
 
+/** How many replay episodes run at once. Each is a worker thread, so this bounds CPU and file I/O. */
+const REPLAY_CONCURRENCY = 4;
+
+/** Run `worker` over `items` with at most `limit` in flight, preserving input order in the result. */
+async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const run = async (): Promise<void> => {
+    for (;;) {
+      const index = next;
+      next += 1;
+      if (index >= items.length) return;
+      results[index] = await worker(items[index], index);
+    }
+  };
+  const count = Math.min(Math.max(1, limit), Math.max(1, items.length));
+  const runners: Promise<void>[] = [];
+  for (let index = 0; index < count; index += 1) runners.push(run());
+  await Promise.all(runners);
+  return results;
+}
+
 export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResult> {
   // Normalize at the boundary, same as the live phase.
   const options: DreamOptions = { ...rawOptions, task: normalizeTask(rawOptions.task) };
   const { dreamRoot, task, iteration } = options;
   const log = options.log ?? (() => {});
-  const policyDir = path.join(dreamRoot, "policy");
   ensurePolicyRuntime(dreamRoot, BUNDLED_POLICY_DIR);
   const currentPolicy = options.policyPath ?? liveMethodPath(dreamRoot);
   if (!fs.existsSync(currentPolicy)) throw new Error(`no policy to improve at ${currentPolicy}`);
@@ -176,20 +205,26 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     let policyName: string | null = null;
     let deterministic: boolean | null = null;
 
-    for (let index = 0; index < worlds.length; index += 1) {
-      const world = worlds[index];
-      const episode = await replayEpisode({
-        policyPath,
-        world,
-        beta: null, // the version's own baked-in default beta
-        maxParallelism: task.workers,
-        k2: task.k2,
-        beta1: task.beta1,
-        beta2: task.beta2,
-        lambda: rewardConfig.lambda,
-        timeoutMs: 120_000,
-        verifyDeterminism: index === 0,
-      });
+    const selectionRuns = await mapLimit(
+      worlds.map((_, index) => index),
+      REPLAY_CONCURRENCY,
+      async (index) =>
+        replayEpisode({
+          policyPath,
+          world: worlds[index],
+          beta: null, // the version's own baked-in default beta
+          maxParallelism: task.workers,
+          k2: task.k2,
+          beta1: task.beta1,
+          beta2: task.beta2,
+          lambda: rewardConfig.lambda,
+          timeoutMs: 120_000,
+          verifyDeterminism: index === 0,
+          signal: options.signal,
+        }),
+    );
+    for (let index = 0; index < selectionRuns.length; index += 1) {
+      const episode = selectionRuns[index];
       if (typeof episode.beta === "number" && Number.isFinite(episode.beta)) defaultBeta = episode.beta;
       if (episode.deterministic === false && deterministic !== false) deterministic = false;
       else if (episode.deterministic === true && deterministic === null) deterministic = true;
@@ -238,18 +273,25 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
       const penalties: number[] = [];
       const traceAucs: number[] = [];
       const betaErrors: string[] = [];
-      for (let index = 0; index < worlds.length; index += 1) {
-        const episode = await replayEpisode({
-          policyPath,
-          world: worlds[index],
-          beta,
-          maxParallelism: task.workers,
-          k2: task.k2,
-          beta1: task.beta1,
-          beta2: task.beta2,
-          lambda: rewardConfig.lambda,
-          timeoutMs: 120_000,
-        });
+      const betaRuns = await mapLimit(
+        worlds.map((_, index) => index),
+        REPLAY_CONCURRENCY,
+        async (index) =>
+          replayEpisode({
+            policyPath,
+            world: worlds[index],
+            beta,
+            maxParallelism: task.workers,
+            k2: task.k2,
+            beta1: task.beta1,
+            beta2: task.beta2,
+            lambda: rewardConfig.lambda,
+            timeoutMs: 120_000,
+            signal: options.signal,
+          }),
+      );
+      for (let index = 0; index < betaRuns.length; index += 1) {
+        const episode = betaRuns[index];
         const metrics = episode.metrics;
         if (!episode.ok) {
           // Failed episodes are recorded, never averaged in as if they had scored zero.
@@ -325,135 +367,168 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
   };
 
   log(`[dream ${iteration}] fixed history: ${worlds.length} world(s); M=${revisions} revision(s)`);
-  // Version 0 is the policy that just ran live: it must be evaluated from a stable, immutable path.
-  let candidatePath = archivePolicyVersion(dreamRoot, 0, fs.readFileSync(currentPolicy, "utf8"));
-  for (let revision = 0; revision < revisions; revision += 1) {
-    const evaluation = await evaluate(revision, candidatePath);
-    evaluations.push(evaluation);
-    log(
-      `[dream ${iteration}] pi_${revision}: V=${evaluation.v_mean.toFixed(4)} beta=${evaluation.default_beta} ` +
-        `pareto.reward=${evaluation.summary.pareto_reward.toFixed(4)} auc=${evaluation.summary.auc.toFixed(4)} ` +
-        `penalty=${evaluation.summary.parallel_penalty.toFixed(4)} deterministic=${evaluation.deterministic ?? "n/a"}`,
-    );
-    if (evaluation.deterministic === false) {
-      evaluation.error = `${evaluation.error ? `${evaluation.error}; ` : ""}non-deterministic replay`;
-      evaluation.v_mean = Number.NEGATIVE_INFINITY;
-    }
-    const isLast = revision === revisions - 1;
-    if (isLast || options.evaluateOnly) continue;
 
-    // --- revise the executable policy (the paper's policy-development agent) ---
-    // The agent edits the deployed method file; each revision is then snapshotted as a new version.
-    const methodFile = liveMethodPath(dreamRoot);
-    const before = fs.readFileSync(methodFile, "utf8");
-    const prompt = developmentPrompt(options, worlds.length);
-    const agentRun = await runAgent({
-      agent: task.agent,
-      cwd: dreamRoot,
-      prompt,
-      timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
-      logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
-    });
-    const after = fs.existsSync(methodFile) ? fs.readFileSync(methodFile, "utf8") : "";
-    if (!agentRun.ok || after === before) {
-      log(
-        `[dream ${iteration}] revision ${revision + 1} left the policy unchanged (${agentRun.ok ? "no edit" : (agentRun.spawnError ?? "agent failed")})`,
-      );
-    } else {
-      improved = true;
-    }
-    candidatePath = archivePolicyVersion(dreamRoot, revision + 1, after === "" ? before : after);
-  }
-
-  // --- selection ----------------------------------------------------------
-  let selected = 0;
-  for (let index = 1; index < evaluations.length; index += 1) {
-    if (evaluations[index].v_mean > evaluations[selected].v_mean) selected = index;
-  }
-  const best = evaluations[selected];
-  // Apply the paper's cross-cycle default-beta rule before deploying.
-  const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta, fingerprint);
-  // The guarantee is `V* >= V_0` over the candidate set. It also has to *exist*: if every version
-  // failed to score, deploying anything (or reporting success) would be a lie.
-  const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
-  const monotone =
-    scored.length > 0 && Number.isFinite(best.v_mean) && best.v_mean >= (scored[0]?.v_mean ?? Number.NEGATIVE_INFINITY);
-  if (monotone) {
-    deployPolicy(dreamRoot, fs.readFileSync(best.policy_path, "utf8"));
-  }
-  const resultsDir = proposalResultsDir(dreamRoot, iteration);
-  writeJson(path.join(resultsDir, "beta_sweep.json"), {
-    iteration,
-    lambda: rewardConfig.lambda,
-    beta1: task.beta1,
-    beta2: task.beta2,
-    worlds: iterations,
-    selected_revision: selected,
-    selected_policy: best.policy_path,
-    deployed_beta: deployedBeta,
-    auc: best.summary.auc,
-    pareto_reward: best.summary.pareto_reward,
-    parallel_penalty: best.summary.parallel_penalty,
-    frontier: best.summary.frontier,
-    versions: evaluations.map((e) => ({
-      revision: e.revision,
-      v_mean: e.v_mean,
-      default_beta: e.default_beta,
-      deterministic: e.deterministic,
-      auc: e.summary.auc,
-      pareto_reward: e.summary.pareto_reward,
-      parallel_penalty: e.summary.parallel_penalty,
-      frontier: e.summary.frontier,
-      points: e.points.map((p) => ({
-        beta: p.beta,
-        attainment: p.attainment,
-        work: p.work,
-        parallelism: p.parallelism,
-        value: p.value,
-        penalty: p.penalty,
-        trace_auc: p.trace_auc,
+  /** Persist the sweep and traces; `final` also writes the selection sidecar. */
+  const writeResults = (final: boolean, selected: number | null, deployedBeta: number | null, monotone: boolean | null): void => {
+    const resultsDir = proposalResultsDir(dreamRoot, iteration);
+    const bestEval = selected === null ? null : (evaluations[selected] ?? null);
+    writeJson(path.join(resultsDir, "beta_sweep.json"), {
+      iteration,
+      final,
+      lambda: rewardConfig.lambda,
+      beta1: task.beta1,
+      beta2: task.beta2,
+      worlds: iterations,
+      selected_revision: selected,
+      selected_policy: bestEval?.policy_path ?? null,
+      deployed_beta: deployedBeta,
+      auc: bestEval?.summary.auc ?? 0,
+      pareto_reward: bestEval?.summary.pareto_reward ?? 0,
+      parallel_penalty: bestEval?.summary.parallel_penalty ?? 0,
+      frontier: bestEval?.summary.frontier ?? [],
+      versions: evaluations.map((e) => ({
+        revision: e.revision,
+        v_mean: e.v_mean,
+        default_beta: e.default_beta,
+        deterministic: e.deterministic,
+        auc: e.summary.auc,
+        pareto_reward: e.summary.pareto_reward,
+        parallel_penalty: e.summary.parallel_penalty,
+        frontier: e.summary.frontier,
+        points: e.points.map((p) => ({
+          beta: p.beta,
+          attainment: p.attainment,
+          work: p.work,
+          parallelism: p.parallelism,
+          value: p.value,
+          penalty: p.penalty,
+          trace_auc: p.trace_auc,
+        })),
+        per_world: e.per_world,
+        error: e.error,
       })),
-      per_world: e.per_world,
-      error: e.error,
-    })),
-  });
-  appendJsonl(path.join(resultsDir, "policy_execution_traces.jsonl"), traces);
-  writeJson(path.join(resultsDir, "selection.json"), {
-    iteration,
-    selected_revision: selected,
-    monotone,
-    v_mean: evaluations.map((e) => e.v_mean),
-    deployed_beta: deployedBeta,
-  });
-
-  const report = [
-    `iteration ${iteration}: ${worlds.length} replay world(s), ${evaluations.length} version(s) evaluated`,
-    ...evaluations.map(
-      (e) =>
-        `  pi_${e.revision}: V=${e.v_mean.toFixed(4)} beta=${e.default_beta} pareto.reward=${e.summary.pareto_reward.toFixed(4)}` +
-        ` probes=${meanOf(e.per_world.map((w) => w.probes)).toFixed(1)} rounds=${meanOf(e.per_world.map((w) => w.rounds)).toFixed(1)}` +
-        (e.error ? ` error=${e.error}` : ""),
-    ),
-    `selected pi_${selected} (V* >= V_0: ${monotone}) -> deployed with beta=${best.default_beta}`,
-  ].join("\n");
-
-  return {
-    ok: monotone,
-    error: monotone
-      ? null
-      : scored.length === 0
-        ? "no policy version produced a finite replay score (all failed or non-deterministic)"
-        : "selection violated V* >= V_0 (non-deterministic or non-prefix-only policy)",
-    iteration,
-    worlds: worlds.length,
-    revisions: evaluations.length,
-    evaluations,
-    selected,
-    selected_policy: best.policy_path,
-    deployed_beta: deployedBeta,
-    improved,
-    report,
+    });
+    writeJsonl(path.join(resultsDir, "policy_execution_traces.jsonl"), traces);
+    if (final) {
+      writeJson(path.join(resultsDir, "selection.json"), {
+        iteration,
+        selected_revision: selected,
+        monotone,
+        v_mean: evaluations.map((e) => e.v_mean),
+        deployed_beta: deployedBeta,
+      });
+    }
   };
+
+  // Version 0 is the policy that just ran live: it must be evaluated from a stable, immutable path.
+  const baseSource = fs.readFileSync(currentPolicy, "utf8");
+  let candidatePath = archivePolicyVersion(dreamRoot, iteration, 0, baseSource);
+  // The development agent edits a staging copy, never the deployed policy: an exception, a crash, or a
+  // half-finished revision cannot leave an unevaluated (or deleted) policy active.
+  const staging = stagingPolicyPath(dreamRoot);
+  writeFileAtomic(staging, baseSource);
+
+  try {
+    for (let revision = 0; revision < revisions; revision += 1) {
+      const evaluation = await evaluate(revision, candidatePath);
+      evaluations.push(evaluation);
+      log(
+        `[dream ${iteration}] pi_${revision}: V=${evaluation.v_mean.toFixed(4)} beta=${evaluation.default_beta} ` +
+          `pareto.reward=${evaluation.summary.pareto_reward.toFixed(4)} auc=${evaluation.summary.auc.toFixed(4)} ` +
+          `penalty=${evaluation.summary.parallel_penalty.toFixed(4)} deterministic=${evaluation.deterministic ?? "n/a"}`,
+      );
+      if (evaluation.deterministic === false) {
+        evaluation.error = `${evaluation.error ? `${evaluation.error}; ` : ""}non-deterministic replay`;
+        evaluation.v_mean = Number.NEGATIVE_INFINITY;
+      }
+      const isLast = revision === revisions - 1;
+      if (isLast || options.evaluateOnly) continue;
+
+      // --- revise the executable policy (the paper's policy-development agent) ---
+      // Persist the sweep and traces *before* asking for the next revision: the agent reads them, and
+      // in-memory-only results were invisible to the very call they were meant to guide.
+      writeResults(false, null, null, null);
+      const before = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : baseSource;
+      const prompt = developmentPrompt(options, worlds.length);
+      const agentRun = await runAgent({
+        agent: task.agent,
+        cwd: dreamRoot,
+        prompt,
+        timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
+        logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
+        signal: options.signal,
+      });
+      const after = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : "";
+      if (!agentRun.ok || after === before) {
+        log(
+          `[dream ${iteration}] revision ${revision + 1} left the policy unchanged (${agentRun.ok ? "no edit" : (agentRun.spawnError ?? "agent failed")})`,
+        );
+      } else {
+        improved = true;
+      }
+      const nextSource = after === "" ? before : after;
+      candidatePath = archivePolicyVersion(dreamRoot, iteration, revision + 1, nextSource);
+      // Keep staging in sync so the next revision revises this one.
+      writeFileAtomic(staging, nextSource);
+    }
+
+    // --- selection ----------------------------------------------------------
+    if (options.signal?.aborted) throw new Error("dream phase aborted");
+    let selected = 0;
+    for (let index = 1; index < evaluations.length; index += 1) {
+      if (evaluations[index].v_mean > evaluations[selected].v_mean) selected = index;
+    }
+    const best = evaluations[selected];
+    // Apply the paper's cross-cycle default-beta rule before deploying.
+    const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta, fingerprint);
+    // The guarantee is `V* >= V_0` over the candidate set. It also has to *exist*: if every version
+    // failed to score, deploying anything (or reporting success) would be a lie.
+    const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
+    const monotone =
+      scored.length > 0 && Number.isFinite(best.v_mean) && best.v_mean >= (scored[0]?.v_mean ?? Number.NEGATIVE_INFINITY);
+    if (monotone) {
+      deployPolicy(dreamRoot, fs.readFileSync(best.policy_path, "utf8"));
+      // Record the beta the next live episode will actually run at; `planNextGrid` forces it, so the
+      // reported deployed_beta matches behavior instead of describing an adjustment that was never used.
+      writeJson(deployedBetaPath(dreamRoot), { beta: deployedBeta, iteration, policy: best.policy_path });
+    }
+    writeResults(true, selected, deployedBeta, monotone);
+
+    const report = [
+      `iteration ${iteration}: ${worlds.length} replay world(s), ${evaluations.length} version(s) evaluated`,
+      ...evaluations.map(
+        (e) =>
+          `  pi_${e.revision}: V=${e.v_mean.toFixed(4)} beta=${e.default_beta} pareto.reward=${e.summary.pareto_reward.toFixed(4)}` +
+          ` probes=${meanOf(e.per_world.map((w) => w.probes)).toFixed(1)} rounds=${meanOf(e.per_world.map((w) => w.rounds)).toFixed(1)}` +
+          (e.error ? ` error=${e.error}` : ""),
+      ),
+      `selected pi_${selected} (V* >= V_0: ${monotone}) -> deployed with beta=${deployedBeta}`,
+    ].join("\n");
+
+    return {
+      ok: monotone,
+      error: monotone
+        ? null
+        : scored.length === 0
+          ? "no policy version produced a finite replay score (all failed or non-deterministic)"
+          : "selection violated V* >= V_0 (non-deterministic or non-prefix-only policy)",
+      iteration,
+      worlds: worlds.length,
+      revisions: evaluations.length,
+      evaluations,
+      selected,
+      selected_policy: best.policy_path,
+      deployed_beta: deployedBeta,
+      improved,
+      report,
+    };
+  } catch (error) {
+    // Never leave a staged, deleted, or unevaluated policy active: restore what was deployed.
+    writeFileAtomic(currentPolicy, baseSource);
+    throw error;
+  } finally {
+    fs.rmSync(staging, { force: true });
+  }
 }
 
 function meanOf(list: number[]): number {
@@ -464,7 +539,7 @@ function meanOf(list: number[]): number {
 export async function planNextGrid(
   dreamRoot: string,
   task: TaskConfig,
-  iteration: number,
+  _iteration: number,
   baselineScore: number | null,
   policyPath?: string,
 ): Promise<{ plan: GridPlan; beta: number | null; error: string | null }> {
@@ -485,9 +560,14 @@ export async function planNextGrid(
     max_parallelism: task.workers,
     budget: { workers: task.workers, attempts: task.workers * Math.max(1, task.k1) },
   };
+  // The beta the previous dream selected and recorded. Force it into the policy config so the reported
+  // `deployed_beta` is the beta the live episode actually runs at, not a number nothing applies.
+  const deployed = readJson<{ beta?: number }>(deployedBetaPath(dreamRoot));
+  const forcedBeta = typeof deployed?.beta === "number" && Number.isFinite(deployed.beta) ? deployed.beta : null;
   const result = await planGrid({
     policyPath: policyPath ?? liveMethodPath(dreamRoot),
     maxParallelism: task.workers,
+    config: forcedBeta === null ? {} : { beta: forcedBeta },
     gridPlanContext: context,
     timeoutMs: 60_000,
   });
@@ -555,7 +635,7 @@ function crossCycleBeta(dreamRoot: string, currentDefault: number, fingerprint: 
     // Keep prior default unless sweep clearly shows a better nearby beta.
     const nearby = sortedFrontier.filter((p) => Math.abs(p.beta - currentDefault) <= 0.2);
     const betterNearby = nearby.find((p) => p.attainment > (latest.best_score ?? -Infinity));
-    if (betterNearby && betterNearby.attainment > latest.best_score + 0.01) return clamp01(betterNearby.beta);
+    if (betterNearby && betterNearby.attainment > (latest.best_score ?? -Infinity) + 0.01) return clamp01(betterNearby.beta);
     return currentDefault;
   }
   if (plateaued) {

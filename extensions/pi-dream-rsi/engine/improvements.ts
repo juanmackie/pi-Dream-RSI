@@ -118,7 +118,10 @@ export async function measureSeed(options: {
   const scratch = path.join(historyDir(dreamRoot), "seed-workspace");
   const started = Date.now();
   try {
-    copyWorkspace(seed, scratch, { exclude: [dreamRoot, path.join(projectDir, ".git")] });
+    await copyWorkspace(seed, scratch, { exclude: [dreamRoot, path.join(projectDir, ".git")] });
+    // The scratch copy inherits any score file already in the seed workspace; remove it so only this
+    // measurement's own output can be read back.
+    fs.rmSync(path.join(scratch, task.score_path), { force: true });
     const command = await runShellCommand(task.score_program, {
       cwd: scratch,
       timeoutMs: task.evaluator_timeout_ms,
@@ -328,6 +331,37 @@ export function improvements(dreamRoot: string, task?: TaskConfig, projectDir?: 
   };
 }
 
+/** A specific recorded cell of one iteration, when it is a valid comparable candidate. */
+function candidateByCell(
+  dreamRoot: string,
+  iteration: number,
+  cell: string,
+  task: TaskConfig,
+  projectDir: string,
+): Candidate | null {
+  const manifest = readManifest(dreamRoot, iteration);
+  if (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== scoringFingerprint(task)) {
+    return null;
+  }
+  const file = path.join(iterationDir(dreamRoot, iteration), "tree.json");
+  const json = readJson<import("./tree.ts").TreeJSON>(file);
+  if (!json) return null;
+  const node = DiscoveryTree.fromJSON(json).get(cell);
+  if (!node || typeof node.score !== "number") return null;
+  if (node.error !== null || node.fail_class !== "ok") return null;
+  if (!scoreMatchesDirection(task, node.score, node.raw_score)) return null;
+  const workspace = node.workspace ? path.resolve(projectDir, node.workspace) : null;
+  return {
+    iteration,
+    cell: node.meta.cell_id,
+    score: node.score,
+    raw_score: node.raw_score,
+    fail_class: node.fail_class,
+    workspace,
+    program: programIn(node.workspace, task, projectDir),
+  };
+}
+
 /**
  * A specific candidate, resolved through the recorded trees (so it works for runs recorded before the
  * iteration-scoped workspace layout too). Defaults to the best candidate of the newest iteration.
@@ -343,9 +377,10 @@ export function findCandidate(
   for (const candidate_iteration of iterations) {
     if (typeof iteration === "number" && candidate_iteration !== iteration) continue;
     if (typeof cell === "string") {
-      const found = bestOfIteration(dreamRoot, candidate_iteration, task, projectDir);
-      if (found?.cell === cell) return found;
-      if (found === null) continue;
+      // Look the requested cell up directly, not just each iteration's winner: a runner-up is a valid
+      // candidate, and the same cell id exists in every iteration, so the iteration must be honoured.
+      const found = candidateByCell(dreamRoot, candidate_iteration, cell, task, projectDir);
+      if (found) return found;
       continue;
     }
     const best = bestOfIteration(dreamRoot, candidate_iteration, task, projectDir);

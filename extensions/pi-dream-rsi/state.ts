@@ -12,6 +12,7 @@ import * as path from "node:path";
 
 import { DREAM_DIR, readTask, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import {
+  claimCurrentManifest,
   listIterations,
   readJson,
   readManifest,
@@ -19,8 +20,8 @@ import {
   liveMethodPath,
   policyDir,
   tracePoolDir,
-  writeCurrentManifest,
   type LiveCycleManifest,
+  type PhaseOwner,
 } from "./engine/world.ts";
 
 export const LIVE_MANIFEST_ENTRY = "pi-dream-rsi/live";
@@ -103,36 +104,61 @@ export function nextIteration(root: string): number {
 /**
  * Claim `count` consecutive iterations for episodes that are about to start, and return them.
  *
- * Synchronous on purpose: the caller reserves before its first `await`, so a second tool call in the same
- * session cannot squeeze into the same numbers. The claim is the ordinary in-flight mirror the engine
- * already writes, so an interrupted episode is cleaned up by `recoverInterruptedRuns` like any other.
+ * The claim is an exclusive file create, so two sessions (or two processes) sharing a project cannot be
+ * handed the same number: the loser sees EEXIST and moves to the next one. Synchronous on purpose — the
+ * caller reserves before its first `await`, so a second tool call in the same session cannot interleave.
  */
-export function reserveIterations(root: string, count: number, minBase = 1): number[] {
-  const base = Math.max(nextIteration(root), minBase);
+export function reserveIterations(root: string, count: number, minBase = 1, owner?: PhaseOwner): number[] {
+  let iteration = Math.max(nextIteration(root), minBase);
   const reserved: number[] = [];
   for (let offset = 0; offset < count; offset += 1) {
-    const iteration = base + offset;
-    writeCurrentManifest(root, {
-      iteration,
-      status: "running",
-      created_at: new Date().toISOString(),
-      completed_at: null,
-      baked_beta: 0,
-      policy_version: "",
-      policy_name: null,
-      grid: { branch_count: 0, refine_count: 0 },
-      decision_rounds: 0,
-      attempts: 0,
-      baseline_score: null,
-      best_score: null,
-      previous_best_score: null,
-      stopped: null,
-      error: null,
-      note: "reserved: this episode is allocated but has not started yet",
-    });
-    reserved.push(iteration);
+    for (let attempt = 0; attempt < 10_000; attempt += 1) {
+      const manifest: LiveCycleManifest = {
+        iteration,
+        status: "running",
+        created_at: new Date().toISOString(),
+        completed_at: null,
+        owner,
+        baked_beta: 0,
+        policy_version: "",
+        policy_name: null,
+        grid: { branch_count: 0, refine_count: 0 },
+        decision_rounds: 0,
+        attempts: 0,
+        baseline_score: null,
+        best_score: null,
+        previous_best_score: null,
+        stopped: null,
+        error: null,
+        note: "reserved: this episode is allocated but has not started yet",
+      };
+      if (claimCurrentManifest(root, manifest)) {
+        reserved.push(iteration);
+        iteration += 1;
+        break;
+      }
+      iteration += 1; // another session/process owns this number
+    }
   }
   return reserved;
+}
+
+/** True when `pid` is a live process on this host (EPERM still means it exists). */
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+export interface RecoveryOptions {
+  /** The recovering session: its own non-running claims are stale by definition. */
+  sessionId?: string;
+  /** Liveness probe for another owner's pid (injectable for tests). */
+  isAlive?: (pid: number) => boolean;
 }
 
 /**
@@ -140,15 +166,18 @@ export function reserveIterations(root: string, count: number, minBase = 1): num
  * process). Dream-RSI runs one phase at a time, so it is safe to mark those failed — otherwise the
  * interrupted cycle looks permanently in flight and blocks the next one from being trusted.
  *
- * `except` names the iterations this session is still running: concurrent live calls each own their
- * claims, and one of them finishing must not mark a sibling's world as interrupted.
+ * `except` names the iterations this session is still running. Crucially, a claim owned by *another*
+ * session whose process is still alive is left alone: two sessions sharing a project must not mark each
+ * other's genuinely running cycles as interrupted and reuse their numbers. Only confirmed-dead owners
+ * are reclaimed.
  *
  * Only the in-flight mirror is touched, not the final sidecar: the interrupted iteration had no completed
  * world, so the next live cycle restarts that iteration number with a clean tree.
  */
-export function recoverInterruptedRuns(root: string, except: number[] = []): number[] {
+export function recoverInterruptedRuns(root: string, except: number[] = [], options: RecoveryOptions = {}): number[] {
   const dir = tracePoolDir(root);
   if (!fs.existsSync(dir)) return [];
+  const isAlive = options.isAlive ?? pidIsAlive;
   const recovered: number[] = [];
   for (const entry of fs.readdirSync(dir)) {
     const match = /^iter(\d+)_current$/.exec(entry);
@@ -158,6 +187,12 @@ export function recoverInterruptedRuns(root: string, except: number[] = []): num
     const file = path.join(dir, entry, "live_cycle_manifest.json");
     const manifest = readJson<LiveCycleManifest>(file);
     if (!manifest || manifest.status !== "running") continue;
+    const owner = manifest.owner;
+    if (owner) {
+      const ours = options.sessionId !== undefined && owner.session_id === options.sessionId;
+      // Another session's claim with a live process is genuinely running: leave it and its number alone.
+      if (!ours && isAlive(owner.pid)) continue;
+    }
     const updated: LiveCycleManifest = {
       ...manifest,
       status: "failed",
@@ -184,8 +219,8 @@ export function loadState(root: string): LoadedState {
   const policyVersions = fs.existsSync(policyDir(root))
     ? fs
         .readdirSync(policyDir(root))
-        .filter((name) => /^v\d+\.ts$/.test(name))
-        .sort()
+        .filter((name) => /^r\d+_v\d+\.ts$/.test(name))
+        .sort((a, b) => a.localeCompare(b))
     : [];
   const sweeps: LoadedState["sweeps"] = [];
   for (const { iteration } of iterations) {

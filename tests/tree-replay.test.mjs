@@ -79,6 +79,20 @@ test("replay opens branches in creation order, not in the order the policy names
   assert.equal(second[0].node.meta.seq > first[0].node.meta.seq, true);
 });
 
+test("replay never reveals a branch slot that live never executed", async () => {
+  const world = new DiscoveryTree({ branchCount: 2, refineCount: 2 });
+  world.addBranchSlot(0);
+  world.addBranchSlot(1);
+  score(world, "b0a0", 5); // only branch 0 was executed live; b1a0 stays unopened
+  const revealed = new Set();
+  const probe = makeReplayProbe(world, (cell) => revealed.has(cell));
+  const first = await probe(["b0a0"], 1);
+  assert.deepEqual(first.map((r) => r.cell), ["b0a0"]);
+  revealed.add("b0a0");
+  const second = await probe(["b1a0"], 2);
+  assert.deepEqual(second, [], "an unexecuted slot reveals nothing and charges no probe");
+});
+
 test("probing an opened frontier reveals its unique recorded child, and nothing when the chain ends", async () => {
   const world = treeWith({ branches: 1, refine: 3 });
   score(world, "b0a0", 1);

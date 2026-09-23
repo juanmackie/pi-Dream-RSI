@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { EXT, exists, jump, makeProject, mockPi, readJson } from "./fixtures.mjs";
 
 const { default: dreamRsi } = await jump("index.ts");
-const { normalizeTask } = await jump("engine/task.ts");
+const { defaultTask, normalizeTask } = await jump("engine/task.ts");
 const { activeRuns, recoverInterruptedRuns, nextIteration, reserveIterations, runningIterations } = await jump("state.ts");
 const { listIterations } = await jump("engine/world.ts");
 
@@ -141,7 +141,7 @@ test("live then dream through the tools, with status reporting the recorded worl
     assert.match(status.content[0].text, /sweep pareto\.reward=/);
     assert.match(status.content[0].text, /pi_1: V=/);
     // path.relative renders with the platform separator (backslash on Windows): normalize before matching.
-    assert.match(status.content[0].text.replaceAll("\\", "/"), /policy\/method\.ts \(versions: v0000\.ts, v0001\.ts\)/);
+    assert.match(status.content[0].text.replaceAll("\\", "/"), /policy\/method\.ts \(versions: r0001_v0000\.ts, r0001_v0001\.ts\)/);
 
     // The system prompt carries the protocol note and the live status.
     const injected = await harness.handlers.get("before_agent_start")({ systemPrompt: "BASE" }, context);
@@ -328,7 +328,7 @@ test("create sets up a fresh project through the skill, and answers instead when
     const report = harness.notifications.at(-1);
     assert.match(report, /Already configured here/);
     assert.match(report, /IMPROVEMENT READY — NOT APPLIED/);
-    assert.match(report, /dream_rsi_apply cell=\w+ confirm=true/);
+    assert.match(report, /dream_rsi_apply cell=\w+ iteration=\d+ confirm=true/);
     assert.match(report, /preference: fastest/);
     assert.match(report, /Next: \/dream-rsi run 2/);
     assert.match(report, /\/dream-rsi create --reconfigure/);
@@ -787,6 +787,16 @@ test("task normalization fills defaults and rejects nonsense", () => {
   assert.equal(normalized.higher_is_better, true);
   assert.equal(normalized.agent.command, "pi");
   assert.ok(normalized.agent.args.includes("-p"));
+  assert.ok(defaultTask().agent.args.includes("--no-context-files"), "attempts must not inherit context files");
+  assert.ok(defaultTask().agent.args.includes("--no-prompt-templates"), "attempts must not inherit prompt templates");
+  const customAgent = normalizeTask({
+    name: "t",
+    workspace: "seed",
+    eval_program: "solution.py",
+    score_program: "node score.mjs",
+    agent: { command: "pi", args: ["-p"], thinking: null, prompt_via: "stdin" },
+  });
+  assert.deepEqual(customAgent.agent.args, ["-p"], "stored agent_args pass through verbatim");
   assert.equal(normalized.agent.model, null, "no session snapshot is baked into task.json");
   assert.equal(normalized.agent.thinking, null);
   assert.deepEqual(normalized.beta_grid, [0, 0.2, 0.4, 0.6, 0.8, 1]);

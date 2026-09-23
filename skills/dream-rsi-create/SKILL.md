@@ -50,7 +50,7 @@ Collect these; ask the user for anything you cannot find evidence for:
 | **Correctness gate** | What must set `fail_class != "ok"`. | The repo's own checks: its test suite, its assertions, its validity rules. |
 | **Problem file** | A short doc every attempt reads: objective, in-scope files, off-limits, correctness, the baseline. | Write it (step 4). |
 | **Budgets** | `workers`, `max_loops`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, max_loops=2, K1=3, K2=4, M=2`. `max_loops` is how many online episodes may record worlds at once (`loops x W` agents in flight, shared by every live call); raise it only when the provider and the disk can take it. The paper's shape (`W=10, K1=11`) is hours per cycle. |
-| **Attempt agent** | `agent_command`, `agent_args`, optionally `model`. | The CLI that will edit code in the copy. Attempts inherit the active session's model and thinking level, so `model` is only a fallback; confirm the session model exists and is billable — step 6. |
+| **Attempt agent** | `agent_command`, `agent_args`, optionally `model`. | The CLI that will edit code in the copy. Attempts inherit the active session's model and thinking level, so `model` is only a fallback; confirm the session model exists and is billable — step 6. Keep the default `--no-context-files`/`--no-prompt-templates` flags: attempts read instructions from the prompt and history through tools, never from the host repo's context files. |
 
 Ask in one batch. If the user says "just infer it", infer from the repo and **say what you inferred**, so a
 wrong guess is visible before it costs anything.
@@ -119,6 +119,9 @@ measures the user's own code into `history/seed/score.json` — that measurement
 candidate is compared against. Report the measured baseline, then confirm the effective attempt command it
 prints. It shows the active session's model and thinking level (`… --model <provider/id> --thinking <level>`),
 which is what the attempts run on; `model=` would only set a fallback for hosts without a session model.
+An existing task keeps its stored `agent_args` verbatim, so if the printed command lacks
+`--no-prompt-templates --no-context-files`, pass the full `agent_args=` list when reconfiguring — history and
+the recorded baseline are preserved.
 
 Skip the measurement with `measure_seed: false` only if the scorer is slow, and say that the baseline is missing.
 
@@ -127,7 +130,7 @@ Skip the measurement with `measure_seed: false` only if the scorer is slow, and 
 Run the effective attempt command once, outside the task, with a trivial prompt:
 
 ```bash
-pi -p --no-session -na --no-extensions --no-skills --model <session model> --thinking <session level> "Reply with exactly: OK"
+pi -p --no-session -na --no-extensions --no-skills --no-prompt-templates --no-context-files --model <session model> --thinking <session level> "Reply with exactly: OK"
 ```
 
 A bad model id, missing auth, or an empty balance surfaces here for the price of one small call instead of

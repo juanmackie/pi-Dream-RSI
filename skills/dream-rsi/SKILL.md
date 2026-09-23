@@ -69,7 +69,9 @@ What good setup looks like, in short:
 5. **Budgets** — `workers` (W), `k1` (K1), `k2` (K2), `revisions` (M), `beta_grid`, `beta1`, `beta2`.
    Start at `W=2, K1=3, K2=4, M=2`; the paper's shape is `W=10, K1=11` (strong model) or `W=32, K1=20` (fast
    model) over ~5 rounds.
-6. **Agent command** — default `pi -p --no-session -na --no-extensions --no-skills`, prompt over stdin. Each
+6. **Agent command** — default `pi -p --no-session -na --no-extensions --no-skills --no-prompt-templates
+   --no-context-files`, prompt over stdin: attempts are self-contained — instructions come from the prompt,
+   history from tool reads — so they never inherit the host repo's context files or prompt templates. Each
    run inherits the active session's model and thinking level as `--model`/`--thinking` (unless `args`
    already carries `{model}`/`{thinking}`); `agent.model`/`agent.thinking` in `task.json` are only fallbacks.
    `dream_rsi_init` prints the effective command line — check it.

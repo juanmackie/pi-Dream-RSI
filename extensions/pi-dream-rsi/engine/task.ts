@@ -76,6 +76,13 @@ export interface TaskConfig {
   agent_timeout_ms: number;
   evaluator_timeout_ms: number;
   agent: AgentConfig;
+  /**
+   * Workspace-relative paths never copied into an attempt workspace (dependencies, build output).
+   * Empty by default: a candidate may genuinely need everything in the seed workspace to run.
+   */
+  copy_exclude: string[];
+  /** How many recent iteration directories under `work/` to keep; older candidates are pruned. */
+  work_retention: number;
 }
 
 export function defaultTask(name = "task"): TaskConfig {
@@ -102,9 +109,13 @@ export function defaultTask(name = "task"): TaskConfig {
     default_beta: 0.6,
     agent_timeout_ms: 30 * 60 * 1000,
     evaluator_timeout_ms: 30 * 60 * 1000,
+    copy_exclude: [],
+    work_retention: 20,
     agent: {
       command: "pi",
-      args: ["-p", "--no-session", "-na", "--no-extensions", "--no-skills", "--no-prompt-templates"],
+      // Attempts are self-contained: instructions come from the prompt, history is read through tools —
+      // never from the host repo's context files, prompt templates, or a resumed session.
+      args: ["-p", "--no-session", "-na", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files"],
       // A run resolves the *active session* model/thinking level (ctx.model, ctx.thinkingLevel); these are
       // only fallbacks for when no session model is available (SDK/CI). PI_MODEL is not usable here: pi
       // injects it into shell-tool commands, never into the extension process.
@@ -153,6 +164,16 @@ export function validateTask(raw: unknown): string[] {
   }
   if (typeof t.default_beta !== "number" || t.default_beta < 0 || t.default_beta > 1) {
     errors.push("default_beta must be a number in [0, 1]");
+  }
+  if (t.copy_exclude !== undefined) {
+    if (!Array.isArray(t.copy_exclude) || t.copy_exclude.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
+      errors.push("copy_exclude must be an array of non-empty workspace-relative paths");
+    }
+  }
+  if (t.work_retention !== undefined) {
+    if (typeof t.work_retention !== "number" || !Number.isFinite(t.work_retention) || t.work_retention < 1 || t.work_retention > 10_000) {
+      errors.push("work_retention must be a number in [1, 10000]");
+    }
   }
   const agent = t.agent as Partial<AgentConfig> | undefined;
   if (!agent || typeof agent.command !== "string" || agent.command.trim() === "") {

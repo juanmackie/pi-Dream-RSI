@@ -67,7 +67,7 @@ process.stdin.on("end", () => {
   const policyWork = prompt.includes("prefix-only exploration policy");
   appendFileSync("agent-prompts.log", (policyWork ? "development" : "discovery") + " " + prompt.length + "\\n");
   if (policyWork) {
-    const file = "policy/method.ts";
+    const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
     const src = readFileSync(file, "utf8");
     const next = src.includes("default_beta = 0.8;") ? "0.7" : "0.8";
     writeFileSync(file, src.replace(/default_beta = [0-9.]+;/, "default_beta = " + next + ";"));
@@ -82,7 +82,7 @@ process.stdin.on("end", () => {
 import { readFileSync, writeFileSync } from "node:fs";
 let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
-  const file = "policy/method.ts";
+  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
   const src = readFileSync(file, "utf8");
   const next = src.includes("default_beta = 0.8;") ? "0.6" : "0.8";
   writeFileSync(file, src.replace(/default_beta = [0-9.]+;/, "default_beta = " + next + ";")
@@ -91,15 +91,36 @@ process.stdin.on("end", () => {
 `,
   "developer-regress.mjs": `
 import { readFileSync, writeFileSync } from "node:fs";
-process.stdin.on("data", () => {});
+let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
-  const file = "policy/method.ts";
+  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
   const src = readFileSync(file, "utf8");
   // A policy that refuses to probe anything: worse on every world, so selection must keep pi_0.
   writeFileSync(file, src.replace(
     "    while (!_budget_done(question, budget)) {",
     "    while (false) {",
   ));
+});
+`,
+  "developer-delete.mjs": `
+import { rmSync } from "node:fs";
+let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
+process.stdin.on("end", () => {
+  // The failure mode that used to take the deployed policy down with it: the agent removes the file
+  // it was asked to edit. With staging, this must not touch the deployed policy or crash the phase.
+  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
+  rmSync(file, { force: true });
+});
+`,
+  "developer-reads-feedback.mjs": `
+import { existsSync, appendFileSync } from "node:fs";
+let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
+process.stdin.on("end", () => {
+  // The agent runs from the dream root; the revision's own replay feedback must already be on disk.
+  const results = "history/r0001_dream/proposal_results";
+  const sweep = existsSync(results + "/beta_sweep.json");
+  const traces = existsSync(results + "/policy_execution_traces.jsonl");
+  appendFileSync("feedback.log", (sweep ? "sweep" : "no-sweep") + " " + (traces ? "traces" : "no-traces") + "\\n");
 });
 `,
 };

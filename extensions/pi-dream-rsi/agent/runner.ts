@@ -19,8 +19,12 @@ export interface CommandResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  /** True when the caller's AbortSignal cancelled the run (the tree was killed). */
+  aborted?: boolean;
   /** Spawn failure (missing executable, EINVAL, …). */
   spawnError: string | null;
+  /** Set when the log stream failed (disk full, permission): a controlled outcome, not a crash. */
+  logError?: string | null;
   durationMs: number;
   stdoutTail: string;
   stderrTail: string;
@@ -34,6 +38,8 @@ export interface RunOptions {
   env?: Record<string, string>;
   /** Kill the whole process tree, not just the direct child. */
   killTree?: boolean;
+  /** Cancellation: aborting kills the process tree and resolves once it is gone. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -92,6 +98,25 @@ async function collect(
   const logStream = options.logPath
     ? fs.createWriteStream(options.logPath, { flags: "a" })
     : null;
+  // A disk-full or permission error on the log must not crash the host: record it as an outcome.
+  let logError: string | null = null;
+  // Flush (or fail) the log before reporting the result, so a caller that reads the log right after
+  // `runAgent`/`runShellCommand` resolves sees everything the child wrote.
+  const logClosed: Promise<void> = logStream
+    ? new Promise<void>((resolve) => {
+        let done = false;
+        const settle = (): void => {
+          if (done) return;
+          done = true;
+          resolve();
+        };
+        logStream.on("error", (error: Error) => {
+          logError = error.message;
+          settle();
+        });
+        logStream.on("close", settle);
+      })
+    : Promise.resolve();
   let stdoutTail = "";
   let stderrTail = "";
   const append = (current: string, chunk: string): string => {
@@ -100,9 +125,10 @@ async function collect(
   };
 
   return await new Promise<CommandResult>((resolve) => {
-    let child: ChildProcess;
+    let child: ChildProcess | undefined;
     let settled = false;
     let timedOut = false;
+    let aborted = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let grace: ReturnType<typeof setTimeout> | undefined;
 
@@ -111,19 +137,36 @@ async function collect(
       settled = true;
       if (timer) clearTimeout(timer);
       if (grace) clearTimeout(grace);
-      logStream?.end();
-      resolve({
-        ok: false,
-        code: null,
-        signal: null,
-        timedOut,
-        spawnError: null,
-        durationMs: Date.now() - started,
-        stdoutTail,
-        stderrTail,
-        logPath: options.logPath ?? null,
-        ...result,
-      });
+      options.signal?.removeEventListener("abort", onAbort);
+      try {
+        logStream?.end();
+      } catch {
+        // the stream is already gone; the error listener recorded why
+      }
+      void logClosed.then(() =>
+        resolve({
+          ok: false,
+          code: null,
+          signal: null,
+          timedOut,
+          aborted,
+          spawnError: null,
+          logError,
+          durationMs: Date.now() - started,
+          stdoutTail,
+          stderrTail,
+          logPath: options.logPath ?? null,
+          ...result,
+        }),
+      );
+    };
+
+    /** Cancel: kill the tree, then wait (bounded) for it to actually go away before resolving. */
+    const onAbort = (): void => {
+      if (settled) return;
+      aborted = true;
+      if (child) killTree(child);
+      if (!grace) grace = setTimeout(() => finish({ aborted: true }), 2000);
     };
 
     try {
@@ -151,9 +194,12 @@ async function collect(
       return;
     }
 
+    const running = child;
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+
     timer = setTimeout(() => {
       timedOut = true;
-      killTree(child);
+      killTree(running);
       // 'close' waits for the stdio pipes, and a grandchild that inherited them can keep them
       // open forever after the agent itself is gone — settle after a grace period instead of
       // hanging the whole episode (which is how a timed-out attempt used to leave its live cycle
@@ -163,26 +209,37 @@ async function collect(
 
     // A missing agent CLI must not read as a silent hang: say which command was not found and how the
     // task can pin it, because the runner resolves `pi` itself and only falls back to PATH otherwise.
-    child.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
-    child.stdout?.on("data", (chunk: Buffer) => {
+    running.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
+    // Respect backpressure: a slow/failed log pauses the child's stream until it drains, so heavy
+    // output cannot accumulate unbounded in memory (the OS pipe throttles the child in turn).
+    const writeLog = (source: NodeJS.ReadableStream, text: string): void => {
+      if (!logStream || !logStream.writable || logStream.destroyed) return;
+      if (!logStream.write(text)) {
+        source.pause();
+        logStream.once("drain", () => source.resume());
+      }
+    };
+    running.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stdoutTail = append(stdoutTail, text);
-      if (logStream && logStream.writable) logStream.write(text);
+      writeLog(running.stdout as NodeJS.ReadableStream, text);
     });
-    child.stderr?.on("data", (chunk: Buffer) => {
+    running.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
       stderrTail = append(stderrTail, text);
-      if (logStream && logStream.writable) logStream.write(text);
+      writeLog(running.stderr as NodeJS.ReadableStream, text);
     });
-    child.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut, code, signal }));
+    running.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut && !aborted, code, signal }));
 
     // An agent that exits before reading its prompt closes the pipe; the EPIPE is an outcome of the
     // attempt (recorded from its exit code), never a reason to take down the host running the loop.
-    child.stdin?.on("error", () => {});
-    if (child.stdin) {
-      if (options.stdin === undefined) child.stdin.end();
-      else child.stdin.end(options.stdin);
+    running.stdin?.on("error", () => {});
+    if (running.stdin) {
+      if (options.stdin === undefined) running.stdin.end();
+      else running.stdin.end(options.stdin);
     }
+    // An already-aborted signal never fires 'abort': cancel the freshly spawned child explicitly.
+    if (options.signal?.aborted) onAbort();
   });
 }
 
@@ -337,52 +394,120 @@ function isInside(candidate: string, parent: string): boolean {
   return candidate === parent || candidate.startsWith(parent + path.sep);
 }
 
+/** Bounded async work queue: at most `max` copies in flight, so a large workspace cannot flood the
+ *  filesystem or the libuv threadpool. */
+function createLimiter(max: number): <T>(fn: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  const release = (): void => {
+    active -= 1;
+    const next = waiters.shift();
+    if (next) {
+      active += 1;
+      next();
+    }
+  };
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= max) await new Promise<void>((resolve) => waiters.push(resolve));
+    else active += 1;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
+
+const COPY_CONCURRENCY = 8;
+
 /**
- * Recursive copy that can skip subtrees.
+ * Recursive copy that can skip subtrees, asynchronously and with bounded concurrency.
  *
  * `fs.cpSync` cannot do this job: it rejects a destination nested inside the source
  * (`ERR_FS_CP_EINVAL: cannot copy to a subdirectory of self`) before any filter runs, and
  * `workspace: "."` makes the attempt workspaces exactly that. Walking the tree explicitly also
  * makes both rules obvious: never descend into the destination, never descend into an excluded root.
+ *
+ * `seen` holds the real paths on the current descent, so dereferencing a directory symlink (the
+ * Windows fallback when symlink creation is denied) cannot follow a link back into an ancestor and
+ * recurse forever — the old fallback re-walked the same symlink path and overflowed the stack.
  */
-function copyTree(from: string, to: string, skip: (resolved: string) => boolean): void {
-  const stats = fs.lstatSync(from);
+async function copyTree(
+  from: string,
+  to: string,
+  skip: (resolved: string) => boolean,
+  limit: <T>(fn: () => Promise<T>) => Promise<T>,
+  seen: Set<string>,
+): Promise<void> {
+  const stats = await fs.promises.lstat(from);
   if (stats.isDirectory()) {
-    fs.mkdirSync(to, { recursive: true });
-    for (const entry of fs.readdirSync(from, { withFileTypes: true })) {
-      const childFrom = path.join(from, entry.name);
-      const childTo = path.join(to, entry.name);
-      // Only the source side is tested: children of the destination are trivially "inside" it.
-      if (skip(path.resolve(childFrom))) continue;
-      copyTree(childFrom, childTo, skip);
+    let real: string;
+    try {
+      real = await fs.promises.realpath(from);
+    } catch {
+      real = path.resolve(from);
     }
+    if (seen.has(real)) return; // symlink cycle: never re-enter a directory already on this path
+    const nested = new Set(seen);
+    nested.add(real);
+    await fs.promises.mkdir(to, { recursive: true });
+    const entries = await fs.promises.readdir(from, { withFileTypes: true });
+    const results = await Promise.allSettled(
+      entries.map((entry) =>
+        limit(async () => {
+          const childFrom = path.join(from, entry.name);
+          const childTo = path.join(to, entry.name);
+          // Only the source side is tested: children of the destination are trivially "inside" it.
+          if (skip(path.resolve(childFrom))) return;
+          await copyTree(childFrom, childTo, skip, limit, nested);
+        }),
+      ),
+    );
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw failed.reason;
     return;
   }
   if (stats.isSymbolicLink()) {
-    const linkTarget = fs.readlinkSync(from);
+    const linkTarget = await fs.promises.readlink(from);
     try {
-      fs.symlinkSync(linkTarget, to);
+      await fs.promises.symlink(linkTarget, to);
+      return;
     } catch {
       // No symlink privilege (typical on Windows without developer mode): copy what it points at.
-      const resolved = fs.statSync(from);
-      if (resolved.isDirectory()) copyTree(from, to, skip);
-      else fs.copyFileSync(fs.realpathSync(from), to);
+      // Dereference to the real target and walk *that*, so the fallback cannot re-enter the same
+      // symlink path (which used to recurse until the stack overflowed).
+      const real = await fs.promises.realpath(from);
+      if (skip(path.resolve(real))) return;
+      const targetStats = await fs.promises.stat(real);
+      if (targetStats.isDirectory()) await copyTree(real, to, skip, limit, seen);
+      else await fs.promises.copyFile(real, to);
     }
     return;
   }
-  fs.copyFileSync(from, to);
+  await fs.promises.copyFile(from, to);
 }
 
-export function copyWorkspace(from: string, to: string, options: CopyWorkspaceOptions = {}): void {
-  fs.mkdirSync(path.dirname(to), { recursive: true });
-  fs.rmSync(to, { recursive: true, force: true });
+/**
+ * Copy a workspace asynchronously. The copy is bounded, so a big workspace no longer blocks the host
+ * event loop for the whole attempt-preparation window; `exclude` keeps dependencies/build artifacts
+ * out when the task names them.
+ */
+export async function copyWorkspace(from: string, to: string, options: CopyWorkspaceOptions = {}): Promise<void> {
   const source = path.resolve(from);
   const destination = path.resolve(to);
   const excluded = (options.exclude ?? [])
     .map((entry) => path.resolve(entry))
     .filter((entry) => !isInside(source, entry));
-  copyTree(from, to, (resolved) => {
-    if (isInside(resolved, destination)) return true;
-    return excluded.some((root) => isInside(resolved, root));
-  });
+  await fs.promises.rm(to, { recursive: true, force: true });
+  await fs.promises.mkdir(path.dirname(to), { recursive: true });
+  await copyTree(
+    from,
+    to,
+    (resolved) => {
+      if (isInside(resolved, destination)) return true;
+      return excluded.some((root) => isInside(resolved, root));
+    },
+    createLimiter(COPY_CONCURRENCY),
+    new Set(),
+  );
 }

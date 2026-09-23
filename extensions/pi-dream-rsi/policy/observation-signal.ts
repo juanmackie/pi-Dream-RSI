@@ -6,7 +6,8 @@
  * a repairable failure must not close a branch on its own (paper Appendix B).
  */
 
-import type { CellId, Observation } from "../engine/tree.ts";
+import type { CellId } from "./api.ts";
+import type { Observation } from "../engine/tree.ts";
 
 export type Prefix = Record<CellId, Observation>;
 

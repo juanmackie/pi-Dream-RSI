@@ -35,7 +35,7 @@ import {
   type DreamState,
   type RunningPhase,
 } from "./state.ts";
-import { ensureDreamIgnore, ensurePolicyRuntime } from "./engine/world.ts";
+import { ensureDreamIgnore, ensurePolicyRuntime, type PhaseOwner } from "./engine/world.ts";
 import {
   findCandidate,
   improvements,
@@ -73,7 +73,12 @@ const taskParams = {
     beta1: { type: "number", description: "Eq. 1 execution-cost coefficient (default 0.01)." },
     beta2: { type: "number", description: "Eq. 1 parallelism-bonus coefficient (default 0.01)." },
     agent_command: { type: "string", description: "Executable spawned for one attempt (default 'pi')." },
-    agent_args: { type: "array", items: { type: "string" }, description: "Arguments for the attempt agent; '{model}' is substituted." },
+    agent_args: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Arguments for the attempt agent; '{model}' is substituted. Defaults suppress inherited context (--no-context-files --no-prompt-templates); keep them unless attempts should read your repo's instructions.",
+    },
     model: { type: "string", description: "Model id passed to the attempt agent." },
     reset: { type: "boolean", description: "Also reset the seeded policy to the shipped default (does not delete history)." },
     measure_seed: {
@@ -84,6 +89,15 @@ const taskParams = {
       type: "boolean",
       description:
         "Re-run the scorer on the seed even though a reference measurement already exists (default false; a changed workspace or scorer re-measures automatically, and the old measurement is kept).",
+    },
+    copy_exclude: {
+      type: "array",
+      items: { type: "string" },
+      description: "Workspace-relative paths never copied into attempt workspaces (e.g. node_modules, dist).",
+    },
+    work_retention: {
+      type: "number",
+      description: "How many recent iteration workspaces to keep under .dream-rsi/work (default 20; older ones are pruned).",
     },
   },
   required: ["name", "workspace", "eval_program", "score_program"],
@@ -138,6 +152,46 @@ const applyParams = {
   },
   additionalProperties: false,
 };
+
+/** True when `candidate` is `parent` or lives inside it, using resolved (real) paths. */
+function isWithin(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve `relative` inside `root` and refuse any symlink/junction escape.
+ *
+ * A string-prefix check is not enough on Windows: a junction or symlink component can point outside
+ * either workspace while the textual path still looks contained. This walks each existing component,
+ * resolves its real path, and rejects the moment one leaves the root.
+ */
+export function resolveWithinRoot(root: string, relative: string): string | null {
+  let realRoot: string;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch {
+    return null;
+  }
+  const parts = relative.split(/[\\/]+/).filter((part) => part !== "" && part !== ".");
+  let current = realRoot;
+  for (let index = 0; index < parts.length; index += 1) {
+    const candidate = path.join(current, parts[index]);
+    if (!fs.existsSync(candidate)) {
+      current = path.join(current, ...parts.slice(index));
+      break;
+    }
+    let real: string;
+    try {
+      real = fs.realpathSync(candidate);
+    } catch {
+      return null;
+    }
+    if (!isWithin(realRoot, real)) return null;
+    current = real;
+  }
+  return isWithin(realRoot, current) ? current : null;
+}
 
 export default function dreamRsi(pi: ExtensionAPI): void {
   // The factory only registers things: no processes, sockets, watchers or timers start here, because
@@ -266,7 +320,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "dream_rsi_init keeps the recorded baseline only while the scoring configuration still matches it — a changed workspace, scorer or score direction re-measures automatically (the old measurement is kept, not deleted); pass remeasure_seed=true to measure unchanged code on demand.",
     ],
     parameters: taskParams,
-    async execute(_id, params, _signal, onUpdate, ctx) {
+    async execute(_id, params: any, _signal, onUpdate: any, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       fs.mkdirSync(root, { recursive: true });
       const existing = fs.existsSync(path.join(root, "task.json")) ? readTask(root) : null;
@@ -289,6 +343,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         ...(typeof params.higher_is_better === "boolean" ? { higher_is_better: params.higher_is_better } : {}),
         ...(typeof params.beta1 === "number" ? { beta1: params.beta1 } : {}),
         ...(typeof params.beta2 === "number" ? { beta2: params.beta2 } : {}),
+        ...(Array.isArray(params.copy_exclude) ? { copy_exclude: params.copy_exclude as string[] } : {}),
+        ...(typeof params.work_retention === "number" ? { work_retention: params.work_retention } : {}),
       };
       task.agent = {
         ...task.agent,
@@ -397,7 +453,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "After dream_rsi_live, run dream_rsi_dream to improve the exploration policy from the newly recorded world(s).",
     ],
     parameters: liveParams,
-    async execute(_id, params, _signal, onUpdate, ctx) {
+    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
       // Live cycles may overlap each other (parallel worlds), but never a dream phase: that one rewrites the
@@ -418,8 +474,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
         }
         // A run marked running while no phase owns it was interrupted; clear it so the next cycle restarts
-        // cleanly instead of the project looking permanently stuck. Sibling live calls keep their claims.
-        const recovered = recoverInterruptedRuns(root, claimedBy(state.running));
+        // cleanly instead of the project looking permanently stuck. A claim owned by another *live*
+        // session is left alone: recovery only reclaims confirmed-dead owners. Sibling live calls keep
+        // their claims.
+        const sessionId = ctx.sessionManager.getSessionId();
+        const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId });
         if (recovered.length > 0) {
           onUpdate?.({
             content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
@@ -446,8 +505,10 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           want > loops
             ? ` (asked for ${want} loop(s), running ${loops}: max_loops=${task.max_loops}${claimed > 0 ? ` with ${claimed} already in flight` : ""})`
             : "";
-        // Claim the numbers before planning: allocation must not interleave with another call's.
-        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1);
+        // Claim the numbers before planning: allocation must not interleave with another call's. The
+        // owner is recorded so another session cannot reclaim this claim while it is genuinely running.
+        const owner: PhaseOwner = { session_id: sessionId, pid: process.pid, claimed_at: new Date().toISOString() };
+        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1, owner);
         const iteration = iterations[0];
         mine = { label: loops === 1 ? `live cycle ${iteration}` : `live cycles ${iterations.join(", ")}`, iterations };
         state.running.push(mine);
@@ -486,6 +547,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
                 grid: { branch_count: grid.branch_count, refine_count: grid.refine_count },
                 baselineScore: baseline,
                 previousBestScore: previous,
+                signal,
+                owner,
                 log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
               });
               return { iteration: world, episode, error: episode.error };
@@ -501,7 +564,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const last = iterations[iterations.length - 1];
         const policyVersion = outcomes.find((o) => o.episode)?.episode?.manifest.policy_version ?? null;
         state.iteration = Math.max(state.iteration, last);
-        saveTaskEntry(pi, root, { task: task.name, policy: policyVersion, iteration: last, model: runTask.agent.model });
+        saveTaskEntry(pi, root, { task: task.name, policy: policyVersion ?? undefined, iteration: last, model: runTask.agent.model });
         const reports = outcomes.map((outcome) =>
           outcome.episode
             ? iterationReport(root, outcome.iteration, outcome.episode.manifest)
@@ -543,7 +606,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // Whatever is still marked running is this call's own failure; releasing it frees the number too.
         // Siblings keep theirs, so a finishing live call never kills a concurrent one.
         const others = state.running.filter((phase) => phase !== mine);
-        const leftover = recoverInterruptedRuns(root, claimedBy(others));
+        const leftover = recoverInterruptedRuns(root, claimedBy(others), { sessionId: ctx.sessionManager.getSessionId() });
         if (leftover.length > 0) {
           onUpdate?.({ content: [{ type: "text", text: `Marked unfinished cycle(s) failed: ${leftover.join(", ")}.` }] });
         }
@@ -568,7 +631,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "dream_rsi_dream recovers interrupted cycle claims first, then refuses only while a world is genuinely in flight or its manifest is unreadable — it replays every recorded world, so batch the live cycles you want replayed, then dream once.",
     ],
     parameters: dreamParams,
-    async execute(_id, params, _signal, onUpdate, ctx) {
+    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
       if (state.running.length > 0) {
@@ -587,7 +650,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       // replay fewer worlds than the report claims. A run left `running` on disk while no phase in this
       // session owns it was interrupted (crashed session, killed host) — recover it the same way
       // dream_rsi_live does, or one dead cycle blocks dreaming forever.
-      const recovered = recoverInterruptedRuns(root, claimedBy(state.running));
+      const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
       if (recovered.length > 0) {
         onUpdate?.({
           content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
@@ -628,6 +691,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           task: runTask,
           iteration,
           evaluateOnly: params.evaluate_only === true,
+          signal,
           log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
         });
         const pending = reportImprovements(ctx);
@@ -679,7 +743,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "Before calling dream_rsi_apply, show the user which file changes and by how much, and say that it is not committed.",
     ],
     parameters: applyParams,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       let task: TaskConfig;
       try {
@@ -715,10 +779,12 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           problems.push(`${relative}: paths must be relative and stay inside the workspace`);
           continue;
         }
-        const from = path.join(candidateRoot, relative);
-        const to = path.join(seedRoot, relative);
-        if (!from.startsWith(candidateRoot + path.sep) || !to.startsWith(seedRoot + path.sep)) {
-          problems.push(`${relative}: escapes the workspace`);
+        // Resolve real ancestry on both sides: a symlink or Windows junction component can point
+        // outside either workspace while the textual path still looks contained.
+        const from = resolveWithinRoot(candidateRoot, relative);
+        const to = resolveWithinRoot(seedRoot, relative);
+        if (!from || !to) {
+          problems.push(`${relative}: escapes the workspace (symlink/junction)`);
           continue;
         }
         if (!fs.existsSync(from)) {
@@ -745,7 +811,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
                   `${report.seed ? ` vs your code's ${report.seed.raw_score ?? report.seed.score}` : ""}.`,
                 listing,
                 `Review it with: diff -u \"${files[0]?.to}\" \"${files[0]?.from}\"`,
-                `To apply it, call dream_rsi_apply again with confirm: true${typeof params.cell === "string" ? ` and cell: \"${params.cell}\"` : ""}.`,
+                `To apply it, call dream_rsi_apply again with confirm: true, iteration: ${wanted.iteration}${typeof params.cell === "string" ? `, cell: \"${params.cell}\"` : ""}.`,
               ].join("\n"),
             },
           ],
@@ -768,7 +834,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         paths: files.map((file) => file.relative),
         target: path.relative(projectDir(ctx), seedRoot) || seedRoot,
       });
-      setStatus(ctx, improvements(root, task, projectDir(ctx)));
+      setStatus(ctx, suggestionFor(ctx));
       return {
         content: [
           {
@@ -796,7 +862,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "Use dream_rsi_status before deciding the next cycle: it shows the live trend (best score per iteration) and the beta sweep that the cross-cycle beta rule reads.",
     ],
     parameters: statusParams,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
       if (!fs.existsSync(path.join(root, "task.json"))) {
@@ -1121,7 +1187,7 @@ function renderCommandHelp(root: string, configured: boolean): string {
   ].join("\n");
 }
 
-function parseGrid(value: string, fallback: { branch_count: number; refine_count: number }): { branch_count: number; refine_count: number; reason: string } {
+function parseGrid(value: string, fallback: { branch_count: number; refine_count: number; reason: string }): { branch_count: number; refine_count: number; reason: string } {
   const match = /^(\d+)\s*[x×]\s*(\d+)$/.exec(value.trim());
   if (!match) return { ...fallback, reason: `${fallback.reason} (grid argument "${value}" not understood; expected e.g. 4x6)` };
   return {

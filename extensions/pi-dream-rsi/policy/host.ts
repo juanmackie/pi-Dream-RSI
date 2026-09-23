@@ -119,7 +119,7 @@ export class PolicyHost implements QuestionView {
   }
 
   meta(cell_id: CellId): CellMeta {
-    if (cell_id === ROOT_ID) return { branch: -1, attempt: -1, parent_id: null, seq: 0, tags: ["root"] };
+    if (cell_id === ROOT_ID) return { cell_id: ROOT_ID, branch: -1, attempt: -1, parent_id: null, seq: 0, tags: ["root"] };
     const node = this.observedTree.get(cell_id);
     if (!node) throw new Error(`illegal cell id: ${cell_id}`);
     return { ...node.meta, tags: [...node.meta.tags] };

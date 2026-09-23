@@ -19,6 +19,9 @@ import type { Budget, CellId, EpisodeResult, GridPlan, GridPlanningContext, Poli
 
 const WORKER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "worker", "policy-worker.ts");
 
+/** Per-process runtime-materialization cache, keyed by project + extension dir. */
+const workerEntryCache = new Map<string, string | null>();
+
 const DEFAULT_TIMEOUT_MS = 120_000;
 
 /** Modules a prefix-only policy has no business importing. */
@@ -63,6 +66,8 @@ export interface PolicyRunOptions {
   verifyDeterminism?: boolean;
   timeoutMs?: number;
   workerPath?: string;
+  /** Cancellation: aborts the policy run and terminates its worker. */
+  signal?: AbortSignal;
 }
 
 export interface PolicyRunResult {
@@ -83,6 +88,18 @@ export interface PolicyRunResult {
   durationMs?: number;
 }
 
+/** Module specifiers referenced by a policy source: static imports/exports, side-effect, and dynamic. */
+function moduleSpecifiers(source: string): string[] {
+  const out = new Set<string>();
+  const add = (spec: string | undefined): void => {
+    if (spec) out.add(spec);
+  };
+  for (const match of source.matchAll(/\bimport\s+(?:[^"'()]*?\sfrom\s*)?["']([^"']+)["']/g)) add(match[1]);
+  for (const match of source.matchAll(/\bexport\s+(?:\*|\{[^}]*\})\s*from\s*["']([^"']+)["']/g)) add(match[1]);
+  for (const match of source.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) add(match[1]);
+  return [...out];
+}
+
 /** Guardrail scan over policy source. Returns human-readable violations. */
 export function scanPolicySource(rawSource: string): string[] {
   // Comments are stripped first: a docstring saying "never touches node:fs" is not a violation.
@@ -91,18 +108,51 @@ export function scanPolicySource(rawSource: string): string[] {
   for (const needle of FORBIDDEN) {
     if (source.includes(needle)) violations.push(`policy references "${needle}" (prefix-only policies must be pure)`);
   }
-  if (/^\s*import\s+.*\bfrom\s+["'](?!\.)/m.test(source)) {
-    violations.push("policy imports a bare module specifier; only relative imports are allowed");
+  // Every specifier form is checked, not just `import ... from`: `export ... from "fs"` and
+  // `import("fs")` reached the filesystem before this.
+  for (const specifier of moduleSpecifiers(source)) {
+    if (!specifier.startsWith(".")) {
+      violations.push(`policy imports a bare module specifier "${specifier}"; only relative imports are allowed`);
+    }
   }
   return violations;
 }
 
+/**
+ * Scan the policy and the relative modules it imports, transitively.
+ *
+ * The worker thread is the isolation boundary, but a policy that imports a local helper which imports
+ * `node:fs` would otherwise pass a single-file scan. Missing relative modules are skipped: a type-only
+ * import of an engine file resolves to nothing in the project and cannot run anyway.
+ */
 export function readPolicyViolations(policyPath: string): string[] {
-  try {
-    return scanPolicySource(fs.readFileSync(policyPath, "utf8"));
-  } catch (error) {
-    return [`cannot read policy file ${policyPath}: ${error instanceof Error ? error.message : String(error)}`];
-  }
+  const violations: string[] = [];
+  const visited = new Set<string>();
+  const walk = (file: string, origin: string | null, depth: number): void => {
+    if (depth > 16) return;
+    const resolved = path.resolve(file);
+    if (visited.has(resolved)) return;
+    visited.add(resolved);
+    let source: string;
+    try {
+      source = fs.readFileSync(resolved, "utf8");
+    } catch (error) {
+      if (origin === null) {
+        violations.push(`cannot read policy file ${resolved}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    for (const violation of scanPolicySource(source)) {
+      violations.push(origin === null ? violation : `${path.basename(resolved)}: ${violation}`);
+    }
+    for (const specifier of moduleSpecifiers(source)) {
+      if (!specifier.startsWith(".")) continue;
+      const next = path.resolve(path.dirname(resolved), specifier);
+      if (fs.existsSync(next)) walk(next, resolved, depth + 1);
+    }
+  };
+  walk(policyPath, null, 0);
+  return violations;
 }
 
 /**
@@ -117,7 +167,12 @@ function workerEntryFor(policyPath: string, override?: string): string {
   try {
     const dreamRoot = path.dirname(path.dirname(path.resolve(policyPath)));
     const extensionDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+    // Materialize once per process per project: repeated replay runs used to rewrite the whole runtime
+    // tree on every worker spawn (pure overhead, and a write race between concurrent workers).
+    const key = `${dreamRoot}::${extensionDir}`;
+    if (workerEntryCache.has(key)) return workerEntryCache.get(key) ?? WORKER_PATH;
     const mirrored = ensureWorkerRuntime(dreamRoot, extensionDir);
+    workerEntryCache.set(key, mirrored);
     if (mirrored) return mirrored;
   } catch {
     // fall through to the package copy
@@ -171,8 +226,10 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let removeAbort: (() => void) | undefined;
   const cleanup = (): void => {
     if (timer) clearTimeout(timer);
+    removeAbort?.();
     void worker.terminate();
   };
 
@@ -185,9 +242,16 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
       resolve({ ...value, durationMs: Date.now() - started });
     };
 
+    // Cancellation terminates the worker and stops any probe already in flight from being awaited
+    // forever: the caller's claims are released only after this resolves.
+    const onAbort = (): void => finish({ ok: false, timedOut: false, error: "policy run aborted" });
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    removeAbort = () => options.signal?.removeEventListener("abort", onAbort);
+
     timer = setTimeout(() => {
       finish({ ok: false, timedOut: true, error: `policy exceeded ${timeoutMs}ms and was terminated` });
     }, timeoutMs);
+    if (options.signal?.aborted) onAbort();
 
     worker.on("message", async (message: Record<string, unknown>) => {
       const type = String(message.type ?? "");

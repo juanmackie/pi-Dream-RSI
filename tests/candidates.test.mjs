@@ -182,6 +182,22 @@ test("preferences: fastest keeps the leader, safest buys less risk inside the wi
   }
 });
 
+test("a candidate that deletes a seed file reports the deletion, not a simpler change", () => {
+  const project = makeRankedProject();
+  try {
+    fs.rmSync(path.join(project.dreamRoot, "work", "r0001", "b0a0", "prog.py"));
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    const best = ranking.candidates.find((candidate) => candidate.cell === "b0a0");
+    assert.ok(best);
+    const deleted = best.changed_files.find((file) => file.relative === "prog.py");
+    assert.ok(deleted, "the deleted file is reported as a change");
+    assert.equal(deleted.after, 0, "the file is gone from the candidate");
+    assert.ok(deleted.before > 0, "its seed line count is preserved");
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
+
 test("an applied candidate stops being pending, and the renderer never invites an inferior pick", () => {
   const project = makeRankedProject();
   try {
@@ -216,7 +232,7 @@ test("rendering a pending pick carries the numbers, the caveats and the apply ca
     assert.match(text, /score 200  vs your code 100/);
     assert.match(text, /prog\.py \(2 → 2 lines\)/, "line counts come from the workspace files");
     assert.match(text, /mentions: cache, stale, window/);
-    assert.match(text, /dream_rsi_apply cell=b0a0 confirm=true/);
+    assert.match(text, /dream_rsi_apply cell=b0a0 iteration=1 confirm=true/);
     assert.match(text, /runner-ups:/);
     assert.match(text, /preference: fastest/);
     assert.match(text, /data file the scorer rewrites \(corpus\.db\)/);

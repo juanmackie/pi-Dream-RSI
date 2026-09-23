@@ -43,8 +43,6 @@ export interface WorkerData {
   refineCount?: number;
   budget?: Budget | null;
   world?: TreeJSON | null;
-  /** K1 (live) or K2 (replay) decision-round limit enforced by the host. */
-  maxRounds?: number;
   gridPlanContext?: GridPlanningContext | null;
 }
 

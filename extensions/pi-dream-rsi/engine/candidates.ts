@@ -187,23 +187,32 @@ function dataReason(file: string, size: number): string | null {
 }
 
 /** Files that differ from the seed workspace — the honest measure of what taking the candidate means. */
-function changedFilesAgainst(candidate: string, seed: string, task: TaskConfig): ChangedFile[] {
-  const candidateFiles = filesUnder(candidate);
-  const seedFiles = filesUnder(seed);
+function changedFilesAgainst(
+  candidate: string,
+  seed: string,
+  inventories: { seed: Map<string, { size: number; hash: string }>; candidate: Map<string, { size: number; hash: string }> },
+): ChangedFile[] {
+  const seedInventory = inventories.seed;
+  const candidateInventory = inventories.candidate;
   const changed: ChangedFile[] = [];
-  for (const [relative, info] of candidateFiles) {
-    const before = seedFiles.get(relative);
-    if (before && before.hash === info.hash) continue;
-    const absolute = path.join(candidate, relative);
+  // Compare the union of both sides: a file the candidate *deleted* is a change too. Walking only the
+  // candidate hid deletions, so a destructive candidate could look simpler (and safer) than it is.
+  const relatives = new Set<string>([...candidateInventory.keys(), ...seedInventory.keys()]);
+  for (const relative of relatives) {
+    const before = seedInventory.get(relative);
+    const after = candidateInventory.get(relative);
+    if (before && after && before.hash === after.hash) continue;
+    const info = after ?? before;
+    if (!info) continue;
+    const absolute = after ? path.join(candidate, relative) : path.join(seed, relative);
     changed.push({
       relative,
       before: before ? lineCount(path.join(seed, relative)) : 0,
-      after: lineCount(absolute),
+      after: after ? lineCount(path.join(candidate, relative)) : 0,
       data_reason: dataReason(absolute, info.size),
     });
   }
   changed.sort((a, b) => a.relative.localeCompare(b.relative));
-  void task;
   return changed;
 }
 
@@ -354,6 +363,10 @@ export function rankCandidates(options: {
       ? Math.max(...(appliedRecords.map((record) => record.score).filter((score): score is number => typeof score === "number") as number[]))
       : null;
   const seedWorkspace = path.resolve(projectDir, task.workspace);
+  // Read the seed inventory once for the whole ranking: every candidate compares against the same seed,
+  // and re-walking (and re-hashing) a large seed workspace per candidate was the ranking bottleneck.
+  const seedFiles = fs.existsSync(seedWorkspace) ? filesUnder(seedWorkspace) : new Map<string, { size: number; hash: string }>();
+  const candidateInventories = new Map<string, Map<string, { size: number; hash: string }>>();
 
   const dir = path.join(options.dreamRoot, "trace_pool");
   const iterations = fs.existsSync(dir)
@@ -385,7 +398,10 @@ export function rankCandidates(options: {
       const record = fs.existsSync(attemptDir(options.dreamRoot, iteration, node.meta.cell_id))
         ? attemptDir(options.dreamRoot, iteration, node.meta.cell_id)
         : null;
-      const changed = workspace && fs.existsSync(workspace) ? changedFilesAgainst(workspace, seedWorkspace, task) : [];
+      const candidateInventory = workspace ? candidateInventories.get(workspace) ?? filesUnder(workspace) : null;
+      if (workspace && candidateInventory) candidateInventories.set(workspace, candidateInventory);
+      const changed =
+        workspace && candidateInventory ? changedFilesAgainst(workspace, seedWorkspace, { seed: seedFiles, candidate: candidateInventory }) : [];
       const programRelative = task.eval_program.replaceAll("\\", "/");
       const { summary, mentions } = readProposal(record);
       const reference = appliedBest !== null && seed?.score !== null && seed?.score !== undefined && appliedBest > seed.score ? appliedBest : (seed?.score ?? null);
@@ -503,7 +519,7 @@ export function renderSuggestion(ranking: Ranking, options: { compact?: boolean 
       : `plus ${pick.data_changed_files.length} data file${pick.data_changed_files.length === 1 ? "" : "s"} the scorer rewrites (${pick.data_changed_files
           .map((file) => file.relative)
           .join(", ")})`;
-  const apply = `dream_rsi_apply cell=${pick.cell} confirm=true`;
+  const apply = `dream_rsi_apply cell=${pick.cell} iteration=${pick.iteration} confirm=true`;
 
   if (options.compact) {
     const pickLine =

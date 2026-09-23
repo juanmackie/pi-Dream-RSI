@@ -42,7 +42,7 @@ async function liveCycle(project, iteration, extra = {}) {
   });
 }
 
-test("a workspace that contains the Dream-RSI root still copies, minus the tool's own state", () => {
+test("a workspace that contains the Dream-RSI root still copies, minus the tool's own state", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-copy-"));
   // `workspace: "."`: the seed workspace *is* the project root, so the Dream-RSI root sits inside it.
   const dreamRoot = path.join(dir, ".dream-rsi");
@@ -54,14 +54,13 @@ test("a workspace that contains the Dream-RSI root still copies, minus the tool'
 
     // The destination is a subdirectory of the source; this used to throw ERR_FS_CP_EINVAL.
     const target = path.join(dreamRoot, "work", "b0a0");
-    copyWorkspace(dir, target, { exclude: [dreamRoot] });
-    assert.ok(exists(path.join(target, "app.py")), "the real workspace content is copied");
-    assert.equal(exists(path.join(target, ".dream-rsi")), false, "the tool's state dir is never copied");
+    await copyWorkspace(dir, target, { exclude: [dreamRoot] });
+    assert.ok(exists(path.join(target, "app.py")), "the real workspace content is copied");    assert.equal(exists(path.join(target, ".dream-rsi")), false, "the tool's state dir is never copied");
 
     // A refinement copies a workspace that already lives *inside* the excluded root: the exclusion
     // must not swallow the copy.
     const child = path.join(dreamRoot, "work", "b0a1");
-    copyWorkspace(target, child, { exclude: [dreamRoot] });
+    await copyWorkspace(target, child, { exclude: [dreamRoot] });
     assert.ok(exists(path.join(child, "app.py")), "refinement copies still work");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
@@ -141,6 +140,9 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
     assert.equal(dream.evaluations.length, project.task.revisions);
     assert.equal(dream.improved, true, "the policy-development agent changed the policy");
     assert.ok(dream.deployed_beta >= 0 && dream.deployed_beta <= 1);
+    // The reported beta is what the next episode actually runs at, not an unapplied adjustment.
+    const betaSidecar = readJson(path.join(project.dreamRoot, "policy", "deployed_beta.json"));
+    assert.equal(betaSidecar.beta, dream.deployed_beta, "the deployed beta is recorded for the next episode");
 
     // Both prompts were routed to the agent: discovery attempts, then policy revisions.
     const prompts = fs.readFileSync(path.join(project.dreamRoot, "agent-prompts.log"), "utf8").trim().split("\n");
@@ -153,7 +155,10 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
 
     // Every evaluated version is archived and the winner is deployed.
     for (let revision = 0; revision < dream.revisions; revision += 1) {
-      assert.ok(exists(path.join(project.dreamRoot, "policy", `v${String(revision).padStart(4, "0")}.ts`)), `v${revision} archived`);
+      assert.ok(
+        exists(path.join(project.dreamRoot, "policy", `r0001_v${String(revision).padStart(4, "0")}.ts`)),
+        `v${revision} archived`,
+      );
     }
     const deployed = fs.readFileSync(liveMethodPath(project.dreamRoot), "utf8");
     assert.equal(deployed, fs.readFileSync(dream.selected_policy, "utf8"), "the selected version is what runs next");
@@ -181,6 +186,7 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
     // Iteration 2 replays against two worlds and records the previous live best for the beta rule.
     const second = await liveCycle(project, 2, { previousBestScore: first.manifest.best_score });
     assert.equal(second.ok, true, second.error ?? "");
+    assert.equal(second.manifest.baked_beta, dream.deployed_beta, "iteration 2 runs at the deployed beta");
     assert.equal(second.manifest.previous_best_score, first.manifest.best_score);
     const dream2 = await runDreamPhase({ dreamRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task, iteration: 2 });
     assert.equal(dream2.worlds, 2, "the history grows: replay evaluates every recorded world");

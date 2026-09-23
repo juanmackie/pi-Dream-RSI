@@ -30,6 +30,7 @@ import {
   historyDir,
   liveMethodPath,
   nodeWorkspace,
+  pruneWorkspaces,
   roundDir,
   seedBaseline,
   tracePoolDir,
@@ -39,6 +40,7 @@ import {
   writeTree,
   workRoot,
   type LiveCycleManifest,
+  type PhaseOwner,
 } from "./world.ts";
 
 export interface LiveEpisodeOptions {
@@ -56,6 +58,8 @@ export interface LiveEpisodeOptions {
   policyTimeoutMs?: number;
   log?: (message: string) => void;
   signal?: AbortSignal;
+  /** Project-level claim owner, so another session cannot reclaim this in-flight cycle. */
+  owner?: PhaseOwner;
 }
 
 export interface LiveEpisodeResult {
@@ -90,8 +94,23 @@ export function interpretEvaluation(
   if (command.timedOut) {
     return { score: null, raw_score: null, valid: false, fail_class: "timeout", error: "evaluator timed out" };
   }
+  if (command.aborted) {
+    return { score: null, raw_score: null, valid: false, fail_class: "cancelled", error: "evaluator cancelled" };
+  }
   if (command.spawnError) {
     return { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: command.spawnError };
+  }
+  if (!command.ok) {
+    // An unsuccessful execution is not a verdict. A score file that happens to be present is not this
+    // run's output (the attempt workspace inherits its parent's), so it must never validate the attempt.
+    const tail = command.stderrTail.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+    return {
+      score: null,
+      raw_score: null,
+      valid: false,
+      fail_class: "eval_error",
+      error: `evaluator exited with code ${command.code}${tail ? `: ${tail}` : ""}`,
+    };
   }
   if (!scoreJson) {
     return {
@@ -99,9 +118,7 @@ export function interpretEvaluation(
       raw_score: null,
       valid: false,
       fail_class: "eval_error",
-      error: command.ok
-        ? `evaluator wrote no ${task.score_path}`
-        : `evaluator exited with code ${command.code}: ${command.stderrTail.trim().split("\n").slice(-3).join(" | ")}`,
+      error: `evaluator wrote no ${task.score_path}`,
     };
   }
   const reportedClass = scoreJson[task.fail_class_field];
@@ -180,6 +197,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     status: "running",
     created_at: createdAt,
     completed_at: null,
+    owner: options.owner,
     baked_beta: options.bakedBeta,
     policy_version: policyPath,
     policy_name: options.policyName ?? null,
@@ -198,6 +216,11 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
 
   // First cycle in a project: make sure the bulky half of the state dir cannot be committed by accident.
   ensureDreamIgnore(dreamRoot);
+
+  // Bounded retention: attempt workspaces are the bulky half of the state dir. Recorded trees and
+  // attempt records are untouched, so candidates stay auditable; only the copied workspaces age out.
+  const pruned = pruneWorkspaces(dreamRoot, task.work_retention, iteration);
+  if (pruned.length > 0) log(`[live ${iteration}] pruned old workspaces: ${pruned.join(", ")}`);
 
   const promptTemplate = loadPrompt("discovery-agent.md");
   // The discovery prompt tells every attempt to read `$baseline_dir`. On the first cycle there is no
@@ -227,7 +250,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
     if (!parent) throw new Error(`policy selected an unknown cell: ${cell}`);
     if (!isOpened(parent)) {
       // Unopened root slot: the attempt *is* this cell, starting from the initial workspace state.
-      parent.tags = ["branch-root"];
+      parent.meta.tags = ["branch-root"];
       return { cell, parentCell: "root", parentWorkspace: seedWorkspace };
     }
     const attempt = parent.meta.attempt + 1;
@@ -236,9 +259,11 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
   };
 
   /** Prepare the workspace and prompt for one attempt (I/O). */
-  const materialize = (target: { cell: string; parentCell: string; parentWorkspace: string }, round: number): PreparedAttempt => {
+  const materialize = async (target: { cell: string; parentCell: string; parentWorkspace: string }, round: number): Promise<PreparedAttempt> => {
+    const prepareStarted = Date.now();
     const workspace = nodeWorkspace(dreamRoot, iteration, target.cell);
-    copyWorkspace(target.parentWorkspace, workspace, { exclude: [dreamRoot] });
+    const copyExclude = [dreamRoot, ...(task.copy_exclude ?? []).map((entry) => path.resolve(projectDir, entry))];
+    await copyWorkspace(target.parentWorkspace, workspace, { exclude: copyExclude });
     const parentProposal = target.parentCell === "root" ? null : tree.get(target.parentCell)?.proposal ?? null;
     if (parentProposal) {
       const from = path.join(projectDir, parentProposal);
@@ -255,6 +280,16 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
       node.workspace = workspaceRel;
       node.proposal = path.join(workspaceRel, "proposal.md");
     }
+    // Preparation-time metric: how long the copy+prompt step took, so a slow copy is visible without
+    // guessing from the total attempt duration.
+    const prepareMs = Date.now() - prepareStarted;
+    writeJson(path.join(record, "prepare.json"), {
+      cell: target.cell,
+      parent_cell: target.parentCell,
+      prepare_ms: prepareMs,
+      copied_from: path.relative(projectDir, target.parentWorkspace) || target.parentWorkspace,
+    });
+    log(`[live ${iteration}] prepared ${target.cell} in ${prepareMs}ms`);
     return {
       cell: target.cell,
       parentCell: target.parentCell,
@@ -296,11 +331,14 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
       prompt: prepared.prompt,
       timeoutMs: task.agent_timeout_ms,
       logPath: prepared.logPath,
+      signal: options.signal,
     });
     const proposalPath = path.join(prepared.workspace, "proposal.md");
     let outcome: ScoreOutcome;
     let evalRun: CommandResult | null = null;
-    if (agentRun.timedOut) {
+    if (agentRun.aborted || options.signal?.aborted) {
+      outcome = { score: null, raw_score: null, valid: false, fail_class: "cancelled", error: "attempt cancelled" };
+    } else if (agentRun.timedOut) {
       // Say how long it ran and whether it ever printed: a silent timeout with an empty agent.log is a
       // different diagnosis (blocked before startup: session/daemon, provider queue) from a slow one.
       const seconds = Math.round(agentRun.durationMs / 100) / 10;
@@ -332,11 +370,18 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
         fail_class: "no_proposal",
         error: "agent produced no proposal.md",
       };
+    } else if (options.signal?.aborted) {
+      outcome = { score: null, raw_score: null, valid: false, fail_class: "cancelled", error: "attempt cancelled before evaluation" };
     } else {
+      // The workspace was copied from the parent and carries its files, including the parent's score
+      // file. Remove it before scoring: a scorer that fails without writing its own verdict must not
+      // have the parent's success read back as this attempt's result.
+      fs.rmSync(path.join(prepared.workspace, task.score_path), { force: true });
       evalRun = await runShellCommand(task.score_program, {
         cwd: prepared.workspace,
         timeoutMs: task.evaluator_timeout_ms,
         logPath: path.join(recordDir, "eval.log"),
+        signal: options.signal,
       });
       outcome = interpretEvaluation(task, evalRun, readScoreFile(prepared.workspace, task));
     }
@@ -378,7 +423,7 @@ export async function runLiveEpisode(rawOptions: LiveEpisodeOptions): Promise<Li
           throw error;
         }
         try {
-          return await execute(materialize(target, round));
+          return await execute(await materialize(target, round));
         } catch (error) {
           log(`[live ${iteration}] attempt ${target.cell} failed before the agent ran: ${String(error)}`);
           return recordPrepareFailure(target.cell, error);

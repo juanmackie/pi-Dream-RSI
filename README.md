@@ -232,7 +232,7 @@ K1=6, K2=8, M=3`):
 dream_rsi_init   name="lasso-path" workspace="task/seed" eval_program="solution.cpp" \
                  score_program="node /abs/task/score.mjs" problem_file="task/PROBLEM.md" \
                  workers=10 k1=11 k2=8 revisions=4 \
-                 agent_command="pi" agent_args=["-p","--no-session","-na","--no-extensions","--no-skills"]
+                 agent_command="pi" agent_args=["-p","--no-session","-na","--no-extensions","--no-skills","--no-prompt-templates","--no-context-files"]
                  # model="<provider/model>"   (optional fallback; attempts use the active session model)
 dream_rsi_live     # cycle 1 — also drops its best attempt in history/baseline as the floor to beat
 dream_rsi_dream    # replay it, rewrite the policy, deploy the winner
@@ -297,6 +297,8 @@ Your scorer writes this:
 A non-`ok` fail class, or a score that isn't a finite number, makes the attempt a **repairable failure** with an
 `error.txt` — it doesn't score, and it doesn't close the direction. `fail_class == "ok"` with `error === null`
 counts as a successful evaluation even when `valid` is false: the measured number beats any claim about it.
+The scorer must exit `0` and write a fresh `score_path`: a non-zero exit is an `eval_error` even when an earlier
+score file is still present, because an attempt workspace inherits its parent's files.
 Crashes, missing files, and timeouts get classified for you (`eval_error`, `timeout`, `no_proposal`,
 `agent_error`, `invalid_score`).
 
@@ -403,8 +405,10 @@ export class OptimalPolicy extends LLMDesignedMethod {
 Three contracts the runtime actually enforces:
 
 - **Prefix-only.** `question.observed()` shows revealed cells and nothing else. A policy that imports `node:fs`,
-  `node:child_process`, `process.exit`, `getBuiltinModule`, or any bare module specifier is refused before it
-  runs. The trace files are between-round feedback; reading them inside `solve()` is cheating, not cleverness.
+  `node:child_process`, `process.exit`, `getBuiltinModule`, or any bare module specifier — static `import`,
+  `import()`, or `export … from` — is refused before it runs, and the scan follows the policy's relative imports
+  so a local helper cannot smuggle one in. The trace files are between-round feedback; reading them inside
+  `solve()` is cheating, not cleverness.
 - **Bounded.** Batches must be legal, duplicate-free, at most `max_parallelism`, and never a parent plus its
   child. The environment owns the round limit: after `K1` (live) or `K2` (replay) rounds, `legal_actions()` is
   empty and further probes are rejected. A policy that hangs gets killed on the worker deadline.
@@ -432,7 +436,8 @@ Read this before trusting a number.
 ## Tests
 
 ```bash
-npm test    # 56 tests, no LLM, ~20s
+npm test          # 97 tests, no LLM, ~25s
+npm run typecheck # tsc --noEmit (CI runs both on Windows and Linux)
 ```
 
 It covers `A(T)` and frontier rules, batch legality, replay transitions (root rule, unique recorded child, grid

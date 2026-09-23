@@ -10,7 +10,7 @@
  * The world is the frozen discovery tree; the observed tree grows inside `PolicyHost`.
  */
 
-import { ROOT_ID, type DiscoveryTree } from "./tree.ts";
+import { ROOT_ID, isOpened, type DiscoveryTree } from "./tree.ts";
 import type { ProbeFn, RevealedNode, Decision } from "../policy/host.ts";
 import type { CellId } from "../policy/api.ts";
 import { runPolicyChecked } from "../policy/runner.ts";
@@ -26,12 +26,14 @@ export function makeReplayProbe(world: DiscoveryTree, isRevealed: (cell: CellId)
       const node = world.get(cell);
       return node?.meta.parent_id === ROOT_ID && node.meta.attempt === 0 && !isRevealed(cell);
     };
-    // Root rule: earliest-created recorded branch outside the observed tree.
+    // Root rule: earliest-created recorded branch outside the observed tree. Only *executed* branch
+    // roots are eligible: a live episode may have opened fewer branches than the grid planned, and
+    // revealing an unused slot would charge a probe and leave it selectable, distorting the sweep.
     const slots = cells.filter(isSlotProbe);
     if (slots.length > 0) {
       const pending = world
         .list()
-        .filter((n) => n.meta.parent_id === ROOT_ID && !isRevealed(n.meta.cell_id))
+        .filter((n) => n.meta.parent_id === ROOT_ID && !isRevealed(n.meta.cell_id) && isOpened(n))
         .sort((a, b) => a.meta.seq - b.meta.seq);
       for (let i = 0; i < slots.length && i < pending.length; i += 1) {
         out.push({ cell: pending[i].meta.cell_id, node: pending[i] });
@@ -53,7 +55,7 @@ export interface ReplayEpisodeOptions {
   policyPath: string;
   world: DiscoveryTree;
   /** The one scalar baked into the policy config for this evaluation. */
-  beta: number;
+  beta: number | null;
   maxParallelism: number;
   /** K2 — maximum decision rounds replay allows. */
   k2: number;
@@ -63,6 +65,8 @@ export interface ReplayEpisodeOptions {
   timeoutMs?: number;
   /** Run the episode twice from independent module instances and compare decision traces. */
   verifyDeterminism?: boolean;
+  /** Cancellation: stops the policy worker. */
+  signal?: AbortSignal;
 }
 
 export interface ReplayEpisodeResult {
@@ -72,6 +76,8 @@ export interface ReplayEpisodeResult {
   metrics: TraceMetrics;
   trace: Decision[];
   deterministic: boolean | null;
+  /** The beta the policy actually ran at (its baked-in default when the runtime forced none). */
+  beta: number | null;
   durationMs: number;
 }
 

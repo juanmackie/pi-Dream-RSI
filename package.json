@@ -1,6 +1,6 @@
 {
   "name": "pi-dream-rsi",
-  "version": "0.5.2",
+  "version": "0.6.0",
   "type": "module",
   "description": "Dream-RSI for pi — recursive self-improvement of executable exploration policies over discovery trees (arXiv 2609.14858)",
   "keywords": [
@@ -51,6 +51,12 @@
   ],
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "prepublishOnly": "npm test"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.87.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.9.0"
   }
 }
