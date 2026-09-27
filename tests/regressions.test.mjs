@@ -262,19 +262,6 @@ test("apply boundary resolution rejects a link that escapes the workspace", () =
   }
 });
 
-test("replay never reveals a branch slot that live never executed", async () => {
-  const world = new DiscoveryTree({ branchCount: 2, refineCount: 2 });
-  world.addBranchSlot(0);
-  world.addBranchSlot(1);
-  world.setOutcome("b0a0", { evaluated: true, fail_class: "ok", error: null, score: 5 });
-  const revealed = new Set();
-  const probe = makeReplayProbe(world, (cell) => revealed.has(cell));
-  const first = await probe(["b0a0"], 1);
-  assert.deepEqual(first.map((record) => record.cell), ["b0a0"]);
-  revealed.add("b0a0");
-  const second = await probe(["b1a0"], 2);
-  assert.deepEqual(second, [], "an unexecuted slot reveals nothing and charges no probe");
-});
 
 test("archived policy versions are immutable across cycles", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-versions-"));

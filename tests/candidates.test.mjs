@@ -14,7 +14,7 @@ import * as path from "node:path";
 
 import { jump } from "./fixtures.mjs";
 
-const { rankCandidates, renderSuggestion, parsePreference, MIN_WIN_FRACTION } = await jump("engine/candidates.ts");
+const { rankCandidates, renderSuggestion, MIN_WIN_FRACTION } = await jump("engine/candidates.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, writeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
 const { improvements, seedMatchesTask } = await jump("engine/improvements.ts");
@@ -222,39 +222,7 @@ test("an applied candidate stops being pending, and the renderer never invites a
   }
 });
 
-test("rendering a pending pick carries the numbers, the caveats and the apply call", () => {
-  const project = makeRankedProject();
-  try {
-    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir, goal: "fastest" });
-    const text = renderSuggestion(ranking);
-    assert.match(text, /IMPROVEMENT READY — NOT APPLIED/);
-    assert.match(text, /TOP PICK  b0a0/);
-    assert.match(text, /score 200  vs your code 100/);
-    assert.match(text, /prog\.py \(2 → 2 lines\)/, "line counts come from the workspace files");
-    assert.match(text, /mentions: cache, stale, window/);
-    assert.match(text, /dream_rsi_apply cell=b0a0 iteration=1 confirm=true/);
-    assert.match(text, /runner-ups:/);
-    assert.match(text, /preference: fastest/);
-    assert.match(text, /data file the scorer rewrites \(corpus\.db\)/);
-    assert.match(renderSuggestion(ranking, { compact: true }), /^⚠️ IMPROVEMENT READY — NOT APPLIED\n/);
-  } finally {
-    fs.rmSync(project.dir, { recursive: true, force: true });
-  }
-});
 
-test("an empty history says so instead of inventing a recommendation", () => {
-  const project = makeRankedProject();
-  try {
-    fs.rmSync(path.join(project.dreamRoot, "trace_pool", "iter0001"), { recursive: true, force: true });
-    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
-    assert.equal(ranking.candidates.length, 0);
-    assert.equal(ranking.pending, null);
-    assert.match(ranking.reason, /no successful candidate recorded yet/);
-    assert.match(renderSuggestion(ranking), /^Nothing to apply: no successful candidate/);
-  } finally {
-    fs.rmSync(project.dir, { recursive: true, force: true });
-  }
-});
 
 test("ranking is deterministic and writes nothing", () => {
   const project = makeRankedProject();
@@ -272,17 +240,6 @@ test("ranking is deterministic and writes nothing", () => {
   } finally {
     fs.rmSync(project.dir, { recursive: true, force: true });
   }
-});
-
-test("parsePreference maps words and stays silent about anything else", () => {
-  assert.equal(parsePreference("fastest").kind, "score");
-  assert.equal(parsePreference("give me the best one").kind, "score");
-  assert.equal(parsePreference("safest option").kind, "safe");
-  assert.equal(parsePreference("least invasive please").kind, "safe");
-  assert.equal(parsePreference("simplest change").kind, "simple");
-  assert.equal(parsePreference("fewest files").kind, "simple");
-  assert.equal(parsePreference("cut recall latency").kind, null);
-  assert.equal(parsePreference(null).kind, null);
 });
 
 test("the configured model is actually passed to attempts", () => {

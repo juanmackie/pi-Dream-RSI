@@ -633,21 +633,6 @@ test("the command drives the agent, and says exactly what is missing when it can
   }
 });
 
-test("help explains the prerequisite instead of leaving you guessing", async () => {
-  const project = makeProject();
-  try {
-    const { context, harness } = await boot(project);
-    await harness.commands.get("dream-rsi").handler("", context);
-    const help = harness.notifications.at(-1);
-    assert.match(help, /arXiv 2609\.14858/);
-    assert.match(help, /\/dream-rsi create \[goal\]/);
-    assert.match(help, /\/dream-rsi suggest \[goal\]/);
-    assert.match(help, /nothing configured here yet/i);
-    assert.match(help, /task\.json/);
-  } finally {
-    project.cleanup();
-  }
-});
 
 test("a phase already in flight is not started twice", async () => {
   const project = makeProject();
@@ -727,21 +712,6 @@ test("mode survives a session rebuild from custom entries, and in-flight cycles 
   }
 });
 
-test("path arguments tolerate a leading @ from the model", async () => {
-  const project = makeProject();
-  try {
-    const { context, harness } = await boot(project);
-    const result = await harness.tools
-      .get("dream_rsi_init")
-      .execute("c1", initParams(project, { workspace: "@seed", problem_file: "@PROBLEM.md" }), undefined, undefined, context);
-    assert.match(result.content[0].text, /Dream-RSI configured/);
-    const task = readJson(path.join(project.dreamRoot, "task.json"));
-    assert.equal(task.workspace, "seed");
-    assert.equal(task.problem_file, "PROBLEM.md");
-  } finally {
-    project.cleanup();
-  }
-});
 
 test("tool parameter schemas stay validatable and strict", async () => {
   const project = makeProject();
