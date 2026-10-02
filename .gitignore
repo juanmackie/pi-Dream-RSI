@@ -2,3 +2,5 @@ node_modules/
 .dream-rsi/
 *.log
 .DS_Store
+*.evals
+*eval

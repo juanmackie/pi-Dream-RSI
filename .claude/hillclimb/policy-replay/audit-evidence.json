@@ -1,0 +1,181 @@
+[
+  {
+    "id": "shipped",
+    "existing": {
+      "score": 130,
+      "valid": true,
+      "fail_class": "ok",
+      "errors": []
+    },
+    "replay": {
+      "metrics": {
+        "probes": 6,
+        "rounds": 3,
+        "attainment": 9,
+        "value": 8.959999999999999,
+        "auc": 5,
+        "parallel_penalty": 0.5,
+        "batch_size": 2
+      },
+      "deterministic": true,
+      "trace": [
+        {
+          "round": 1,
+          "observed": [
+            "b0a0",
+            "b1a0"
+          ],
+          "batch": [
+            "b0a0",
+            "b1a0"
+          ],
+          "revealed": {
+            "b0a0": {
+              "branch": 0,
+              "attempt": 0,
+              "score": 1,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 1,
+              "delta_vs_parent": 1,
+              "n_valid": 1,
+              "n_total": 1
+            },
+            "b1a0": {
+              "branch": 1,
+              "attempt": 0,
+              "score": 2,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 2,
+              "delta_vs_parent": 2,
+              "n_valid": 1,
+              "n_total": 1
+            }
+          },
+          "best_after": 2
+        },
+        {
+          "round": 2,
+          "observed": [
+            "b0a0",
+            "b1a0"
+          ],
+          "batch": [
+            "b1a0",
+            "b0a0"
+          ],
+          "revealed": {
+            "b1a1": {
+              "branch": 1,
+              "attempt": 1,
+              "score": 4,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 4,
+              "delta_vs_parent": 2,
+              "n_valid": 2,
+              "n_total": 2
+            },
+            "b0a1": {
+              "branch": 0,
+              "attempt": 1,
+              "score": 5,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 5,
+              "delta_vs_parent": 4,
+              "n_valid": 2,
+              "n_total": 2
+            }
+          },
+          "best_after": 5
+        },
+        {
+          "round": 3,
+          "observed": [
+            "b0a0",
+            "b0a1",
+            "b1a0",
+            "b1a1"
+          ],
+          "batch": [
+            "b0a1",
+            "b1a1"
+          ],
+          "revealed": {
+            "b0a2": {
+              "branch": 0,
+              "attempt": 2,
+              "score": 9,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 9,
+              "delta_vs_parent": 4,
+              "n_valid": 3,
+              "n_total": 3
+            },
+            "b1a2": {
+              "branch": 1,
+              "attempt": 2,
+              "score": 6,
+              "evaluated": true,
+              "valid": true,
+              "fail_class": "ok",
+              "error": null,
+              "delta_vs_baseline": 6,
+              "delta_vs_parent": 2,
+              "n_valid": 3,
+              "n_total": 3
+            }
+          },
+          "best_after": 9
+        }
+      ]
+    }
+  },
+  {
+    "id": "idle",
+    "existing": {
+      "score": 130,
+      "valid": true,
+      "fail_class": "ok",
+      "errors": []
+    },
+    "replay": {
+      "metrics": {
+        "probes": 0,
+        "rounds": 0,
+        "attainment": 0,
+        "value": 0,
+        "auc": 0,
+        "parallel_penalty": 0,
+        "batch_size": 0
+      },
+      "deterministic": true,
+      "trace": []
+    }
+  },
+  {
+    "id": "syntax-error",
+    "existing": {
+      "score": 0,
+      "valid": false,
+      "fail_class": "syntax_error",
+      "errors": [
+        "Policy import failed: Expected ident"
+      ]
+    },
+    "replay": null
+  }
+]
