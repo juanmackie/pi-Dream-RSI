@@ -208,9 +208,6 @@ export function selectBatch(
     const meta = question.meta(cell);
     return meta.branch < 0 || !closed.has(meta.branch);
   });
-  const explorationQuota = Math.max(1, Math.round(width * schedule.open_root_bias));
-  for (const root of roots.slice(0, Math.min(explorationQuota, width))) batch.push(root);
-
   const ranked = rankFrontiers(prefix, question, closed);
   const recovery = ranked.find((r) => r.repairable);
   if (recovery && batch.length < width) batch.push(recovery.cell);
@@ -219,6 +216,12 @@ export function selectBatch(
     if (batch.length >= width) break;
     if (batch.includes(candidate.cell)) continue;
     batch.push(candidate.cell);
+  }
+
+  const explorationQuota = Math.max(1, Math.round(width * schedule.open_root_bias));
+  for (const root of roots.slice(0, Math.min(explorationQuota, width))) {
+    if (batch.length >= width) break;
+    if (!batch.includes(root)) batch.push(root);
   }
 
   // Never leave a slot idle when untouched directions are still available.
