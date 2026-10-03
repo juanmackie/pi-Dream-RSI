@@ -3,6 +3,9 @@
 > **Historical document.** This is the plan the package was built from (initial build, before the create /
 > suggest / apply surface existed). It is kept as a record of the design decisions and their reasoning, not as
 > current documentation. For what the package does today, read `README.md` and `skills/*/SKILL.md`.
+> Later work adds read-only tree/log visibility and explicit interrupted live-tree resume. Current cycles
+> inherit the session model/thinking; recovered cycles use frozen effective settings. Checkpointed trees
+> retain their iteration numbers, and project process locks coordinate concurrent sessions.
 
 ## Context
 

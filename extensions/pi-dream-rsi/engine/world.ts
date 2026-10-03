@@ -4,14 +4,17 @@
  *   .dream-rsi/
  *     task.json
  *     policy/method.ts                     deployed policy
- *     policy_versions/v0001.ts             every candidate version, archived
+ *     policy/r0001_v0000.ts                every candidate version, archived by cycle and revision
  *     history/baseline/attempt_<cell>/     parallel-refine floor to beat
  *     history/r0001_live/attempt_<cell>/   one record per live attempt
  *     history/r0001_live/tree.json
  *     history/r0001_dream/proposal_results/{beta_sweep.json,policy_execution_traces.jsonl}
  *     trace_pool/iter0001/{tree.json,live_cycle_manifest.json}
  *     trace_pool/iter0001_current/live_cycle_manifest.json
- *     work/<cellId>/                       attempt workspaces (agent cwd)
+ *     trace_pool/iter0001_current/checkpoint.json    durable live recovery state
+ *     trace_pool/iter0001_current/{live,dream}_progress.json
+ *     work/r0001/{seed,frozen,agent_finished}/      immutable recovery snapshots
+ *     work/r0001/<cellId>/                 attempt workspaces (agent cwd)
  */
 
 import * as fs from "node:fs";

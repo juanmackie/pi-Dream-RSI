@@ -1,6 +1,6 @@
 ---
 name: dream-rsi
-description: Run the Dream-RSI loop (arXiv 2609.14858) — an executable exploration policy drives discovery trees of coding-agent attempts, and every offline phase improves that policy by replaying candidate versions over the frozen history. Use when asked to "run dream-rsi", "run another cycle", "improve the exploration policy", "recursive self-improvement loop", or to continue a loop that is already configured. Setup is a separate skill (`dream-rsi-create`).
+description: Run, inspect or resume the Dream-RSI loop (arXiv 2609.14858) — an executable exploration policy drives discovery trees of coding-agent attempts, and every offline phase improves that policy by replaying candidate versions over the frozen history. Use when asked to "run dream-rsi", "watch dream-rsi", "resume an interrupted dream-rsi cycle", "run another cycle", "improve the exploration policy", "recursive self-improvement loop", or to continue a configured loop. Setup is a separate skill (`dream-rsi-create`).
 ---
 
 # Dream-RSI
@@ -34,35 +34,59 @@ offline replay of candidate policies against worlds recorded from real runs.
 |------|--------------|
 | `dream_rsi_init` | Write `.dream-rsi/task.json`, seed `.dream-rsi/policy/method.ts` from the shipped parallel-refine baseline, validate the workspace/problem file, and measure your own code into `history/seed/score.json`. Cheap. Reconfiguring keeps an existing measurement while the scoring contract still matches (workspace, candidate program, scorer, score field, direction); a changed contract re-measures automatically and the previous number is kept as `history/seed/score.<timestamp>.json`. Candidates and worlds recorded under the old contract stop being ranked, applied or replayed. |
 | `dream_rsi_live` | One or more online cycles: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records one world per episode. Pass `loops=n` (clamped to `task.json`'s `max_loops`, default 2) or start several `dream_rsi_live` calls at once to record `n` worlds of the same policy in parallel; the cap is shared across everything in flight. Expensive (real agent time: `loops x W` attempts at once). |
-| `dream_rsi_resume` | Resume an interrupted live tree using its original effective settings. Keeps completed attempts; restarts unfinished generators from the committed parent or evaluates a saved completed generator. Report kept/unfinished attempts and remaining budgets before running. |
-| `dream_rsi_dream` | Offline phase: replay `M` policy versions over all recorded worlds, sweep the beta grid, revision-agent rewrites the policy between revisions, select argmax `V`, deploy the winner. Recovers interrupted cycle claims first, then refuses while a world is genuinely in flight (or its manifest is unreadable) — the history has to be frozen, and only worlds recorded under the current scoring contract are replayed. Moderately expensive (M−1 agent calls, independent of how many worlds are being replayed). |
+| `dream_rsi_resume` | Continue an interrupted live tree using its original effective settings and remaining budget, including later rounds. Keeps completed attempts; restarts unfinished generators from the committed parent or evaluates a saved completed generator. Report kept/unfinished attempts and remaining budgets before running; retries can add calls. Omit `iteration` for the latest recoverable tree. |
+| `dream_rsi_dream` | Offline phase: replay `M` policy versions over completed compatible worlds, sweep beta, revise staged policies, select argmax `V` and deploy the winner. Releases interrupted claims while preserving checkpoints, then refuses while a phase is genuinely in flight or its manifest is unreadable. M−1 revision-agent calls regardless of world count; replay work and history-reading tokens grow with history. |
 | `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true`, copies only the declared program (plus paths the user names), never commits. |
-| `dream_rsi_status` | Iterations with best score + baked beta, worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), and the best candidate on record. |
+| `dream_rsi_status` | Iterations with best score + baked beta, completed worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), persisted live progress, recoverable checkpoints and the best candidate on record. |
 
 `dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
-mode (`/dream-rsi`, or automatically after `dream_rsi_init`). Commands: `/dream-rsi create [goal]
-[--reconfigure|--fresh]`, `/dream-rsi suggest [goal]` (alias `best`), `/dream-rsi status | live | dream | run [n]
-| off`. Free text is treated as a goal.
+mode, enabled by `dream_rsi_init` or the `create`, `live`, `dream`, `run` and `resume` commands. The bare
+`/dream-rsi` shows help without enabling mode.
+
+| Command | Use |
+|---------|-----|
+| `/dream-rsi create [--reconfigure\|--fresh] [goal]` | Set up, report, reconfigure or archive a task; flags precede the goal. |
+| `/dream-rsi suggest [goal]` (alias `best`) | Rank candidates; `fastest`, `safest`, `simplest` choose the preference. |
+| `/dream-rsi status` | Read state, live progress and recoverable checkpoints. |
+| `/dream-rsi watch [iteration]` | Read-only tree/log view; default latest active cycle, then latest recorded. |
+| `/dream-rsi resume [iteration]` | Ask the agent to continue the selected interrupted live tree; default latest recoverable. |
+| `/dream-rsi live [n]` | Start new online cycles, default 1; `n` is 1–8, clamped to the shared task cap. |
+| `/dream-rsi dream` | Improve the policy from completed compatible worlds. |
+| `/dream-rsi run [n]` | Start new full live/dream cycles, default 1; range 1–100. |
+| `/dream-rsi off` | Disable gated tools while retaining saved state and running work. |
+| `/dream-rsi help` (alias `?`, also the bare command) | Show syntax, defaults and dashboard controls. |
+
+Free text routes to setup in an unconfigured project and suggestions in a configured one. Tab completes
+subcommands, setup flags and ranking preferences. Help, status and watching start no agent turn;
+RPC/JSON/print hosts receive session messages for these read-only reports.
 
 ## Visibility and recovery
 
 Use `/dream-rsi watch [iteration]` or `Ctrl+Shift+D` to inspect the live tree, node lifecycle, tool activity,
 and bounded agent/evaluator log tails without spending agent time. A widget appears during live and dream
-phases in terminal mode. Arrows select cycles/nodes, `d` switches live/dream, Tab changes panes, Page Up loads older logs and Esc
-closes the view while work continues. RPC/JSON/print hosts use text and structured progress instead.
+phases in terminal mode. Left/right selects cycles, up/down selects nodes, `d` switches live/dream, and Tab
+changes between tree, tools, agent output and evaluator output. Page Up loads older logs, Page Down returns
+to the tail, and Esc closes the view while work continues. Tails are bounded to 200 lines/64 KiB; full logs
+stay on disk. RPC/JSON/print hosts use text and structured progress instead.
 
-After interruption, `dream_rsi_status` lists recoverable iterations. Use `dream_rsi_resume [iteration]`
+After interruption, `dream_rsi_status` lists recoverable iterations. Use `dream_rsi_resume iteration=<n>`
 only when the user asks to continue that cycle; `/dream-rsi resume [iteration]` is the command entry point.
 Explain how many finished attempts are retained, unfinished work and remaining original budgets. Recovery
 uses the original effective model/thinking, frozen policy/imports, seed snapshot and scoring command,
 even if the current session changed. Generators that did not finish rerun from the committed parent;
-finished generators rerun only evaluation. Extra calls are reported separately. Do not delete the saved
+finished generators rerun only evaluation. Later rounds use the remaining original budget; resume cannot
+extend the grid or add rounds. Extra retry calls are reported separately. Do not delete the saved
 workspaces to unblock a run: active and recoverable workspaces are protected from retention.
 
 Only completed worlds are replayed. Legacy worlds without checkpoints are watchable, completed trees
 cannot be extended, and interrupted dream revisions must be restarted. Recovery refuses corrupt/missing
 snapshots, a changed scoring contract, a divergent saved policy prefix or an active owner before new calls.
 Keep external scorer files, datasets and dependencies unchanged; only their command/settings are frozen.
+For a changed scoring contract, restore the original task fields. For corrupt/missing recovery files,
+restore a backup or start a separate tree with `dream_rsi_live`; retain the original checkpoint and snapshots.
+Project process locks protect active owners and share `max_loops` across live and resume calls.
+After recovery completes, use `dream_rsi_status` or `/dream-rsi suggest` to rank candidates, then
+`dream_rsi_dream` to include the completed world in policy improvement.
 
 ## Setup (ask, don't guess)
 
@@ -93,9 +117,11 @@ What good setup looks like, in short:
 6. **Agent command** — default `pi -p --no-session -na --no-extensions --no-skills --no-prompt-templates
    --no-context-files`, prompt over stdin: attempts are self-contained — instructions come from the prompt,
    history from tool reads — so they never inherit the host repo's context files or prompt templates. Each
-   run inherits the active session's model and thinking level as `--model`/`--thinking` (unless `args`
+   new cycle inherits the active session's model and thinking level as `--model`/`--thinking` (unless `args`
    already carries `{model}`/`{thinking}`); `agent.model`/`agent.thinking` in `task.json` are only fallbacks.
-   `dream_rsi_init` prints the effective command line — check it.
+   `dream_rsi_init` prints the effective arguments, including automatic `--mode json` for pi unless a mode
+   is explicit or `agent.output_format=text`. Compatible custom CLIs can set `agent.output_format=pi-json`
+   in `task.json`; other custom commands retain text output. Resumed cycles keep their saved effective agent.
 
 Before spending agent time, confirm the scorer distinguishes success from failure. A broken scorer turns the
 whole loop into noise, and the cost is paid in agent calls, not in seconds.
@@ -105,8 +131,9 @@ whole loop into noise, and the cost is paid in agent calls, not in seconds.
 1. `dream_rsi_live` → world `t` (or worlds `t..t+n-1` with `loops=n`). Cycle 1 doubles as the baseline: its best attempt is copied to
    `history/baseline/` and becomes the floor every later attempt must read and beat.
 2. `dream_rsi_dream` → versions `v0000..v000M-1`, beta sweep, winner deployed to `policy/method.ts`.
-   It replays every recorded world, so a batch of `n` worlds costs one dream, not `n`.
-3. Every cycle result ends with the ranked candidates (see *Recommending and applying*), and that ranking is
+   It replays completed worlds under the current scoring contract, so a batch of `n` worlds costs one dream.
+   Explicitly resume interrupted trees first if their worlds should be included.
+3. Live and dream results end with the ranked candidates (see *Recommending and applying*), and that ranking is
    what the user acts on. Repeat live → dream for as many rounds as the budget allows.
 
 **Batching worlds is the throughput lever.** `loops x W` agents run at once, so the wall clock approaches one
@@ -178,16 +205,24 @@ the preference: `fastest` (strict score), `safest` (keeps ≥95% of the best win
   task.json                                  budgets, scorer contract, agent command
   .gitignore                                 written on the first cycle: work/ + trace_pool/ + runtime/ stay out of git
   policy/method.ts                           deployed policy (EVOLVE-BLOCK), with api.ts next to it
-  policy/v0000.ts …                          every evaluated version, archived
+  policy/r0001_v0000.ts …                    every evaluated version, archived by cycle and revision
   history/seed/score.json                    what the user's own code measured — the reference point
   history/baseline/                          parallel-refine floor to beat
   history/applied.jsonl                      candidates already applied (append-only)
-  history/r0001_live/attempt_<cell>/{proposal.md,eval/score.json,error.txt,agent.log,prompt.md}
+  history/r0001_live/attempt_<cell>/{proposal.md,eval/score.json,error.txt,agent.log,eval.log,prompt.md}
+  history/r0001_live/attempt_<cell>/retry_<n>/    abandoned generator work/logs
+  history/r0001_live/attempt_<cell>/eval_retry_<n>/   abandoned evaluator workspace
   history/r0001_live/tree.json
   history/r0001_dream/proposal_results/{beta_sweep.json,policy_execution_traces.jsonl,selection.json}
   trace_pool/iter0001/{tree.json,live_cycle_manifest.json}     replay world + live sidecar
-  trace_pool/iter0001_current/                in-flight mirror
+  trace_pool/iter0001_current/live_cycle_manifest.json   running/interrupted claim
+  trace_pool/iter0001_current/checkpoint.json  versioned live checkpoint (keep for recovery)
+  trace_pool/iter0001_current/{live,dream}_progress.json  persisted dashboard telemetry
+  work/r0001/seed/                            frozen seed snapshot
+  work/r0001/frozen/                          frozen policy/imports
+  work/r0001/agent_finished/<cellId>/         generator snapshot for evaluation-only recovery
   work/r0001/<cellId>/                        attempt workspaces (agent cwd), one copy per attempt
+  live-1.lock, dream.lock, .allocator.lock    transient process ownership/allocation
   runtime/                                    the policy worker + its imports, mirrored out of node_modules
                                               (npm installs), so the worker entry can actually run
 ```

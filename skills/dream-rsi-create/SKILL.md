@@ -24,7 +24,10 @@ The prompt that invoked you starts with `reconfigure` or `fresh`; with neither, 
   re-measures automatically — the old number is archived, and candidates/worlds recorded under the old
   contract stop being ranked, applied and replayed. Never pass `remeasure_seed=true` unless the user asks
   for unchanged code to be re-measured, and re-probe the attempt agent only if the agent command changed
-  (attempts use the active session's model and thinking level, so a model change needs no reconfigure).
+  (new cycles use the active session's model and thinking level, so a model change needs no reconfigure).
+  Reconfiguring does not change a saved live checkpoint's effective agent, policy, seed or budgets; resume
+  uses those original settings. Changing the scoring contract blocks resume until its original task fields
+  are restored. Retain checkpointed workspaces and external scoring inputs while recovery is wanted.
 - **reconfigure leaves other tools stale** — `.dream-rsi/` is not the only loop in a project. If an
   autoresearch loop exists (`.auto/prompt.md`, `.auto/measure.sh`, score wrappers), it still describes the
   old objective and the old scorer: update or delete those files in the same breath, or that loop keeps
@@ -49,8 +52,8 @@ Collect these; ask the user for anything you cannot find evidence for:
 | **Scorer** | A command that prints a number (`score_program`) plus a pass/fail verdict. | Look for an existing harness first — see step 2. |
 | **Correctness gate** | What must set `fail_class != "ok"`. | The repo's own checks: its test suite, its assertions, its validity rules. |
 | **Problem file** | A short doc every attempt reads: objective, in-scope files, off-limits, correctness, the baseline. | Write it (step 4). |
-| **Budgets** | `workers`, `max_loops`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, max_loops=2, K1=3, K2=4, M=2`. `max_loops` is how many online episodes may record worlds at once (`loops x W` agents in flight, shared by every live call); raise it only when the provider and the disk can take it. The paper's shape (`W=10, K1=11`) is hours per cycle. |
-| **Attempt agent** | `agent_command`, `agent_args`, optionally `model`. | The CLI that will edit code in the copy. Attempts inherit the active session's model and thinking level, so `model` is only a fallback; confirm the session model exists and is billable — step 6. Keep the default `--no-context-files`/`--no-prompt-templates` flags: attempts read instructions from the prompt and history through tools, never from the host repo's context files. |
+| **Budgets** | `workers`, `max_loops`, `k1`, `k2`, `revisions`, `beta_grid`. | Start small: `W=2, max_loops=2, K1=3, K2=4, M=2`. `max_loops` caps online episodes across live and resume calls (`loops x W` agents in flight); raise it only when the provider and the disk can take it. The paper's shape (`W=10, K1=11`) is hours per cycle. |
+| **Attempt agent** | `agent_command`, `agent_args`, optionally `model`; `agent.output_format` in `task.json` for custom output. | New cycles inherit the active session's model/thinking, so `model` is a fallback; confirm the session model exists and is billable — step 6. Resumed cycles use saved settings. Keep default `--no-context-files`/`--no-prompt-templates` flags so attempts read instructions from the prompt and history through tools. |
 
 Ask in one batch. If the user says "just infer it", infer from the repo and **say what you inferred**, so a
 wrong guess is visible before it costs anything.
@@ -118,7 +121,8 @@ Call `dream_rsi_init` with the interview results. It writes `.dream-rsi/task.jso
 measures the user's own code into `history/seed/score.json` — that measurement is the reference point every
 candidate is compared against. Report the measured baseline, then confirm the effective attempt command it
 prints. It shows the active session's model and thinking level (`… --model <provider/id> --thinking <level>`),
-which is what the attempts run on; `model=` would only set a fallback for hosts without a session model.
+which new cycles run on; `model=` only sets a fallback for hosts without a session model. The printed arguments
+also include automatic JSON streaming for pi; resumed cycles keep their saved effective arguments.
 An existing task keeps its stored `agent_args` verbatim, so if the printed command lacks
 `--no-prompt-templates --no-context-files`, pass the full `agent_args=` list when reconfiguring — history and
 the recorded baseline are preserved.
@@ -130,11 +134,12 @@ Skip the measurement with `measure_seed: false` only if the scorer is slow, and 
 Run the effective attempt command once, outside the task, with a trivial prompt:
 
 ```bash
-pi -p --no-session -na --no-extensions --no-skills --no-prompt-templates --no-context-files --model <session model> --thinking <session level> "Reply with exactly: OK"
+pi -p --no-session -na --no-extensions --no-skills --no-prompt-templates --no-context-files --mode json --model <session model> --thinking <session level> "Reply with exactly: OK"
 ```
 
 A bad model id, missing auth, or an empty balance surfaces here for the price of one small call instead of
-six failed attempts. Report the outcome verbatim.
+six failed attempts. For JSON mode, read the assistant message and tool/error events; raw JSON is expected.
+Use the configured command and explicit mode when they differ from this default. Report the outcome.
 
 Then **stop and ask**. State: the baseline to beat, the planned grid (`W × K1` agent calls per cycle), and the
 cost. Do not call `dream_rsi_live` until the user agrees — `create` is an on-ramp, not a spending decision.
@@ -146,8 +151,11 @@ and a tree/log overlay during live and dream work. The default pi child streams 
 
 An interrupted live cycle can be continued with `/dream-rsi resume [iteration]` after reporting kept
 attempts and remaining original budgets. It freezes the effective model/thinking, seed, policy and task
-settings; external scoring files and dependencies must stay unchanged. Legacy worlds and dream revisions
-have no resume checkpoint. Resume is explicit, and a completed tree cannot be extended.
+settings; later rounds spend only the remaining original budget and retries can add calls. External scoring
+files and dependencies must stay unchanged. Completed legacy worlds are watchable but have no live resume
+checkpoint; dream revisions cannot be resumed. Resume is explicit, and a completed tree cannot be extended.
+`/dream-rsi help` lists defaults and controls; Tab completes commands. `/dream-rsi off` disables gated tools
+while preserving saved state and running work.
 
 ## 7. After the first cycle, the recommendation is automatic
 

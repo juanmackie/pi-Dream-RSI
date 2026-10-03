@@ -94,9 +94,8 @@ export function runningIterations(root: string): number[] {
 }
 
 /**
- * The next free iteration number. Recorded worlds and in-flight claims both count, so two live calls in
- * one session can never be handed the same number. A claim that was recovered as failed stops counting,
- * which is what lets an interrupted cycle restart its number instead of leaving a permanent hole.
+ * Allocation starting point after recorded worlds and in-flight claims. reserveIterations additionally
+ * skips existing claim files, preserving interrupted trees and their numbers for explicit resume.
  */
 export function nextIteration(root: string): number {
   const recorded = listIterations(root);
@@ -105,7 +104,7 @@ export function nextIteration(root: string): number {
 }
 
 /**
- * Claim `count` consecutive iterations for episodes that are about to start, and return them.
+ * Claim `count` new iteration numbers for episodes that are about to start, and return them.
  *
  * The claim is an exclusive file create, so two sessions (or two processes) sharing a project cannot be
  * handed the same number: the loser sees EEXIST and moves to the next one. Synchronous on purpose — the
@@ -170,17 +169,15 @@ export interface RecoveryOptions {
 }
 
 /**
- * A run left `running` on disk while no phase is active in this session was interrupted (crash, killed
- * process). Dream-RSI runs one phase at a time, so it is safe to mark those failed — otherwise the
- * interrupted cycle looks permanently in flight and blocks the next one from being trusted.
+ * Release stale `running` claims after interruption. A tree with a checkpoint becomes `interrupted`
+ * and remains available for explicit resume; a legacy claim without one becomes `failed`.
  *
  * `except` names the iterations this session is still running. Crucially, a claim owned by *another*
  * session whose process is still alive is left alone: two sessions sharing a project must not mark each
- * other's genuinely running cycles as interrupted and reuse their numbers. Only confirmed-dead owners
- * are reclaimed.
+ * other's genuinely running cycles as interrupted. Phase locks also protect work in this process.
  *
- * Only the in-flight mirror is touched, not the final sidecar: the interrupted iteration had no completed
- * world, so the next live cycle restarts that iteration number with a clean tree.
+ * Only the in-flight manifest is touched. Checkpoints, snapshots, completed siblings and iteration
+ * numbers are retained; a new live cycle starts a new tree rather than replacing interrupted work.
  */
 export function recoverInterruptedRuns(root: string, except: number[] = [], options: RecoveryOptions = {}): number[] {
   const dir = tracePoolDir(root);
