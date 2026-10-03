@@ -212,6 +212,8 @@ test("a crash during publication is repaired idempotently without repeating comp
     assert.equal(readCheckpoint(p.dreamRoot, 1).status, "complete");
     assert.deepEqual(recoverableIterations(p.dreamRoot), [1]);
     const count = controlled.calls().length;
+    fs.mkdirSync(path.dirname(nodeWorkspace(p.dreamRoot, 9, "x")), { recursive: true });
+    assert.equal(pruneWorkspaces(p.dreamRoot, 1, 9).includes(1), false, "incomplete publication is still recoverable");
     fs.rmSync(blocked, { recursive: true });
     const recovered = await runLiveEpisode(options(p, { resume: true }));
     assert.equal(recovered.ok, true, recovered.error); assert.equal(controlled.calls().length, count);
@@ -233,6 +235,7 @@ test("reload cancels and drains live children, closes the overlay, and leaves a 
     assert.equal(result.details.ok, false); assert.deepEqual(recoverableIterations(p.dreamRoot), [1]);
     assert.equal(fs.existsSync(p.script(".dream-rsi/live-1.lock")), false);
     assert.equal(readProgress(p.dreamRoot, 1).status, "interrupted");
+    assert.equal(harness.widgets.at(-1)[1], undefined);
   } finally { p.cleanup(); }
 });
 
@@ -316,4 +319,30 @@ test("a forcibly killed host recovers completed work and stops its matching orph
     if (orphan) await stopRecoveredChild(orphan);
     p.cleanup();
   }
+});
+
+test("checkpoint write failure aborts children and preserves the last durable completed sibling", async () => {
+  const mutableFs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const p = makeProject({ task: { k1: 1 } }); const rename = mutableFs.renameSync;
+  let fail = false;
+  try {
+    const controlled = controlledAgent(p); await setup(p);
+    const run = runLiveEpisode(options(p, { onProgress: (s) => {
+      if (s.completed && !fail) {
+        fail = true;
+        mutableFs.renameSync = (from, to) => {
+          if (to === checkpointPath(p.dreamRoot, 1)) throw Object.assign(new Error("fixture disk failure"), { code: "ENOSPC" });
+          return rename(from, to);
+        };
+        syncBuiltinESMExports(); fs.writeFileSync(controlled.gate, "yes");
+      }
+    } }));
+    await assert.rejects(run, /disk failure/);
+    const saved = readCheckpoint(p.dreamRoot, 1);
+    assert.equal(saved.batches[0].attempts.filter((a) => a.record).length, 1, "last durable checkpoint is intact");
+    mutableFs.renameSync = rename; syncBuiltinESMExports();
+    const result = await runLiveEpisode(options(p, { resume: true })); assert.equal(result.ok, true, result.error);
+    assert.equal(controlled.calls().filter((c) => c === "b0a0").length, 1);
+  } finally { mutableFs.renameSync = rename; syncBuiltinESMExports(); p.cleanup(); }
 });

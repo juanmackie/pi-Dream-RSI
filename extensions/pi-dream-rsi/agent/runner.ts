@@ -149,6 +149,7 @@ async function collect(
       settled = true;
       const stdoutEnd = stdoutDecoder.end();
       const stderrEnd = stderrDecoder.end();
+      stdoutTail = append(stdoutTail, stdoutEnd); stderrTail = append(stderrTail, stderrEnd);
       decoder.feed("stdout", stdoutEnd); decoder.feed("stderr", stderrEnd); decoder.finish();
       if (timer) clearTimeout(timer);
       if (grace) clearTimeout(grace);
@@ -227,7 +228,7 @@ async function collect(
     running.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
     // Respect backpressure: a slow/failed log pauses the child's stream until it drains, so heavy
     // output cannot accumulate unbounded in memory (the OS pipe throttles the child in turn).
-    const writeLog = (source: NodeJS.ReadableStream, text: string): void => {
+    const writeLog = (source: NodeJS.ReadableStream, text: string | Buffer): void => {
       if (!logStream || !logStream.writable || logStream.destroyed) return;
       if (!logStream.write(text)) {
         source.pause();
@@ -238,13 +239,13 @@ async function collect(
       const text = stdoutDecoder.write(chunk);
       decoder.feed("stdout", text);
       stdoutTail = append(stdoutTail, text);
-      writeLog(running.stdout as NodeJS.ReadableStream, text);
+      writeLog(running.stdout as NodeJS.ReadableStream, chunk);
     });
     running.stderr?.on("data", (chunk: Buffer) => {
       const text = stderrDecoder.write(chunk);
       decoder.feed("stderr", text);
       stderrTail = append(stderrTail, text);
-      writeLog(running.stderr as NodeJS.ReadableStream, text);
+      writeLog(running.stderr as NodeJS.ReadableStream, chunk);
     });
     running.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut && !aborted, code, signal }));
     if (running.pid !== undefined) {

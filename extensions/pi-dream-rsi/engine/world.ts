@@ -377,7 +377,8 @@ export function pruneWorkspaces(root: string, keep: number, currentIteration?: n
     if (entry.iteration === currentIteration) continue;
     const current = iterationDir(root, entry.iteration, true);
     const manifest = readJson<LiveCycleManifest>(path.join(current, "live_cycle_manifest.json"));
-    if (manifest?.status === "running" || (manifest?.status !== "complete" && fs.existsSync(path.join(current, "checkpoint.json")))) continue;
+    const published = readManifest(root, entry.iteration)?.status === "complete";
+    if (manifest?.status === "running" || (!published && fs.existsSync(path.join(current, "checkpoint.json")))) continue;
     fs.rmSync(path.join(dir, entry.name), { recursive: true, force: true });
     removed.push(entry.iteration);
   }
