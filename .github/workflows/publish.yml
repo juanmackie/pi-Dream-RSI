@@ -1,0 +1,65 @@
+name: Publish to npm
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - package.json
+
+permissions: {}
+
+jobs:
+  publish:
+    name: Publish version bump
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the pushed commit
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Check whether the package version changed
+        id: version
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          import { execFileSync } from 'node:child_process';
+
+          const current = JSON.parse(readFileSync('package.json', 'utf8')).version;
+          if (!current) throw new Error('package.json has no version');
+
+          const event = JSON.parse(readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          let previous = null;
+          if (event.before && !/^0+$/.test(event.before)) {
+            const source = execFileSync('git', ['show', `${event.before}:package.json`], { encoding: 'utf8' });
+            previous = JSON.parse(source).version ?? null;
+          }
+
+          const changed = previous !== current;
+          appendFileSync(process.env.GITHUB_OUTPUT, ['changed=' + changed, ''].join(String.fromCharCode(10)));
+          console.log(changed
+            ? `Publishing package version ${current} (previous: ${previous ?? 'none'})`
+            : `Skipping publish; package version remains ${current}`);
+          NODE
+
+      - name: Install dependencies
+        if: steps.version.outputs.changed == 'true'
+        run: npm ci
+
+      - name: Publish to npm with trusted publishing
+        if: steps.version.outputs.changed == 'true'
+        run: npm publish

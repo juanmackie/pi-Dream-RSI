@@ -161,6 +161,9 @@ policy is probing one at a time — batching is the first thing the next revisio
 
 ## Install
 
+Maintainers: [version bumps on `main` publish automatically to npm](RELEASING.md#one-time-npm-setup) after the
+package checks pass. The npm trusted publisher needs a one-time setup before the first automated release.
+
 ```bash
 # 1. Register it as a pi package (user settings; pi can update or remove it later)
 pi install npm:pi-dream-rsi                      # from npm — https://pi.dev/packages/pi-dream-rsi
