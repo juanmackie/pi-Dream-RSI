@@ -15,6 +15,7 @@ import {
 import { readPolicyViolations, scanPolicySource } from "../extensions/pi-dream-rsi/policy/runner.ts";
 import { LLMDesignedMethod, _budget_done, _record_curve, finalize_result, newSimResult, resolveBeta } from "../extensions/pi-dream-rsi/policy/api.ts";
 import { PolicyHost } from "../extensions/pi-dream-rsi/policy/host.ts";
+import { OptimalPolicy, selectBatch } from "../extensions/pi-dream-rsi/policy/method.ts";
 import { branch_best_for, branch_failed_hard, branch_stale_for, probe_improved_vs_parent, repairable_failures } from "../extensions/pi-dream-rsi/policy/observation-signal.ts";
 
 const cfg = { maxParallelism: 2, beta1: 0.01, beta2: 0.01, lambda: 1, baselineScore: null };
@@ -155,4 +156,47 @@ test("prefix signals: repairable failures stay eligible; closure needs cumulativ
   const reopened = { ...prefix, b1a2: { branch: 1, attempt: 2, score: 7, evaluated: true, valid: true, fail_class: "ok", error: null, delta_vs_baseline: 4, delta_vs_parent: 4, n_valid: 1, n_total: 3 } };
   assert.equal(branch_best_for(reopened, 1), 7);
   assert.equal(branch_failed_hard(reopened, "b1a2", { baseline_score: 3 }, 2), false);
+});
+
+
+test("bounded exploration opens untouched branches before refinements exhaust the round budget", async () => {
+  const depths = new Map();
+  const host = new PolicyHost({
+    mode: "live", maxParallelism: 2, maxRounds: 3,
+    grid: { branch_count: 3, refine_count: 2 },
+    baselineScore: 0,
+    probe: async (cells) => cells.map((cell) => {
+      const branch = Number(/^b(\d+)a/.exec(cell)[1]);
+      const attempt = (depths.get(branch) ?? -1) + 1;
+      depths.set(branch, attempt);
+      return { cell: `b${branch}a${attempt}`, node: {
+        evaluated: true, valid: true, fail_class: "ok", error: null, score: attempt + 1,
+      }};
+    }),
+  });
+  const result = await new OptimalPolicy({ beta: 0.6 }).solve(host, { rounds: 3, attempts: 6 });
+  assert.equal(result.probes, 6);
+  assert.equal(result.rounds, 3);
+  assert.deepEqual(host.decisions[1].batch, ["b2a0", "b0a0"]);
+  assert.deepEqual([...depths.values()], [1, 1, 1]);
+});
+
+test("one recovery per batch leaves room for healthy refinements and respects beta's root quota", () => {
+  const prefix = {
+    b0a0: { branch: 0, attempt: 0, evaluated: true, fail_class: "eval_error", error: "compile", score: null, delta_vs_parent: null },
+    b1a0: { branch: 1, attempt: 0, evaluated: true, fail_class: "eval_error", error: "compile", score: null, delta_vs_parent: null },
+    b2a0: { branch: 2, attempt: 0, evaluated: true, fail_class: "ok", error: null, score: 5, delta_vs_parent: 5 },
+  };
+  const question = {
+    max_parallelism: 4,
+    legal_roots: () => ["b3a0", "b4a0", "b5a0"],
+    legal_actions: () => ["b3a0", "b4a0", "b5a0", "b0a0", "b1a0", "b2a0"],
+    meta: (cell) => ({ branch: Number(/^b(\d+)a/.exec(cell)[1]), attempt: 0 }),
+  };
+  const batch = selectBatch(prefix, question, new Set(), LLMDesignedMethod.schedule(0));
+  assert.deepEqual(batch, ["b3a0", "b0a0", "b2a0", "b4a0"]);
+  assert.equal(batch.filter((cell) => prefix[cell]?.fail_class === "eval_error").length, 1);
+  assert.equal(new Set(batch).size, batch.length);
+  assert.deepEqual(selectBatch(prefix, question, new Set(), LLMDesignedMethod.schedule(1)),
+    ["b3a0", "b4a0", "b5a0", "b0a0"]);
 });
