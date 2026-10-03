@@ -436,7 +436,7 @@ Read this before trusting a number.
 ## Tests
 
 ```bash
-npm test          # 97 tests, no LLM, ~25s
+npm test          # deterministic unit and integration tests, no LLM
 npm run typecheck # tsc --noEmit (CI runs both on Windows and Linux)
 ```
 
@@ -454,6 +454,32 @@ vs. relocated-directory layouts).
 What tests can't cover is your scorer and your model. For that, on a scratch project: `/dream-rsi create <goal>`
 to get set up (the skill interviews you and verifies the scorer), then **How to run it well** steps 3–5 — step 3
 tells you whether the task fits, step 5 tells you when to stop.
+
+## Developing the shipped policy
+
+The repository's own optimization task uses a behavioral benchmark in `.auto/`.
+Run the trusted scorer by absolute path from a candidate workspace:
+
+```bash
+node "/absolute/path/to/pi-Dream-RSI/.auto/score.mjs" --benchmark-version=2
+# Or pass a separate workspace:
+node "/absolute/path/to/pi-Dream-RSI/.auto/score.mjs" "/path/to/candidate" --benchmark-version=2
+```
+
+It stages only the candidate policy beside trusted helpers and uses the production
+replay engine on four frozen synthetic worlds: depth, breadth, repair and plateau.
+The score is their mean Eq. 1 value at the policy's default beta. Every world runs
+twice in fresh workers; any execution, guardrail or determinism failure invalidates
+the complete score. `eval/score.json` includes the benchmark version and per-world
+metrics. This measures behavior, with no quality points for syntax or source tokens.
+It makes no claim about production generalization.
+
+For an existing task, reconfigure its scorer command to include
+`--benchmark-version=2` and remeasure the seed. The command change updates the
+scoring fingerprint so old structure scores cannot be ranked or replayed with the
+new behavioral measurements. See [PROBLEM.md](PROBLEM.md) for the complete contract.
+The scorer and Python wrapper are development tools in this repository, outside the
+published npm package; keep the trusted harness outside candidate edit scope.
 
 ## What this is not
 

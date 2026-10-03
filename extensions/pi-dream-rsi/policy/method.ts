@@ -209,19 +209,19 @@ export function selectBatch(
     return meta.branch < 0 || !closed.has(meta.branch);
   });
   const ranked = rankFrontiers(prefix, question, closed);
+  const explorationQuota = Math.max(1, Math.round(width * schedule.open_root_bias));
+  for (const root of roots.slice(0, Math.min(explorationQuota, width))) {
+    batch.push(root);
+  }
+
   const recovery = ranked.find((r) => r.repairable);
   if (recovery && batch.length < width) batch.push(recovery.cell);
 
+  // Other failed frontiers remain eligible for a later round; one recovery per batch is enough.
   for (const candidate of ranked) {
     if (batch.length >= width) break;
-    if (batch.includes(candidate.cell)) continue;
+    if (candidate.repairable || batch.includes(candidate.cell)) continue;
     batch.push(candidate.cell);
-  }
-
-  const explorationQuota = Math.max(1, Math.round(width * schedule.open_root_bias));
-  for (const root of roots.slice(0, Math.min(explorationQuota, width))) {
-    if (batch.length >= width) break;
-    if (!batch.includes(root)) batch.push(root);
   }
 
   // Never leave a slot idle when untouched directions are still available.

@@ -285,7 +285,13 @@ test("evaluator failures are recorded as repairable evidence and never crash the
     await deployShippedPolicy(project);
     const episode = await liveCycle(project, 1);
     assert.equal(episode.ok, true, "the cycle completes even when every evaluation fails");
-    assert.equal(episode.tree.nNonRoot, 6);
+    assert.equal(episode.tree.nNonRoot, 4, "two branch openings plus one recovery in each remaining round");
+    assert.equal(episode.manifest.decision_rounds, 3);
+    const trace = fs.readFileSync(
+      path.join(project.dreamRoot, "history", "r0001_live", "policy_execution_traces.jsonl"), "utf8",
+    ).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(trace.map((decision) => decision.batch.length), [2, 1, 1],
+      "failed branches share one recovery slot per batch");
     for (const node of episode.tree.list()) {
       assert.equal(node.fail_class, "eval_error");
       assert.equal(node.score, null);
@@ -295,7 +301,8 @@ test("evaluator failures are recorded as repairable evidence and never crash the
     assert.equal(episode.manifest.best_score, null);
     // A repairable failure is evidence, not closure: the branch remains repliable.
     const tree = readTree(project.dreamRoot, 1);
-    assert.ok(tree.nNonRoot > 0);
+    assert.deepEqual(tree.legalActions().sort(), ["b0a1", "b1a1"],
+      "both repairable branches remain eligible after their retries");
   } finally {
     project.cleanup();
   }
