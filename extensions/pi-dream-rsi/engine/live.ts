@@ -13,7 +13,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { copyWorkspace, childIdentity, stopRecoveredChild, runAgent, runShellCommand, type CommandResult } from "../agent/runner.ts";
+import { copyWorkspace, childOwnership, stopRecoveredChild, runAgent, runShellCommand, type CommandResult } from "../agent/runner.ts";
 import { DiscoveryTree, isOpened, type TreeNode } from "./tree.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { runPolicy } from "../policy/runner.ts";
@@ -425,7 +425,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       logPath: prepared.logPath,
       signal,
       onOutput: (event) => progress.output(prepared.cell, false, event),
-      onSpawn: (pid) => { pending.process = { pid, identity: childIdentity(pid) }; commit(); },
+      onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
     });
     pending.process = undefined;
     if (agentRun.aborted || signal.aborted) throw new Error("attempt interrupted during generation");
@@ -486,7 +486,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
         logPath: path.join(recordDir, "eval.log"),
         signal,
         onOutput: (event) => progress.output(prepared.cell, true, event),
-        onSpawn: (pid) => { pending.process = { pid, identity: childIdentity(pid) }; commit(); },
+        onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
       });
       pending.process = undefined;
       if (evalRun.aborted || signal.aborted) throw new Error("attempt interrupted during evaluation");

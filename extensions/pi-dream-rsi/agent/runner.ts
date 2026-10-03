@@ -545,11 +545,44 @@ export function childIdentity(pid: number): string | null {
       const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
       return `linux:${fields[19]}`;
     }
-    if (process.platform === "win32") return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`], { encoding: "utf8", windowsHide: true, timeout: 5000 }).trim();
+    if (process.platform === "win32") return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `$dreamProcess = Get-Process -Id ${pid} -ErrorAction SilentlyContinue; if ($dreamProcess) { $dreamProcess.StartTime.ToUniversalTime().Ticks.ToString() }`], { encoding: "utf8", windowsHide: true, timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }).trim() || null;
     return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }).trim() || null;
   } catch { return null; }
 }
-export async function stopRecoveredChild(child: { pid: number; identity: string | null }): Promise<void> {
+export interface OwnedChild { pid: number; identity: string | null; children?: OwnedChild[] }
+/** Windows shell wrappers can exit before their agent; save the agent's own birth identity too. */
+export function childOwnership(pid: number): OwnedChild {
+  if (process.platform !== "win32") return { pid, identity: childIdentity(pid) };
+  try {
+    const script = `
+function Get-DreamIdentity($dreamPid) {
+  $dreamProcess = Get-Process -Id $dreamPid -ErrorAction SilentlyContinue
+  if ($dreamProcess) { return $dreamProcess.StartTime.ToUniversalTime().Ticks.ToString() }
+  return $null
+}
+$dreamAll = @(Get-CimInstance Win32_Process)
+$dreamQueue = [System.Collections.Generic.Queue[int]]::new()
+$dreamQueue.Enqueue(${pid})
+$dreamChildren = @()
+$dreamSeen = @{}
+while ($dreamQueue.Count -gt 0) {
+  $dreamParent = $dreamQueue.Dequeue()
+  if ($dreamSeen.ContainsKey($dreamParent)) { continue }
+  $dreamSeen[$dreamParent] = $true
+  foreach ($dreamChild in $dreamAll) {
+    if ($dreamChild.ParentProcessId -eq $dreamParent) {
+      $dreamChildren += @{pid=[int]$dreamChild.ProcessId; identity=(Get-DreamIdentity $dreamChild.ProcessId)}
+      $dreamQueue.Enqueue([int]$dreamChild.ProcessId)
+    }
+  }
+}
+@{pid=${pid}; identity=(Get-DreamIdentity ${pid}); children=@($dreamChildren)} | ConvertTo-Json -Compress -Depth 5`;
+    return JSON.parse(execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script],
+      { encoding: "utf8", windowsHide: true, timeout: 5000, stdio: ["ignore", "pipe", "ignore"] }));
+  } catch { return { pid, identity: childIdentity(pid) }; }
+}
+export async function stopRecoveredChild(child: OwnedChild): Promise<void> {
+  for (const descendant of child.children ?? []) await stopRecoveredChild(descendant);
   const current = childIdentity(child.pid);
   if (!current) {
     try { process.kill(child.pid, 0); }

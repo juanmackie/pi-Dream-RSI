@@ -293,7 +293,8 @@ test("missing parent snapshots and edited frozen helpers fail before resumed cal
 test("a forcibly killed host recovers completed work and stops its matching orphan child", async () => {
   const { spawn } = await import("node:child_process"); const { once } = await import("node:events");
   const { pathToFileURL } = await import("node:url"); const { childIdentity, stopRecoveredChild } = await jump("agent/runner.ts");
-  const p = makeProject({ task: { k1: 1 } }); let child; let orphan;
+  const p = makeProject({ task: { k1: 1 } }); let child; let orphan; let restoring;
+  const recovery = new AbortController();
   try {
     const controlled = controlledAgent(p); await setup(p);
     const script = p.script("crash-host.mjs");
@@ -303,8 +304,9 @@ test("a forcibly killed host recovers completed work and stops its matching orph
     await until(() => { try { const cp = readCheckpoint(p.dreamRoot, 1); return cp.batches[0]?.attempts.some((a) => a.record) && cp.batches[0].attempts[1].process; } catch { return false; } });
     orphan = readCheckpoint(p.dreamRoot, 1).batches[0].attempts[1].process;
     const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
-    assert.equal(childIdentity(orphan.pid), orphan.identity);
-    const restoring = runLiveEpisode(options(p, { resume: true }));
+    const owned = [orphan, ...(orphan.children ?? [])];
+    assert.ok(owned.some((process) => process.identity && childIdentity(process.pid) === process.identity));
+    restoring = runLiveEpisode(options(p, { resume: true, signal: recovery.signal }));
     await until(() => controlled.calls().filter((c) => c === "b1a0").length === 2);
     fs.writeFileSync(controlled.gate, "yes");
     const resumed = await restoring;
@@ -313,11 +315,13 @@ test("a forcibly killed host recovers completed work and stops its matching orph
     if (process.platform === "linux") {
       try { const stat = fs.readFileSync(`/proc/${orphan.pid}/stat`, "utf8"); assert.ok(stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")); }
       catch (error) { if (error.code !== "ENOENT") throw error; }
-    } else assert.notEqual(childIdentity(orphan.pid), orphan.identity);
+    } else assert.ok(owned.filter((process) => process.identity).every((process) => childIdentity(process.pid) !== process.identity));
   } finally {
+    recovery.abort();
+    if (restoring) await Promise.allSettled([restoring]);
     if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     if (orphan) await stopRecoveredChild(orphan);
-    p.cleanup();
+    fs.rmSync(p.dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 

@@ -464,6 +464,8 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
     for (let revision = 0; revision < revisions; revision += 1) {
       const evaluation = await evaluate(revision, candidatePath);
       evaluations.push(evaluation);
+      if (Number.isFinite(evaluation.v_mean)) progress.snapshot.best = Math.max(progress.snapshot.best ?? Number.NEGATIVE_INFINITY, evaluation.v_mean);
+      progress.activity(`revision ${revision} evaluated: V=${evaluation.v_mean}`);
       log(
         `[dream ${iteration}] pi_${revision}: V=${evaluation.v_mean.toFixed(4)} beta=${evaluation.default_beta} ` +
           `pareto.reward=${evaluation.summary.pareto_reward.toFixed(4)} auc=${evaluation.summary.auc.toFixed(4)} ` +

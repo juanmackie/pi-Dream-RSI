@@ -86,5 +86,5 @@ export function progressIterations(root: string): number[] {
 }
 export function progressSummary(s: ProgressSnapshot): string {
   const active = Object.values(s.attempts).filter((a) => ["preparing", "agent", "evaluation"].includes(a.stage)).length;
-  return `${s.phase} ${s.iteration}: ${s.status} | round ${s.round}/${s.round_budget} | workers ${active}/${s.workers} | completed ${s.completed} | best ${s.best ?? "n/a"}\n${s.activity}`;
+  return `${s.phase} ${s.iteration}: ${s.status} | round ${s.round}/${s.round_budget} | workers ${active}/${s.workers} | completed ${s.completed} | ${s.phase === "dream" ? "best V" : "best"} ${s.best ?? "n/a"}\n${s.activity}`;
 }

@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
-import { copyWorkspace, type CommandResult } from "../agent/runner.ts";
+import { copyWorkspace, type CommandResult, type OwnedChild } from "../agent/runner.ts";
 import { readPolicyViolations } from "../policy/runner.ts";
 import type { RevealedNode } from "../policy/host.ts";
 import type { PolicyRunResult } from "../policy/runner.ts";
@@ -17,7 +17,7 @@ export interface PreparedAttempt {
 export interface PendingAttempt {
   cell: string; parentCell: string; parentWorkspace: string;
   stage: "preparing" | "agent" | "evaluation" | "complete";
-  process?: { pid: number; identity: string | null };
+  process?: OwnedChild;
   retry: number; prepared?: PreparedAttempt; agentRun?: CommandResult;
   workspace_hash?: string; agent_snapshot?: string; record: RevealedNode | null;
 }
@@ -74,7 +74,14 @@ export function freezePolicy(policy: string, destination: string): Record<string
   walk(path.resolve(policy));
   // Type-only imports can point outside policy/; keep the whole common ancestor layout.
   let base = path.dirname(path.resolve(policy));
-  while ([...files.keys()].some((f) => !f.startsWith(base + path.sep))) base = path.dirname(base);
+  while ([...files.keys()].some((f) => {
+    const relative = path.relative(base, f);
+    return relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative);
+  })) {
+    const parent = path.dirname(base);
+    if (parent === base) throw new Error("policy import closure crosses filesystem volumes");
+    base = parent;
+  }
   const hashes: Record<string, string> = {};
   for (const [file, source] of files) {
     const target = path.join(destination, path.relative(base, file));
