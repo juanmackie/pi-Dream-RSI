@@ -15,6 +15,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { allocator, acquirePhase } from "./ownership.ts";
+import { ProgressRecorder, type ProgressObserver } from "./progress.ts";
+import { activeRuns } from "../state.ts";
 import { runAgent } from "../agent/runner.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { readManifest, readTree } from "./world.ts";
@@ -54,6 +57,7 @@ export interface DreamOptions {
   /** Overrides the deployed policy for revision 0 (used by tests). */
   policyPath?: string;
   log?: (message: string) => void;
+  onProgress?: ProgressObserver;
   /** Wall-clock cap per policy-development agent call. */
   developmentTimeoutMs?: number;
   /** Skip the policy-development agent (revision 0 only) — useful for smoke tests. */
@@ -142,6 +146,21 @@ async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index
 }
 
 export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResult> {
+  const release = allocator(rawOptions.dreamRoot, () => {
+    if (activeRuns(rawOptions.dreamRoot).length) throw new Error("live cycles are still in flight");
+    return acquirePhase(rawOptions.dreamRoot, "dream");
+  });
+  const progress = new ProgressRecorder(rawOptions.dreamRoot, rawOptions.iteration, "dream",
+    rawOptions.evaluateOnly ? 1 : rawOptions.task.revisions, 4, rawOptions.onProgress);
+  try {
+    const result = await runOwnedDreamPhase(rawOptions, progress);
+    progress.finish(rawOptions.signal?.aborted ? "interrupted" : result.ok ? "complete" : "failed");
+    return result;
+  } catch (error) { progress.activity(String(error)); progress.finish(rawOptions.signal?.aborted ? "interrupted" : "failed"); throw error; }
+  finally { release(); }
+}
+
+async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRecorder): Promise<DreamResult> {
   // Normalize at the boundary, same as the live phase.
   const options: DreamOptions = { ...rawOptions, task: normalizeTask(rawOptions.task) };
   const { dreamRoot, task, iteration } = options;
@@ -161,6 +180,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     const tree = readTree(dreamRoot, t);
     if (!tree) continue;
     const manifest = readManifest(dreamRoot, t);
+    if (manifest && manifest.status !== "complete") continue;
     const fromOtherContract =
       (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint) ||
       // Pre-fingerprint worlds: a stored score that is not `higher ? raw : -raw` under the current
@@ -198,6 +218,8 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
 
   /** Evaluate one policy version: selection beta first, then the full grid for the sweep. */
   const evaluate = async (revision: number, policyPath: string): Promise<VersionEvaluation> => {
+    progress.snapshot.round = revision + 1;
+    progress.activity(`replay revision ${revision}: selection and beta sweep`);
     const perWorld: VersionEvaluation["per_world"] = [];
     const errors: string[] = [];
     const values: number[] = [];
@@ -208,8 +230,10 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
     const selectionRuns = await mapLimit(
       worlds.map((_, index) => index),
       REPLAY_CONCURRENCY,
-      async (index) =>
-        replayEpisode({
+      async (index) => {
+        const cell = `r${revision}-world${iterations[index]}-selection`;
+        progress.stage(cell, "root", revision + 1, "evaluation");
+        const result = await replayEpisode({
           policyPath,
           world: worlds[index],
           beta: null, // the version's own baked-in default beta
@@ -221,7 +245,10 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
           timeoutMs: 120_000,
           verifyDeterminism: index === 0,
           signal: options.signal,
-        }),
+        });
+        progress.stage(cell, "root", revision + 1, result.ok ? "complete" : "failed", 0, result.metrics.value, result.error);
+        return result;
+      },
     );
     for (let index = 0; index < selectionRuns.length; index += 1) {
       const episode = selectionRuns[index];
@@ -276,8 +303,10 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
       const betaRuns = await mapLimit(
         worlds.map((_, index) => index),
         REPLAY_CONCURRENCY,
-        async (index) =>
-          replayEpisode({
+        async (index) => {
+          const cell = `r${revision}-world${iterations[index]}-beta${beta}`;
+          progress.stage(cell, "root", revision + 1, "evaluation");
+          const result = await replayEpisode({
             policyPath,
             world: worlds[index],
             beta,
@@ -288,7 +317,10 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
             lambda: rewardConfig.lambda,
             timeoutMs: 120_000,
             signal: options.signal,
-          }),
+          });
+          progress.stage(cell, "root", revision + 1, result.ok ? "complete" : "failed", 0, result.metrics.value, result.error);
+          return result;
+        },
       );
       for (let index = 0; index < betaRuns.length; index += 1) {
         const episode = betaRuns[index];
@@ -450,6 +482,8 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
       writeResults(false, null, null, null);
       const before = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : baseSource;
       const prompt = developmentPrompt(options, worlds.length);
+      const cell = `revision-${revision + 1}`;
+      progress.stage(cell, "root", revision + 1, "agent");
       const agentRun = await runAgent({
         agent: task.agent,
         cwd: dreamRoot,
@@ -457,7 +491,9 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
         timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
         logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
         signal: options.signal,
+        onOutput: (event) => progress.output(cell, false, event),
       });
+      progress.stage(cell, "root", revision + 1, agentRun.ok ? "complete" : "failed", 0, null, agentRun.spawnError);
       const after = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : "";
       if (!agentRun.ok || after === before) {
         log(
@@ -472,6 +508,7 @@ export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResu
       writeFileAtomic(staging, nextSource);
     }
 
+    progress.activity("selecting best policy revision");
     // --- selection ----------------------------------------------------------
     if (options.signal?.aborted) throw new Error("dream phase aborted");
     let selected = 0;
@@ -542,6 +579,7 @@ export async function planNextGrid(
   _iteration: number,
   baselineScore: number | null,
   policyPath?: string,
+  signal?: AbortSignal,
 ): Promise<{ plan: GridPlan; beta: number | null; error: string | null }> {
   const history = recentManifests(dreamRoot, 3)
     .filter((manifest) => manifest.task_fingerprint === undefined || manifest.task_fingerprint === scoringFingerprint(task))
@@ -570,6 +608,7 @@ export async function planNextGrid(
     config: forcedBeta === null ? {} : { beta: forcedBeta },
     gridPlanContext: context,
     timeoutMs: 60_000,
+    signal,
   });
   if (!result.ok || !result.plan) return { plan: fallbackGrid(task), beta: null, error: result.error ?? "plan_grid failed" };
   return {

@@ -34,14 +34,35 @@ offline replay of candidate policies against worlds recorded from real runs.
 |------|--------------|
 | `dream_rsi_init` | Write `.dream-rsi/task.json`, seed `.dream-rsi/policy/method.ts` from the shipped parallel-refine baseline, validate the workspace/problem file, and measure your own code into `history/seed/score.json`. Cheap. Reconfiguring keeps an existing measurement while the scoring contract still matches (workspace, candidate program, scorer, score field, direction); a changed contract re-measures automatically and the previous number is kept as `history/seed/score.<timestamp>.json`. Candidates and worlds recorded under the old contract stop being ranked, applied or replayed. |
 | `dream_rsi_live` | One or more online cycles: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records one world per episode. Pass `loops=n` (clamped to `task.json`'s `max_loops`, default 2) or start several `dream_rsi_live` calls at once to record `n` worlds of the same policy in parallel; the cap is shared across everything in flight. Expensive (real agent time: `loops x W` attempts at once). |
+| `dream_rsi_resume` | Resume an interrupted live tree using its original effective settings. Keeps completed attempts; restarts unfinished generators from the committed parent or evaluates a saved completed generator. Report kept/unfinished attempts and remaining budgets before running. |
 | `dream_rsi_dream` | Offline phase: replay `M` policy versions over all recorded worlds, sweep the beta grid, revision-agent rewrites the policy between revisions, select argmax `V`, deploy the winner. Recovers interrupted cycle claims first, then refuses while a world is genuinely in flight (or its manifest is unreadable) — the history has to be frozen, and only worlds recorded under the current scoring contract are replayed. Moderately expensive (M−1 agent calls, independent of how many worlds are being replayed). |
 | `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true`, copies only the declared program (plus paths the user names), never commits. |
 | `dream_rsi_status` | Iterations with best score + baked beta, worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), and the best candidate on record. |
 
-`dream_rsi_live`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
+`dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
 mode (`/dream-rsi`, or automatically after `dream_rsi_init`). Commands: `/dream-rsi create [goal]
 [--reconfigure|--fresh]`, `/dream-rsi suggest [goal]` (alias `best`), `/dream-rsi status | live | dream | run [n]
 | off`. Free text is treated as a goal.
+
+## Visibility and recovery
+
+Use `/dream-rsi watch [iteration]` or `Ctrl+Shift+D` to inspect the live tree, node lifecycle, tool activity,
+and bounded agent/evaluator log tails without spending agent time. A widget appears during live and dream
+phases in terminal mode. Arrows select cycles/nodes, `d` switches live/dream, Tab changes panes, Page Up loads older logs and Esc
+closes the view while work continues. RPC/JSON/print hosts use text and structured progress instead.
+
+After interruption, `dream_rsi_status` lists recoverable iterations. Use `dream_rsi_resume [iteration]`
+only when the user asks to continue that cycle; `/dream-rsi resume [iteration]` is the command entry point.
+Explain how many finished attempts are retained, unfinished work and remaining original budgets. Recovery
+uses the original effective model/thinking, frozen policy/imports, seed snapshot and scoring command,
+even if the current session changed. Generators that did not finish rerun from the committed parent;
+finished generators rerun only evaluation. Extra calls are reported separately. Do not delete the saved
+workspaces to unblock a run: active and recoverable workspaces are protected from retention.
+
+Only completed worlds are replayed. Legacy worlds without checkpoints are watchable, completed trees
+cannot be extended, and interrupted dream revisions must be restarted. Recovery refuses corrupt/missing
+snapshots, a changed scoring contract, a divergent saved policy prefix or an active owner before new calls.
+Keep external scorer files, datasets and dependencies unchanged; only their command/settings are frozen.
 
 ## Setup (ask, don't guess)
 

@@ -9,6 +9,8 @@
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
+import { OutputDecoder, type OutputEvent } from "./output.ts";
 
 import { THINKING_LEVELS, type AgentConfig } from "../engine/task.ts";
 
@@ -32,6 +34,10 @@ export interface CommandResult {
 }
 
 export interface RunOptions {
+  onOutput?: (event: OutputEvent) => void;
+  /** Durable child ownership; unlike output observers, errors cancel execution. */
+  onSpawn?: (pid: number) => void;
+  outputFormat?: "text" | "pi-json";
   cwd: string;
   timeoutMs: number;
   logPath?: string | null;
@@ -117,6 +123,12 @@ async function collect(
         logStream.on("close", settle);
       })
     : Promise.resolve();
+  // Observer failures cannot change execution or the score.
+  const decoder = new OutputDecoder(options.outputFormat === "pi-json", (event) => {
+    try { options.onOutput?.(event); } catch { /* presentation only */ }
+  });
+  const stdoutDecoder = new StringDecoder("utf8");
+  const stderrDecoder = new StringDecoder("utf8");
   let stdoutTail = "";
   let stderrTail = "";
   const append = (current: string, chunk: string): string => {
@@ -135,6 +147,9 @@ async function collect(
     const finish = (result: Partial<CommandResult>): void => {
       if (settled) return;
       settled = true;
+      const stdoutEnd = stdoutDecoder.end();
+      const stderrEnd = stderrDecoder.end();
+      decoder.feed("stdout", stdoutEnd); decoder.feed("stderr", stderrEnd); decoder.finish();
       if (timer) clearTimeout(timer);
       if (grace) clearTimeout(grace);
       options.signal?.removeEventListener("abort", onAbort);
@@ -220,16 +235,21 @@ async function collect(
       }
     };
     running.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
+      const text = stdoutDecoder.write(chunk);
+      decoder.feed("stdout", text);
       stdoutTail = append(stdoutTail, text);
       writeLog(running.stdout as NodeJS.ReadableStream, text);
     });
     running.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
+      const text = stderrDecoder.write(chunk);
+      decoder.feed("stderr", text);
       stderrTail = append(stderrTail, text);
       writeLog(running.stderr as NodeJS.ReadableStream, text);
     });
     running.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut && !aborted, code, signal }));
+    if (running.pid !== undefined) {
+      try { options.onSpawn?.(running.pid); } catch { onAbort(); }
+    }
 
     // An agent that exits before reading its prompt closes the pipe; the EPIPE is an outcome of the
     // attempt (recorded from its exit code), never a reason to take down the host running the loop.
@@ -271,6 +291,8 @@ export function buildAgentArgs(agent: AgentConfig): string[] {
   if (agent.thinking && !hasThinkingPlaceholder && !args.includes("--thinking")) {
     args.push("--thinking", agent.thinking);
   }
+  const explicitMode = args.some((arg) => arg === "--mode" || arg.startsWith("--mode="));
+  if (!explicitMode && (agent.output_format === "pi-json" || (agent.command === "pi" && agent.output_format !== "text"))) args.push("--mode", "json");
   return args;
 }
 
@@ -361,6 +383,10 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
   const command = self ? self.command : agent.command;
   const invocationArgs = self ? [...self.args, ...args] : args;
   const shell = self ? false : process.platform === "win32";
+  const modeIndex = args.indexOf("--mode");
+  const json = agent.output_format === "pi-json" || (agent.output_format !== "text" &&
+    (args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json")));
+  options = { ...options, outputFormat: json ? "pi-json" : "text" };
   const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
   if (agent.prompt_via === "arg") {
     return collect(command, [...invocationArgs, options.prompt], { ...options, shell, env });
@@ -453,15 +479,13 @@ async function copyTree(
     await fs.promises.mkdir(to, { recursive: true });
     const entries = await fs.promises.readdir(from, { withFileTypes: true });
     const results = await Promise.allSettled(
-      entries.map((entry) =>
-        limit(async () => {
+      entries.map(async (entry) => {
           const childFrom = path.join(from, entry.name);
           const childTo = path.join(to, entry.name);
           // Only the source side is tested: children of the destination are trivially "inside" it.
           if (skip(path.resolve(childFrom))) return;
           await copyTree(childFrom, childTo, skip, limit, nested);
         }),
-      ),
     );
     const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failed) throw failed.reason;
@@ -480,11 +504,11 @@ async function copyTree(
       if (skip(path.resolve(real))) return;
       const targetStats = await fs.promises.stat(real);
       if (targetStats.isDirectory()) await copyTree(real, to, skip, limit, seen);
-      else await fs.promises.copyFile(real, to);
+      else await limit(() => fs.promises.copyFile(real, to));
     }
     return;
   }
-  await fs.promises.copyFile(from, to);
+  await limit(() => fs.promises.copyFile(from, to));
 }
 
 /**
@@ -510,4 +534,41 @@ export async function copyWorkspace(from: string, to: string, options: CopyWorks
     createLimiter(COPY_CONCURRENCY),
     new Set(),
   );
+}
+
+/** PID plus process birth identity prevents stale recovery records killing a reused PID. */
+export function childIdentity(pid: number): string | null {
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return `linux:${fields[19]}`;
+    }
+    if (process.platform === "win32") return execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`], { encoding: "utf8", windowsHide: true, timeout: 5000 }).trim();
+    return execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf8", timeout: 5000 }).trim() || null;
+  } catch { return null; }
+}
+export async function stopRecoveredChild(child: { pid: number; identity: string | null }): Promise<void> {
+  const current = childIdentity(child.pid);
+  if (!current) {
+    try { process.kill(child.pid, 0); }
+    catch { return; }
+    throw new Error(`cannot verify interrupted child ${child.pid}; wait for it to exit before resuming`);
+  }
+  if (current !== child.identity) {
+    if (!child.identity && current) throw new Error(`cannot verify interrupted child ${child.pid}; wait for it to exit before resuming`);
+    return; // exited, zombie, or PID belongs to a different process
+  }
+  killTree({ pid: child.pid } as ChildProcess);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    if (childIdentity(child.pid) !== current) return;
+    if (process.platform === "linux") {
+      try {
+        const stat = fs.readFileSync(`/proc/${child.pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 2).startsWith("Z ")) return;
+      } catch { return; }
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`interrupted child ${child.pid} did not stop`);
 }

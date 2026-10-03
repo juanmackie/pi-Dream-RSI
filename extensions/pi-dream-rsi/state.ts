@@ -9,6 +9,9 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { allocator, dreamIsActive, phaseIsActive } from "./engine/ownership.ts";
+import { checkpointPath, recoverableIterations } from "./engine/checkpoint.ts";
+import { progressIterations, readProgress, progressSummary } from "./engine/progress.ts";
 
 import { DREAM_DIR, readTask, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import {
@@ -108,7 +111,11 @@ export function nextIteration(root: string): number {
  * handed the same number: the loser sees EEXIST and moves to the next one. Synchronous on purpose — the
  * caller reserves before its first `await`, so a second tool call in the same session cannot interleave.
  */
-export function reserveIterations(root: string, count: number, minBase = 1, owner?: PhaseOwner): number[] {
+export function reserveIterations(root: string, count: number, minBase = 1, owner?: PhaseOwner, maxLoops?: number): number[] {
+  return allocator(root, () => {
+  if (dreamIsActive(root)) throw new Error("a dream phase owns this project");
+  if (maxLoops !== undefined) count = Math.min(count, Math.max(0, maxLoops - runningIterations(root).length));
+  if (count === 0) throw new Error("project max_loops budget is already in use");
   let iteration = Math.max(nextIteration(root), minBase);
   const reserved: number[] = [];
   for (let offset = 0; offset < count; offset += 1) {
@@ -141,6 +148,7 @@ export function reserveIterations(root: string, count: number, minBase = 1, owne
     }
   }
   return reserved;
+  });
 }
 
 /** True when `pid` is a live process on this host (EPERM still means it exists). */
@@ -187,6 +195,7 @@ export function recoverInterruptedRuns(root: string, except: number[] = [], opti
     const file = path.join(dir, entry, "live_cycle_manifest.json");
     const manifest = readJson<LiveCycleManifest>(file);
     if (!manifest || manifest.status !== "running") continue;
+    if (phaseIsActive(root, `live-${iteration}`)) continue;
     const owner = manifest.owner;
     if (owner) {
       const ours = options.sessionId !== undefined && owner.session_id === options.sessionId;
@@ -195,7 +204,7 @@ export function recoverInterruptedRuns(root: string, except: number[] = [], opti
     }
     const updated: LiveCycleManifest = {
       ...manifest,
-      status: "failed",
+      status: fs.existsSync(checkpointPath(root, iteration)) ? "interrupted" : "failed",
       completed_at: new Date().toISOString(),
       error: manifest.error ?? "interrupted — the previous run did not finish",
     };
@@ -251,12 +260,14 @@ export function iterationReport(root: string, iteration: number, manifest: LiveC
   const baseline = manifest.baseline_score;
   const delta = typeof scored === "number" && typeof baseline === "number" ? scored - baseline : null;
   const lines = [
-    `${manifest.status === "complete" ? "Live cycle" : "⚠️ Live cycle FAILED"} ${iteration}`,
+    `${manifest.status === "complete" ? "Live cycle" : manifest.status === "interrupted" ? "⚠️ Live cycle INTERRUPTED" : "⚠️ Live cycle FAILED"} ${iteration}`,
     `  grid:       ${manifest.grid.branch_count} branches x ${manifest.grid.refine_count} refinements (beta=${manifest.baked_beta})`,
     `  attempts:   ${manifest.attempts} across ${manifest.decision_rounds} decision round(s), W=${manifest.grid.branch_count}`,
     `  score:      best=${scored ?? "n/a"}${baseline === null ? "" : ` baseline=${baseline}`}${delta === null ? "" : ` delta=${delta > 0 ? "+" : ""}${delta}`}`,
     `  stopped:    ${manifest.stopped ?? "n/a"}${manifest.error ? ` | error: ${manifest.error}` : ""}`,
-    `  world:      ${path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json")}`,
+    manifest.status === "complete" ? `  world:      ${path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json")}` :
+      `  recovery:   ${fs.existsSync(checkpointPath(root, iteration)) ? checkpointPath(root, iteration) : "no checkpoint (cycle did not start)"}`,
+
     `  records:    ${path.join(historyDir(root), `r${String(iteration).padStart(4, "0")}_live`)}`,
   ];
   return lines.join("\n");
@@ -285,6 +296,12 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
     `  scoring:  ${task.score_program} -> ${task.score_path}.${task.score_field} (${task.higher_is_better ? "higher" : "lower"} is better)`,
     `  policy:   ${path.relative(root, state.policy)} (versions: ${state.policyVersions.length === 0 ? "none archived" : state.policyVersions.join(", ")})`,
   ];
+  const recoverable = recoverableIterations(root);
+  if (recoverable.length) lines.push(`  recoverable: ${recoverable.join(", ")} — /dream-rsi resume [iteration]`);
+  for (const iteration of progressIterations(root)) {
+    const progress = readProgress(root, iteration);
+    if (progress?.status === "running" || progress?.status === "interrupted") lines.push(`  ${progressSummary(progress)}`);
+  }
   const active = activeRuns(root);
   if (active.length > 0) lines.push(`  in flight: ${active.join("; ")}`);
   const worlds = state.iterations.length;

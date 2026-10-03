@@ -206,7 +206,7 @@ There are two ways in, and they are not interchangeable:
 - **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` writes the configuration, `dream_rsi_live`/
   `dream_rsi_dream` run the phases, `dream_rsi_apply` copies a candidate back, `dream_rsi_status` reports.
 
-**`create` and `suggest` route themselves**, and everything except `status`, `off`, and `help` needs a
+**`create` and `suggest` route themselves**, and everything except `status`, `watch`, `off`, and `help` needs a
 configured task in the project you are in — that is `<cwd>/.dream-rsi/task.json`. `/dream-rsi create <goal>` writes
 it (via the interview); the rest report this when it is missing:
 
@@ -250,6 +250,7 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 |------|---------------|--------------|
 | `dream_rsi_init` | one scorer run | Writes `task.json`, seeds the policy, measures your code as the baseline candidates must beat. Reconfiguring keeps that measurement while the scoring contract still matches (workspace, candidate program, scorer, score field, direction); a changed contract re-measures automatically, and the old number is kept as `history/seed/score.<timestamp>.json` (`remeasure_seed=true` forces it on unchanged code). Old-contract candidates and worlds stop being ranked, applied or replayed until a cycle is recorded under the new contract. |
 | `dream_rsi_live` | `W × K1` agent calls per episode | One or more online cycles: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world per episode. `loops=n` (or several calls) records `n` worlds of the same policy in parallel; `max_loops` caps everything in flight. |
+| `dream_rsi_resume` | unfinished attempts only | Resume an interrupted live tree from its checkpoint and original effective settings. Completed attempts are reused; a completed generator only reruns evaluation. |
 | `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over the recorded worlds, sweep beta, rewrite the policy, deploy the winner. Recovers interrupted cycle claims first, then refuses while a world is genuinely in flight or its manifest is unreadable; only worlds recorded under the current scoring contract are replayed, and cost does not grow with the number of worlds. |
 | `dream_rsi_apply` | nothing | Copies a candidate's `eval_program` over your code. Needs `confirm: true`; never commits. |
 | `dream_rsi_status` | nothing | Iterations, worlds, policy versions, last sweep, and whether something is waiting to be applied. |
@@ -260,6 +261,8 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 |---------|--------------|
 | `/dream-rsi create <goal>` | Interview (fresh project), or on a configured project ask: report + best candidate for `<goal>`, reconfigure, or start fresh. `--reconfigure` / `--fresh` skip the dialog. |
 | `/dream-rsi suggest <goal>` | Rank the candidates on demand. `best` is an alias. Preferences: `fastest`, `safest`, `simplest`. |
+| `/dream-rsi watch [iteration]` | Open the tree/log dashboard; defaults to the latest active cycle, then latest recorded. `Ctrl+Shift+D` opens it during a run. |
+| `/dream-rsi resume [iteration]` | Ask the agent to resume the selected interrupted live cycle, or the latest recoverable one. |
 | `/dream-rsi status` | The same state `dream_rsi_status` shows. |
 | `/dream-rsi live [n]` \| `dream` | Ask the agent for one phase — `n` online cycles in parallel for `live`. |
 | `/dream-rsi run [n]` | Ask the agent for `n` full cycles. |
@@ -271,6 +274,51 @@ Starting a fresh task archives the current one instead of deleting it: `task.jso
 `.dream-rsi/archive/<timestamp>/` (which gets the same `.gitignore` treatment, so archived `work/` and
 `trace_pool/` stay out of version control). Reconfiguring touches none of it — it only rewrites the fields you
 change.
+
+## Watching and resuming a cycle
+
+Live and dream phases automatically show a terminal widget with the cycle, round budget, active workers,
+completed attempts, best score and latest activity. `/dream-rsi watch` or `Ctrl+Shift+D` opens an overlay
+while work continues. Left/right selects a cycle; up/down selects a tree node; Tab switches between tree/tool
+activity, agent output and evaluator output; `d` switches between live and dream progress. Page Up loads older log pages from disk, Page Down returns to
+the tail, and Esc closes the view. Closing the view leaves the cycle running. Another pi session opened
+in the same project can watch its persisted progress. Historical worlds, including worlds from older
+versions, can also be inspected with `/dream-rsi watch 1`.
+
+Terminal dashboards run only in `tui` mode. RPC, JSON and print hosts receive text updates and structured
+`details.progress`; `dream_rsi_status` includes persisted progress and recoverable iterations. Watching is
+read-only and does not start an agent. Log tails are bounded to 200 lines and 64 KiB per displayed stream;
+full logs remain in `history/r####_live/attempt_<cell>/{agent,eval}.log`. Presentation updates are throttled
+to four per second, with final states shown immediately.
+
+Interrupting a live cycle kills and drains its children and leaves a recoverable checkpoint. Run
+`/dream-rsi resume [iteration]` (or `dream_rsi_resume iteration=1`) explicitly. The agent reports the kept
+attempts, unfinished work and remaining budget first. Resume uses the **original effective model, thinking
+level, scorer command, grid, budgets, frozen policy/imports and seed snapshot**. Later session model or
+budget changes apply to new cycles. Restoring an interrupted generator reruns that logical attempt from
+its committed parent; restoring a finished generator reruns only its evaluator. Abandoned work and logs
+are archived per retry, and extra agent/evaluator calls are reported separately from logical attempts.
+
+Resume rebuilds the policy's private state by replaying saved ordered batch requests and results from reset.
+It checks that the saved prefix still matches before new agent/scorer calls. A completed sibling survives
+an interrupted batch, while policy decisions still wait for the whole batch. Atomic, versioned checkpoints
+are saved before dispatch and before replies. Corrupt checkpoints, missing/edited snapshots, changed scoring
+contracts and divergent policy requests stop recovery before new calls. External scorer files, datasets,
+installed tools and credentials must remain available and unchanged; the checkpoint freezes the command
+and settings, not the external environment.
+
+Project locks coordinate live, resume and dream across sessions, share `max_loops`, and prevent duplicate
+resume. An owner with a live process is preserved; dead owners can be recovered. Resume also stops a saved
+orphan child after verifying its process birth identity, so a reused PID is never killed. Retention protects active
+and recoverable workspaces. Only completed worlds enter replay; final publication can be retried without
+repeating completed work. Legacy cycles without checkpoints can be watched but cannot be resumed. Completed
+trees cannot be extended, and interrupted dream revisions must be started again.
+
+For the default `pi` agent, JSON streaming is added unless `agent.args` already specifies `--mode`.
+Custom commands retain raw text output. `agent.output_format` in `task.json` can be `auto` (default), `text`
+or `pi-json`; choose `text` to keep a pi invocation in text mode or `pi-json` for a compatible custom CLI.
+Explicit CLI modes are retained. Complete raw stdout/stderr is written to the log even when the dashboard
+shows decoded assistant text and tool activity.
 
 ## What you give it
 

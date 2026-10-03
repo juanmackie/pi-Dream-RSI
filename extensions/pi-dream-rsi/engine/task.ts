@@ -31,6 +31,7 @@ export interface AgentConfig {
    * which is the supported way to hand an agent a variable it genuinely needs.
    */
   env?: Record<string, string>;
+  output_format?: "auto" | "text" | "pi-json";
 }
 
 export interface TaskConfig {
@@ -188,6 +189,7 @@ export function validateTask(raw: unknown): string[] {
   if (agent && agent.prompt_via !== "stdin" && agent.prompt_via !== "arg") {
     errors.push('agent.prompt_via must be "stdin" or "arg"');
   }
+  if (agent?.output_format !== undefined && !["auto", "text", "pi-json"].includes(agent.output_format)) errors.push("agent.output_format must be auto, text, or pi-json");
   if (agent && agent.env !== undefined) {
     const entries = agent.env && typeof agent.env === "object" && !Array.isArray(agent.env) ? Object.entries(agent.env) : null;
     if (!entries) errors.push("agent.env must be an object of string values");

@@ -139,6 +139,16 @@ six failed attempts. Report the outcome verbatim.
 Then **stop and ask**. State: the baseline to beat, the planned grid (`W × K1` agent calls per cycle), and the
 cost. Do not call `dream_rsi_live` until the user agrees — `create` is an on-ramp, not a spending decision.
 
+When introducing the loop, point out `/dream-rsi watch` and `Ctrl+Shift+D`: terminal mode shows a widget
+and a tree/log overlay during live and dream work. The default pi child streams JSON unless an explicit
+`--mode` was configured. Custom commands keep raw output; `agent.output_format` in `task.json` accepts
+`auto`, `text` and `pi-json`. For headless hosts, use text/structured progress from the tools.
+
+An interrupted live cycle can be continued with `/dream-rsi resume [iteration]` after reporting kept
+attempts and remaining original budgets. It freezes the effective model/thinking, seed, policy and task
+settings; external scoring files and dependencies must stay unchanged. Legacy worlds and dream revisions
+have no resume checkpoint. Resume is explicit, and a completed tree cannot be extended.
+
 ## 7. After the first cycle, the recommendation is automatic
 
 Once a cycle has run, every `dream_rsi_live`/`dream_rsi_dream` result ends with the ranked candidates, and

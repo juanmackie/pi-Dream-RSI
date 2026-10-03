@@ -41,11 +41,11 @@ function initParams(project, extra = {}) {
   };
 }
 
-test("registers four tools, one command and the lifecycle hooks", async () => {
+test("registers six tools, one command and the lifecycle hooks", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_resume", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status"]);
     assert.deepEqual([...harness.commands.keys()], ["dream-rsi"]);
     for (const event of ["session_start", "session_tree", "session_shutdown", "before_agent_start", "agent_start", "resources_discover"]) {
       assert.equal(typeof harness.handlers.get(event), "function", `${event} hook registered`);
@@ -717,7 +717,7 @@ test("tool parameter schemas stay validatable and strict", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.equal(harness.tools.size, 5);
+    assert.equal(harness.tools.size, 6);
     for (const [name, tool] of harness.tools) {
       const schema = tool.parameters;
       assert.equal(schema.type, "object", `${name}: parameters must be an object schema`);
@@ -833,9 +833,10 @@ test("a policy that reaches outside the prefix is blocked before it runs", async
 
     const live = await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
     assert.match(live.content[0].text, /FAILED|failed/, "a non-prefix-only policy must not run");
-    const manifest = readJson(path.join(project.dreamRoot, "trace_pool", "iter0001", "live_cycle_manifest.json"));
+    const manifest = readJson(path.join(project.dreamRoot, "trace_pool", "iter0001_current", "live_cycle_manifest.json"));
     assert.equal(manifest.status, "failed");
     assert.match(manifest.note, /node:fs/);
+    assert.equal(exists(path.join(project.dreamRoot, "trace_pool", "iter0001", "tree.json")), false, "failed cycles do not publish replay worlds");
   } finally {
     project.cleanup();
   }

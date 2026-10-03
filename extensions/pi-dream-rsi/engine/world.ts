@@ -16,12 +16,13 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 
 import { DiscoveryTree, type TreeJSON } from "./tree.ts";
 
 export interface LiveCycleManifest {
   iteration: number;
-  status: "running" | "complete" | "failed";
+  status: "running" | "complete" | "failed" | "interrupted";
   created_at: string;
   completed_at: string | null;
   /**
@@ -96,11 +97,15 @@ export function deployedBetaPath(dreamRoot: string): string {
 }
 
 /** Write a file atomically (same directory, then rename), so a crash cannot leave a half-written policy. */
-export function writeFileAtomic(file: string, contents: string): void {
+export function writeFileAtomic(file: string, contents: string, durable = false): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, contents, "utf8");
-  fs.renameSync(tmp, file);
+  const tmp = `${file}.tmp-${process.pid}-${randomUUID()}`;
+  try {
+    fs.writeFileSync(tmp, contents, "utf8");
+    if (durable) { const fd = fs.openSync(tmp, "r+"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+    fs.renameSync(tmp, file);
+    if (durable && process.platform !== "win32") { const fd = fs.openSync(path.dirname(file), "r"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
+  } finally { fs.rmSync(tmp, { force: true }); }
 }
 
 export function workRoot(dreamRoot: string): string {
@@ -280,7 +285,7 @@ export function writeManifest(root: string, manifest: LiveCycleManifest): string
 /** In-flight mirror, so a crashed/interrupted cycle is still visible. */
 export function writeCurrentManifest(root: string, manifest: LiveCycleManifest): string {
   const current = path.join(iterationDir(root, manifest.iteration, true), "live_cycle_manifest.json");
-  writeJson(current, manifest);
+  writeFileAtomic(current, `${JSON.stringify(manifest, null, 2)}\n`);
   return current;
 }
 
@@ -370,6 +375,9 @@ export function pruneWorkspaces(root: string, keep: number, currentIteration?: n
   const removed: number[] = [];
   for (const entry of entries.slice(Math.max(1, keep))) {
     if (entry.iteration === currentIteration) continue;
+    const current = iterationDir(root, entry.iteration, true);
+    const manifest = readJson<LiveCycleManifest>(path.join(current, "live_cycle_manifest.json"));
+    if (manifest?.status === "running" || (manifest?.status !== "complete" && fs.existsSync(path.join(current, "checkpoint.json")))) continue;
     fs.rmSync(path.join(dir, entry.name), { recursive: true, force: true });
     removed.push(entry.iteration);
   }

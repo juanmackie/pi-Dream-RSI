@@ -243,7 +243,7 @@ test("ranking is deterministic and writes nothing", () => {
 });
 
 test("the configured model is actually passed to attempts", () => {
-  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin" };
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin", output_format: "text" };
   assert.deepEqual(buildAgentArgs(base), ["-p", "--no-session"], "no model, no flag");
   assert.deepEqual(buildAgentArgs({ ...base, model: "opencode-go/deepseek-v4.1-flash" }), [
     "-p",
@@ -256,7 +256,7 @@ test("the configured model is actually passed to attempts", () => {
 });
 
 test("the session thinking level is passed to attempts", () => {
-  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin" };
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin", output_format: "text" };
   assert.deepEqual(buildAgentArgs({ ...base, thinking: "high" }), ["-p", "--no-session", "--thinking", "high"]);
   assert.deepEqual(
     buildAgentArgs({ ...base, args: ["-p", "--thinking={thinking}"], thinking: "low" }),

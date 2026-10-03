@@ -104,6 +104,7 @@ export async function replayEpisode(options: ReplayEpisodeOptions): Promise<Repl
     maxRounds: options.k2,
     timeoutMs: options.timeoutMs ?? 60_000,
     verifyDeterminism: options.verifyDeterminism ?? false,
+    signal: options.signal,
   });
   const trace = run.trace ?? [];
   return {
