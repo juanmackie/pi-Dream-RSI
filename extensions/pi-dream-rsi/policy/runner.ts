@@ -68,6 +68,8 @@ export interface PolicyRunOptions {
   workerPath?: string;
   /** Cancellation: aborts the policy run and terminates its worker. */
   signal?: AbortSignal;
+  /** Stop/drain the caller's live child processes when orchestration ends early. */
+  onStop?: () => void;
 }
 
 export interface PolicyRunResult {
@@ -235,11 +237,16 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
 
   return await new Promise<PolicyRunResult>((resolve) => {
     let settled = false;
+    const probes = new Set<Promise<void>>();
     const finish = (value: PolicyRunResult): void => {
       if (settled) return;
       settled = true;
+      if (!value.ok) options.onStop?.();
       cleanup();
-      resolve({ ...value, durationMs: Date.now() - started });
+      void Promise.allSettled([...probes]).then(async () => {
+        await worker.terminate();
+        resolve({ ...value, durationMs: Date.now() - started });
+      });
     };
 
     // Cancellation terminates the worker and stops any probe already in flight from being awaited
@@ -253,7 +260,8 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
     }, timeoutMs);
     if (options.signal?.aborted) onAbort();
 
-    worker.on("message", async (message: Record<string, unknown>) => {
+    worker.on("message", (message: Record<string, unknown>) => {
+      if (settled) return;
       const type = String(message.type ?? "");
       if (type === "probe") {
         if (!options.probe) {
@@ -262,15 +270,18 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
         }
         const cells = (message.cells ?? []) as CellId[];
         const round = Number(message.round ?? 0);
-        try {
-          options.onBatch?.(cells, round);
-          const records = await options.probe(cells, round);
-          worker.postMessage({ type: "probe-reply", records });
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          // A rejected batch is a contract violation: stop the run and say why.
-          finish({ ok: false, error: reason, violations: [reason] });
-        }
+        const pending = (async () => {
+          try {
+            options.onBatch?.(cells, round);
+            const records = await options.probe!(cells, round);
+            if (!settled) worker.postMessage({ type: "probe-reply", records });
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            finish({ ok: false, error: reason, violations: [reason] });
+          }
+        })();
+        probes.add(pending);
+        void pending.finally(() => probes.delete(pending));
         return;
       }
       if (type === "grid-plan") {

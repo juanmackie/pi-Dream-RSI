@@ -21,10 +21,10 @@ require a publish. Publishing is for users, not for dogfooding — see [Developm
 ```bash
 # 1. Everything the tarball ships must be committed — publish the repo, not the working tree.
 git status --short                     # expect no surprises
-npm run typecheck && npm test          # 97 tests; also runs via prepublishOnly
+npm run typecheck && npm test          # full suite; also runs via prepublishOnly
 
 # 2. Version bump (keep the surfaces in step).
-npm version patch --no-git-tag-version # 0.1.1 -> 0.1.2
+npm version patch --no-git-tag-version
 #   ...edit README if install instructions changed...
 
 # 3. Commit the bump first — the published tarball must correspond to a commit, never a dirty tree.
@@ -50,6 +50,14 @@ curl -s -o /dev/null -w "%{http_code}\n" https://pi.dev/packages/pi-dream-rsi
 - `pi-package` is still in `keywords` and `pi.extensions` / `pi.skills` still resolve. Drop either one and the
   package silently disappears from the gallery.
 - Prompts and skills are shipped as-is — they are the product, and they are what goes stale first.
+- README, both skills, command help/completions and tool descriptions must agree on all six tools,
+  dashboard controls, mode gating and interrupted live-tree recovery. Historical plans are labelled as such.
+- Linux and Windows CI must pass on the commit being released; recovery tests exercise process cleanup and
+  durable checkpoints. On a scratch task, check `/dream-rsi help`, headless status and `Ctrl+Shift+D` while
+  work runs. Interrupt and explicitly resume a live tree; confirm completed attempts are kept, original
+  settings stay fixed, and only the completed world enters dream replay.
+- `npm pack --dry-run` must include `dashboard.ts`, agent output decoding, progress/checkpoint/ownership
+  modules, prompts and both skills. Terminal UI APIs come from the pi host; there are no package runtime deps.
 
 ## Development setup
 

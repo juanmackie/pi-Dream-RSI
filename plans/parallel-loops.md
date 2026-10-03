@@ -1,5 +1,11 @@
 # Parallel Dream-RSI loops (parallel worlds)
 
+> **Historical implementation plan.** The original parallel-loop work is complete. Its references to
+> failed-claim number reuse and one-session ownership describe the design at that time. Live-tree recovery
+> now preserves interrupted iteration numbers and checkpoints, and project process locks coordinate
+> live/resume/dream across sessions. See [README.md](../README.md#watching-and-resuming-a-cycle) and
+> [the operating skill](../skills/dream-rsi/SKILL.md) for current behavior.
+
 ## Context
 
 One online cycle today is a strictly serial phase: `dream_rsi_live` runs one episode (W attempts per

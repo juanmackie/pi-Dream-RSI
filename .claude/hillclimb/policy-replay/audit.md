@@ -1,5 +1,9 @@
 # Existing evaluation audit
 
+> **Historical audit of the former structural scorer.** Benchmark version 2 now measures production
+> replay behavior and fixes the equal-score regression described here. See [PROBLEM.md](../../../PROBLEM.md)
+> for the current scoring contract. The measurements below are retained as evidence of the original issue.
+
 Ran the existing scorer on three policies in separate temporary workspaces, then called the production `replayEpisode` entry point on the two valid policies. No model calls were made. The project policy, scorer, and Dream-RSI state were not edited.
 
 | Policy | Existing score | Valid | Replay probes | Replay attainment | Replay V |

@@ -158,8 +158,10 @@ Beta has three distinct roles. Do not conflate them:
 
 Keep all thresholds relative to the prefix; never use absolute score cutoffs.
 
-Use the following cross-cycle default-beta rule. Read the most recent 2-3 **live** `{trace_pool}` iteration
-manifests (and `_current` when present) for each iteration's final best score and actual baked-in beta.
+Use the following cross-cycle default-beta rule. Read the most recent 2-3 **completed live** `{trace_pool}`
+iteration manifests for each iteration's final best score and actual baked-in beta. A `_current` mirror is
+usable only when its manifest says `complete`; running/interrupted checkpoints and progress telemetry are
+unfinished work, not replay worlds or final trend evidence.
 Read the matching archived `beta_sweep.json` values (`pareto.reward`, AUC, parallel penalty, and the
 per-beta frontier). Scores alone do not establish that beta caused a change, so always use both sources:
 

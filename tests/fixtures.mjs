@@ -187,6 +187,7 @@ export async function deployShippedPolicy(project, source = null) {
 export function mockPi() {
   const tools = new Map();
   const commands = new Map();
+  const shortcuts = new Map();
   const handlers = new Map();
   const entries = [];
   const statuses = [];
@@ -194,6 +195,9 @@ export function mockPi() {
   const harness = {
     tools,
     commands,
+    shortcuts,
+    widgets: [],
+    customViews: [],
     handlers,
     entries,
     statuses,
@@ -219,6 +223,7 @@ export function mockPi() {
       if (!harness.activeTools.includes(tool.name)) harness.activeTools.push(tool.name);
     },
     registerCommand: (name, definition) => commands.set(name, definition),
+    registerShortcut: (name, definition) => shortcuts.set(name, definition),
     on: (event, handler) => handlers.set(event, handler),
     appendEntry: (type, data) => entries.push({ type: "custom", customType: type, data }),
     getActiveTools: () => [...harness.activeTools],
@@ -229,6 +234,7 @@ export function mockPi() {
     sendMessage: (message, options) => harness.injectedMessages.push({ message, options }),
   };
   const context = {
+    mode: "print",
     cwd: null,
     sessionManager: {
       getSessionId: () => "test-session",
@@ -236,6 +242,11 @@ export function mockPi() {
       getBranch: () => harness.branch ?? entries,
     },
     ui: {
+      setWidget: (key, value) => harness.widgets.push([key, value]),
+      custom: (factory, options) => new Promise((resolve) => {
+        const view = factory({ requestRender: () => {} }, {}, {}, resolve);
+        harness.customViews.push({ view, options });
+      }),
       notify: (message) => notifications.push(message),
       setStatus: (key, value) => statuses.push([key, value ?? null]),
       // A host without a TUI (print mode, RPC without a client) answers undefined/false, which must land

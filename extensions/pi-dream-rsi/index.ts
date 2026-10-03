@@ -7,8 +7,11 @@
  *
  *   dream_rsi_init    write task.json, seed the policy, validate the evaluator contract
  *   dream_rsi_live    one online rollout (policy pi_t, W workers, <= K1 rounds) -> discovery tree T_t
+ *   dream_rsi_resume  continue an interrupted live tree with its saved settings and remaining budget
  *   dream_rsi_dream   the offline phase: replay every candidate on every world, revise, select, deploy
- *   dream_rsi_status  what the loop currently is: iterations, worlds, versions, sweep, beta
+ *   dream_rsi_apply   apply a recorded candidate after explicit confirmation
+ *   dream_rsi_status  iterations, worlds, versions, sweep, progress and recoverable checkpoints
+ *   /dream-rsi watch  read-only tree and log dashboard (also Ctrl+Shift+D)
  *
  * No LLM runs in the driver: the only agents are the discovery attempts (one per selected node) and
  * the policy-development agent (one per revision), both spawned through the configured agent command.
@@ -19,6 +22,12 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { readTask, validateTask, writeTask, defaultTask, programFingerprint, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
+import { Dashboard } from "./dashboard.ts";
+import { buildAgentArgs } from "./agent/runner.ts";
+import { readCheckpoint, recoverableIterations } from "./engine/checkpoint.ts";
+import { progressIterations, readProgress, progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
+import { allocator, dreamIsActive, phaseIsActive, pidIsAlive } from "./engine/ownership.ts";
+import { writeCurrentManifest, readJson, currentManifestPath, type LiveCycleManifest } from "./engine/world.ts";
 import { runLiveEpisode } from "./engine/live.ts";
 import { planNextGrid, runDreamPhase } from "./engine/dream.ts";
 import { loadPrompt } from "./engine/prompt.ts";
@@ -199,6 +208,26 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // and the only session-scoped handles (per-session state) are dropped in `session_shutdown`.
   const runtimes = new Map<string, DreamState>();
   const gatedNames = new Set<string>();
+  const dashboards = new Map<string, Dashboard>();
+  const closingSessions = new Set<string>();
+  const jobs = new Map<string, Set<{ controller: AbortController; finished: Promise<void> }>>();
+  const dashboardFor = (ctx: ExtensionContext): Dashboard => {
+    const id = ctx.sessionManager.getSessionId();
+    let dashboard = dashboards.get(id); if (!dashboard) { dashboard = new Dashboard(ctx); dashboards.set(id, dashboard); }
+    return dashboard;
+  };
+  const observe = (ctx: ExtensionContext, onUpdate: any) => (progress: ProgressSnapshot): void => {
+    if (!closingSessions.has(ctx.sessionManager.getSessionId())) dashboardFor(ctx).observe(progress);
+    onUpdate?.({ content: [{ type: "text", text: progressSummary(progress) }], details: { progress } });
+  };
+  const beginJob = (ctx: ExtensionContext, signal?: AbortSignal): { signal: AbortSignal; end: () => void } => {
+    const id = ctx.sessionManager.getSessionId(); const controller = new AbortController();
+    const abort = (): void => controller.abort(); signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    let resolve!: () => void; const finished = new Promise<void>((done) => { resolve = done; });
+    const job = { controller, finished }; let set = jobs.get(id); if (!set) { set = new Set(); jobs.set(id, set); } set.add(job);
+    return { signal: controller.signal, end: () => { signal?.removeEventListener("abort", abort); set!.delete(job); if (!set!.size) jobs.delete(id); resolve(); } };
+  };
 
   const projectDir = (ctx: ExtensionContext): string => ctx.cwd;
   const dreamRoot = (ctx: ExtensionContext): string => dreamRootFor(ctx.cwd);
@@ -248,6 +277,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   };
 
   const reconstruct = (ctx: ExtensionContext): void => {
+    const id = ctx.sessionManager.getSessionId();
+    closingSessions.delete(id);
+    dashboards.get(id)?.dispose(); dashboards.delete(id);
     const state = { mode: false, iteration: 0, running: [] } as DreamState;
     // `getBranch()` (not `getEntries()`): a mode or iteration recorded on another branch must not
     // leak back in when the session tree is rewired.
@@ -316,7 +348,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptSnippet: "Configure the Dream-RSI task (workspace, eval_program, score_program, budgets, agent).",
     promptGuidelines: [
       "Call dream_rsi_init before dream_rsi_live: it writes .dream-rsi/task.json and seeds the exploration policy.",
-      "dream_rsi_init does not run anything expensive; it only writes configuration and validates that the workspace and problem file exist.",
+      "dream_rsi_init validates configuration and measures the seed with the scorer by default; measure_seed=false skips that measurement. It starts no discovery or revision agents.",
       "dream_rsi_init keeps the recorded baseline only while the scoring configuration still matches it — a changed workspace, scorer or score direction re-measures automatically (the old measurement is kept, not deleted); pass remeasure_seed=true to measure unchanged code on demand.",
     ],
     parameters: taskParams,
@@ -424,8 +456,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               `  candidate:  ${task.eval_program}`,
               `  scorer:     ${task.score_program}`,
               `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} loops<=${task.max_loops} beta_grid=[${task.beta_grid.join(", ")}]`,
-              `  agent:      ${configuredAgent.command} ${configuredAgent.args.join(" ")}${configuredAgent.model ? ` --model ${configuredAgent.model}` : ""}${configuredAgent.thinking ? ` --thinking ${configuredAgent.thinking}` : ""}`,
-              `  (attempts follow the active session model/thinking level; pass model= only to set the fallback)`,
+              `  agent:      ${configuredAgent.command} ${buildAgentArgs(configuredAgent).join(" ")}`,
+              `  (new cycles follow the active session model/thinking level; resumed cycles keep their saved settings; model= sets the fallback)`,
               `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
               baselineNote,
               ...programNote,
@@ -451,6 +483,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "dream_rsi_live loops=N records N worlds of the same policy in parallel — one dream then replays all of them. Real fan-out is loops x W agent processes (clamped to task.json's max_loops, default 2), so raise it only when the attempt model and the disk can take it.",
       "Start several dream_rsi_live calls in one turn to run independent cycles side by side: they share the max_loops budget, and dream_rsi_dream replays whatever worlds they recorded once they have finished.",
       "After dream_rsi_live, run dream_rsi_dream to improve the exploration policy from the newly recorded world(s).",
+      "dream_rsi_live exposes progress through its updates and /dream-rsi watch (Ctrl+Shift+D in terminal mode). Interrupted checkpointed cycles remain available to dream_rsi_resume; a new live call starts a new tree.",
     ],
     parameters: liveParams,
     async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
@@ -466,6 +499,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         };
       }
       let mine: RunningPhase | null = null;
+      let job: ReturnType<typeof beginJob> | undefined;
       try {
         let task: TaskConfig;
         try {
@@ -473,15 +507,13 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         } catch (error) {
           return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
         }
-        // A run marked running while no phase owns it was interrupted; clear it so the next cycle restarts
-        // cleanly instead of the project looking permanently stuck. A claim owned by another *live*
-        // session is left alone: recovery only reclaims confirmed-dead owners. Sibling live calls keep
-        // their claims.
+        // Release stale claims so new cycles can start. Checkpointed trees remain available for explicit
+        // resume; another live session and sibling calls keep their claims.
         const sessionId = ctx.sessionManager.getSessionId();
         const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId });
         if (recovered.length > 0) {
           onUpdate?.({
-            content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
+            content: [{ type: "text", text: recoveryNotice(recovered) }],
           });
         }
         // The world cap is shared by every live call in flight, not per call.
@@ -500,7 +532,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         }
         const requested = typeof params.loops === "number" ? Math.floor(params.loops) : 1;
         const want = Math.max(1, Number.isFinite(requested) ? requested : 1);
-        const loops = Math.min(want, remaining);
+        let loops = Math.min(want, remaining);
         const clampNote =
           want > loops
             ? ` (asked for ${want} loop(s), running ${loops}: max_loops=${task.max_loops}${claimed > 0 ? ` with ${claimed} already in flight` : ""})`
@@ -508,16 +540,18 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // Claim the numbers before planning: allocation must not interleave with another call's. The
         // owner is recorded so another session cannot reclaim this claim while it is genuinely running.
         const owner: PhaseOwner = { session_id: sessionId, pid: process.pid, claimed_at: new Date().toISOString() };
-        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1, owner);
+        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1, owner, task.max_loops);
+        loops = iterations.length;
         const iteration = iterations[0];
         mine = { label: loops === 1 ? `live cycle ${iteration}` : `live cycles ${iterations.join(", ")}`, iterations };
         state.running.push(mine);
+        job = beginJob(ctx, signal);
         const baseline = readBaselineScore(root, task);
         const previous = latestBest(root, task);
         // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
         const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
 
-        const planned = await planNextGrid(root, runTask, iteration, baseline);
+        const planned = await planNextGrid(root, runTask, iteration, baseline, undefined, job.signal);
         const grid = params.grid ? parseGrid(String(params.grid), planned.plan) : planned.plan;
         const bakedBeta = typeof planned.beta === "number" ? planned.beta : task.default_beta;
 
@@ -547,8 +581,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
                 grid: { branch_count: grid.branch_count, refine_count: grid.refine_count },
                 baselineScore: baseline,
                 previousBestScore: previous,
-                signal,
+                signal: job!.signal,
                 owner,
+                onProgress: observe(ctx, onUpdate),
                 log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
               });
               return { iteration: world, episode, error: episode.error };
@@ -585,11 +620,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               .map((o) => ({
                 iteration: o.iteration,
                 ok: o.episode?.ok === true,
-                attempts: o.episode?.tree.nNonRoot ?? 0,
+                attempts: o.episode?.manifest.attempts ?? 0,
                 rounds: o.episode?.manifest.decision_rounds ?? 0,
                 best: o.episode?.manifest.best_score ?? null,
               })),
-            attempts: outcomes.reduce((sum, o) => sum + (o.episode?.tree.nNonRoot ?? 0), 0),
+            attempts: outcomes.reduce((sum, o) => sum + (o.episode?.manifest.attempts ?? 0), 0),
             rounds: outcomes.reduce((most, o) => Math.max(most, o.episode?.manifest.decision_rounds ?? 0), 0),
             best: outcomes.reduce<number | null>((best, o) => {
               const score = o.episode?.manifest.best_score;
@@ -603,14 +638,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       } catch (error) {
         return { content: [{ type: "text", text: `❌ live cycle failed: ${(error as Error).message}` }], details: {} };
       } finally {
-        // Whatever is still marked running is this call's own failure; releasing it frees the number too.
+        // Release this call's stale claims while preserving checkpointed trees and their iteration numbers.
         // Siblings keep theirs, so a finishing live call never kills a concurrent one.
         const others = state.running.filter((phase) => phase !== mine);
         const leftover = recoverInterruptedRuns(root, claimedBy(others), { sessionId: ctx.sessionManager.getSessionId() });
         if (leftover.length > 0) {
-          onUpdate?.({ content: [{ type: "text", text: `Marked unfinished cycle(s) failed: ${leftover.join(", ")}.` }] });
+          onUpdate?.({ content: [{ type: "text", text: recoveryNotice(leftover) }] });
         }
         state.running = others;
+        job?.end();
         ctx.ui.setStatus(
           "dream-rsi",
           others.length > 0 ? `dream-rsi: ${others.map((p) => p.label).join(", ")}` : state.mode ? "dream-rsi: active" : undefined,
@@ -620,15 +656,70 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   });
 
   registerGatedTool({
+    name: "dream_rsi_resume", label: "Dream-RSI Resume",
+    description: "Resume an interrupted live cycle from its checkpoint, original effective settings and remaining original budget. Completed attempts are reused; unfinished generators restart from their committed parent, while saved completed generators need only evaluation. Omit iteration for the latest recoverable cycle.",
+    promptSnippet: "Resume an interrupted Dream-RSI live tree with its original settings.",
+    promptGuidelines: [
+      "Before dream_rsi_resume, report kept attempts, unfinished work, original model/thinking and remaining budgets. Retries can add calls beyond the original logical attempt budget; completed trees and interrupted dream revisions cannot be extended/resumed.",
+      "dream_rsi_resume requires the original scoring contract and intact saved workspaces; do not delete checkpoints or snapshots to bypass a recovery error. After completion, use dream_rsi_status or /dream-rsi suggest to rank candidates, then dream_rsi_dream to improve the policy.",
+    ],
+    parameters: { type: "object", properties: { iteration: { type: "integer", minimum: 1, description: "Interrupted live iteration to resume; omit for the latest recoverable cycle." } }, additionalProperties: false } as any,
+    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
+      const root = dreamRoot(ctx); const state = stateFor(ctx);
+      let phase: RunningPhase | undefined; let job: ReturnType<typeof beginJob> | undefined;
+      try {
+        if (state.running.some((p) => !p.label.startsWith("live"))) throw new Error("a dream phase is already running");
+        recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
+        const task = readTask(root);
+        const iteration = params.iteration ?? recoverableIterations(root)[0];
+        if (!iteration) throw new Error("no recoverable interrupted live cycle");
+        const cp = readCheckpoint(root, iteration);
+        if (!recoverableIterations(root).includes(iteration)) throw new Error("cycle is already complete; resume only accepts interrupted live trees");
+        const kept = cp.batches.flatMap((b) => b.attempts).filter((a) => a.record).length;
+        const unfinished = cp.batches.flatMap((b) => b.attempts).filter((a) => !a.record);
+        const owner: PhaseOwner = { session_id: ctx.sessionManager.getSessionId(), pid: process.pid, claimed_at: new Date().toISOString() };
+        allocator(root, () => {
+          if (dreamIsActive(root)) throw new Error("a dream phase owns this project");
+          const current = readJson<LiveCycleManifest>(currentManifestPath(root, iteration));
+          if (phaseIsActive(root, `live-${iteration}`) || (current?.status === "running" && current.owner && pidIsAlive(current.owner.pid))) throw new Error("cycle already has an active owner");
+          if (runningIterations(root).length >= task.max_loops) throw new Error("project max_loops budget is already in use");
+          writeCurrentManifest(root, { ...cp.manifest, status: "running", owner });
+        });
+        phase = { label: `live resume ${iteration}`, iterations: [iteration] }; state.running.push(phase);
+        job = beginJob(ctx, signal);
+        const header = `Resume live ${iteration}: keeping ${kept} attempts; ${unfinished.length} unfinished (${unfinished.filter((a) => a.stage === "evaluation").length} evaluation-only). ` +
+          `Original model=${cp.task.agent.model ?? "default"}, thinking=${cp.task.agent.thinking ?? "default"}, W=${cp.task.workers}, ` +
+          `rounds remaining=${cp.task.k1 - cp.batches.filter((b) => b.attempts.every((a) => a.record)).length}, logical attempts remaining=${cp.manifest.grid.branch_count * cp.manifest.grid.refine_count - kept}.`;
+        onUpdate?.({ content: [{ type: "text", text: header }], details: { kept, unfinished: unfinished.length, original_agent: cp.task.agent } });
+        const result = await runLiveEpisode({ dreamRoot: root, projectDir: ctx.cwd, task, iteration, resume: true,
+          policyPath: cp.policy, bakedBeta: cp.manifest.baked_beta, baselineScore: cp.manifest.baseline_score,
+          grid: cp.manifest.grid, owner, signal: job.signal, onProgress: observe(ctx, onUpdate) });
+        state.iteration = Math.max(state.iteration, iteration);
+        saveTaskEntry(pi, root, { iteration });
+        const saved = readCheckpoint(root, iteration);
+        return { content: [{ type: "text", text: `${header}\n${iterationReport(root, iteration, result.manifest)}\nExtra calls across recovery: agents=${saved.extra_agent_calls}, evaluators=${saved.extra_eval_calls}.` }],
+          details: { ok: result.ok, iteration, kept, attempts: result.manifest.attempts, best: result.manifest.best_score,
+            extra_agent_calls: saved.extra_agent_calls, extra_eval_calls: saved.extra_eval_calls, progress: readProgress(root, iteration) } };
+      } catch (error) {
+        return { content: [{ type: "text", text: `❌ resume failed: ${(error as Error).message}` }], details: { ok: false } };
+      } finally {
+        if (phase) state.running = state.running.filter((p) => p !== phase);
+        recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
+        job?.end();
+      }
+    },
+  });
+
+  registerGatedTool({
     name: "dream_rsi_dream",
     label: "Dream-RSI Offline Phase",
     description:
-      "Run the offline phase: freeze the recorded history as replay worlds, evaluate the current policy version and M-1 revisions of it on every world (deterministic replay, Eq. 1), sweep the beta grid, then select argmax V and deploy the winner for the next live cycle. Each revision is produced by the policy-development agent editing .dream-rsi/policy/method.ts.",
+      "Run the offline phase: freeze completed worlds recorded under the current scoring contract, evaluate the current policy and M-1 revisions on every world (deterministic replay, Eq. 1), sweep beta, select argmax V and deploy the winner. The policy-development agent edits staged candidates; the selected version replaces .dream-rsi/policy/method.ts.",
     promptSnippet: "Improve the exploration policy offline: replay M versions over the frozen history, select argmax V, deploy.",
     promptGuidelines: [
       "Use dream_rsi_dream after dream_rsi_live; it spends agent time only on policy revisions, and replay itself is deterministic and cheap.",
       "dream_rsi_dream asserts V* >= V_0: a reported failure means the policy was non-deterministic or non-prefix-only, so its result must not be trusted.",
-      "dream_rsi_dream recovers interrupted cycle claims first, then refuses only while a world is genuinely in flight or its manifest is unreadable — it replays every recorded world, so batch the live cycles you want replayed, then dream once.",
+      "dream_rsi_dream releases interrupted claims, preserving live checkpoints for explicit resume, then refuses while a phase is genuinely in flight or its manifest is unreadable. It replays completed worlds under the current scoring contract; resume any interrupted trees you want included before dreaming.",
     ],
     parameters: dreamParams,
     async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
@@ -653,7 +744,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
       if (recovered.length > 0) {
         onUpdate?.({
-          content: [{ type: "text", text: `Recovered interrupted cycle(s): ${recovered.join(", ")} (marked failed).` }],
+          content: [{ type: "text", text: recoveryNotice(recovered) }],
         });
       }
       const inFlight = activeRuns(root);
@@ -678,6 +769,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
       const phase: RunningPhase = { label: `dream phase ${iteration}`, iterations: [] };
       state.running = [phase];
+      const job = beginJob(ctx, signal);
       ctx.ui.setStatus("dream-rsi", `dream-rsi: dreaming ${iteration}`);
       try {
         const runTask: TaskConfig = {
@@ -691,7 +783,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           task: runTask,
           iteration,
           evaluateOnly: params.evaluate_only === true,
-          signal,
+          signal: job.signal,
+          onProgress: observe(ctx, onUpdate),
           log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
         });
         const pending = reportImprovements(ctx);
@@ -727,6 +820,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `❌ dream phase failed: ${(error as Error).message}` }], details: {} };
       } finally {
         state.running = state.running.filter((running) => running !== phase);
+        job.end();
         ctx.ui.setStatus("dream-rsi", state.mode ? "dream-rsi: active" : undefined);
       }
     },
@@ -856,10 +950,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_status",
     label: "Dream-RSI Status",
     description:
-      "Report the Dream-RSI state: recorded iterations with their best scores and baked-in beta, replay worlds, deployed policy version, and the last beta sweep (pareto.reward, AUC, parallel penalty, per-beta frontier).",
-    promptSnippet: "Report Dream-RSI iterations, worlds, policy versions and the last beta sweep.",
+      "Report Dream-RSI iterations, best scores, baked-in beta, completed worlds, policy versions, the last beta sweep (pareto.reward, AUC, parallel penalty), persisted live progress and recoverable checkpoints.",
+    promptSnippet: "Report Dream-RSI state, live progress and recoverable iterations without spending agent time.",
     promptGuidelines: [
       "Use dream_rsi_status before deciding the next cycle: it shows the live trend (best score per iteration) and the beta sweep that the cross-cycle beta rule reads.",
+      "dream_rsi_status lists saved live checkpoints; use dream_rsi_resume only for an interrupted tree the user wants continued. An active owner prevents duplicate recovery. /dream-rsi watch and Ctrl+Shift+D inspect logs without starting model work.",
     ],
     parameters: statusParams,
     async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
@@ -873,22 +968,28 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const lines = [summary, renderSuggestion(ranking, { compact: true })];
       if (ranking.seed) lines.push(`  baseline: your code measures ${ranking.seed.raw_score ?? "n/a"} (${ranking.seed.fail_class}${ranking.seed.fail_class === "ok" ? "" : `: ${ranking.seed.error}`})`);
       setStatus(ctx, ranking);
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { root, improvements: ranking } };
+      return { content: [{ type: "text", text: lines.join("\n") }], details: { root, improvements: ranking, recoverable: recoverableIterations(root),
+        progress: progressIterations(root).map((i) => readProgress(root, i)).filter(Boolean) } };
     },
   });
 
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: create [goal] [--reconfigure|--fresh] | suggest [goal] | status | run [n] | live | dream | off",
+    description: "Dream-RSI: create [--reconfigure|--fresh] [goal] | suggest/best [goal] | status | watch [iteration] | resume [iteration] | live [n] | dream | run [n] | off | help",
+    getArgumentCompletions: commandCompletions,
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
       const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
       const verb = parts[0] ?? "help";
       const rest = parts.slice(1).join(" ");
       const configured = fs.existsSync(path.join(root, "task.json"));
+      const report = (text: string, type: "info" | "error" = "info"): void => {
+        ctx.ui.notify(text, type);
+        if (ctx.mode !== "tui") pi.sendMessage({ customType: "dream-rsi/command", content: text, display: true }, { triggerTurn: false });
+      };
       const missingTask = (): void => {
-        ctx.ui.notify(
+        report(
           [
             `No Dream-RSI task in this project: ${path.join(root, "task.json")} is missing.`,
             `Run /dream-rsi create <goal> to set one up here (the agent calls dream_rsi_init),`,
@@ -912,7 +1013,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // Two channels on purpose: `notify` is the immediate TUI signal (a no-op in print mode), and the
         // session message makes the same text durable and visible to the agent without spending a turn.
         ctx.ui.notify(text, "info");
-        pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { deliverAs: "nextTurn" });
+        pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { triggerTurn: false });
       };
       /**
        * Hand a message to the agent. `/skill:<name>` only expands with `expandPromptTemplates`, and the
@@ -926,13 +1027,26 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         pi.sendUserMessage(message, { expandPromptTemplates: true, deliverAs: "followUp" });
       };
 
+      if (verb === "watch") {
+        if (rest && !validIteration(rest)) { report("watch expects a positive, safely representable integer iteration number", "error"); return; }
+        const summary = await dashboardFor(ctx).watch(root, rest ? Number(rest) : undefined);
+        if (summary) pi.sendMessage({ customType: "dream-rsi/watch", content: summary, display: true }, { triggerTurn: false });
+        return;
+      }
+      if (verb === "resume") {
+        if (rest && !validIteration(rest)) { report("resume expects a positive, safely representable integer iteration number", "error"); return; }
+        if (!configured) { missingTask(); return; }
+        setMode(ctx, true);
+        sendWhenReady(`Resume the interrupted Dream-RSI live cycle${rest ? ` ${rest}` : " with the latest recoverable checkpoint"} using dream_rsi_resume${rest ? ` iteration=${rest}` : ""}. Report the saved settings, kept attempts and remaining budgets before running.`);
+        return;
+      }
       if (verb === "off") {
         setMode(ctx, false);
-        ctx.ui.notify("Dream-RSI mode off (state on disk is untouched).", "info");
+        report("Dream-RSI mode off (state on disk is untouched; running work continues).", "info");
         return;
       }
       if (verb === "status") {
-        ctx.ui.notify(configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`, "info");
+        report(configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`, "info");
         return;
       }
       if (verb === "create") {
@@ -956,7 +1070,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           if (choice === CREATE_FRESH) {
             const running = activeRuns(root);
             if (running.length > 0) {
-              ctx.ui.notify(`Refusing to start a fresh task while a phase is in flight: ${running.join("; ")}.`, "error");
+              report(`Refusing to start a fresh task while a phase is in flight: ${running.join("; ")}.`, "error");
               return;
             }
             if (
@@ -972,7 +1086,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               // carries the reset for a later reload; the in-memory state needs it now.
               saveTaskEntry(pi, root, { iteration: 0, reset: true });
               stateFor(ctx).iteration = 0;
-              ctx.ui.notify(`Archived the previous task to ${archived} — loading the dream-rsi-create skill for a fresh one`, "info");
+              report(`Archived the previous task to ${archived} — loading the dream-rsi-create skill for a fresh one`, "info");
               sendWhenReady(`/skill:dream-rsi-create fresh ${goal}`.replace(/\s+/g, " ").trim());
               return;
             }
@@ -980,7 +1094,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           }
           if (choice === CREATE_RECONFIGURE) {
             setMode(ctx, true);
-            ctx.ui.notify("Dream-RSI mode ON — loading the dream-rsi-create skill to reconfigure this task", "info");
+            report("Dream-RSI mode ON — loading the dream-rsi-create skill to reconfigure this task", "info");
             sendWhenReady(`/skill:dream-rsi-create reconfigure ${goal}`.replace(/\s+/g, " ").trim());
             return;
           }
@@ -995,14 +1109,14 @@ export default function dreamRsi(pi: ExtensionAPI): void {
             "",
             renderSuggestion(ranking),
             "",
-            "Next: /dream-rsi run 2 to keep searching, /dream-rsi create --reconfigure to change this task, or /dream-rsi create --fresh to start an unrelated one.",
+            "Next: /dream-rsi watch to inspect progress, /dream-rsi resume to continue an interrupted tree, /dream-rsi run 2 to start new cycles, or /dream-rsi create --reconfigure | --fresh to change tasks.",
           ].join("\n");
           ctx.ui.notify(text, "info");
-          pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { deliverAs: "nextTurn" });
+          pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { triggerTurn: false });
           return;
         }
         setMode(ctx, true);
-        ctx.ui.notify("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
+        report("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
         sendWhenReady(`/skill:dream-rsi-create ${rest}`.replace(/\s+/g, " ").trim());
         return;
       }
@@ -1021,7 +1135,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         }
         const state = stateFor(ctx);
         if (state.running.length > 0) {
-          ctx.ui.notify(`A Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}.`, "error");
+          report(`A Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}.`, "error");
           return;
         }
         setMode(ctx, true);
@@ -1030,7 +1144,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           const parsed = Number(requested);
           const limit = verb === "run" ? 100 : 8;
           if (!Number.isInteger(parsed) || parsed < 1 || parsed > limit) {
-            ctx.ui.notify(
+            report(
               verb === "run"
                 ? `/dream-rsi run takes a cycle count between 1 and 100; got "${requested}".`
                 : `/dream-rsi live takes a loop count between 1 and 8; got "${requested}".`,
@@ -1051,17 +1165,17 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // The command drives the agent rather than dead-ending in a notification: a human at the prompt
         // cannot call tools, and "ask the agent to run the loop" is not an instruction that does anything.
         sendWhenReady(instruction);
-        ctx.ui.notify(`Dream-RSI mode active — asked the agent to run ${verb === "run" ? `${cycles} cycle${cycles === 1 ? "" : "s"}` : verb}.`, "info");
+        report(`Dream-RSI mode active — asked the agent to run ${verb === "run" ? `${cycles} cycle${cycles === 1 ? "" : "s"}` : verb}.`, "info");
         return;
       }
       if (verb === "help" || verb === "?") {
-        ctx.ui.notify(renderCommandHelp(root, configured), "info");
+        report(renderCommandHelp(root, configured), "info");
         return;
       }
       // Anything else is a goal: pick up where the project is, don't make the user learn verbs.
       if (!configured) {
         setMode(ctx, true);
-        ctx.ui.notify("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
+        report("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
         sendWhenReady(`/skill:dream-rsi-create ${verb} ${rest}`.replace(/\s+/g, " ").trim());
         return;
       }
@@ -1071,13 +1185,20 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
   // -- lifecycle -----------------------------------------------------------
 
+  pi.registerShortcut("ctrl+shift+d", { description: "Watch Dream-RSI tree and worker output", handler: async (ctx) => { await dashboardFor(ctx).watch(dreamRoot(ctx)); } });
   pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
   pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
   // Contribute the skill from this package, so the loop is documented to the agent even when the
   // extension is loaded by path (`pi -e …`) rather than as a package with `pi.skills`.
   pi.on("resources_discover", async () => ({ skillPaths: [SKILLS_DIR] }));
   pi.on("session_shutdown", async (_event, ctx) => {
-    runtimes.delete(ctx.sessionManager.getSessionId());
+    const id = ctx.sessionManager.getSessionId();
+    closingSessions.add(id);
+    dashboards.get(id)?.dispose(); dashboards.delete(id);
+    const running = [...(jobs.get(id) ?? [])];
+    for (const job of running) job.controller.abort();
+    await Promise.allSettled(running.map((job) => job.finished));
+    runtimes.delete(id);
   });
   pi.on("before_agent_start", async (event, ctx) => {
     const state = stateFor(ctx);
@@ -1089,6 +1210,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "\nThe loop is: dream_rsi_live (one online exploration cycle -> discovery tree T_t) then dream_rsi_dream (replay every candidate policy version over the frozen history, revise, select argmax V, deploy)." +
       "\ndream_rsi_live takes loops=<n> (clamped to task.json's max_loops) to record n worlds of the same policy in parallel, and you may start several dream_rsi_live calls in one turn when cycles are independent — they share that cap. One dream then replays all of them, so prefer wider batches over many narrow cycles when the attempt model and the disk can take the fan-out (loops x W agents at once)." +
       "\nRead the task problem statement and .dream-rsi/history/baseline before proposing a first cycle, and report grid/budget before spending agent time." +
+      "\n/dream-rsi watch and Ctrl+Shift+D inspect trees and logs without spending agent time. dream_rsi_status reports progress and recoverable checkpoints. Continue an interrupted live tree explicitly with dream_rsi_resume: report kept attempts, original settings and remaining budget first; completed attempts are reused and retries are counted separately. New live calls start new trees. Only completed worlds under the current scoring contract enter dream replay." +
       "\nPolicy code is prefix-only and deterministic; replay is deterministic, so a V* >= V_0 violation means the policy is unsound — do not deploy it.";
     const status = statusSummary(root, { sessionIteration: state.iteration });
     if (status) note += `\n\n${status}`;
@@ -1171,20 +1293,61 @@ function renderCommandHelp(root: string, configured: boolean): string {
     "Dream-RSI (arXiv 2609.14858)",
     "  /dream-rsi create [goal]    set up a task here (loads the dream-rsi-create skill); on a configured",
     "                              project, ask whether to report, reconfigure or start fresh",
-    "  /dream-rsi create --reconfigure | --fresh",
+    "  /dream-rsi create --reconfigure|--fresh [goal]",
     "                              the same choice without the dialog (print/scripted use)",
-    "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest",
-    "  /dream-rsi status           iterations, worlds, policy versions, last sweep",
-    "  /dream-rsi live [n]         ask the agent for one online exploration cycle, or n of them in parallel",
+    "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest (alias: best)",
+    "  /dream-rsi status           iterations, worlds, policies, sweep, progress and recoverable checkpoints",
+    "  /dream-rsi watch [iteration] browse trees/logs; default: latest active cycle, then latest recorded",
+    "                              Ctrl+Shift+D opens the same view; arrows select cycles/nodes,",
+    "                              d switches live/dream, Tab changes panes, PgUp/PgDn page logs, Esc closes",
+    "                              RPC/JSON/print hosts receive text; watching spends no agent time",
+    "  /dream-rsi resume [iteration] ask the agent to continue an interrupted tree; default: latest recoverable",
+    "                              keeps completed attempts, original settings and remaining budget; retries add calls",
+    "  /dream-rsi live [n]         ask the agent for new online cycles; default: 1, range: 1–8, shared task cap",
     "  /dream-rsi dream            ask the agent for one offline policy-improvement phase",
-    "  /dream-rsi run [n]          ask the agent for n full cycles (live then dream)",
-    "  /dream-rsi off              leave Dream-RSI mode",
+    "  /dream-rsi run [n]          ask the agent for n full cycles (live then dream); default: 1, range: 1–100",
+    "  /dream-rsi off              disable gated tools; saved state and running work are kept",
+    "  /dream-rsi help | ?         show this help (also /dream-rsi alone; leaves mode unchanged)",
     "",
     configured
       ? `Configured here (task file: ${path.join(root, "task.json")}). Anything else you type is treated as a goal for a suggestion.`
       : `Nothing configured here yet: \`/dream-rsi create <goal>\` starts the interview (or any text does), and writes ${path.join(root, "task.json")}.`,
     `  root: ${root}`,
   ].join("\n");
+}
+
+/** Completion values replace the full argument prefix, including the subcommand. */
+function commandCompletions(prefix: string) {
+  const query = prefix.trimStart().replace(/\s+/g, " ");
+  let choices = [
+    { value: "create", label: "create [goal]", description: "Set up, reconfigure or archive a task" },
+    { value: "suggest", label: "suggest [goal]", description: "Rank recorded candidates" },
+    { value: "best", label: "best [goal]", description: "Alias for suggest" },
+    { value: "status", label: "status", description: "State, progress and recoverable checkpoints" },
+    { value: "watch", label: "watch [iteration]", description: "Inspect trees and logs without agent calls" },
+    { value: "resume", label: "resume [iteration]", description: "Continue an interrupted live tree with saved settings" },
+    { value: "live", label: "live [n]", description: "Start new online cycles; default 1, up to 8 (shared task cap)" },
+    { value: "dream", label: "dream", description: "Improve the policy using completed worlds" },
+    { value: "run", label: "run [n]", description: "Start full live/dream cycles; default 1, up to 100" },
+    { value: "off", label: "off", description: "Disable gated tools; running work continues" },
+    { value: "help", label: "help", description: "Command syntax, defaults and dashboard controls" },
+  ];
+  if (/^create\s/.test(query)) {
+    choices = ["--reconfigure", "--fresh"].map((flag) => ({ value: `create ${flag}`, label: `create ${flag}`, description: flag === "--fresh" ? "Archive the current task and start a new one" : "Re-interview for this task" }));
+  } else {
+    const verb = /^(suggest|best)\s/.exec(query)?.[1];
+    if (verb) choices = ["fastest", "safest", "simplest"].map((goal) => ({ value: `${verb} ${goal}`, label: `${verb} ${goal}`, description: "Candidate ranking preference" }));
+  }
+  const matches = choices.filter((choice) => choice.value.startsWith(query));
+  return matches.length ? matches : null;
+}
+
+function validIteration(value: string): boolean {
+  return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
+function recoveryNotice(iterations: number[]): string {
+  return `Recovered interrupted cycle(s): ${iterations.join(", ")} (released stale claims). Checkpointed live trees remain resumable; use /dream-rsi status to inspect them and /dream-rsi resume [iteration] to continue one.`;
 }
 
 function parseGrid(value: string, fallback: { branch_count: number; refine_count: number; reason: string }): { branch_count: number; refine_count: number; reason: string } {

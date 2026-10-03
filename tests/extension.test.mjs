@@ -1,5 +1,5 @@
 /**
- * Extension surface: tool registration, mode gating, the four tools end to end (with stub agents), and
+ * Extension surface: tool registration, mode gating, the six tools end to end (with stub agents), and
  * the session-prompt injection. The pi API is mocked — no TUI, no LLM.
  */
 
@@ -41,11 +41,11 @@ function initParams(project, extra = {}) {
   };
 }
 
-test("registers four tools, one command and the lifecycle hooks", async () => {
+test("registers six tools, one command and the lifecycle hooks", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_resume", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status"]);
     assert.deepEqual([...harness.commands.keys()], ["dream-rsi"]);
     for (const event of ["session_start", "session_tree", "session_shutdown", "before_agent_start", "agent_start", "resources_discover"]) {
       assert.equal(typeof harness.handlers.get(event), "function", `${event} hook registered`);
@@ -57,6 +57,79 @@ test("registers four tools, one command and the lifecycle hooks", async () => {
   } finally {
     project.cleanup();
   }
+});
+
+test("command completion discovers watch/resume, setup flags and ranking preferences", async () => {
+  const project = makeProject();
+  try {
+    const { harness } = await boot(project);
+    const complete = harness.commands.get("dream-rsi").getArgumentCompletions;
+    const verbs = complete("").map((item) => item.value);
+    assert.ok(verbs.includes("watch"));
+    assert.ok(verbs.includes("resume"));
+    assert.deepEqual(complete("res").map((item) => item.value), ["resume"]);
+    assert.deepEqual(complete("create --f").map((item) => item.value), ["create --fresh"]);
+    assert.deepEqual(complete("suggest sa").map((item) => item.value), ["suggest safest"]);
+    assert.deepEqual(complete("best si").map((item) => item.value), ["best simplest"]);
+    assert.equal(complete("watch 1"), null);
+    assert.equal(complete("improve my program"), null, "free-text goals remain free text");
+    assert.equal(harness.sentMessages.length, 0);
+    assert.equal(fs.existsSync(project.dreamRoot), false, "completion does not create task state");
+  } finally { project.cleanup(); }
+});
+
+test("headless help/status and invalid recovery arguments report without activating model work", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const command = harness.commands.get("dream-rsi");
+    for (const mode of ["print", "rpc", "json"]) {
+      context.mode = mode;
+      await command.handler("help", context);
+      const help = harness.injectedMessages.at(-1).message.content;
+      assert.deepEqual(harness.injectedMessages.at(-1).options, { triggerTurn: false }, "idle hosts receive the report immediately, without waiting for another turn");
+      assert.match(help, /latest recoverable/);
+      assert.match(help, /Ctrl\+Shift\+D/);
+      assert.match(help, /original settings and remaining budget/);
+      await command.handler("status", context);
+      assert.match(harness.injectedMessages.at(-1).message.content, /No Dream-RSI task/);
+      await command.handler("watch", context);
+      assert.equal(harness.injectedMessages.at(-1).message.customType, "dream-rsi/watch");
+      assert.deepEqual(harness.injectedMessages.at(-1).options, { triggerTurn: false });
+      for (const verb of ["watch", "resume"]) {
+        for (const arg of ["0", "-1", "1.5", "1 2", "9007199254740993", "9".repeat(400)]) {
+          await command.handler(`${verb} ${arg}`, context);
+          assert.match(harness.injectedMessages.at(-1).message.content, /integer iteration number/);
+        }
+      }
+    }
+    assert.equal(harness.sentMessages.length, 0, "read-only reports and invalid arguments never start an agent turn");
+    assert.equal(harness.activeTools.includes("dream_rsi_resume"), false);
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), false);
+    assert.equal(fs.existsSync(project.dreamRoot), false);
+    context.mode = "tui";
+    const before = harness.injectedMessages.length;
+    await command.handler("?", context);
+    assert.match(harness.notifications.at(-1), /latest recoverable/);
+    assert.equal(harness.injectedMessages.length, before, "terminal help uses the UI notification");
+  } finally { project.cleanup(); }
+});
+
+test("init displays the same expanded streaming arguments used by a new pi child", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.model = { provider: "provider", id: "model" }; context.thinkingLevel = "high";
+    const result = await harness.tools.get("dream_rsi_init").execute("c1", initParams(project, {
+      agent_command: "pi", agent_args: ["-p", "--model", "{model}", "--thinking", "{thinking}"], measure_seed: false,
+    }), undefined, undefined, context);
+    const agent = result.content[0].text.split("\n").find((line) => line.includes("agent:"));
+    assert.match(agent, /--model provider\/model --thinking high --mode json/);
+    assert.equal(agent.match(/--model/g).length, 1);
+    assert.equal(agent.match(/--thinking/g).length, 1);
+    assert.doesNotMatch(agent, /\{model\}|\{thinking\}/);
+    assert.equal(harness.sentMessages.length, 0);
+  } finally { project.cleanup(); }
 });
 
 test("init writes task.json, seeds the policy runtime, and gates the expensive tools", async () => {
@@ -330,12 +403,14 @@ test("create sets up a fresh project through the skill, and answers instead when
     assert.match(report, /IMPROVEMENT READY — NOT APPLIED/);
     assert.match(report, /dream_rsi_apply cell=\w+ iteration=\d+ confirm=true/);
     assert.match(report, /preference: fastest/);
-    assert.match(report, /Next: \/dream-rsi run 2/);
+    assert.match(report, /Next: \/dream-rsi watch/);
+    assert.match(report, /\/dream-rsi resume/);
+    assert.match(report, /\/dream-rsi run 2/);
     assert.match(report, /\/dream-rsi create --reconfigure/);
-    assert.equal(harness.injectedMessages.length, 1, "the suggestion is injected into the session, not just toasted");
-    assert.equal(harness.injectedMessages[0].message.customType, "dream-rsi/suggestion");
-    assert.match(harness.injectedMessages[0].message.content, /IMPROVEMENT READY/);
-    assert.deepEqual(harness.injectedMessages[0].options, { deliverAs: "nextTurn" });
+    const suggestions = harness.injectedMessages.filter((item) => item.message.customType === "dream-rsi/suggestion");
+    assert.equal(suggestions.length, 1, "the suggestion is injected into the session, not just toasted");
+    assert.match(suggestions[0].message.content, /IMPROVEMENT READY/);
+    assert.deepEqual(suggestions[0].options, { triggerTurn: false });
     assert.equal(harness.activeTools.includes("dream_rsi_apply"), true, "reporting leaves the loop usable");
   } finally {
     project.cleanup();
@@ -717,7 +792,7 @@ test("tool parameter schemas stay validatable and strict", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.equal(harness.tools.size, 5);
+    assert.equal(harness.tools.size, 6);
     for (const [name, tool] of harness.tools) {
       const schema = tool.parameters;
       assert.equal(schema.type, "object", `${name}: parameters must be an object schema`);
@@ -833,9 +908,10 @@ test("a policy that reaches outside the prefix is blocked before it runs", async
 
     const live = await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
     assert.match(live.content[0].text, /FAILED|failed/, "a non-prefix-only policy must not run");
-    const manifest = readJson(path.join(project.dreamRoot, "trace_pool", "iter0001", "live_cycle_manifest.json"));
+    const manifest = readJson(path.join(project.dreamRoot, "trace_pool", "iter0001_current", "live_cycle_manifest.json"));
     assert.equal(manifest.status, "failed");
     assert.match(manifest.note, /node:fs/);
+    assert.equal(exists(path.join(project.dreamRoot, "trace_pool", "iter0001", "tree.json")), false, "failed cycles do not publish replay worlds");
   } finally {
     project.cleanup();
   }
