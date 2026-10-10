@@ -512,7 +512,7 @@ Read this before trusting a number.
 | Beta grid, `K1`, `K2`, `M` defaults | Not published. Shipped defaults: `W=4`, `K1=6`, `K2=8`, `M=3`, grid `[0, .2, .4, .6, .8, 1]`, `beta1=beta2=0.01`, `default_beta=0.6`. The paper's task shape (`W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, five rounds) is what the create skill recommends. |
 | `pareto.auc` normalization | "High per-trace attainment with few total probes" is implemented as mean attainment over the probes actually taken, averaged across worlds, then trapezoidal over the beta→work curve. |
 | Grid vs. tree bookkeeping | The paper's trees branch by "opening a root". Here an unopened root is a **root slot** (`b<branch>a0`), so one batch can open several directions, as the prompt describes. Replay opens branches in creation order (the paper's root rule), so a policy that takes roots in `legal_roots()` order behaves exactly as written. |
-| Semantic direction guidance | Deliberately absent. The paper's §4 ablation found prompt-level semantic guidance over-constrains the search and hurts; `$direction_guidance` renders empty. |
+| Semantic direction guidance | Off by default: the paper's §4 ablation found prompt-level semantic guidance over-constrains the search and hurts, so `$direction_guidance` renders empty. Opt-in experiment: set `guidance: "summary"` in `task.json` (via `dream_rsi_init` or reconfigure) to render a deterministic, ≤1500-char summary of evaluated history instead. Prompt-only (excluded from the scoring fingerprint); existing checkpoints keep `""`. Measure on a scratch task before adopting — protocol: same seed, one cycle each (`W=2, K1=3`, cheap model), compare best score + mechanism diversity across the two worlds; two worlds is signal, not proof. |
 
 ## Tests
 

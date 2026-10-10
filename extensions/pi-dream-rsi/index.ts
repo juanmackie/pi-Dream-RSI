@@ -108,6 +108,10 @@ const taskParams = {
       type: "number",
       description: "How many recent iteration workspaces to keep under .dream-rsi/work (default 20; older ones are pruned).",
     },
+    guidance: {
+      type: "string",
+      description: 'Attempt-prompt direction guidance: "off" (default, historical empty $direction_guidance) or "summary" (deterministic bounded evaluated-history summary; experimental, paper §4 ablation).',
+    },
   },
   required: ["name", "workspace", "eval_program", "score_program"],
   additionalProperties: false,
@@ -377,6 +381,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         ...(typeof params.beta2 === "number" ? { beta2: params.beta2 } : {}),
         ...(Array.isArray(params.copy_exclude) ? { copy_exclude: params.copy_exclude as string[] } : {}),
         ...(typeof params.work_retention === "number" ? { work_retention: params.work_retention } : {}),
+        ...(params.guidance === "off" || params.guidance === "summary" ? { guidance: params.guidance } : {}),
       };
       task.agent = {
         ...task.agent,

@@ -27,6 +27,7 @@ import { ProgressRecorder, readProgress, type ProgressObserver } from "./progres
 import { readCheckpoint, saveCheckpoint, validateCheckpoint, freezePolicy, snapshotSeed, workspaceHash,
   type LiveCheckpoint, type PendingAttempt, type PreparedAttempt } from "./checkpoint.ts";
 import { normalizeTask, scoringFingerprint } from "./task.ts";
+import { renderDirectionGuidance } from "./guidance.ts";
 import {
   archiveAttempt,
   writeJsonl,
@@ -280,7 +281,8 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
   }
   const basePromptVars = cp?.prompt_vars ?? {
     // Pure Dream-RSI: semantic direction guidance is deliberately empty (paper §4 ablation).
-    direction_guidance: "",
+    // Opt-in experiment: task.guidance "summary" renders evaluated history (engine/guidance.ts).
+    direction_guidance: task.guidance === "summary" ? renderDirectionGuidance(tree.list()) : "",
     history_dir: historyDir(dreamRoot),
     baseline_dir: baselineDir(dreamRoot),
     eval_program: task.eval_program,
