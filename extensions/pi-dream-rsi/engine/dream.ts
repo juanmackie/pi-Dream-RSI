@@ -525,6 +525,11 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
     const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
     const monotone =
       scored.length > 0 && Number.isFinite(best.v_mean) && best.v_mean >= (scored[0]?.v_mean ?? Number.NEGATIVE_INFINITY);
+    // Eq. 1 trades peak attainment against probe cost, so the winner can explore less than a loser
+    // with a higher best score. That is the paper's intended trade-off, but on a [0, 1] metric (or any
+    // scale where beta1/beta2 dwarf meaningful gains) it silently deploys a policy that stops early.
+    // Name it so the operator can retune beta instead of wondering why exploration shrank.
+    const scaleNote = efficiencyOverturnNote(evaluations, selected);
     if (monotone) {
       deployPolicy(dreamRoot, fs.readFileSync(best.policy_path, "utf8"));
       // Record the beta the next live episode will actually run at; `planNextGrid` forces it, so the
@@ -539,9 +544,11 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
         (e) =>
           `  pi_${e.revision}: V=${e.v_mean.toFixed(4)} beta=${e.default_beta} pareto.reward=${e.summary.pareto_reward.toFixed(4)}` +
           ` probes=${meanOf(e.per_world.map((w) => w.probes)).toFixed(1)} rounds=${meanOf(e.per_world.map((w) => w.rounds)).toFixed(1)}` +
+          ` attainment=${meanAttainment(e) === null ? "n/a" : (meanAttainment(e) as number).toFixed(4)}` +
           (e.error ? ` error=${e.error}` : ""),
       ),
       `selected pi_${selected} (V* >= V_0: ${monotone}) -> deployed with beta=${deployedBeta}`,
+      ...(scaleNote ? [scaleNote] : []),
     ].join("\n");
 
     return {
@@ -572,6 +579,39 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
 
 function meanOf(list: number[]): number {
   return list.length === 0 ? 0 : list.reduce((a, b) => a + b, 0) / list.length;
+}
+
+/** Mean attainment over successfully replayed worlds; null when none replayed. */
+export function meanAttainment(evaluation: Pick<VersionEvaluation, "per_world">): number | null {
+  const values = evaluation.per_world
+    .filter((w) => w.ok && typeof w.attainment === "number")
+    .map((w) => w.attainment as number);
+  return values.length === 0 ? null : values.reduce((a, b) => a + b, 0) / values.length;
+}
+
+/**
+ * Warn when Eq. 1 efficiency overturned peak attainment: the selected version has a higher V but a
+ * lower mean attainment than another version. Returns null when V and attainment agree.
+ */
+export function efficiencyOverturnNote(
+  evaluations: Pick<VersionEvaluation, "revision" | "v_mean" | "per_world">[],
+  selected: number,
+): string | null {
+  const best = evaluations[selected];
+  if (!best) return null;
+  const bestAttainment = meanAttainment(best);
+  if (bestAttainment === null) return null;
+  const overturned = evaluations.filter((e, index) => {
+    if (index === selected || !Number.isFinite(e.v_mean)) return false;
+    const attainment = meanAttainment(e);
+    return attainment !== null && attainment > bestAttainment && e.v_mean < best.v_mean;
+  });
+  if (overturned.length === 0) return null;
+  return (
+    `note: pi_${selected} won on efficiency (V) with lower mean attainment ` +
+    `(${bestAttainment.toFixed(4)}) than ${overturned.map((e) => `pi_${e.revision} (${(meanAttainment(e) ?? 0).toFixed(4)})`).join(", ")} — ` +
+    `if peak score matters more than probe cost, lower beta1/beta2 (defaults 0.01 assume scores of order 1-10 per probe)`
+  );
 }
 
 /** Ask the deployed policy for the next live grid (used by `dream_rsi_live`). */

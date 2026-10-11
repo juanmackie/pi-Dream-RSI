@@ -40,6 +40,7 @@ import {
   runningIterations,
   LIVE_MANIFEST_ENTRY,
   saveTaskEntry,
+  handoffSummary,
   statusSummary,
   type DreamState,
   type RunningPhase,
@@ -51,9 +52,19 @@ import {
   measureSeed,
   readSeedMeasurement,
   recordApplied,
+  resolveBaselineScore,
   seedMatchesTask,
 } from "./engine/improvements.ts";
 import { rankCandidates, renderSuggestion, type Ranking } from "./engine/candidates.ts";
+import {
+  locallyChanged,
+  replaceFiles,
+  resolveWithinRoot,
+  targetState,
+  verifyApply,
+  type ApplyFile,
+  type ApplyVerification,
+} from "./engine/apply.ts";
 import { BUNDLED_POLICY_DIR, SKILLS_DIR } from "./layout.ts";
 
 
@@ -162,49 +173,19 @@ const applyParams = {
       type: "boolean",
       description: "Must be true, and only after the user explicitly asked for the change to be applied.",
     },
+    verify: {
+      type: "boolean",
+      description:
+        "Default true: run the scorer on scratch copies of the user's code without and with the files, and write only when the result measures better. Set false only when the scorer cannot run now; the apply is then recorded as unverified.",
+    },
+    overwrite_changed: {
+      type: "boolean",
+      description:
+        "Replace a target file that changed after the candidate's cycle started (the previous version is kept). Only after the user accepted losing that change.",
+    },
   },
   additionalProperties: false,
 };
-
-/** True when `candidate` is `parent` or lives inside it, using resolved (real) paths. */
-function isWithin(parent: string, candidate: string): boolean {
-  const relative = path.relative(parent, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-/**
- * Resolve `relative` inside `root` and refuse any symlink/junction escape.
- *
- * A string-prefix check is not enough on Windows: a junction or symlink component can point outside
- * either workspace while the textual path still looks contained. This walks each existing component,
- * resolves its real path, and rejects the moment one leaves the root.
- */
-export function resolveWithinRoot(root: string, relative: string): string | null {
-  let realRoot: string;
-  try {
-    realRoot = fs.realpathSync(root);
-  } catch {
-    return null;
-  }
-  const parts = relative.split(/[\\/]+/).filter((part) => part !== "" && part !== ".");
-  let current = realRoot;
-  for (let index = 0; index < parts.length; index += 1) {
-    const candidate = path.join(current, parts[index]);
-    if (!fs.existsSync(candidate)) {
-      current = path.join(current, ...parts.slice(index));
-      break;
-    }
-    let real: string;
-    try {
-      real = fs.realpathSync(candidate);
-    } catch {
-      return null;
-    }
-    if (!isWithin(realRoot, real)) return null;
-    current = real;
-  }
-  return isWithin(realRoot, current) ? current : null;
-}
 
 export default function dreamRsi(pi: ExtensionAPI): void {
   // The factory only registers things: no processes, sockets, watchers or timers start here, because
@@ -450,6 +431,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               "  note:      the recorded baseline belongs to the previous scoring configuration — it will not be used (candidates are not compared against it) until your code is re-measured; drop measure_seed=false or pass remeasure_seed=true.",
             ]
           : [];
+      // Scoring runs inside the attempt workspace, which the candidate can edit. A scorer referenced
+      // by a workspace-relative command (./score.sh) runs from the candidate's copy and can be
+      // rewritten by it: verification still stops a bad apply from landing, but the attempts are
+      // wasted. Keep the scorer outside the workspace and reference it by absolute path.
+      const scorerNote = /^\s*\./.test(task.score_program)
+        ? [
+            `  note:      scorer "${task.score_program}" looks workspace-relative — a candidate can edit that copy. Move the scorer outside "${task.workspace}" and reference it by absolute path.`,
+          ]
+        : [];
       return {
         content: [
           {
@@ -467,6 +457,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               baselineNote,
               ...programNote,
               ...staleNote,
+              ...scorerNote,
               `Next: dream_rsi_live to run one online rollout.`,
               `Nothing is ever written to your code: candidates land in .dream-rsi/work/, and applying one is a separate, explicit step (dream_rsi_apply).`,
             ].join("\n"),
@@ -835,14 +826,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_apply",
     label: "Dream-RSI Apply Candidate",
     description:
-      "Copy a recorded candidate's implementation back over your own code. Requires confirm=true, copies only the declared eval_program plus any paths you name, writes nothing else, and never commits. Applying is always a deliberate act by the user.",
-    promptSnippet: "Apply a Dream-RSI candidate's code to the user's own files (needs explicit confirmation).",
+      "Copy a recorded candidate's implementation back over your own code. Requires confirm=true and copies only the declared eval_program plus any paths you name. Before it writes, it scores scratch copies of your code without and with those files (two scorer runs) and refuses when the result does not measure better. It writes all files or none, keeps the replaced versions, and never commits. Applying is always a deliberate act by the user.",
+    promptSnippet: "Apply a Dream-RSI candidate's code to the user's own files (needs explicit confirmation; verified with the scorer before it writes).",
     promptGuidelines: [
       "Use dream_rsi_apply only after the user explicitly asks for a candidate to be applied — never on your own initiative, and never as a follow-up to dream_rsi_live or dream_rsi_dream.",
       "Before calling dream_rsi_apply, show the user which file changes and by how much, and say that it is not committed.",
+      "When dream_rsi_apply refuses, report the measured numbers and the other files the candidate changed. Add those files with paths=[...] only when the user agrees. Pass verify=false or overwrite_changed=true only when the user asks for it.",
     ],
     parameters: applyParams,
-    async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
+    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       let task: TaskConfig;
       try {
@@ -870,26 +862,31 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
       const candidateRoot = wanted.workspace as string;
       const seedRoot = path.resolve(projectDir(ctx), task.workspace);
-      const relativePaths = [task.eval_program, ...((params.paths ?? []) as string[])];
-      const files: { relative: string; from: string; to: string; before: number; after: number }[] = [];
+      const files: ApplyFile[] = [];
       const problems: string[] = [];
-      for (const relative of relativePaths) {
-        if (path.isAbsolute(relative) || relative.split(/[\\/]/).includes("..")) {
-          problems.push(`${relative}: paths must be relative and stay inside the workspace`);
+      for (const named of [task.eval_program, ...((params.paths ?? []) as string[])]) {
+        if (path.isAbsolute(named) || named.split(/[\\/]/).includes("..")) {
+          problems.push(`${named}: paths must be relative and stay inside the workspace`);
           continue;
         }
+        const relative = named.split(/[\\/]+/).filter((part) => part !== "" && part !== ".").join("/");
         // Resolve real ancestry on both sides: a symlink or Windows junction component can point
         // outside either workspace while the textual path still looks contained.
         const from = resolveWithinRoot(candidateRoot, relative);
         const to = resolveWithinRoot(seedRoot, relative);
         if (!from || !to) {
-          problems.push(`${relative}: escapes the workspace (symlink/junction)`);
+          problems.push(`${named}: escapes the workspace (symlink/junction)`);
           continue;
         }
         if (!fs.existsSync(from)) {
-          problems.push(`${relative}: not present in the candidate workspace`);
+          problems.push(`${named}: not present in the candidate workspace`);
           continue;
         }
+        if (!fs.statSync(from).isFile() || (fs.existsSync(to) && !fs.statSync(to).isFile())) {
+          problems.push(`${named}: only files can be applied; name each file`);
+          continue;
+        }
+        if (files.some((file) => file.to === to)) continue; // named twice: one copy, one kept version
         const before = fs.existsSync(to) ? fs.readFileSync(to, "utf8").split("\n").length : 0;
         files.push({ relative, from, to, before, after: fs.readFileSync(from, "utf8").split("\n").length });
       }
@@ -897,56 +894,164 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: `❌ nothing applied:\n- ${problems.join("\n- ")}` }], details: { problems } };
       }
 
+      const candidateScore = wanted.raw_score ?? wanted.score;
       const listing = files
         .map((file) => `  ${file.relative}\n    from: ${file.from}\n    to:   ${file.to}  (${file.before} → ${file.after} lines)`)
         .join("\n");
+      // The candidate was scored with every file of its workspace in place. Code files that differ from
+      // the user's code and are not part of this apply are named: the score can depend on them.
+      const ranked = suggestionFor(ctx).candidates.find((c) => c.iteration === wanted.iteration && c.cell === wanted.cell);
+      const applying = new Set(files.map((file) => file.relative));
+      const notCopied = (ranked?.out_of_scope_files ?? []).filter((relative) => !applying.has(relative));
+      const notCopiedNote =
+        notCopied.length === 0
+          ? null
+          : `The candidate workspace also differs from your code in: ${notCopied.slice(0, 8).join(", ")}` +
+            `${notCopied.length > 8 ? ` (+${notCopied.length - 8} more)` : ""}. ` +
+            "These are not copied unless you name them in paths, and the candidate's score can depend on them.";
+      // The candidate was built from the cycle's seed snapshot. A target that changed since then holds
+      // work the candidate does not contain.
+      const changed = locallyChanged(root, wanted.iteration, files);
+      const lines = (...entries: (string | null)[]): string => entries.filter((entry): entry is string => entry !== null).join("\n");
+
       if (params.confirm !== true) {
         return {
           content: [
             {
               type: "text",
-              text: [
-                `Not applied — confirm first. ${wanted.cell} (iteration ${wanted.iteration}) scored ${wanted.raw_score ?? wanted.score}` +
+              text: lines(
+                `Not applied — confirm first. ${wanted.cell} (iteration ${wanted.iteration}) scored ${candidateScore}` +
                   `${report.seed ? ` vs your code's ${report.seed.raw_score ?? report.seed.score}` : ""}.`,
                 listing,
+                notCopiedNote,
+                changed.length > 0
+                  ? `⚠️ Changed after cycle ${wanted.iteration} started: ${changed.join(", ")}. Applying replaces that change (needs overwrite_changed: true).`
+                  : null,
                 `Review it with: diff -u \"${files[0]?.to}\" \"${files[0]?.from}\"`,
-                `To apply it, call dream_rsi_apply again with confirm: true, iteration: ${wanted.iteration}${typeof params.cell === "string" ? `, cell: \"${params.cell}\"` : ""}.`,
-              ].join("\n"),
+                `To apply it, call dream_rsi_apply again with confirm: true, iteration: ${wanted.iteration}${typeof params.cell === "string" ? `, cell: \"${params.cell}\"` : ""}. ` +
+                  "It first scores your code without and with these files (two scorer runs on scratch copies) and writes only when the result measures better.",
+              ),
             },
           ],
-          details: { needs_confirmation: true, candidate: wanted, files },
+          details: { needs_confirmation: true, candidate: wanted, files, not_copied: notCopied, locally_changed: changed },
         };
       }
 
-      const copied: string[] = [];
-      for (const file of files) {
-        fs.mkdirSync(path.dirname(file.to), { recursive: true });
-        fs.copyFileSync(file.from, file.to);
-        copied.push(path.relative(projectDir(ctx), file.to) || file.to);
+      const applyHistory = path.join(root, "history", "apply");
+      if (changed.length > 0 && params.overwrite_changed !== true) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: lines(
+                `❌ nothing applied: ${changed.join(", ")} changed after cycle ${wanted.iteration} took its seed snapshot, and ${wanted.cell} was built from the earlier version. Applying it replaces that change.`,
+                `Merge by hand (diff -u \"${files[0]?.to}\" \"${files[0]?.from}\"), run a new cycle from your current code, or call dream_rsi_apply again with overwrite_changed: true (the replaced version is kept under ${applyHistory}).`,
+              ),
+            },
+          ],
+          details: { candidate: wanted, files, locally_changed: changed },
+        };
       }
-      recordApplied(root, {
-        iteration: wanted.iteration,
-        cell: wanted.cell,
-        score: wanted.score,
-        fingerprint: scoringFingerprint(task),
-        applied_at: new Date().toISOString(),
-        paths: files.map((file) => file.relative),
-        target: path.relative(projectDir(ctx), seedRoot) || seedRoot,
-      });
+
+      // Scorer logs and the replaced files of this apply.
+      const evidence = path.join(applyHistory, new Date().toISOString().replace(/[:.]/g, "-"));
+      let verification: ApplyVerification | null = null;
+      if (params.verify !== false) {
+        onUpdate?.({
+          content: [{ type: "text", text: "Verifying: scoring your code without and with these files on scratch copies. Your code is not changed yet." }],
+        });
+        const targets = targetState(files);
+        try {
+          verification = await verifyApply({ dreamRoot: root, projectDir: projectDir(ctx), task, files, evidenceDir: evidence, signal });
+        } catch (error) {
+          return {
+            content: [{ type: "text", text: `❌ Not applied — verification could not run: ${(error as Error).message}. Your code is unchanged.` }],
+            details: { candidate: wanted, files },
+          };
+        }
+        if (!verification.improved) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: lines(
+                  `❌ Not applied — not a measured improvement: ${verification.reason}.`,
+                  `${wanted.cell} (iteration ${wanted.iteration}) scored ${candidateScore} in its own attempt workspace.`,
+                  notCopiedNote,
+                  `Scorer output: ${evidence}`,
+                  "Your code is unchanged.",
+                ),
+              },
+            ],
+            details: { verification, candidate: wanted, files, not_copied: notCopied },
+          };
+        }
+        if (targetState(files) !== targets) {
+          return {
+            content: [{ type: "text", text: "❌ Not applied — a target file changed while the verification ran. This tool wrote nothing; call dream_rsi_apply again." }],
+            details: { verification, candidate: wanted, files },
+          };
+        }
+      }
+
+      const replaced = path.join(evidence, "replaced");
+      let kept: string[];
+      try {
+        kept = replaceFiles(files, replaced);
+      } catch (error) {
+        return {
+          content: [{ type: "text", text: `❌ Not applied — writing failed: ${(error as Error).message}. Files already written were restored; your code is unchanged.` }],
+          details: { candidate: wanted, files },
+        };
+      }
+      const copied = files.map((file) => path.relative(projectDir(ctx), file.to) || file.to);
+      try {
+        recordApplied(root, {
+          iteration: wanted.iteration,
+          cell: wanted.cell,
+          score: verification ? verification.after.score : wanted.score,
+          candidate_score: wanted.score,
+          ...(verification ? { before_score: verification.before.score } : {}),
+          verified: verification !== null,
+          fingerprint: scoringFingerprint(task),
+          applied_at: new Date().toISOString(),
+          paths: files.map((file) => file.relative),
+          target: path.relative(projectDir(ctx), seedRoot) || seedRoot,
+          ...(kept.length > 0 ? { backup: path.relative(projectDir(ctx), replaced) } : {}),
+        });
+      } catch (error) {
+        // The files are written; say so instead of reporting an apply that left no record.
+        return {
+          content: [
+            {
+              type: "text",
+              text: `⚠️ Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code, but the apply record could not be written: ${(error as Error).message}. Files written: ${copied.join(", ")}. This candidate stays listed as pending until history/applied.jsonl can be written.`,
+            },
+          ],
+          details: { applied: wanted, files: copied, verification, recorded: false },
+        };
+      }
       setStatus(ctx, suggestionFor(ctx));
+      const measured = (outcome: ApplyVerification["before"]): string =>
+        String(outcome.raw_score ?? outcome.score ?? `no score (${outcome.fail_class})`);
       return {
         content: [
           {
             type: "text",
-            text: [
-              `Applied ${wanted.cell} (iteration ${wanted.iteration}, scored ${wanted.raw_score ?? wanted.score}) over your code:`,
+            text: lines(
+              verification
+                ? `Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code — VERIFIED: your code measured ${measured(verification.before)} before and ${measured(verification.after)} with these files (the candidate scored ${candidateScore} in its attempt workspace).`
+                : `Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code — UNVERIFIED (verify=false): the scorer was not run on your code. ${candidateScore} is the candidate's score in its own attempt workspace.`,
               listing,
               `Files written: ${copied.join(", ")}`,
+              kept.length > 0 ? `Replaced versions kept at: ${replaced}` : null,
+              verification ? null : notCopiedNote,
               `Nothing was committed. Review with git diff and run your own checks before committing — a score from one benchmark is not a correctness review.`,
-            ].join("\n"),
+              "The next dream_rsi_live starts from this code.",
+            ),
           },
         ],
-        details: { applied: wanted, files: copied },
+        details: { applied: wanted, files: copied, verification, backup: kept.length > 0 ? replaced : null },
       };
     },
   });
@@ -1217,7 +1322,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "\nRead the task problem statement and .dream-rsi/history/baseline before proposing a first cycle, and report grid/budget before spending agent time." +
       "\n/dream-rsi watch and Ctrl+Shift+D inspect trees and logs without spending agent time. dream_rsi_status reports progress and recoverable checkpoints. Continue an interrupted live tree explicitly with dream_rsi_resume: report kept attempts, original settings and remaining budget first; completed attempts are reused and retries are counted separately. New live calls start new trees. Only completed worlds under the current scoring contract enter dream replay." +
       "\nPolicy code is prefix-only and deterministic; replay is deterministic, so a V* >= V_0 violation means the policy is unsound — do not deploy it.";
-    const status = statusSummary(root, { sessionIteration: state.iteration });
+    const status = handoffSummary(root, state.iteration);
     if (status) note += `\n\n${status}`;
     return { systemPrompt: event.systemPrompt + note };
   });
@@ -1366,19 +1471,7 @@ function parseGrid(value: string, fallback: { branch_count: number; refine_count
 }
 
 function readBaselineScore(root: string, task: TaskConfig): number | null {
-  const file = path.join(root, "history", "baseline", "score.json");
-  if (!fs.existsSync(file)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
-      score?: number;
-      task_fingerprint?: string;
-    };
-    // A baseline recorded under another scoring contract is a floor for a different game.
-    if (parsed.task_fingerprint !== undefined && parsed.task_fingerprint !== scoringFingerprint(task)) return null;
-    return typeof parsed.score === "number" ? parsed.score : null;
-  } catch {
-    return null;
-  }
+  return resolveBaselineScore(root, task);
 }
 
 function latestBest(root: string, task: TaskConfig): number | null {

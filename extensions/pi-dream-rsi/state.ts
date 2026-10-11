@@ -12,6 +12,7 @@ import * as path from "node:path";
 import { allocator, dreamIsActive, phaseIsActive } from "./engine/ownership.ts";
 import { checkpointPath, recoverableIterations } from "./engine/checkpoint.ts";
 import { progressIterations, readProgress, progressSummary } from "./engine/progress.ts";
+import { renderHandoffSummary } from "./engine/handoff.ts";
 
 import { DREAM_DIR, readTask, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import {
@@ -76,7 +77,7 @@ export function activeRuns(root: string): string[] {
       out.push(`live cycle ${match[1]} (unreadable manifest)`);
     }
   }
-  return out;
+  return out.sort((a, b) => a.localeCompare(b));
 }
 
 /** Iterations whose in-flight mirror still says `running` — worlds claimed but not finished. */
@@ -353,4 +354,23 @@ export function statusSummary(root: string, options: StatusOptions = {}): string
     }
   }
   return lines.join("\n");
+}
+
+/** Bounded prompt handoff; statusSummary remains the complete operator report. */
+export function handoffSummary(root: string, sessionIteration?: number): string {
+  const summary = statusSummary(root, { sessionIteration });
+  const activeIteration = runningIterations(root).at(-1);
+  const recoverable = recoverableIterations(root);
+  const iteration = activeIteration ?? recoverable[0];
+  const kind = activeIteration ? "active" : iteration ? "recoverable" : undefined;
+  const manifestPath = iteration
+    ? path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}_current`, "live_cycle_manifest.json")
+    : undefined;
+  const manifest = manifestPath ? readJson<LiveCycleManifest>(manifestPath) : undefined;
+  const ownerText = manifest?.owner
+    ? `${kind === "active" ? "live owner" : "recorded owner"} session ${manifest.owner.session_id}, pid ${manifest.owner.pid}`
+    : undefined;
+  const checkpointFile = iteration ? checkpointPath(root, iteration) : undefined;
+  const checkpoint = checkpointFile && fs.existsSync(checkpointFile) ? checkpointFile : undefined;
+  return renderHandoffSummary(summary, { iteration, kind, owner: ownerText, checkpoint });
 }

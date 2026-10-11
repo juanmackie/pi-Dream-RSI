@@ -26,7 +26,11 @@ offline replay of candidate policies against worlds recorded from real runs.
   so replay is deterministic and cheap.
 - **Reward:** selection uses Eq. 1, `V = max s_v − β1·N + β2·N/max(1, k*)` (quality, execution cost,
   parallelism). The beta sweep ranks `pareto.reward = pareto.auc − λ·parallel_penalty`, where a full batch
-  approaches penalty `1/W` and a serial policy sits near `1`.
+  approaches penalty `1/W` and a serial policy sits near `1`. `β1`/`β2` are absolute score units per
+  probe — scale them to the metric (`[0, 1]` wants `~0.001`). The dream report names it when efficiency
+  overturned peak attainment so the operator can retune instead of deploying an early-stopping policy.
+  The tree root is the measured seed score when no cycle-1 baseline exists yet, so cost tasks do not
+  lose to idle by default.
 
 ## Tools
 
@@ -36,7 +40,7 @@ offline replay of candidate policies against worlds recorded from real runs.
 | `dream_rsi_live` | One or more online cycles: `plan_grid` picks the branch × refinement grid, the policy batches nodes, W attempts run in parallel, the scorer evaluates each — records one world per episode. Pass `loops=n` (clamped to `task.json`'s `max_loops`, default 2) or start several `dream_rsi_live` calls at once to record `n` worlds of the same policy in parallel; the cap is shared across everything in flight. Expensive (real agent time: `loops x W` attempts at once). |
 | `dream_rsi_resume` | Continue an interrupted live tree using its original effective settings and remaining budget, including later rounds. Keeps completed attempts; restarts unfinished generators from the committed parent or evaluates a saved completed generator. Report kept/unfinished attempts and remaining budgets before running; retries can add calls. Omit `iteration` for the latest recoverable tree. |
 | `dream_rsi_dream` | Offline phase: replay `M` policy versions over completed compatible worlds, sweep beta, revise staged policies, select argmax `V` and deploy the winner. Releases interrupted claims while preserving checkpoints, then refuses while a phase is genuinely in flight or its manifest is unreadable. M−1 revision-agent calls regardless of world count; replay work and history-reading tokens grow with history. |
-| `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true`, copies only the declared program (plus paths the user names), never commits. |
+| `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true` and copies only the declared program (plus paths the user names). First it runs the scorer on scratch copies of the user's code without and with the files (two scorer runs) and writes only when the result measures better. Writes all files or none, keeps the replaced versions, never commits. |
 | `dream_rsi_status` | Iterations with best score + baked beta, completed worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), persisted live progress, recoverable checkpoints and the best candidate on record. |
 
 `dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
@@ -172,6 +176,16 @@ candidates, and `/dream-rsi suggest <goal>` reproduces that ranking on demand. P
    user names) over their code and appends to `history/applied.jsonl`. It never commits, never branches, never
    runs tests. Applying is the user's decision, every time — never call it on your own initiative, and never
    present it as already done.
+5. **Report what the apply measured.** The tool scores the user's code without and with the files before it
+   writes. A refusal is a result, not an error to work around:
+   - *not a measured improvement* — report the two numbers. The tool names the other files the candidate
+     changed; add them with `paths=[...]` only when the user agrees.
+   - *a target file changed after the cycle started* — the candidate does not contain that change. Offer a merge
+     by hand or a new cycle. Pass `overwrite_changed=true` only when the user accepts that the file is replaced.
+   - Pass `verify=false` only when the user asks for it; the apply is then recorded as unverified.
+
+A new cycle starts from the user's code as it is. An unapplied candidate does not carry into the next cycle, so
+settle the pending candidate before the next `dream_rsi_live` when the next cycle must build on it.
 
 `/dream-rsi create <goal>` on a configured project ends the same way — it asks first, and the report branch is
 this same ranking — so a user who starts with "set this up" also ends with "here is what to take". Goal words pick
@@ -209,6 +223,7 @@ the preference: `fastest` (strict score), `safest` (keeps ≥95% of the best win
   history/seed/score.json                    what the user's own code measured — the reference point
   history/baseline/                          parallel-refine floor to beat
   history/applied.jsonl                      candidates already applied (append-only)
+  history/apply/<timestamp>/                 one apply: before.log, after.log (scorer output), replaced/ (old files)
   history/r0001_live/attempt_<cell>/{proposal.md,eval/score.json,error.txt,agent.log,eval.log,prompt.md}
   history/r0001_live/attempt_<cell>/retry_<n>/    abandoned generator work/logs
   history/r0001_live/attempt_<cell>/eval_retry_<n>/   abandoned evaluator workspace

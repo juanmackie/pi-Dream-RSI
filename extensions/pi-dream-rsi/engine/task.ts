@@ -67,7 +67,10 @@ export interface TaskConfig {
   k2: number;
   /** M — policy revisions per offline phase. */
   revisions: number;
-  /** Numeric reward shaping for Eq. 1 (the paper states the form, not the values). */
+  /**
+   * Numeric reward shaping for Eq. 1 (the paper states the form, not the values). Absolute score
+   * units per probe: scale to the metric (scores in [0, 1] want ~0.001, scores near 100 keep 0.01).
+   */
   beta1: number;
   beta2: number;
   /** Beta grid swept during offline evaluation. */

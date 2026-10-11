@@ -12,6 +12,7 @@ import {
   sweepSummary,
   traceMetrics,
 } from "../extensions/pi-dream-rsi/engine/reward.ts";
+import { efficiencyOverturnNote, meanAttainment } from "../extensions/pi-dream-rsi/engine/dream.ts";
 import { readPolicyViolations, scanPolicySource } from "../extensions/pi-dream-rsi/policy/runner.ts";
 import { LLMDesignedMethod, _budget_done, _record_curve, finalize_result, newSimResult, resolveBeta } from "../extensions/pi-dream-rsi/policy/api.ts";
 import { PolicyHost } from "../extensions/pi-dream-rsi/policy/host.ts";
@@ -199,4 +200,39 @@ test("one recovery per batch leaves room for healthy refinements and respects be
   assert.equal(new Set(batch).size, batch.length);
   assert.deepEqual(selectBatch(prefix, question, new Set(), LLMDesignedMethod.schedule(1)),
     ["b3a0", "b4a0", "b5a0", "b0a0"]);
+});
+
+test("cost tasks: a seeded root keeps an improving policy ahead of idle", () => {
+  // Seed measured -100 (a cost normalized to higher-is-better). Working policy reaches -96.
+  const idle = traceMetrics([], { ...cfg, baselineScore: -100 });
+  assert.equal(idle.value, -100);
+  const working = replayValue(-96, 4, 2, { ...cfg, baselineScore: -100 });
+  assert.ok(working > idle.value, `working ${working} should beat idle ${idle.value}`);
+  // Without the seed the root scores 0 and idle always wins on a cost task — the bug the
+  // baseline fallback fixes. This documents the failure mode, not the desired behavior.
+  const idleUnseeded = traceMetrics([], { ...cfg, baselineScore: null });
+  assert.equal(idleUnseeded.value, 0);
+  assert.ok(idleUnseeded.value > working, "unseeded idle 0 beats working -96: needs the seed fallback");
+});
+
+test("selection names it when efficiency overturns peak attainment", () => {
+  const early = {
+    revision: 0, v_mean: 0.805,
+    per_world: [{ ok: true, attainment: 0.805, probes: 1, rounds: 1, value: 0.805, auc: 0.805, parallel_penalty: 1, iteration: 1, error: null }],
+  };
+  const full = {
+    revision: 1, v_mean: 0.78,
+    per_world: [{ ok: true, attainment: 0.82, probes: 5, rounds: 3, value: 0.78, auc: 0.8, parallel_penalty: 0.5, iteration: 1, error: null }],
+  };
+  assert.equal(meanAttainment(early), 0.805);
+  assert.equal(meanAttainment(full), 0.82);
+  const note = efficiencyOverturnNote([early, full], 0);
+  assert.match(note ?? "", /won on efficiency/, "early winner with lower attainment gets a note");
+  assert.match(note ?? "", /beta1\/beta2/);
+  assert.equal(efficiencyOverturnNote([early, full], 1), null, "selecting the higher-attainment version needs no note");
+  const agreeing = [
+    { revision: 0, v_mean: 0.7, per_world: [{ ok: true, attainment: 0.7 }] },
+    { revision: 1, v_mean: 0.9, per_world: [{ ok: true, attainment: 0.9 }] },
+  ];
+  assert.equal(efficiencyOverturnNote(agreeing, 1), null);
 });

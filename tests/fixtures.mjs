@@ -51,6 +51,29 @@ writeFileSync("eval/score.json", JSON.stringify({
   error: broken ? "candidate marked BROKEN" : null,
 }));
 `,
+  // A candidate that moves part of its change into a second file, and a scorer that needs both.
+  "agent-helper.mjs": `
+import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
+process.stdin.on("data", () => {});
+process.stdin.on("end", () => {
+  const depth = (readFileSync("solution.py", "utf8").match(/x/g) ?? []).length;
+  appendFileSync("solution.py", "import helper\\n" + "x".repeat(1 + (depth % 3)) + "\\n");
+  writeFileSync("helper.py", "FAST = True\\n");
+  writeFileSync("proposal.md", "# split the hot path into helper.py\\ndepth=" + depth + "\\n");
+});
+`,
+  "score-helper.mjs": `
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+const src = readFileSync("solution.py", "utf8");
+mkdirSync("eval", { recursive: true });
+const broken = src.includes("import helper") && !existsSync("helper.py");
+writeFileSync("eval/score.json", JSON.stringify({
+  score: broken ? 0 : (src.match(/x/g) ?? []).length,
+  valid: !broken,
+  fail_class: broken ? "import_error" : "ok",
+  error: broken ? "ModuleNotFoundError: helper" : null,
+}));
+`,
   "score-fail.mjs": `
 console.error("evaluator exploded");
 process.exit(4);

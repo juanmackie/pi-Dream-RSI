@@ -261,7 +261,7 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 | `dream_rsi_live` | `W × K1` agent calls per episode | One or more online cycles: plan the grid, batch nodes, run attempts in parallel, score each, record a replay world per episode. `loops=n` (or several calls) records `n` worlds of the same policy in parallel; `max_loops` caps everything in flight. |
 | `dream_rsi_resume` | remaining original budget + retries | Continue an interrupted live tree with its original effective settings and budget. Completed attempts are reused; a saved completed generator only needs evaluation. Later rounds can start new attempts within the original budget. Retries add calls and are reported separately. |
 | `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over completed worlds, sweep beta, rewrite the policy, deploy the winner. Releases interrupted claims while preserving checkpoints, then refuses while a phase is genuinely in flight or its manifest is unreadable. Only worlds under the current scoring contract are replayed. Revision-call count is fixed; replay work and history-reading tokens grow with history. |
-| `dream_rsi_apply` | nothing | Copies a candidate's `eval_program` over your code. Needs `confirm: true`; never commits. |
+| `dream_rsi_apply` | two scorer runs | Copies a candidate's `eval_program` over your code, but only after your code measures better with it than without it. Needs `confirm: true`; writes all files or none; never commits. |
 | `dream_rsi_status` | nothing | Iterations, completed worlds, policy versions, last sweep, persisted live progress, recoverable checkpoints and candidates waiting to be applied. |
 
 `dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` only become callable in Dream-RSI mode.
@@ -381,6 +381,7 @@ Crashes, missing files, and timeouts get classified for you (`eval_error`, `time
   policy/r0001_v0000.ts …                         every evaluated version, archived by cycle and revision
   history/seed/score.json                         what YOUR code measured (the reference point for candidates)
   history/applied.jsonl                           candidates you have already applied (append-only)
+  history/apply/<timestamp>/                      one apply: before.log, after.log (scorer output), replaced/ (old files)
   history/baseline/attempt_<cell>/                the floor to beat (best attempt of cycle 1)
   history/r0001_live/attempt_<cell>/              proposal.md, eval/score.json, error.txt, prompt.md, logs
   history/r0001_live/tree.json                    the recorded discovery tree T_1
@@ -446,18 +447,40 @@ you took, so the same candidate is not offered twice.
 
 ```text
 dream_rsi_apply                          # without confirm: prints the files, line counts and the diff command
-dream_rsi_apply confirm=true             # copies the pending best candidate over your code
+dream_rsi_apply confirm=true             # verifies, then copies the pending best candidate over your code
 dream_rsi_apply confirm=true cell=b1a1 paths=["src/lib/support.py"]   # extra files, if the task needs them
 ```
+
+A candidate's score comes from its own attempt workspace. That number does not prove that your code is better
+after a copy: the candidate can depend on a file that is not copied, and your files can have changed since the
+cycle started. So an apply is a checked transaction:
+
+1. **Changed files stop it.** If a target file changed after the candidate's cycle took its seed snapshot, the
+   apply stops, because the candidate does not contain that change. Merge by hand, run a new cycle, or pass
+   `overwrite_changed=true` to replace the file.
+2. **The scorer decides.** The tool copies your workspace to a scratch directory two times and runs
+   `score_program` in each: one copy as it is, one copy with the candidate's files. It writes to your code only
+   when the second result is a valid score and is better than the first. If not, it reports the two numbers and
+   the other files the candidate changed, and your code stays as it was.
+3. **All files or none.** If a copy fails, the files that were already written get their previous content back.
 
 What it does and does not do:
 
 - Copies **only** the declared `eval_program` plus any paths you name, and only from the candidate workspace
   into your seed workspace. Paths that are absolute, contain `..`, or escape either workspace are refused.
 - Refuses without `confirm: true`, so a misread tool call cannot rewrite your code.
+- Keeps the scorer output and the replaced files in `history/apply/<timestamp>/`, and records the score your
+  code measured (not the candidate's own score) in `history/applied.jsonl`.
 - **Never commits, never creates a branch, never runs your tests.** It prints the files it wrote and tells you
   to review.
 - The candidate's `proposal.md` is *not* applied — reports are for reading, not for your repo.
+
+`verify=false` skips step 2 for a scorer that cannot run now. The apply is then reported and recorded as
+unverified. The check is one run before and one run after: it catches a broken or worse result, but it does not
+make a noisy scorer reliable.
+
+**A new cycle starts from your code as it is.** Cycles do not build on a candidate until you apply it, so apply
+the pending candidate before the next `dream_rsi_live` when the next cycle must continue from it.
 
 Or do it by hand, which is the same thing:
 
@@ -507,7 +530,7 @@ Read this before trusting a number.
 
 | Knob | What this implementation does |
 |------|------------------------------|
-| `beta1`, `beta2` (Eq. 1) | The paper gives the form, not the values. Defaults `0.01` / `0.01`, configurable per task. |
+| `beta1`, `beta2` (Eq. 1) | The paper gives the form, not the values. Defaults `0.01` / `0.01`, configurable per task. They are absolute score units per probe: one probe must improve the best score by more than ~`beta1` to pay for itself. Scale them to your metric — scores in `[0, 1]` want `~0.001`, scores near `100` can keep `0.01`, costs (negative scores) need the tree root seeded from your measured code so idle does not score `0` and always win. When the dream report says efficiency overturned peak attainment, lower them. |
 | `lambda` (sweep ranking) | Same: default `1`, stored next to every sweep. |
 | Beta grid, `K1`, `K2`, `M` defaults | Not published. Shipped defaults: `W=4`, `K1=6`, `K2=8`, `M=3`, grid `[0, .2, .4, .6, .8, 1]`, `beta1=beta2=0.01`, `default_beta=0.6`. The paper's task shape (`W=10, K1=11` for a strong model, `W=32, K1=20` for a fast one, five rounds) is what the create skill recommends. |
 | `pareto.auc` normalization | "High per-trace attainment with few total probes" is implemented as mean attainment over the probes actually taken, averaged across worlds, then trapezoidal over the beta→work curve. |
@@ -526,7 +549,11 @@ depth cap, `K2`, `Child(v)=∅`), Eq. 1 worked out by hand, AUC/penalty/frontier
 `V* ≥ V_0`, prefix-only enforcement, a full two-cycle loop with stub agents (live → worlds → revisions → deploy →
 replay both worlds), every scorer diagnosis (`invalid_score`, `eval_error`, `no_proposal`, `agent_error`,
 `timeout`), candidate ranking (score order, `fastest`/`safest`/`simplest`, the win band, applied exclusion,
-secondary metrics, scoped-vs-data files, determinism, and that ranking writes nothing), the agent-command
+secondary metrics, scoped-vs-data files, determinism, and that ranking writes nothing), verified apply (a
+candidate that does not measure better on your code is refused, a file changed after the cycle started is kept,
+a failed multi-file copy is rolled back), reward scale (a seeded cost-task root keeps an improving
+policy ahead of idle, efficiency-overturning-peak selection is named, seed fallback when no baseline
+exists), the agent-command
 builder (`--model` appended vs `{model}` substituted), and the extension surface (gating, `create`/`suggest`
 dispatch and routing, the configured-project choice dialog, archive-on-fresh, baseline retention across
 reconfigures, session rebuild, branch-local state, crashed-cycle visibility, schema strictness, package

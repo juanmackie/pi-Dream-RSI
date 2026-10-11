@@ -17,7 +17,7 @@ import { jump } from "./fixtures.mjs";
 const { rankCandidates, renderSuggestion, MIN_WIN_FRACTION } = await jump("engine/candidates.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, writeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
-const { improvements, seedMatchesTask } = await jump("engine/improvements.ts");
+const { improvements, resolveBaselineScore, seedMatchesTask } = await jump("engine/improvements.ts");
 const { writeJson } = await jump("engine/world.ts");
 const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
 
@@ -556,6 +556,54 @@ test("a spawned agent does not inherit the host session identity", async () => {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tree root falls back to the measured seed when no cycle-1 baseline exists", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-baseline-"));
+  const projectDir = path.join(dir, "proj");
+  const dreamRoot = path.join(projectDir, ".dream-rsi");
+  fs.mkdirSync(path.join(projectDir, "seed"), { recursive: true });
+  const task = normalizeTask({
+    name: "cost",
+    workspace: "seed",
+    eval_program: "prog.py",
+    score_program: "node score.mjs",
+    workers: 2,
+    k1: 2,
+    k2: 2,
+    revisions: 1,
+    higher_is_better: false,
+  });
+  writeTask(dreamRoot, task);
+  // A cost task measured at raw 100 -> normalized score -100.
+  writeJson(path.join(dreamRoot, "history", "seed", "score.json"), {
+    score: -100,
+    raw_score: 100,
+    fail_class: "ok",
+    error: null,
+    measured_at: new Date(0).toISOString(),
+    workspace: "seed",
+    score_program: task.score_program,
+    fingerprint: scoringFingerprint(task),
+    seconds: 0.1,
+  });
+  try {
+    assert.equal(resolveBaselineScore(dreamRoot, task), -100);
+    // A stale baseline from another contract must not leak in either.
+    writeJson(path.join(dreamRoot, "history", "baseline", "score.json"), {
+      score: 999,
+      task_fingerprint: "deadbeefdeadbeef",
+    });
+    assert.equal(resolveBaselineScore(dreamRoot, task), -100);
+    // A current baseline wins over the seed once cycle 1 recorded it.
+    writeJson(path.join(dreamRoot, "history", "baseline", "score.json"), {
+      score: -96,
+      task_fingerprint: scoringFingerprint(task),
+    });
+    assert.equal(resolveBaselineScore(dreamRoot, task), -96);
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

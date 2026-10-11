@@ -31,7 +31,7 @@ const { recoverInterruptedRuns, reserveIterations } = await jump("state.ts");
 const { makeReplayProbe } = await jump("engine/replay.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { findCandidate } = await jump("engine/improvements.ts");
-const { resolveWithinRoot } = await jump("index.ts");
+const { replaceFiles, resolveWithinRoot } = await jump("engine/apply.ts");
 
 const OK_COMMAND = {
   ok: true,
@@ -257,6 +257,29 @@ test("apply boundary resolution rejects a link that escapes the workspace", () =
     }
     assert.ok(resolveWithinRoot(root, "app.py"), "an ordinary path resolves");
     assert.equal(resolveWithinRoot(root, "evil/secret.py"), null, "a link escape is refused");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("an apply that fails on a later file restores the files it already replaced", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-apply-"));
+  try {
+    const file = (name, text) => {
+      const target = path.join(dir, name);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      if (text !== undefined) fs.writeFileSync(target, text, "utf8");
+      return target;
+    };
+    const files = [
+      { relative: "a.py", from: file("candidate/a.py", "new a\n"), to: file("seed/a.py", "old a\n"), before: 2, after: 2 },
+      { relative: "new.py", from: file("candidate/new.py", "new file\n"), to: file("seed/new.py"), before: 0, after: 2 },
+      { relative: "gone.py", from: file("candidate/gone.py"), to: file("seed/gone.py", "old gone\n"), before: 2, after: 0 },
+    ];
+    assert.throws(() => replaceFiles(files, path.join(dir, "replaced")));
+    assert.equal(fs.readFileSync(files[0].to, "utf8"), "old a\n", "a replaced file gets its previous content back");
+    assert.equal(fs.existsSync(files[1].to), false, "a file the apply created is removed again");
+    assert.equal(fs.readFileSync(files[2].to, "utf8"), "old gone\n");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

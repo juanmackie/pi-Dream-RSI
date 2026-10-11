@@ -16,10 +16,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
+import { scoreSeedCopy } from "./apply.ts";
 import { DiscoveryTree, type TreeNode } from "./tree.ts";
 import { historyDir, iterationDir, readJson, readManifest, workRoot, writeJson } from "./world.ts";
-import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import { programFingerprint, readTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 
 /** A candidate has to beat the recorded baseline by this much (relative) before it is worth reporting. */
@@ -50,13 +49,25 @@ export interface SeedMeasurement {
 export interface AppliedRecord {
   iteration: number;
   cell: string;
-  /** Normalized score at apply time (higher is better under the then-current contract). */
+  /**
+   * Normalized score (higher is better under the then-current contract) that the user's code measured
+   * with the files applied. For an unverified apply, and in records written before verification
+   * existed, it is the score the candidate got in its own attempt workspace.
+   */
   score: number | null;
+  /** What the candidate scored in its own attempt workspace. */
+  candidate_score?: number | null;
+  /** What the user's code measured immediately before the apply; absent when not verified. */
+  before_score?: number | null;
+  /** False when verification was skipped; absent in records written before verification existed. */
+  verified?: boolean;
   /** Scoring-contract fingerprint at apply time; absent in records written before it existed. */
   fingerprint?: string;
   applied_at: string;
   paths: string[];
   target: string;
+  /** Where the replaced files were kept, relative to the project; absent when nothing was replaced. */
+  backup?: string;
 }
 
 export interface Candidate {
@@ -75,6 +86,7 @@ export interface Candidate {
 export interface ImprovementReport {
   seed: SeedMeasurement | null;
   applied: { score: number | null; count: number } | null;
+  /** The best candidate on record that has not been applied. */
   best: Candidate | null;
   /**
    * Set when there is something worth applying right now. `gain_pct` is null when the reference score is
@@ -115,19 +127,15 @@ export async function measureSeed(options: {
   const log = options.log ?? (() => {});
   const seed = path.resolve(projectDir, task.workspace);
   if (!fs.existsSync(seed)) return null;
-  const scratch = path.join(historyDir(dreamRoot), "seed-workspace");
   const started = Date.now();
   try {
-    await copyWorkspace(seed, scratch, { exclude: [dreamRoot, path.join(projectDir, ".git")] });
-    // The scratch copy inherits any score file already in the seed workspace; remove it so only this
-    // measurement's own output can be read back.
-    fs.rmSync(path.join(scratch, task.score_path), { force: true });
-    const command = await runShellCommand(task.score_program, {
-      cwd: scratch,
-      timeoutMs: task.evaluator_timeout_ms,
+    const outcome = await scoreSeedCopy({
+      dreamRoot,
+      projectDir,
+      task,
+      scratch: path.join(historyDir(dreamRoot), "seed-workspace"),
       logPath: path.join(historyDir(dreamRoot), "seed", "score.log"),
     });
-    const outcome: ScoreOutcome = interpretEvaluation(task, command, readScoreFile(scratch, task));
     const measurement: SeedMeasurement = {
       score: outcome.score,
       raw_score: outcome.raw_score,
@@ -160,13 +168,32 @@ export async function measureSeed(options: {
   } catch (error) {
     log(`[seed] baseline measurement failed: ${error instanceof Error ? error.message : String(error)}`);
     return null;
-  } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
   }
 }
 
 export function readSeedMeasurement(dreamRoot: string): SeedMeasurement | null {
   return readJson<SeedMeasurement>(seedScorePath(dreamRoot));
+}
+
+/**
+ * The tree root's starting score: the cycle-1 baseline when it describes the current task,
+ * otherwise the measured seed score, otherwise null. Without the seed fallback an idle replay
+ * scores 0 while a cost-task policy scores negative, so doing nothing always wins.
+ */
+export function resolveBaselineScore(dreamRoot: string, task: TaskConfig): number | null {
+  try {
+    const parsed = readJson<{ score?: number; task_fingerprint?: string }>(
+      path.join(historyDir(dreamRoot), "baseline", "score.json"),
+    );
+    if (parsed && (parsed.task_fingerprint === undefined || parsed.task_fingerprint === scoringFingerprint(task))) {
+      if (typeof parsed.score === "number") return parsed.score;
+    }
+  } catch {
+    // Fall through to the seed measurement below.
+  }
+  const seed = readSeedMeasurement(dreamRoot);
+  if (seed && seedMatchesTask(seed, task) && typeof seed.score === "number") return seed.score;
+  return null;
 }
 
 export function readApplied(dreamRoot: string): AppliedRecord[] {
@@ -210,8 +237,17 @@ export function seedMatchesTask(seed: SeedMeasurement, task: TaskConfig): boolea
   return seed.workspace === task.workspace && (seed.score_program ?? task.score_program) === task.score_program;
 }
 
-/** The best valid candidate of one recorded iteration, ignoring scores from another contract. */
-function bestOfIteration(dreamRoot: string, iteration: number, task: TaskConfig, projectDir: string): Candidate | null {
+/**
+ * The best valid candidate of one recorded iteration, ignoring scores from another contract.
+ * `skip` holds cell ids to leave out (candidates that were already applied).
+ */
+function bestOfIteration(
+  dreamRoot: string,
+  iteration: number,
+  task: TaskConfig,
+  projectDir: string,
+  skip?: Set<string>,
+): Candidate | null {
   const manifest = readManifest(dreamRoot, iteration);
   if (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== scoringFingerprint(task)) {
     return null; // recorded under a different scoring contract: not comparable with this task
@@ -225,6 +261,7 @@ function bestOfIteration(dreamRoot: string, iteration: number, task: TaskConfig,
     if (typeof node.score !== "number") continue;
     if (node.error !== null || node.fail_class !== "ok") continue;
     if (!scoreMatchesDirection(task, node.score, node.raw_score)) continue;
+    if (skip?.has(node.meta.cell_id)) continue;
     if (!best || node.score > (best.score ?? Number.NEGATIVE_INFINITY)) best = node;
   }
   if (!best) return null;
@@ -271,16 +308,21 @@ export function improvements(dreamRoot: string, task?: TaskConfig, projectDir?: 
   const appliedScores = appliedRecords.map((record) => record.score).filter((score): score is number => typeof score === "number");
   const appliedBest = appliedScores.length > 0 ? Math.max(...appliedScores) : null;
 
+  // An applied candidate is never offered again. Its recorded score can be higher than the score the
+  // user's code measured with it, so the reference alone does not exclude it.
   let best: Candidate | null = null;
   for (const iteration of recordedIterations(dreamRoot)) {
-    const candidate = bestOfIteration(dreamRoot, iteration, resolvedTask, project);
+    const appliedCells = new Set(appliedRecords.filter((record) => record.iteration === iteration).map((record) => record.cell));
+    const candidate = bestOfIteration(dreamRoot, iteration, resolvedTask, project, appliedCells);
     if (candidate && (!best || candidate.score > best.score)) best = candidate;
   }
 
   const unreachable =
     "no candidate workspace on disk for the best score (workspaces are per iteration: check .dream-rsi/work/)";
   if (!best) {
-    return { seed, applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length }, best: null, pending: null, reason: "no successful candidate recorded yet" };
+    const reason =
+      appliedRecords.length > 0 ? "no successful candidate on record that is not already applied" : "no successful candidate recorded yet";
+    return { seed, applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length }, best: null, pending: null, reason };
   }
   if (!best.program) {
     return {

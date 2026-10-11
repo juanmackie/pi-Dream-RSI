@@ -167,7 +167,8 @@ the scorer cannot see (a staleness window, an approximation). If the project alr
 held-out set, score the top pick on it before recommending — a win that survives a workload it was never fitted
 to is the one to take. Then ask whether to apply it. `dream_rsi_apply`
 copies the candidate's file over the user's code, with `confirm: true`, records it in `history/applied.jsonl`
-(so it is not offered again), and never commits.
+(so it is not offered again), and never commits. Before it writes, it runs the scorer on the user's code
+without and with the file and refuses when the result does not measure better.
 
 ## Anti-patterns
 

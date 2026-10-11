@@ -12,8 +12,10 @@ import { EXT, exists, jump, makeProject, mockPi, readJson } from "./fixtures.mjs
 
 const { default: dreamRsi } = await jump("index.ts");
 const { defaultTask, normalizeTask } = await jump("engine/task.ts");
-const { activeRuns, recoverInterruptedRuns, nextIteration, reserveIterations, runningIterations } = await jump("state.ts");
+const { activeRuns, recoverInterruptedRuns, nextIteration, reserveIterations, runningIterations, handoffSummary } = await jump("state.ts");
 const { listIterations } = await jump("engine/world.ts");
+const { HANDOFF_MAX_CHARS } = await jump("engine/handoff.ts");
+const { saveCheckpoint } = await jump("engine/checkpoint.ts");
 
 async function boot(project) {
   const { pi, context, harness } = mockPi();
@@ -112,6 +114,78 @@ test("headless help/status and invalid recovery arguments report without activat
     await command.handler("?", context);
     assert.match(harness.notifications.at(-1), /latest recoverable/);
     assert.equal(harness.injectedMessages.length, before, "terminal help uses the UI notification");
+  } finally { project.cleanup(); }
+});
+
+test("intent matrix keeps read-only requests inert and requires explicit setup/resume steps", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const command = harness.commands.get("dream-rsi");
+    const readOnly = [
+      { intent: "help", expected: /latest recoverable/ },
+      { intent: "status", expected: /No Dream-RSI task/ },
+      { intent: "watch", expected: /no recorded progress/ },
+      { intent: "resume 0", expected: /integer iteration number/ },
+    ];
+    for (const { intent, expected } of readOnly) {
+      const before = harness.sentMessages.length;
+      await command.handler(intent, context);
+      const result = harness.notifications.at(-1) ?? harness.injectedMessages.at(-1)?.message.content;
+      assert.match(result, expected, `${intent} returns the documented result`);
+      assert.equal(harness.sentMessages.length, before, `${intent} starts no agent turn`);
+      assert.equal(harness.activeTools.some((name) => ["dream_rsi_live", "dream_rsi_dream", "dream_rsi_apply"].includes(name)), false);
+      assert.equal(fs.existsSync(project.dreamRoot), false, `${intent} creates no task state`);
+    }
+
+    await command.handler("create maximize x markers", context);
+    assert.equal(harness.sentMessages.length, 1, "setup begins only after the explicit create command");
+    assert.match(harness.sentMessages[0].content, /^\/skill:dream-rsi-create maximize x markers$/);
+    assert.equal(fs.existsSync(project.dreamRoot), false, "setup handoff itself does not create a task");
+
+    await harness.tools.get("dream_rsi_init").execute("init", initParams(project), undefined, undefined, context);
+    const manifest = { iteration: 1, status: "interrupted", created_at: new Date().toISOString(), completed_at: null,
+      baked_beta: 0.6, policy_version: "", policy_name: null, grid: { branch_count: 2, refine_count: 3 },
+      decision_rounds: 2, attempts: 4, baseline_score: 0, best_score: 3, previous_best_score: null, stopped: null, error: null, note: "interrupted" };
+    fs.mkdirSync(path.join(project.dreamRoot, "trace_pool", "iter0001_current"), { recursive: true });
+    saveCheckpoint(project.dreamRoot, { version: 1, project: project.projectDir, task: project.task, manifest, policy: "",
+      policy_hashes: {}, seed: "", seed_hash: "", prompt_template: "", prompt_vars: {}, tree: { version: 1, iteration: 1, cells: [] },
+      batches: [], status: "interrupted", extra_agent_calls: 0, extra_eval_calls: 0, resumes: 0 });
+    fs.writeFileSync(path.join(project.dreamRoot, "trace_pool", "iter0001_current", "live_cycle_manifest.json"), JSON.stringify(manifest));
+    harness.sentMessages.length = 0;
+    await command.handler("resume 1", context);
+    assert.equal(harness.sentMessages.length, 1, "only the explicit resume command asks for continuation");
+    assert.match(harness.sentMessages[0].content, /Report the saved settings, kept attempts and remaining budgets before running/);
+  } finally { project.cleanup(); }
+});
+
+test("full status keeps older results while automatic handoff selects one active iteration", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("init", initParams(project), undefined, undefined, context);
+    for (let iteration = 1; iteration <= 20; iteration += 1) {
+      const directory = path.join(project.dreamRoot, "trace_pool", `iter${String(iteration).padStart(4, "0")}`);
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "live_cycle_manifest.json"), JSON.stringify({ iteration, status: "complete",
+        created_at: "now", completed_at: "now", baked_beta: 0.6, policy_version: "", policy_name: null,
+        grid: { branch_count: 2, refine_count: 3 }, decision_rounds: 3, attempts: 6, baseline_score: 0,
+        best_score: iteration, previous_best_score: iteration - 1, stopped: null, error: null, note: null }));
+    }
+    const activeDirectory = path.join(project.dreamRoot, "trace_pool", "iter0021_current");
+    fs.mkdirSync(activeDirectory, { recursive: true });
+    fs.writeFileSync(path.join(activeDirectory, "live_cycle_manifest.json"), JSON.stringify({ iteration: 21, status: "running",
+      owner: { session_id: "owner-21", pid: 4321, claimed_at: "now" } }));
+    const fullResult = await harness.tools.get("dream_rsi_status").execute("status-full", { detail: "full" }, undefined, undefined, context);
+    const full = fullResult.content[0].text;
+    const handoff = handoffSummary(project.dreamRoot);
+    assert.match(full, /t=1: status=complete/);
+    assert.match(full, /t=20: status=complete/);
+    assert.match(handoff, /selected iteration: 21 \(active\)/);
+    assert.match(handoff, /owner: iteration 21, live owner session owner-21, pid 4321/);
+    assert.doesNotMatch(handoff, /t=1: status=complete/);
+    assert.match(handoff, /next safe action: inspect or wait for the active owner/);
+    assert.ok(handoff.length <= HANDOFF_MAX_CHARS);
   } finally { project.cleanup(); }
 });
 
@@ -221,6 +295,8 @@ test("live then dream through the tools, with status reporting the recorded worl
     assert.ok(injected.systemPrompt.startsWith("BASE"));
     assert.match(injected.systemPrompt, /Dream-RSI Mode \(ACTIVE\)/);
     assert.match(injected.systemPrompt, /t=1: status=complete/);
+    const handoff = injected.systemPrompt.slice(injected.systemPrompt.indexOf("Dream-RSI — fixture"));
+    assert.ok(handoff.length <= HANDOFF_MAX_CHARS, "automatic state handoff has a hard character cap");
   } finally {
     project.cleanup();
   }
@@ -360,12 +436,84 @@ test("apply refuses without confirmation, then copies only the declared program"
     assert.equal(log.length, 1);
     assert.equal(JSON.parse(log[0]).cell, candidate.cell);
     assert.equal(typeof JSON.parse(log[0]).fingerprint, "string", "the apply record is bound to the scoring contract");
+    // The recorded score is what your code measured after the copy, with the measurement before it.
+    assert.equal(JSON.parse(log[0]).verified, true);
+    assert.equal(JSON.parse(log[0]).before_score, 0);
+    assert.equal(JSON.parse(log[0]).score, candidate.score);
     // Only the declared program was copied: the seed workspace is otherwise untouched.
     assert.equal(exists(path.join(project.seed, "proposal.md")), false, "reports are not applied");
 
     // 4. After applying, the same candidate is no longer pending.
     const status = await harness.tools.get("dream_rsi_status").execute("c6", {}, undefined, undefined, context);
     assert.match(status.content[0].text, /Nothing to apply:/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("apply writes nothing when the candidate does not measure better on your code, then applies with the file it needs", async () => {
+  const project = makeProject({ scorer: "score-helper.mjs" });
+  try {
+    const { context, harness } = await boot(project);
+    const init = initParams(project, { agent_args: [project.script("agent-helper.mjs")] });
+    await harness.tools.get("dream_rsi_init").execute("c1", init, undefined, undefined, context);
+    const live = await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+    const candidate = live.details.pending_improvement;
+    const sourcePath = path.join(project.seed, "solution.py");
+    const beforeRun = fs.readFileSync(sourcePath, "utf8");
+    const appliedLog = path.join(project.dreamRoot, "history", "applied.jsonl");
+    const apply = harness.tools.get("dream_rsi_apply");
+
+    // The candidate scored in a workspace that also holds helper.py. The declared program alone breaks your code.
+    const refused = await apply.execute("c3", { confirm: true }, undefined, undefined, context);
+    assert.match(refused.content[0].text, /Not applied/);
+    assert.match(refused.content[0].text, /import_error/, "the measured failure is reported");
+    assert.match(refused.content[0].text, /helper\.py/, "the file the candidate also changed is named");
+    assert.equal(refused.details.verification.improved, false);
+    assert.equal(fs.readFileSync(sourcePath, "utf8"), beforeRun, "a failed verification writes nothing");
+    assert.equal(exists(path.join(project.seed, "helper.py")), false);
+    assert.equal(exists(appliedLog), false, "a refused apply is not recorded as applied");
+    const status = await harness.tools.get("dream_rsi_status").execute("c4", {}, undefined, undefined, context);
+    assert.match(status.content[0].text, /IMPROVEMENT READY — NOT APPLIED/, "the candidate stays pending");
+
+    const applied = await apply.execute("c5", { confirm: true, paths: ["helper.py"] }, undefined, undefined, context);
+    assert.match(applied.content[0].text, /Applied/);
+    assert.equal(fs.readFileSync(sourcePath, "utf8"), fs.readFileSync(candidate.program, "utf8"));
+    assert.ok(exists(path.join(project.seed, "helper.py")));
+    const record = JSON.parse(fs.readFileSync(appliedLog, "utf8").trim());
+    assert.equal(record.verified, true);
+    assert.equal(record.score, candidate.score, "the recorded score is the one your code measured");
+    assert.deepEqual(record.paths, ["solution.py", "helper.py"]);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("apply does not replace a file you changed after the cycle started unless you accept it", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.tools.get("dream_rsi_init").execute("c1", initParams(project), undefined, undefined, context);
+    await harness.tools.get("dream_rsi_live").execute("c2", {}, undefined, undefined, context);
+    const sourcePath = path.join(project.seed, "solution.py");
+    fs.appendFileSync(sourcePath, "# local edit\n");
+    const edited = fs.readFileSync(sourcePath, "utf8");
+    const appliedLog = path.join(project.dreamRoot, "history", "applied.jsonl");
+    const apply = harness.tools.get("dream_rsi_apply");
+
+    const refused = await apply.execute("c3", { confirm: true }, undefined, undefined, context);
+    assert.match(refused.content[0].text, /nothing applied/);
+    assert.match(refused.content[0].text, /overwrite_changed/);
+    assert.equal(fs.readFileSync(sourcePath, "utf8"), edited, "your later edit is still there");
+    assert.equal(exists(appliedLog), false);
+
+    // Accepted, and with verification off: the apply is labelled and recorded as unverified.
+    const forced = await apply.execute("c4", { confirm: true, overwrite_changed: true, verify: false }, undefined, undefined, context);
+    assert.match(forced.content[0].text, /UNVERIFIED/);
+    assert.notEqual(fs.readFileSync(sourcePath, "utf8"), edited);
+    const record = JSON.parse(fs.readFileSync(appliedLog, "utf8").trim());
+    assert.equal(record.verified, false);
+    assert.equal(fs.readFileSync(path.join(project.projectDir, record.backup, "solution.py"), "utf8"), edited, "the replaced version is kept");
   } finally {
     project.cleanup();
   }

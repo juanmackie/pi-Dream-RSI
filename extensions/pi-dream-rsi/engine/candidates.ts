@@ -557,6 +557,7 @@ export function renderSuggestion(ranking: Ranking, options: { compact?: boolean 
   lines.push(`preference: ${ranking.preference.label}${ranking.goal ? `  (goal: "${ranking.goal}")` : ""}`);
   if (pending) {
     lines.push("your code is unchanged. Report this to the user and ask whether to apply it; call dream_rsi_apply only after they say yes.");
+    lines.push("A new cycle starts from your code as it is then: it builds on this candidate only after it is applied.");
   }
   return lines.join("\n");
 }
