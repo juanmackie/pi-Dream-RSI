@@ -15,7 +15,7 @@ const { Dashboard, DashboardView, readLogPage } = await jump("dashboard.ts");
 const { default: extension } = await jump("index.ts");
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(predicate) { for (let i = 0; i < 500; i++) { if (predicate()) return; await pause(20); } throw new Error("fixture never reached requested stage"); }
+async function until(predicate, tries = 500, stage = "requested stage") { for (let i = 0; i < tries; i++) { if (predicate()) return; await pause(20); } throw new Error(`fixture never reached ${stage}`); }
 const options = (p, extra = {}) => ({ dreamRoot: p.dreamRoot, projectDir: p.projectDir, task: p.task,
   iteration: 1, policyPath: liveMethodPath(p.dreamRoot), bakedBeta: .6,
   grid: { branch_count: 2, refine_count: 2 }, baselineScore: null, ...extra });
@@ -301,13 +301,15 @@ test("a forcibly killed host recovers completed work and stops its matching orph
     const liveUrl = pathToFileURL(path.resolve("extensions/pi-dream-rsi/engine/live.ts")).href;
     fs.writeFileSync(script, `import { runLiveEpisode } from ${JSON.stringify(liveUrl)};const options=JSON.parse(process.argv[2]);await runLiveEpisode({...options,owner:{pid:process.pid,session_id:'crash-host',claimed_at:new Date().toISOString()}});`);
     child = spawn(process.execPath, [script, JSON.stringify(options(p))], { stdio: "ignore" });
-    await until(() => { try { const cp = readCheckpoint(p.dreamRoot, 1); return cp.batches[0]?.attempts.some((a) => a.record) && cp.batches[0].attempts[1].process; } catch { return false; } });
+    // A full child host importing the TS engine is slow to boot, and the suite runs files in
+    // parallel: 10s is marginal under load (the recorded flake), so allow 30s here.
+    await until(() => { try { const cp = readCheckpoint(p.dreamRoot, 1); return cp.batches[0]?.attempts.some((a) => a.record) && cp.batches[0].attempts[1].process; } catch { return false; } }, 1500, "live host with one record and an in-flight child");
     orphan = readCheckpoint(p.dreamRoot, 1).batches[0].attempts[1].process;
     const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
     const owned = [orphan, ...(orphan.children ?? [])];
     assert.ok(owned.some((process) => process.identity && childIdentity(process.pid) === process.identity));
     restoring = runLiveEpisode(options(p, { resume: true, signal: recovery.signal }));
-    await until(() => controlled.calls().filter((c) => c === "b1a0").length === 2);
+    await until(() => controlled.calls().filter((c) => c === "b1a0").length === 2, 1500, "restarted b1a0 attempt");
     fs.writeFileSync(controlled.gate, "yes");
     const resumed = await restoring;
     assert.equal(resumed.ok, true, resumed.error); assert.equal(controlled.calls().filter((c) => c === "b0a0").length, 1);
