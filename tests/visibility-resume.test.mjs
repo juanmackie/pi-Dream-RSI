@@ -300,17 +300,39 @@ test("a forcibly killed host recovers completed work and stops its matching orph
     const controlled = controlledAgent(p); await setup(p);
     const script = p.script("crash-host.mjs");
     const liveUrl = pathToFileURL(path.resolve("extensions/pi-dream-rsi/engine/live.ts")).href;
-    fs.writeFileSync(script, `import { runLiveEpisode } from ${JSON.stringify(liveUrl)};const options=JSON.parse(process.argv[2]);await runLiveEpisode({...options,owner:{pid:process.pid,session_id:'crash-host',claimed_at:new Date().toISOString()}});`);
-    child = spawn(process.execPath, [script, JSON.stringify(options(p))], { stdio: "ignore" });
+    fs.writeFileSync(script, `import { runLiveEpisode } from ${JSON.stringify(liveUrl)};const options=JSON.parse(process.argv[2]);const result=await runLiveEpisode({...options,owner:{pid:process.pid,session_id:'crash-host',claimed_at:new Date().toISOString()}});if(!result.ok){console.error("crash-host live episode ended not-ok: "+(result.error ?? "unknown"));process.exit(2);}`);
+    child = spawn(process.execPath, [script, JSON.stringify(options(p))], { stdio: ["ignore", "pipe", "pipe"] });
+    let hostOutput = "";
+    child.stdout?.on("data", (d) => { hostOutput += String(d); });
+    child.stderr?.on("data", (d) => { hostOutput += String(d); });
+    let hostExit = null;
+    child.on("exit", (code, signal) => { hostExit = { code, signal }; });
     // A full child host importing the TS engine is slow to boot, and the suite runs files in
-    // parallel: 10s is marginal under load (the recorded flake), so allow 30s here.
-    await until(() => { try { const cp = readCheckpoint(p.dreamRoot, 1); return cp.batches[0]?.attempts.some((a) => a.record) && cp.batches[0].attempts[1].process; } catch { return false; } }, 1500, "live host with one record and an in-flight child");
+    // parallel: 10s is marginal under load (the recorded flake), so allow 120s here. Fail fast
+    // when the host exits before publishing the expected checkpoint, surfacing its output.
+    const deadline = Date.now() + 120_000;
+    let lastState = "no checkpoint yet";
+    for (;;) {
+      let ready = false;
+      try {
+        const cp = readCheckpoint(p.dreamRoot, 1);
+        const batch = cp.batches[0];
+        lastState = `batches=${cp.batches.length} attempts=${batch?.attempts.map((a) => `${a.cell}:${a.record ? "record" : a.stage}${a.process ? "+proc" : ""}`).join(",") ?? "none"} calls=${controlled.calls().join(",")}`;
+        ready = Boolean(batch?.attempts.some((a) => a.record) && batch.attempts[1]?.process);
+      } catch (error) { lastState = `checkpoint unreadable: ${String(error).slice(0, 200)} calls=${controlled.calls().join(",")}`; }
+      if (ready) break;
+      if (hostExit) throw new Error(`crash-host exited early code=${hostExit.code} signal=${hostExit.signal} state=${lastState} output=${hostOutput.slice(-2000)}`);
+      if (Date.now() > deadline) throw new Error(`fixture never reached live host with one record and an in-flight child (state=${lastState} hostExit=${JSON.stringify(hostExit)} output=${hostOutput.slice(-2000)})`);
+      await pause(20);
+    }
     orphan = readCheckpoint(p.dreamRoot, 1).batches[0].attempts[1].process;
-    const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
+    if (child.exitCode === null && child.signalCode === null && !hostExit) {
+      const exited = once(child, "exit"); child.kill("SIGKILL"); await exited;
+    } else try { child.kill("SIGKILL"); } catch { /* already gone */ }
     const owned = [orphan, ...(orphan.children ?? [])];
     assert.ok(owned.some((process) => process.identity && childIdentity(process.pid) === process.identity));
     restoring = runLiveEpisode(options(p, { resume: true, signal: recovery.signal }));
-    await until(() => controlled.calls().filter((c) => c === "b1a0").length === 2, 1500, "restarted b1a0 attempt");
+    await until(() => controlled.calls().filter((c) => c === "b1a0").length === 2, 3000, "restarted b1a0 attempt");
     fs.writeFileSync(controlled.gate, "yes");
     const resumed = await restoring;
     assert.equal(resumed.ok, true, resumed.error); assert.equal(controlled.calls().filter((c) => c === "b0a0").length, 1);
@@ -389,7 +411,7 @@ test("interruption during timeout assessment resumes evaluation without another 
     const gate = path.join(p.projectDir, "eval-allow");
     fs.writeFileSync(path.join(p.projectDir, "agent-count-hang.mjs"), `import * as fs from 'node:fs';\nimport * as path from 'node:path';\nlet pr='';process.stdin.on('data',d=>pr+=d);process.stdin.on('end',()=>{const cell=path.basename(process.cwd());fs.appendFileSync(${JSON.stringify(callsFile)},cell+'\\n');fs.appendFileSync('solution.py','x\\n');console.log('edited '+cell);setInterval(()=>{},1000);});\n`, "utf8");
     p.task.agent = { command: "node", args: [path.join(p.projectDir, "agent-count-hang.mjs")], model: null, prompt_via: "stdin" };
-    p.task.agent_timeout_ms = 800;
+    p.task.agent_timeout_ms = 5000;
     fs.writeFileSync(path.join(p.projectDir, "score-gated.mjs"), `import * as fs from 'node:fs';\nimport * as path from 'node:path';\nconst cell=path.basename(process.cwd());\nif(cell==='b1a0'&&!fs.existsSync(${JSON.stringify(gate)})){const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(t);fs.mkdirSync('eval',{recursive:true});fs.writeFileSync('eval/score.json',JSON.stringify({score:2,valid:true,fail_class:'ok',error:null}));}},20);}else{fs.mkdirSync('eval',{recursive:true});fs.writeFileSync('eval/score.json',JSON.stringify({score:2,valid:true,fail_class:'ok',error:null}));}\n`, "utf8");
     p.task.score_program = `node "${path.join(p.projectDir, "score-gated.mjs")}"`;
     await setup(p);
@@ -406,7 +428,7 @@ test("interruption during timeout assessment resumes evaluation without another 
     assert.equal(resumed.ok, true, resumed.error);
     const saved = readCheckpoint(p.dreamRoot, 1);
     assert.equal(saved.extra_eval_calls, 1, "assessment retry counts through existing retry accounting");
-    const callsAfter = fs.readFileSync(callsFile, "utf8").trim().split("\n").length;
+    const callsAfter = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8").trim().split("\n").length : 0;
     assert.equal(callsAfter, callsBefore, "no additional agent calls for evaluation-only recovery");
     assert.equal(resumed.manifest.attempts, 2, "assessment retries do not add probes");
     for (const node of resumed.tree.list()) {

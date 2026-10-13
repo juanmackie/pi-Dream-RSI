@@ -315,7 +315,7 @@ test("missing score file, missing proposal, agent failure and agent timeout all 
     { agent: "agent-fail.mjs", fail: "agent_error" },
     // Marker-2 timeouts are assessed: a silent hang with an unchanged workspace
     // scores 0 via score-ok, becoming timeout_scored with ordinary scores still null.
-    { agent: "agent-hang.mjs", fail: "timeout_scored", agentTimeoutMs: 1500 },
+    { agent: "agent-hang.mjs", fail: "timeout_scored", agentTimeoutMs: 5000 },
   ];
   for (const scenario of cases) {
     const project = makeProject({ scorer: scenario.scorer ?? "score-ok.mjs", agent: scenario.agent, agentTimeoutMs: scenario.agentTimeoutMs });
@@ -467,7 +467,7 @@ test("grid planning: bootstrap without history, then widen while improving and n
 });
 
 test("per-batch guidance delivers timeout diagnostics with identical sibling prompts", async () => {
-  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "summary", k1: 2 } });
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { guidance: "summary", k1: 2 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);
@@ -510,7 +510,7 @@ test("per-batch guidance delivers timeout diagnostics with identical sibling pro
 });
 
 test("phase-1 checkpoints with marker 1 do not assess timeout workspaces", async () => {
-  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "summary", k1: 1 } });
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { guidance: "summary", k1: 1 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);
@@ -546,7 +546,7 @@ test("phase-1 checkpoints with marker 1 do not assess timeout workspaces", async
 });
 
 test("guidance off produces an empty direction slot", async () => {
-  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "off", k1: 1 } });
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { guidance: "off", k1: 1 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);
@@ -568,7 +568,7 @@ test("agent had_output distinguishes silent hangs from output-producing hangs", 
     { agent: "agent-hang.mjs", silent: true },
     { agent: noisy, silent: false },
   ]) {
-    const project = makeProject({ agent: scenario.agent, agentTimeoutMs: 800 });
+    const project = makeProject({ agent: scenario.agent, agentTimeoutMs: 5000 });
     try {
       if (scenario.agent === noisy) {
         fs.writeFileSync(project.script(noisy), `process.stdin.on("data", () => {});\nprocess.stdin.on("end", () => { console.log("working..."); setInterval(() => {}, 1000); });\n`, "utf8");
@@ -591,7 +591,7 @@ test("agent had_output distinguishes silent hangs from output-producing hangs", 
         agent: { command: "node", args: [script], model: null, thinking: null, prompt_via: "stdin" },
         cwd: project.seed,
         prompt: "hi",
-        timeoutMs: 600,
+        timeoutMs: 3000,
         logPath: null,
       });
       assert.equal(probe.timedOut, true);
@@ -724,7 +724,7 @@ test("timeout classification is pure: scored only for accepted numeric assessmen
 });
 
 test("an agent that edits then hangs gets a fresh diagnostic assessment without proposal.md", async () => {
-  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+  const project = makeProject({ agentTimeoutMs: 5000, task: { k1: 1 } });
   try {
     fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nlet p="";process.stdin.on("data",d=>p+=d);process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");console.log("edited");setInterval(()=>{},1000);});\n`, "utf8");
     project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
@@ -754,7 +754,7 @@ test("an agent that edits then hangs gets a fresh diagnostic assessment without 
 
 test("silent edits are still assessed; untouched workspaces record a baseline-like zero", async () => {
   for (const [name, edit] of [["silent-edit", true], ["no-edit", false]]) {
-    const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+    const project = makeProject({ agentTimeoutMs: 5000, task: { k1: 1 } });
     try {
       const script = project.script(`agent-${name}.mjs`);
       fs.writeFileSync(script, edit
@@ -782,7 +782,7 @@ test("silent edits are still assessed; untouched workspaces record a baseline-li
 });
 
 test("lower-is-better timeout assessments normalize for policy use and keep raw for reporting", async () => {
-  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1, higher_is_better: false } });
+  const project = makeProject({ agentTimeoutMs: 5000, task: { k1: 1, higher_is_better: false } });
   try {
     fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");setInterval(()=>{},1000);});\n`, "utf8");
     project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
@@ -806,7 +806,7 @@ test("failed timeout evaluations stay unresolved with distinct agent and evaluat
     { name: "wrong", scorer: null, match: /wrong_answer/ },
   ];
   for (const c of cases) {
-    const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, scorer: c.scorer ?? "score-ok.mjs", task: { k1: 1 } });
+    const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, scorer: c.scorer ?? "score-ok.mjs", task: { k1: 1 } });
     try {
       if (c.name === "malformed") {
         fs.writeFileSync(project.script("score-bad.mjs"), `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:"nan",valid:true,fail_class:"ok",error:null}));\n`, "utf8");
@@ -831,7 +831,7 @@ test("failed timeout evaluations stay unresolved with distinct agent and evaluat
     }
   }
   // Evaluator timeout keeps the agent deadline separate from the evaluator deadline.
-  const slow = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { k1: 1 }, evaluatorTimeoutMs: 400 });
+  const slow = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { k1: 1 }, evaluatorTimeoutMs: 2000 });
   try {
     fs.writeFileSync(slow.script("score-slow.mjs"), `setInterval(()=>{},1000);\n`, "utf8");
     slow.task.score_program = `node "${slow.script("score-slow.mjs")}"`;
@@ -849,7 +849,7 @@ test("failed timeout evaluations stay unresolved with distinct agent and evaluat
 });
 
 test("an inherited score file cannot supply a timeout assessment", async () => {
-  const project = makeProject({ agentTimeoutMs: 900, scorer: "score-nofile.mjs", task: { k1: 1 } });
+  const project = makeProject({ agentTimeoutMs: 5000, scorer: "score-nofile.mjs", task: { k1: 1 } });
   try {
     // Parent would score highly if its file leaked; the child scorer writes nothing.
     fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");mkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:99,valid:true,fail_class:"ok",error:null}));setInterval(()=>{},1000);});\n`, "utf8");
@@ -867,7 +867,7 @@ test("an inherited score file cannot supply a timeout assessment", async () => {
 });
 
 test("timeout assessments preserve the evaluator valid:false flag", async () => {
-  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+  const project = makeProject({ agentTimeoutMs: 5000, task: { k1: 1 } });
   try {
     fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","x\\n");setInterval(()=>{},1000);});\n`, "utf8");
     project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };

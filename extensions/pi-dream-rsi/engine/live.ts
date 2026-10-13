@@ -310,7 +310,24 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     manifest.attempts = tree.list().filter((n) => n.evaluated).length;
     manifest.best_score = tree.bestScore();
     checkpoint.manifest = manifest; checkpoint.tree = tree.toJSON();
-    try { saveCheckpoint(dreamRoot, checkpoint); } catch (error) { abort(); throw error; }
+    // Windows file locking (AV/indexer holding checkpoint.json open) can fail an atomic rename
+    // with a transient EPERM/EBUSY/EACCES while another process polls the file. A failed commit
+    // aborts the whole episode, so retry those codes briefly; anything else (ENOSPC, real disk
+    // failures) still aborts immediately, as does a retry budget that runs out.
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      try { saveCheckpoint(dreamRoot, checkpoint); lastError = null; break; }
+      catch (error) {
+        lastError = error;
+        const code = (error as NodeJS.ErrnoException | null)?.code;
+        if (code === "EPERM" || code === "EBUSY" || code === "EACCES") {
+          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+          continue;
+        }
+        break;
+      }
+    }
+    if (lastError) { abort(); throw lastError; }
     progress.snapshot.tree = checkpoint.tree; progress.snapshot.best = manifest.best_score;
   };
   const policyOptions = { policyPath, mode: "live" as const, maxParallelism: task.workers,
