@@ -382,3 +382,55 @@ test("copy_exclude keeps named directories out of an attempt workspace", async (
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("deterministic guidance-off runs without timeouts record no diagnostic fields", async () => {
+  const project = makeProject({ task: { guidance: "off", k1: 1 } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const episode = await runOneLiveCycle(project, { branch_count: 2, refine_count: 1 });
+    assert.equal(episode.ok, true, episode.error ?? "");
+    for (const node of episode.tree.list()) {
+      assert.equal(node.partial, undefined, "no partial flag without timeouts");
+      assert.equal(node.agent_timeout, undefined);
+      assert.equal(node.timeout_assessment, undefined);
+      assert.equal(node.fail_class, "ok");
+      assert.equal(typeof node.score, "number");
+    }
+    const { iterationReport } = await jump("state.ts");
+    const manifest = { ...episode.manifest };
+    // Reports without new records retain existing text (no partial section).
+    const report = iterationReport(project.dreamRoot, 1, manifest);
+    assert.doesNotMatch(report, /partial assessment/);
+    assert.match(report, /best=/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("partial assessments never become apply candidates or baselines", async () => {
+  const { seedBaseline } = await jump("engine/world.ts");
+  const project = makeProject();
+  try {
+    await writeTaskJson(project);
+    const tree = new DiscoveryTree({ baselineScore: null, branchCount: 1, refineCount: 1 });
+    tree.addBranchSlot(0);
+    tree.setOutcome("b0a0", {
+      evaluated: true, valid: false, fail_class: "timeout_scored", error: "discovery agent timed out after 10s",
+      score: null, raw_score: null, partial: true,
+      agent_timeout: { duration_ms: 10000, had_output: true },
+      timeout_assessment: { score: 999, raw_score: 999, valid: true, fail_class: "ok", error: null },
+    });
+    // findCandidate ignores partial assessments (same filter as ranking).
+    assert.equal(findCandidate(project.dreamRoot, normalizeTask(project.task), project.projectDir, 1, "b0a0"), null);
+    // Baseline promotion ignores partial assessments (needs valid + numeric ordinary score).
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-partial-base-"));
+    try {
+      const root = path.join(dir, ".dream-rsi");
+      fs.mkdirSync(path.join(root, "history", "r0001_live", "attempt_b0a0"), { recursive: true });
+      assert.equal(seedBaseline(root, 1, tree), null);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  } finally {
+    project.cleanup();
+  }
+});

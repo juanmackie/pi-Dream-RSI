@@ -31,6 +31,13 @@ export interface CommandResult {
   stdoutTail: string;
   stderrTail: string;
   logPath: string | null;
+  /**
+   * Whether the process emitted any stdout or stderr bytes. Recorded for newly
+   * executed attempts so timeout diagnostics can distinguish silent hangs from
+   * slow ones. Absent in older serialized results: callers must fall back to
+   * checking `stdoutTail`/`stderrTail` instead of inferring silence.
+   */
+  hadOutput?: boolean;
 }
 
 export interface RunOptions {
@@ -131,6 +138,9 @@ async function collect(
   const stderrDecoder = new StringDecoder("utf8");
   let stdoutTail = "";
   let stderrTail = "";
+  // Whether the child emitted any stdout/stderr bytes at all. Tails alone cannot
+  // prove this for older results, so record it explicitly for new executions.
+  let sawOutput = false;
   const append = (current: string, chunk: string): string => {
     const next = current + chunk;
     return next.length > TAIL_BYTES ? next.slice(next.length - TAIL_BYTES) : next;
@@ -172,6 +182,7 @@ async function collect(
           stdoutTail,
           stderrTail,
           logPath: options.logPath ?? null,
+          hadOutput: sawOutput,
           ...result,
         }),
       );
@@ -236,12 +247,14 @@ async function collect(
       }
     };
     running.stdout?.on("data", (chunk: Buffer) => {
+      if (chunk.length > 0) sawOutput = true;
       const text = stdoutDecoder.write(chunk);
       decoder.feed("stdout", text);
       stdoutTail = append(stdoutTail, text);
       writeLog(running.stdout as NodeJS.ReadableStream, chunk);
     });
     running.stderr?.on("data", (chunk: Buffer) => {
+      if (chunk.length > 0) sawOutput = true;
       const text = stderrDecoder.write(chunk);
       decoder.feed("stderr", text);
       stderrTail = append(stderrTail, text);
@@ -376,6 +389,7 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
       stdoutTail: "",
       stderrTail: "",
       logPath: options.logPath ?? null,
+      hadOutput: false,
     });
   }
   // The default `pi` agent re-spawns the running pi invocation, so it never depends on PATH. A custom

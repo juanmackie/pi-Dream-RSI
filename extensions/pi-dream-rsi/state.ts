@@ -257,6 +257,7 @@ export function iterationReport(root: string, iteration: number, manifest: LiveC
   const scored = manifest.best_score;
   const baseline = manifest.baseline_score;
   const delta = typeof scored === "number" && typeof baseline === "number" ? scored - baseline : null;
+  const tag = `r${String(iteration).padStart(4, "0")}`;
   const lines = [
     `${manifest.status === "complete" ? "Live cycle" : manifest.status === "interrupted" ? "⚠️ Live cycle INTERRUPTED" : "⚠️ Live cycle FAILED"} ${iteration}`,
     `  grid:       ${manifest.grid.branch_count} branches x ${manifest.grid.refine_count} refinements (beta=${manifest.baked_beta})`,
@@ -266,8 +267,44 @@ export function iterationReport(root: string, iteration: number, manifest: LiveC
     manifest.status === "complete" ? `  world:      ${path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json")}` :
       `  recovery:   ${fs.existsSync(checkpointPath(root, iteration)) ? checkpointPath(root, iteration) : "no checkpoint (cycle did not start)"}`,
 
-    `  records:    ${path.join(historyDir(root), `r${String(iteration).padStart(4, "0")}_live`)}`,
+    `  records:    ${path.join(historyDir(root), `${tag}_live`)}`,
   ];
+  // Timeout-assessment section: only when diagnostic assessment records exist.
+  // Main best-score lines above stay unchanged; every value here is labeled partial.
+  try {
+    const pooled = readJson<{ cells?: { meta?: { cell_id?: string; seq?: number }; partial?: boolean; fail_class?: string; timeout_assessment?: { raw_score?: unknown; fail_class?: string; error?: string | null; valid?: boolean } }[] }>(
+      path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json"),
+    ) ?? readJson<{ cells?: { meta?: { cell_id?: string; seq?: number }; partial?: boolean; fail_class?: string; timeout_assessment?: { raw_score?: unknown; fail_class?: string; error?: string | null; valid?: boolean } }[] }>(
+      path.join(historyDir(root), `${tag}_live`, "tree.json"),
+    );
+    const assessed = (pooled?.cells ?? [])
+      .filter((n) => n?.partial === true || n?.timeout_assessment !== undefined || n?.fail_class === "timeout_scored")
+      .sort((a, b) => (a.meta?.seq ?? 0) - (b.meta?.seq ?? 0));
+    if (assessed.length > 0) {
+      lines.push("  partial assessments (diagnostic only, excluded from attainment and promotion):");
+      const recent = assessed.slice(-10);
+      const fmtRaw = (raw: unknown): string =>
+        typeof raw === "number" && Number.isFinite(raw) ? String(Math.round(raw * 10000) / 10000) : "n/a";
+      for (const n of recent) {
+        const cell = n.meta?.cell_id ?? "unknown";
+        const cls = n.fail_class ?? "timeout";
+        const raw = fmtRaw(n.timeout_assessment?.raw_score);
+        if (cls === "timeout_scored" && raw !== "n/a") {
+          lines.push(`    ${cell} timeout_scored partial raw ${raw}${n.timeout_assessment?.valid === false ? " valid:false" : ""}`);
+        } else {
+          const fail = n.timeout_assessment
+            ? `${n.timeout_assessment.fail_class ?? "unresolved"}${n.timeout_assessment.error ? `: ${n.timeout_assessment.error}` : ""}`
+            : "unresolved";
+          lines.push(`    ${cell} ${cls} partial raw ${raw} assessment ${fail}`);
+        }
+      }
+      if (assessed.length > recent.length) {
+        lines.push(`    ... ${assessed.length - recent.length} more partial assessment(s) omitted; see ${path.join(historyDir(root), `${tag}_live`)}`);
+      }
+    }
+  } catch {
+    // Unreadable tree: keep the existing report text unchanged.
+  }
   return lines.join("\n");
 }
 

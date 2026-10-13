@@ -21,7 +21,17 @@ export interface PendingAttempt {
   retry: number; prepared?: PreparedAttempt; agentRun?: CommandResult;
   workspace_hash?: string; agent_snapshot?: string; record: RevealedNode | null;
 }
-export interface SavedBatch { round: number; cells: string[]; attempts: PendingAttempt[] }
+export interface SavedBatch {
+  round: number;
+  cells: string[];
+  attempts: PendingAttempt[];
+  /**
+   * Direction guidance rendered from evaluated history before this batch started.
+   * Present only for checkpoints with `timeout_recovery_version` 1 or 2; legacy
+   * batches keep using the episode-level `prompt_vars`.
+   */
+  direction_guidance?: string;
+}
 export interface LiveCheckpoint {
   version: 1; project: string; task: TaskConfig; manifest: LiveCycleManifest;
   policy: string; policy_hashes: Record<string, string>; seed: string; seed_hash: string;
@@ -29,6 +39,13 @@ export interface LiveCheckpoint {
   tree: TreeJSON; batches: SavedBatch[]; status: "running" | "interrupted" | "complete";
   extra_agent_calls: number; extra_eval_calls: number; resumes: number;
   final?: PolicyRunResult;
+  /**
+   * Timeout-evidence behavior marker, separate from the envelope `version`.
+   * Missing preserves legacy prompt construction and timeout handling;
+   * `1` refreshes guidance per batch without evaluating timeout workspaces;
+   * `2` refreshes guidance per batch and evaluates timeout workspaces.
+   */
+  timeout_recovery_version?: 1 | 2;
 }
 const hash = (data: string | Buffer): string => createHash("sha256").update(data).digest("hex");
 export function checkpointPath(root: string, iteration: number): string { return path.join(iterationDir(root, iteration, true), "checkpoint.json"); }
@@ -97,6 +114,9 @@ export async function validateCheckpoint(root: string, project: string, currentT
   const cp = readCheckpoint(root, iteration);
   if (cp.project !== path.resolve(project)) throw new Error("checkpoint belongs to a different project");
   normalizeTask(cp.task);
+  if (cp.timeout_recovery_version !== undefined && cp.timeout_recovery_version !== 1 && cp.timeout_recovery_version !== 2) {
+    throw new Error(`unsupported timeout recovery version: ${String(cp.timeout_recovery_version)}`);
+  }
   if (scoringFingerprint(currentTask) !== scoringFingerprint(cp.task)) throw new Error("scoring/execution contract changed; restore the original task before resuming");
   for (const [file, expected] of Object.entries(cp.policy_hashes)) {
     if (hash(fs.readFileSync(file)) !== expected) throw new Error(`frozen policy changed: ${file}`);

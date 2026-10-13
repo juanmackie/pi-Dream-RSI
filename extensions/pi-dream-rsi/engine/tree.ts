@@ -33,6 +33,22 @@ export interface CellMeta {
 
 
 /** One completed (or revealed) generation-evaluation attempt. */
+export interface AgentTimeoutDiagnostics {
+  /** Agent runtime in ms (the runner's measured duration, not the attempt total). */
+  duration_ms: number;
+  /** Whether the agent emitted any stdout/stderr bytes before timing out. */
+  had_output: boolean;
+}
+
+/** Diagnostic assessment of a timed-out attempt's preserved workspace. Same score interpretation as the evaluator outcome. */
+export interface TimeoutAssessment {
+  score: number | null;
+  raw_score: number | null;
+  valid: boolean;
+  fail_class: string;
+  error: string | null;
+}
+
 export interface TreeNode {
   meta: CellMeta;
   evaluated: boolean;
@@ -50,6 +66,16 @@ export interface TreeNode {
   artifacts: string[];
   /** Wall-clock ms of the attempt, for status reporting only (never used by replay). */
   duration_ms: number | null;
+  /**
+   * True when generation did not finish (agent timeout). Describes unfinished
+   * generation, not evaluator validity. Absent in older records: treat missing
+   * as false and never serialize `partial: false` into old records.
+   */
+  partial?: boolean;
+  /** Agent timeout diagnostics, present only for timed-out attempts with new behavior. */
+  agent_timeout?: AgentTimeoutDiagnostics;
+  /** Diagnostic assessment of the preserved workspace, separate from ordinary scores. */
+  timeout_assessment?: TimeoutAssessment;
 }
 
 /**
@@ -80,6 +106,15 @@ export interface Observation {
   delta_vs_parent: number | null;
   n_valid: number;
   n_total: number;
+  /**
+   * True when generation did not finish. Absent in older records: treat missing
+   * as false. Ordinary score helpers must not treat partial assessments as successes.
+   */
+  partial?: boolean;
+  /** Agent timeout diagnostics, when present on the node. */
+  agent_timeout?: AgentTimeoutDiagnostics;
+  /** Diagnostic assessment of the preserved workspace, when present on the node. */
+  timeout_assessment?: TimeoutAssessment;
 }
 
 export interface TreeJSON {
@@ -271,7 +306,7 @@ export class DiscoveryTree {
     const delta = (ref: number | null | undefined): number | null =>
       typeof ref === "number" && typeof node.score === "number" ? Number((node.score - ref).toFixed(10)) : null;
     const parentScore = parent && typeof parent.score === "number" ? parent.score : baseline;
-    return {
+    const observation: Observation = {
       branch: node.meta.branch,
       attempt: node.meta.attempt,
       score: node.score,
@@ -284,6 +319,12 @@ export class DiscoveryTree {
       n_valid: evaluated.filter((n) => n.valid).length,
       n_total: evaluated.length,
     };
+    // Copy optional timeout diagnostics when present; omit when absent so old
+    // records stay byte-identical and missing `partial` reads as false.
+    if (node.partial === true) observation.partial = true;
+    if (node.agent_timeout !== undefined) observation.agent_timeout = { ...node.agent_timeout };
+    if (node.timeout_assessment !== undefined) observation.timeout_assessment = { ...node.timeout_assessment };
+    return observation;
   }
 
   /** Best score over successful evaluations across the revealed tree (root included). */

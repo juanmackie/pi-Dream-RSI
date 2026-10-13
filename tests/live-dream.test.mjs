@@ -313,7 +313,9 @@ test("missing score file, missing proposal, agent failure and agent timeout all 
     { scorer: "score-nofile.mjs", agent: "agent-ok.mjs", fail: "eval_error" },
     { agent: "agent-noproposal.mjs", fail: "no_proposal" },
     { agent: "agent-fail.mjs", fail: "agent_error" },
-    { agent: "agent-hang.mjs", fail: "timeout", agentTimeoutMs: 1500 },
+    // Marker-2 timeouts are assessed: a silent hang with an unchanged workspace
+    // scores 0 via score-ok, becoming timeout_scored with ordinary scores still null.
+    { agent: "agent-hang.mjs", fail: "timeout_scored", agentTimeoutMs: 1500 },
   ];
   for (const scenario of cases) {
     const project = makeProject({ scorer: scenario.scorer ?? "score-ok.mjs", agent: scenario.agent, agentTimeoutMs: scenario.agentTimeoutMs });
@@ -325,12 +327,17 @@ test("missing score file, missing proposal, agent failure and agent timeout all 
       const classes = new Set(episode.tree.list().map((n) => n.fail_class));
       assert.deepEqual([...classes], [scenario.fail], `${scenario.agent} should fail as ${scenario.fail}`);
       assert.equal(episode.manifest.best_score, null);
-      if (scenario.fail === "timeout") {
+      if (scenario.fail === "timeout_scored") {
         // The error has to carry the evidence (duration, and that nothing was printed): an empty
         // agent.log plus a bare "timed out" is what made the original report guess for an hour.
-        const node = episode.tree.list().find((n) => n.fail_class === "timeout");
+        const node = episode.tree.list().find((n) => n.fail_class === "timeout_scored");
         assert.match(node.error, /timed out after \d+(\.\d+)?s/);
         assert.match(node.error, /no output at all/);
+        assert.equal(node.score, null);
+        assert.equal(node.partial, true);
+        assert.ok(node.agent_timeout);
+        assert.equal(node.timeout_assessment.fail_class, "ok");
+        assert.equal(node.timeout_assessment.score, 0, "numeric zero is retained, not treated as missing");
       }
     } finally {
       project.cleanup();
@@ -454,6 +461,425 @@ test("grid planning: bootstrap without history, then widen while improving and n
     const fallback = fallbackGrid(project.task);
     assert.equal(fallback.branch_count, project.task.workers);
     assert.ok(fallback.reason.length > 0);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("per-batch guidance delivers timeout diagnostics with identical sibling prompts", async () => {
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "summary", k1: 2 } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const { readCheckpoint } = await jump("engine/checkpoint.ts");
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 2, refine_count: 2 } });
+    assert.equal(episode.ok, true, episode.error ?? "");
+    const cp = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(cp.timeout_recovery_version, 2, "new phase-2 cycles receive marker 2");
+    assert.ok(cp.batches.length >= 2, "two rounds produce two batches");
+    const [first, second] = cp.batches;
+    assert.match(first.direction_guidance ?? "", /no evaluated attempts yet/);
+    // Second batch was rendered before its siblings ran: it sees the first round's timeouts.
+    // Marker-2 first-round timeouts are assessed (timeout_scored with silent diagnostics).
+    assert.match(second.direction_guidance ?? "", /timeout/);
+    assert.match(second.direction_guidance ?? "", /no output/);
+    // Sibling prompts share the identical saved guidance despite different completion times.
+    const secondCells = second.attempts.map((a) => a.cell).filter(Boolean);
+    assert.ok(secondCells.length >= 1, "second batch has attempts");
+    for (const cell of secondCells) {
+      const prompt = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${cell}`, "prompt.md"), "utf8");
+      assert.ok(prompt.includes(second.direction_guidance), `${cell} uses the batch guidance`);
+    }
+    if (secondCells.length >= 2) {
+      const promptA = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${secondCells[0]}`, "prompt.md"), "utf8");
+      const promptB = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", `attempt_${secondCells[1]}`, "prompt.md"), "utf8");
+      assert.ok(promptA.includes(second.direction_guidance), "first sibling uses the batch guidance");
+      assert.ok(promptB.includes(second.direction_guidance), "second sibling uses the same batch guidance");
+    }
+    // Timeout diagnostics reach the prompt; ordinary scores stay null.
+    for (const node of episode.tree.list()) {
+      assert.ok(node.fail_class === "timeout" || node.fail_class === "timeout_scored");
+      assert.equal(node.score, null);
+      assert.equal(node.raw_score, null);
+      assert.equal(node.valid, false);
+      assert.match(node.error, /discovery agent timed out after/);
+    }
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("phase-1 checkpoints with marker 1 do not assess timeout workspaces", async () => {
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "summary", k1: 1 } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const { readCheckpoint, saveCheckpoint } = await jump("engine/checkpoint.ts");
+    // Force a phase-1 checkpoint: marker 1 means refresh guidance without evaluation.
+    // Run one cycle then downgrade its marker to simulate a pre-phase-2 checkpoint.
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    assert.equal(episode.ok, true);
+    const cp = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(cp.timeout_recovery_version, 2);
+    // A preserved phase-1 checkpoint (marker 1) stays phase-1 after phase 2 ships:
+    // its timeout nodes carry no diagnostic assessment fields.
+    const downgraded = { ...cp, timeout_recovery_version: 1 };
+    for (const batch of downgraded.batches) {
+      for (const attempt of batch.attempts) {
+        if (attempt.record) {
+          delete attempt.record.node.partial;
+          delete attempt.record.node.agent_timeout;
+          delete attempt.record.node.timeout_assessment;
+          if (attempt.record.node.fail_class === "timeout_scored") {
+            attempt.record.node.fail_class = "timeout";
+          }
+        }
+      }
+    }
+    saveCheckpoint(project.dreamRoot, downgraded);
+    const reloaded = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(reloaded.timeout_recovery_version, 1, "phase-1 marker is preserved");
+    assert.equal(reloaded.batches[0].attempts[0].record.node.timeout_assessment, undefined);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("guidance off produces an empty direction slot", async () => {
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { guidance: "off", k1: 1 } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const { readCheckpoint } = await jump("engine/checkpoint.ts");
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 2, refine_count: 1 } });
+    assert.equal(episode.ok, true, episode.error ?? "");
+    const cp = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(cp.batches[0].direction_guidance ?? "missing", "", "guidance off checkpoints an empty slot");
+    const prompt = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "prompt.md"), "utf8");
+    assert.doesNotMatch(prompt, /Direction guidance:/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("agent had_output distinguishes silent hangs from output-producing hangs", async () => {
+  const noisy = "agent-noisy-hang.mjs";
+  for (const scenario of [
+    { agent: "agent-hang.mjs", silent: true },
+    { agent: noisy, silent: false },
+  ]) {
+    const project = makeProject({ agent: scenario.agent, agentTimeoutMs: 800 });
+    try {
+      if (scenario.agent === noisy) {
+        fs.writeFileSync(project.script(noisy), `process.stdin.on("data", () => {});\nprocess.stdin.on("end", () => { console.log("working..."); setInterval(() => {}, 1000); });\n`, "utf8");
+      }
+      await writeTaskJson(project);
+      await deployShippedPolicy(project);
+      const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+      const node = episode.tree.list().find((n) => n.fail_class === "timeout" || n.fail_class === "timeout_scored");
+      assert.ok(node, "hang becomes a timeout");
+      if (scenario.silent) {
+        assert.match(node.error, /with no output at all/);
+      } else {
+        assert.match(node.error, /with output/);
+        assert.doesNotMatch(node.error, /no output at all/);
+      }
+      // The runner records the fact explicitly; older results fall back to tails.
+      const { runAgent } = await jump("agent/runner.ts");
+      const script = scenario.agent === noisy ? project.script(noisy) : project.script("agent-hang.mjs");
+      const probe = await runAgent({
+        agent: { command: "node", args: [script], model: null, thinking: null, prompt_via: "stdin" },
+        cwd: project.seed,
+        prompt: "hi",
+        timeoutMs: 600,
+        logPath: null,
+      });
+      assert.equal(probe.timedOut, true);
+      assert.equal(probe.hadOutput, !scenario.silent);
+    } finally {
+      project.cleanup();
+    }
+  }
+});
+
+test("unsupported timeout recovery markers fail before launching agents", async () => {
+  const project = makeProject({ task: { k1: 1 } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const { readCheckpoint, saveCheckpoint } = await jump("engine/checkpoint.ts");
+    const callsFile = path.join(project.projectDir, "calls.jsonl");
+    fs.writeFileSync(
+      path.join(project.projectDir, "counting.mjs"),
+      `import * as fs from 'node:fs';\nlet p='';process.stdin.on('data',d=>p+=d);process.stdin.on('end',()=>{fs.appendFileSync(${JSON.stringify(callsFile)},'call\\n');});\n`,
+      "utf8",
+    );
+    project.task.agent = { command: "node", args: [path.join(project.projectDir, "counting.mjs")], model: null, prompt_via: "stdin" };
+    const abort = new AbortController();
+    const run = runLiveEpisode({
+      dreamRoot: project.dreamRoot,
+      projectDir: project.projectDir,
+      task: project.task,
+      iteration: 1,
+      policyPath: liveMethodPath(project.dreamRoot),
+      bakedBeta: 0.6,
+      grid: { branch_count: 1, refine_count: 1 },
+      baselineScore: null,
+      signal: abort.signal,
+    });
+    // Interrupt after the first batch is checkpointed but before it completes.
+    const timer = setTimeout(() => abort.abort(), 300);
+    await run;
+    clearTimeout(timer);
+    const cp = readCheckpoint(project.dreamRoot, 1);
+    cp.timeout_recovery_version = 99;
+    saveCheckpoint(project.dreamRoot, cp);
+    const before = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "";
+    await assert.rejects(
+      runLiveEpisode({
+        dreamRoot: project.dreamRoot,
+        projectDir: project.projectDir,
+        task: project.task,
+        iteration: 1,
+        policyPath: liveMethodPath(project.dreamRoot),
+        bakedBeta: 0.6,
+        grid: { branch_count: 1, refine_count: 1 },
+        baselineScore: null,
+        resume: true,
+      }),
+      /unsupported timeout recovery version/,
+    );
+    const after = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8") : "";
+    assert.equal(after, before, "rejected checkpoints spend zero extra agent calls");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("legacy checkpoints without a marker resume with legacy prompt behavior", async () => {
+  const project = makeProject({ task: { k1: 1, guidance: "summary" } });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const { readCheckpoint, saveCheckpoint } = await jump("engine/checkpoint.ts");
+    // Simulate a legacy checkpoint: no marker, no per-batch guidance, episode-level vars only.
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    assert.equal(episode.ok, true);
+    const cp = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(cp.timeout_recovery_version, 2);
+    assert.ok(typeof cp.batches[0].direction_guidance === "string");
+    const stripped = { ...cp };
+    delete stripped.timeout_recovery_version;
+    for (const batch of stripped.batches) delete batch.direction_guidance;
+    saveCheckpoint(project.dreamRoot, stripped);
+    const reloaded = readCheckpoint(project.dreamRoot, 1);
+    assert.equal(reloaded.timeout_recovery_version, undefined, "legacy absence is preserved");
+    assert.equal(reloaded.batches[0].direction_guidance, undefined);
+    // Validation accepts the legacy marker absence.
+    const { validateCheckpoint } = await jump("engine/checkpoint.ts");
+    const { normalizeTask: normalize } = await jump("engine/task.ts");
+    await validateCheckpoint(project.dreamRoot, project.projectDir, normalize(project.task), 1);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("timeout classification is pure: scored only for accepted numeric assessments", async () => {
+  const { classifyAgentTimeout } = await jump("engine/timeout.ts");
+  const agent = { duration_ms: 480000, had_output: true };
+  const err = "discovery agent timed out after 480s with output (see agent.log)";
+  const scored = classifyAgentTimeout(err, agent, { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null });
+  assert.equal(scored.fail_class, "timeout_scored");
+  assert.equal(scored.partial, true);
+  assert.equal(scored.valid, false);
+  assert.equal(scored.error, err);
+  assert.deepEqual(scored.agent_timeout, agent);
+  assert.deepEqual(scored.timeout_assessment, { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null });
+  // Numeric zero is a measured assessment, never missing.
+  const zero = classifyAgentTimeout(err, agent, { score: 0, raw_score: 0, valid: true, fail_class: "ok", error: null });
+  assert.equal(zero.fail_class, "timeout_scored");
+  assert.equal(zero.timeout_assessment.score, 0);
+  // Evaluator valid:false is preserved but still scored when otherwise accepted.
+  const soft = classifyAgentTimeout(err, agent, { score: 5, raw_score: 5, valid: false, fail_class: "ok", error: null });
+  assert.equal(soft.fail_class, "timeout_scored");
+  assert.equal(soft.timeout_assessment.valid, false);
+  // All failure modes stay timeout with an unresolved assessment, never zero.
+  for (const evalOutcome of [
+    { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: "evaluator exited with code 4" },
+    { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: "evaluator wrote no eval/score.json" },
+    { score: null, raw_score: null, valid: false, fail_class: "invalid_score", error: 'score field "score" is missing or not a finite number' },
+    { score: null, raw_score: null, valid: false, fail_class: "timeout", error: "evaluator timed out" },
+    { score: null, raw_score: 3, valid: false, fail_class: "wrong_answer", error: "bad result" },
+    { score: null, raw_score: null, valid: false, fail_class: "ok", error: "stale" },
+    { score: NaN, raw_score: NaN, valid: true, fail_class: "ok", error: null },
+    { score: Infinity, raw_score: Infinity, valid: true, fail_class: "ok", error: null },
+  ]) {
+    const unresolved = classifyAgentTimeout(err, agent, evalOutcome);
+    assert.equal(unresolved.fail_class, "timeout");
+    assert.equal(unresolved.partial, true);
+    assert.equal(unresolved.valid, false);
+    assert.equal(unresolved.error, err);
+    assert.notEqual(unresolved.timeout_assessment.score, 0, "missing assessments are never replaced with zero");
+  }
+});
+
+test("an agent that edits then hangs gets a fresh diagnostic assessment without proposal.md", async () => {
+  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+  try {
+    fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nlet p="";process.stdin.on("data",d=>p+=d);process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");console.log("edited");setInterval(()=>{},1000);});\n`, "utf8");
+    project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    assert.equal(episode.ok, true, episode.error ?? "");
+    const node = episode.tree.list()[0];
+    assert.equal(node.fail_class, "timeout_scored");
+    assert.equal(node.score, null);
+    assert.equal(node.raw_score, null);
+    assert.equal(node.valid, false);
+    assert.equal(node.partial, true);
+    assert.equal(node.agent_timeout.had_output, true);
+    assert.equal(typeof node.agent_timeout.duration_ms, "number");
+    // Fresh scorer value for the edited workspace (seed 0 x + 4 x).
+    assert.equal(node.timeout_assessment.fail_class, "ok");
+    assert.equal(node.timeout_assessment.raw_score, 4);
+    assert.equal(node.timeout_assessment.score, 4);
+    // No proposal.md was required for the assessment.
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "proposal.md")), false);
+    assert.ok(fs.existsSync(path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "eval", "score.json")));
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("silent edits are still assessed; untouched workspaces record a baseline-like zero", async () => {
+  for (const [name, edit] of [["silent-edit", true], ["no-edit", false]]) {
+    const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+    try {
+      const script = project.script(`agent-${name}.mjs`);
+      fs.writeFileSync(script, edit
+        ? `import { appendFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","xx\\n");setInterval(()=>{},1000);});\n`
+        : `process.stdin.on("data",()=>{});process.stdin.on("end",()=>{setInterval(()=>{},1000);});\n`, "utf8");
+      project.task.agent = { command: "node", args: [script], model: null, prompt_via: "stdin" };
+      await writeTaskJson(project);
+      await deployShippedPolicy(project);
+      const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+      const node = episode.tree.list()[0];
+      assert.equal(node.fail_class, "timeout_scored");
+      assert.equal(node.partial, true);
+      if (edit) {
+        assert.equal(node.agent_timeout.had_output, false);
+        assert.equal(node.timeout_assessment.raw_score, 2);
+      } else {
+        // Unchanged workspace is still assessable; the zero does not claim progress.
+        assert.equal(node.timeout_assessment.raw_score, 0);
+        assert.equal(node.score, null, "top-level score stays null so no progress is claimed");
+      }
+    } finally {
+      project.cleanup();
+    }
+  }
+});
+
+test("lower-is-better timeout assessments normalize for policy use and keep raw for reporting", async () => {
+  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1, higher_is_better: false } });
+  try {
+    fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");setInterval(()=>{},1000);});\n`, "utf8");
+    project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    const node = episode.tree.list()[0];
+    assert.equal(node.fail_class, "timeout_scored");
+    assert.equal(node.timeout_assessment.raw_score, 4);
+    assert.equal(node.timeout_assessment.score, -4, "normalized to higher-is-better for policy use");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("failed timeout evaluations stay unresolved with distinct agent and evaluator deadlines", async () => {
+  const cases = [
+    { name: "crash", scorer: "score-fail.mjs", match: /eval_error/ },
+    { name: "nofile", scorer: "score-nofile.mjs", match: /wrote no/ },
+    { name: "malformed", scorer: null, match: /not a finite number/ },
+    { name: "wrong", scorer: null, match: /wrong_answer/ },
+  ];
+  for (const c of cases) {
+    const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, scorer: c.scorer ?? "score-ok.mjs", task: { k1: 1 } });
+    try {
+      if (c.name === "malformed") {
+        fs.writeFileSync(project.script("score-bad.mjs"), `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:"nan",valid:true,fail_class:"ok",error:null}));\n`, "utf8");
+        project.task.score_program = `node "${project.script("score-bad.mjs")}"`;
+      }
+      if (c.name === "wrong") {
+        fs.writeFileSync(project.script("score-wrong.mjs"), `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:1,valid:false,fail_class:"wrong_answer",error:"bad result"}));\n`, "utf8");
+        project.task.score_program = `node "${project.script("score-wrong.mjs")}"`;
+      }
+      await writeTaskJson(project);
+      await deployShippedPolicy(project);
+      const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+      const node = episode.tree.list()[0];
+      assert.equal(node.fail_class, "timeout", `${c.name} retains the agent timeout class`);
+      assert.equal(node.partial, true);
+      assert.ok(node.agent_timeout, "agent diagnostics are still recorded");
+      assert.match(node.error, /discovery agent timed out/);
+      assert.equal(node.score, null);
+      assert.match(`${node.timeout_assessment.fail_class}: ${node.timeout_assessment.error ?? ""}`, c.match);
+    } finally {
+      project.cleanup();
+    }
+  }
+  // Evaluator timeout keeps the agent deadline separate from the evaluator deadline.
+  const slow = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 800, task: { k1: 1 }, evaluatorTimeoutMs: 400 });
+  try {
+    fs.writeFileSync(slow.script("score-slow.mjs"), `setInterval(()=>{},1000);\n`, "utf8");
+    slow.task.score_program = `node "${slow.script("score-slow.mjs")}"`;
+    await writeTaskJson(slow);
+    await deployShippedPolicy(slow);
+    const episode = await liveCycle(slow, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    const node = episode.tree.list()[0];
+    assert.equal(node.fail_class, "timeout");
+    assert.match(node.error, /discovery agent timed out/);
+    assert.equal(node.timeout_assessment.fail_class, "timeout");
+    assert.match(node.timeout_assessment.error, /evaluator timed out/);
+  } finally {
+    slow.cleanup();
+  }
+});
+
+test("an inherited score file cannot supply a timeout assessment", async () => {
+  const project = makeProject({ agentTimeoutMs: 900, scorer: "score-nofile.mjs", task: { k1: 1 } });
+  try {
+    // Parent would score highly if its file leaked; the child scorer writes nothing.
+    fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","xxxx\\n");mkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:99,valid:true,fail_class:"ok",error:null}));setInterval(()=>{},1000);});\n`, "utf8");
+    project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    const node = episode.tree.list()[0];
+    assert.equal(node.fail_class, "timeout");
+    assert.equal(node.timeout_assessment.fail_class, "eval_error");
+    assert.notEqual(node.timeout_assessment.raw_score, 99);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("timeout assessments preserve the evaluator valid:false flag", async () => {
+  const project = makeProject({ agentTimeoutMs: 900, task: { k1: 1 } });
+  try {
+    fs.writeFileSync(project.script("agent-edit-hang.mjs"), `import { appendFileSync } from "node:fs";\nprocess.stdin.on("data",()=>{});process.stdin.on("end",()=>{appendFileSync("solution.py","x\\n");setInterval(()=>{},1000);});\n`, "utf8");
+    project.task.agent = { command: "node", args: [project.script("agent-edit-hang.mjs")], model: null, prompt_via: "stdin" };
+    fs.writeFileSync(project.script("score-soft.mjs"), `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:7,valid:false,fail_class:"ok",error:null}));\n`, "utf8");
+    project.task.score_program = `node "${project.script("score-soft.mjs")}"`;
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 } });
+    const node = episode.tree.list()[0];
+    assert.equal(node.fail_class, "timeout_scored");
+    assert.equal(node.timeout_assessment.valid, false);
+    assert.equal(node.timeout_assessment.score, 7);
   } finally {
     project.cleanup();
   }

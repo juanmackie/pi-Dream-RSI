@@ -236,3 +236,34 @@ test("selection names it when efficiency overturns peak attainment", () => {
   ];
   assert.equal(efficiencyOverturnNote(agreeing, 1), null);
 });
+
+test("partial diagnostic assessments leave all reward metrics unchanged", () => {
+  const base = (extra) => ({
+    score: null, evaluated: true, valid: false, fail_class: "timeout",
+    error: "discovery agent timed out after 480s", delta_vs_baseline: null, delta_vs_parent: null,
+    branch: 0, attempt: 0, n_valid: 0, n_total: 1, ...extra,
+  });
+  const traceTimeout = [
+    { round: 1, observed: [], batch: ["b0a0"], revealed: { b0a0: base({}) }, best_after: null },
+    { round: 2, observed: ["b0a0"], batch: ["b0a0"], revealed: { b0a1: base({ branch: 0, attempt: 1 }) }, best_after: null },
+  ];
+  const traceScored = [
+    { round: 1, observed: [], batch: ["b0a0"], revealed: { b0a0: base({ partial: true, agent_timeout: { duration_ms: 480000, had_output: true }, timeout_assessment: { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null } }) }, best_after: null },
+    { round: 2, observed: ["b0a0"], batch: ["b0a0"], revealed: { b0a1: base({ branch: 0, attempt: 1, fail_class: "timeout_scored", partial: true, agent_timeout: { duration_ms: 480000, had_output: true }, timeout_assessment: { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null } }) }, best_after: null },
+  ];
+  const a = traceMetrics(traceTimeout, { ...cfg, baselineScore: 0 });
+  const b = traceMetrics(traceScored, { ...cfg, baselineScore: 0 });
+  assert.deepEqual(b, a, "adding diagnostics must not change attainment, probes, rounds, value or sweep inputs");
+  assert.equal(a.probes, 2, "timed-out attempts stay in the probe count");
+  assert.equal(a.attainment, 0, "partial scores never satisfy attainment");
+});
+
+test("partial assessments are never successful evaluations", async () => {
+  const { isSuccess } = await import("../extensions/pi-dream-rsi/engine/tree.ts");
+  const { probe_succeeded } = await import("../extensions/pi-dream-rsi/policy/observation-signal.ts");
+  const partial = { evaluated: true, fail_class: "timeout_scored", error: "discovery agent timed out after 480s", score: null, partial: true, timeout_assessment: { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null } };
+  assert.equal(isSuccess(partial), false);
+  assert.equal(probe_succeeded({ ...partial, branch: 0, attempt: 0, delta_vs_baseline: null, delta_vs_parent: null, n_valid: 0, n_total: 1 }), false);
+  const unresolved = { evaluated: true, fail_class: "timeout", error: "discovery agent timed out after 480s", score: null, partial: true };
+  assert.equal(isSuccess(unresolved), false);
+});

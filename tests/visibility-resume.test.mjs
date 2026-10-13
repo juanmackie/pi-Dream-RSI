@@ -2,6 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { jump, makeProject, deployShippedPolicy, writeTaskJson, mockPi } from "./fixtures.mjs";
 const { runLiveEpisode } = await jump("engine/live.ts");
@@ -351,4 +352,131 @@ test("checkpoint write failure aborts children and preserves the last durable co
     const result = await runLiveEpisode(options(p, { resume: true })); assert.equal(result.ok, true, result.error);
     assert.equal(controlled.calls().filter((c) => c === "b0a0").length, 1);
   } finally { mutableFs.renameSync = rename; syncBuiltinESMExports(); p.cleanup(); }
+});
+
+test("resumed and restarted attempts preserve their batch guidance", async () => {
+  const p = makeProject({ task: { k1: 2, guidance: "summary" } });
+  try {
+    const controlled = controlledAgent(p); await setup(p);
+    const abort = new AbortController();
+    const run = runLiveEpisode(options(p, { signal: abort.signal }));
+    await until(() => { try { return readCheckpoint(p.dreamRoot, 1).batches[0]?.attempts.some((a) => a.record) && controlled.calls().length === 2; } catch { return false; } });
+    abort.abort(); await run;
+    const interrupted = readCheckpoint(p.dreamRoot, 1);
+    assert.equal(interrupted.timeout_recovery_version, 2);
+    const firstGuidance = interrupted.batches[0].direction_guidance;
+    assert.match(firstGuidance ?? "", /no evaluated attempts yet/);
+    // The interrupted batch must not be recomputed from a tree containing its own completed sibling.
+    fs.writeFileSync(controlled.gate, "yes");
+    const resumed = await runLiveEpisode(options(p, { resume: true }));
+    assert.equal(resumed.ok, true, resumed.error);
+    const saved = readCheckpoint(p.dreamRoot, 1);
+    assert.equal(saved.batches[0].direction_guidance, firstGuidance, "interrupted batch reuses saved guidance");
+    const restartedPrompt = fs.readFileSync(path.join(p.dreamRoot, "history", "r0001_live", "attempt_b1a0", "prompt.md"), "utf8");
+    assert.ok(restartedPrompt.includes(firstGuidance), "restarted agent reuses the batch guidance, not a recomputed summary");
+    assert.doesNotMatch(restartedPrompt, /b0a0  .*\/ ok.*b1a0/, "restarted prompt does not see its own completed sibling");
+    // A later batch still receives earlier diagnostics.
+    if (saved.batches.length >= 2) {
+      assert.match(saved.batches[1].direction_guidance ?? "", /b0a0/);
+    }
+  } finally { p.cleanup(); }
+});
+
+test("interruption during timeout assessment resumes evaluation without another agent call", async () => {
+  const p = makeProject({ task: { k1: 1, workers: 2 } });
+  try {
+    const callsFile = path.join(p.projectDir, "agent-calls.jsonl");
+    const gate = path.join(p.projectDir, "eval-allow");
+    fs.writeFileSync(path.join(p.projectDir, "agent-count-hang.mjs"), `import * as fs from 'node:fs';\nimport * as path from 'node:path';\nlet pr='';process.stdin.on('data',d=>pr+=d);process.stdin.on('end',()=>{const cell=path.basename(process.cwd());fs.appendFileSync(${JSON.stringify(callsFile)},cell+'\\n');fs.appendFileSync('solution.py','x\\n');console.log('edited '+cell);setInterval(()=>{},1000);});\n`, "utf8");
+    p.task.agent = { command: "node", args: [path.join(p.projectDir, "agent-count-hang.mjs")], model: null, prompt_via: "stdin" };
+    p.task.agent_timeout_ms = 800;
+    fs.writeFileSync(path.join(p.projectDir, "score-gated.mjs"), `import * as fs from 'node:fs';\nimport * as path from 'node:path';\nconst cell=path.basename(process.cwd());\nif(cell==='b1a0'&&!fs.existsSync(${JSON.stringify(gate)})){const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(gate)})){clearInterval(t);fs.mkdirSync('eval',{recursive:true});fs.writeFileSync('eval/score.json',JSON.stringify({score:2,valid:true,fail_class:'ok',error:null}));}},20);}else{fs.mkdirSync('eval',{recursive:true});fs.writeFileSync('eval/score.json',JSON.stringify({score:2,valid:true,fail_class:'ok',error:null}));}\n`, "utf8");
+    p.task.score_program = `node "${path.join(p.projectDir, "score-gated.mjs")}"`;
+    await setup(p);
+    const abort = new AbortController();
+    const run = runLiveEpisode(options(p, { grid: { branch_count: 2, refine_count: 1 }, signal: abort.signal }));
+    await until(() => { try { const cp = readCheckpoint(p.dreamRoot, 1); return cp.batches[0]?.attempts.some((a) => a.record) && cp.batches[0].attempts.some((a) => !a.record && a.stage === "evaluation"); } catch { return false; } });
+    abort.abort(); await run;
+    const interrupted = readCheckpoint(p.dreamRoot, 1);
+    assert.equal(interrupted.batches[0].attempts.filter((a) => a.record).length, 1, "one sibling completed with its assessment");
+    assert.equal(interrupted.batches[0].attempts.filter((a) => !a.record).length, 1);
+    const callsBefore = fs.existsSync(callsFile) ? fs.readFileSync(callsFile, "utf8").trim().split("\n").length : 0;
+    fs.writeFileSync(gate, "yes");
+    const resumed = await runLiveEpisode(options(p, { resume: true }));
+    assert.equal(resumed.ok, true, resumed.error);
+    const saved = readCheckpoint(p.dreamRoot, 1);
+    assert.equal(saved.extra_eval_calls, 1, "assessment retry counts through existing retry accounting");
+    const callsAfter = fs.readFileSync(callsFile, "utf8").trim().split("\n").length;
+    assert.equal(callsAfter, callsBefore, "no additional agent calls for evaluation-only recovery");
+    assert.equal(resumed.manifest.attempts, 2, "assessment retries do not add probes");
+    for (const node of resumed.tree.list()) {
+      assert.equal(node.fail_class, "timeout_scored");
+      assert.equal(node.partial, true);
+    }
+  } finally { p.cleanup(); }
+});
+
+test("cycle reports append partial assessments only when present and keep best-score lines", async () => {
+  const { iterationReport } = await jump("state.ts");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-report-"));
+  try {
+    const manifest = { iteration: 1, status: "complete", created_at: new Date().toISOString(), completed_at: new Date().toISOString(), baked_beta: 0.6, policy_version: "p", policy_name: null, grid: { branch_count: 1, refine_count: 1 }, decision_rounds: 1, attempts: 1, baseline_score: 0, best_score: 5, previous_best_score: null, stopped: "budget", error: null, note: null };
+    fs.mkdirSync(path.join(root, "trace_pool", "iter0001"), { recursive: true });
+    fs.mkdirSync(path.join(root, "history", "r0001_live"), { recursive: true });
+    const base = iterationReport(root, 1, manifest);
+    assert.doesNotMatch(base, /partial assessment/, "reports without new records retain existing text");
+    assert.match(base, /best=5/);
+    const { DiscoveryTree } = await jump("engine/tree.ts");
+    const { writeJson: write } = await jump("engine/world.ts");
+    const tree = new DiscoveryTree({ baselineScore: 0, branchCount: 12, refineCount: 1 });
+    for (let b = 0; b < 12; b += 1) {
+      tree.addBranchSlot(b);
+      tree.setOutcome(`b${b}a0`, {
+        evaluated: true, valid: false, fail_class: b % 3 === 0 ? "timeout" : "timeout_scored",
+        error: "discovery agent timed out after 10s with output (see agent.log)", score: null, raw_score: null,
+        duration_ms: 12000, partial: true, agent_timeout: { duration_ms: 10000, had_output: true },
+        timeout_assessment: b % 3 === 0
+          ? { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: "boom" }
+          : { score: b, raw_score: b, valid: true, fail_class: "ok", error: null },
+      });
+    }
+    write(path.join(root, "trace_pool", "iter0001", "tree.json"), tree.toJSON());
+    const withPartial = iterationReport(root, 1, manifest);
+    assert.match(withPartial, /best=5/, "main best-score line is unchanged");
+    assert.match(withPartial, /partial assessments \(diagnostic only/);
+    assert.match(withPartial, /b11a0 timeout_scored partial raw 11/);
+    assert.match(withPartial, /assessment eval_error: boom/, "unresolved failures stay readable");
+    assert.match(withPartial, /2 more partial assessment\(s\) omitted/, "ten most recent with omitted count");
+    assert.match(withPartial, /history[\\/]r0001_live/, "records location is shown");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("dashboard distinguishes partial scores, stays within width and keeps logs accessible", async () => {
+  const p = makeProject(); try {
+    await setup(p);
+    const recorder = new ProgressRecorder(p.dreamRoot, 1, "live", 2, 2);
+    recorder.stage("b0a0", "root", 1, "failed", 0, null, "discovery agent timed out after 480s with output (see agent.log)");
+    recorder.stage("b1a0", "root", 1, "failed", 0, null, "discovery agent timed out after 480s");
+    recorder.snapshot.tree = {
+      version: 1, branch_count: 2, refine_count: 1, seq: 3, baseline_score: null,
+      cells: [
+        { meta: { cell_id: "b0a0", branch: 0, attempt: 0, parent_id: "root", seq: 1, tags: [] }, evaluated: true, valid: false, fail_class: "timeout_scored", error: "discovery agent timed out after 480s with output (see agent.log)", score: null, raw_score: null, workspace: null, proposal: null, artifacts: [], duration_ms: 500000, partial: true, agent_timeout: { duration_ms: 480000, had_output: true }, timeout_assessment: { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null } },
+        { meta: { cell_id: "b1a0", branch: 1, attempt: 0, parent_id: "root", seq: 2, tags: [] }, evaluated: true, valid: false, fail_class: "timeout", error: "discovery agent timed out after 480s", score: null, raw_score: null, workspace: null, proposal: null, artifacts: [], duration_ms: 500000, partial: true, agent_timeout: { duration_ms: 480000, had_output: false }, timeout_assessment: { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: "boom" } },
+      ],
+    };
+    recorder.finish("complete");
+    const view = new DashboardView(p.dreamRoot);
+    const lines = view.render(80).join("\n");
+    assert.match(lines, /timeout_scored/, "timeout_scored is shown explicitly");
+    assert.match(lines, /partial_score=0\.72/, "diagnostic value is separate from ordinary score");
+    assert.match(lines, /score=n\/a/, "ordinary score field never carries partial values");
+    assert.match(lines, /discovery agent timed out/, "agent timeout explanation is preserved");
+    view.nodeIndex = 1;
+    const unresolvedLines = view.render(120).join("\n");
+    assert.match(unresolvedLines, /assessment eval_error: boom/, "evaluator failures are shown separately");
+    assert.ok(view.render(40).every((line) => visibleWidth(line) <= 40), "dashboard stays within its width limit");
+    // Agent and evaluator logs remain accessible via panes.
+    view.handleInput("\t"); assert.equal(view.pane, 1);
+    view.handleInput("\t"); assert.equal(view.pane, 2);
+  } finally { p.cleanup(); }
 });

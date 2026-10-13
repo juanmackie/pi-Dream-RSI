@@ -77,12 +77,33 @@ export class DashboardView {
     const rows = ["Dream-RSI watch   ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close", ...progressSummary(s).split("\n"), ""];
     const start = Math.max(0, this.nodeIndex - 5);
     for (const cell of cells.slice(start, start + 10)) {
-      const a = s.attempts[cell]; const node = s.tree?.cells.find((n) => n.meta.cell_id === cell);
-      rows.push(`${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? node?.meta.parent_id ?? "root"}  ${a?.stage ?? "unopened"}  score=${a?.score ?? node?.score ?? "n/a"}${a?.retry ? ` retry=${a.retry}` : ""}`);
+      const a = s.attempts[cell]; const node = s.tree?.cells.find((n) => n.meta.cell_id === cell) as
+        | { meta?: { parent_id?: string | null }; score?: number | null; fail_class?: string; timeout_assessment?: { raw_score?: unknown } }
+        | undefined;
+      // Ordinary score stays ordinary; diagnostic values render separately as partial_score.
+      const ordinary = a?.score ?? node?.score ?? "n/a";
+      const rawPartial = (node?.timeout_assessment as { raw_score?: unknown } | undefined)?.raw_score;
+      const partialNote =
+        typeof rawPartial === "number" && Number.isFinite(rawPartial)
+          ? ` partial_score=${Math.round(rawPartial * 10000) / 10000}`
+          : "";
+      // Show timeout diagnostics explicitly; other fail classes keep the concise stage view.
+      const fail = (node as { fail_class?: string } | undefined)?.fail_class;
+      const failNote = fail === "timeout_scored" || fail === "timeout" ? ` ${fail}` : "";
+      rows.push(`${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? (node as { meta?: { parent_id?: string | null } } | undefined)?.meta?.parent_id ?? "root"}  ${a?.stage ?? "unopened"}${failNote}  score=${ordinary}${partialNote}${a?.retry ? ` retry=${a.retry}` : ""}`);
     }
     if (attempt) {
       const elapsed = attempt.stage === "agent" || attempt.stage === "evaluation" || attempt.stage === "preparing" ? Date.now() : attempt.updated_at;
-      rows.push("", `${selected}: round ${attempt.round} | elapsed ${Math.max(0, Math.round((elapsed - attempt.started_at) / 1000))}s | ${attempt.error ?? ""}`);
+      const selectedNode = s.tree?.cells.find((n) => n.meta.cell_id === selected) as
+        | { error?: string | null; fail_class?: string; timeout_assessment?: { fail_class?: string; error?: string | null } }
+        | undefined;
+      // Preserve the failed stage and agent timeout explanation; show evaluator
+      // failures separately when the diagnostic assessment is unresolved.
+      const evalFailure =
+        selectedNode?.timeout_assessment && selectedNode.fail_class === "timeout"
+          ? ` | assessment ${selectedNode.timeout_assessment.fail_class}${selectedNode.timeout_assessment.error ? `: ${selectedNode.timeout_assessment.error}` : ""}`
+          : "";
+      rows.push("", `${selected}: round ${attempt.round} | elapsed ${Math.max(0, Math.round((elapsed - attempt.started_at) / 1000))}s | ${attempt.error ?? ""}${evalFailure}`);
     }
     if (this.pane === 0) rows.push("", "Tool activity", ...(attempt?.tools.length ? attempt.tools.slice(-8) : ["(no tool activity)"]));
     else {

@@ -207,3 +207,52 @@ test("the environment enforces the round limit (K1/K2), so a policy cannot outru
   assert.deepEqual(host.legal_actions(), [], "no legal action after K2 rounds");
   await assert.rejects(() => host.probe_batch(["b0a0"]), /round limit reached/);
 });
+
+test("old timeout worlds without new fields load, replay and report identically", async () => {
+  const tree = treeWith({ baseline: null, branches: 1, refine: 2 });
+  tree.setOutcome("b0a0", { evaluated: true, valid: false, fail_class: "timeout", error: "discovery agent timed out after 480s", score: null, raw_score: null, duration_ms: 500000 });
+  const json = tree.toJSON();
+  assert.equal(json.cells[0].partial, undefined, "old records never gain partial:false");
+  assert.equal(json.cells[0].agent_timeout, undefined);
+  assert.equal(json.cells[0].timeout_assessment, undefined);
+  const reloaded = DiscoveryTree.fromJSON(JSON.parse(JSON.stringify(json)));
+  const node = reloaded.get("b0a0");
+  assert.equal(node.partial, undefined);
+  assert.equal(isSuccess(node), false);
+  assert.equal(reloaded.bestScore(), null);
+  const obs = reloaded.observation("b0a0");
+  assert.equal(obs.partial, undefined, "missing partial reads as false");
+  assert.equal(obs.timeout_assessment, undefined);
+  assert.equal(obs.score, null);
+  assert.equal(obs.delta_vs_parent, null, "partial values never populate ordinary deltas");
+  // Replay reveals the stored timeout without running any scorer.
+  const revealed = new Set();
+  const probe = makeReplayProbe(reloaded, (cell) => revealed.has(cell));
+  const out = await probe(["b0a0"], 1);
+  assert.equal(out[0].node.fail_class, "timeout");
+  assert.equal(out[0].node.score, null);
+});
+
+test("replay reveals stored diagnostic assessments without running evaluators", async () => {
+  const world = treeWith({ baseline: null, branches: 1, refine: 2 });
+  world.setOutcome("b0a0", {
+    evaluated: true, valid: false, fail_class: "timeout_scored", error: "discovery agent timed out after 480s with output (see agent.log)",
+    score: null, raw_score: null, duration_ms: 500000, partial: true,
+    agent_timeout: { duration_ms: 480000, had_output: true },
+    timeout_assessment: { score: 0.72, raw_score: 0.72, valid: true, fail_class: "ok", error: null },
+  });
+  const revealed = new Set();
+  const probe = makeReplayProbe(world, (cell) => revealed.has(cell));
+  const out = await probe(["b0a0"], 1);
+  assert.equal(out[0].node.fail_class, "timeout_scored");
+  assert.equal(out[0].node.timeout_assessment.score, 0.72);
+  // Observations carry the diagnostics for policy use, but ordinary helpers ignore them.
+  const host = new PolicyHost({ mode: "replay", maxParallelism: 1, slots: [0], probe: async (cells) => { const r = await probe(cells, 1); for (const rec of r) revealed.add(rec.cell); return r; } });
+  await host.probe_batch(["b0a0"]);
+  const obs = host.observed()["b0a0"];
+  assert.equal(obs.partial, true);
+  assert.deepEqual(obs.agent_timeout, { duration_ms: 480000, had_output: true });
+  assert.equal(obs.timeout_assessment.score, 0.72);
+  assert.equal(obs.score, null);
+  assert.equal(host.best_score, null, "partial scores never become the best score");
+});

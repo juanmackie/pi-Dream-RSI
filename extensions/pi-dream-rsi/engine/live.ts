@@ -28,6 +28,7 @@ import { readCheckpoint, saveCheckpoint, validateCheckpoint, freezePolicy, snaps
   type LiveCheckpoint, type PendingAttempt, type PreparedAttempt } from "./checkpoint.ts";
 import { normalizeTask, scoringFingerprint } from "./task.ts";
 import { renderDirectionGuidance } from "./guidance.ts";
+import { classifyAgentTimeout } from "./timeout.ts";
 import {
   archiveAttempt,
   writeJsonl,
@@ -300,7 +301,8 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     const hashes = freezePolicy(originalPolicy, path.join(path.dirname(seedWorkspace), "frozen"));
     cp = { version: 1, project: path.resolve(projectDir), task, manifest, policy: Object.keys(hashes)[0], policy_hashes: hashes,
       seed: seedWorkspace, seed_hash: seedHash, prompt_template: promptTemplate, prompt_vars: basePromptVars,
-      tree: tree.toJSON(), batches: [], status: "running", extra_agent_calls: 0, extra_eval_calls: 0, resumes: 0 };
+      tree: tree.toJSON(), batches: [], status: "running", extra_agent_calls: 0, extra_eval_calls: 0, resumes: 0,
+      timeout_recovery_version: 2 };
   }
   const checkpoint = cp;
   const policyPath = checkpoint.policy;
@@ -348,7 +350,11 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
   };
 
   /** Prepare the workspace and prompt for one attempt (I/O). */
-  const materialize = async (target: { cell: string; parentCell: string; parentWorkspace: string }, round: number): Promise<PreparedAttempt> => {
+  const materialize = async (
+    target: { cell: string; parentCell: string; parentWorkspace: string },
+    round: number,
+    directionGuidance?: string,
+  ): Promise<PreparedAttempt> => {
     const prepareStarted = Date.now();
     const workspace = nodeWorkspace(dreamRoot, iteration, target.cell);
     const copyExclude = [dreamRoot, ...(task.copy_exclude ?? []).map((entry) => path.resolve(projectDir, entry))];
@@ -360,7 +366,11 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     }
     const record = attemptDir(dreamRoot, iteration, target.cell);
     fs.mkdirSync(record, { recursive: true });
-    const prompt = renderPrompt(promptTemplate, { ...basePromptVars, node_dir: workspace });
+    const promptVars =
+      directionGuidance !== undefined
+        ? { ...basePromptVars, direction_guidance: directionGuidance, node_dir: workspace }
+        : { ...basePromptVars, node_dir: workspace };
+    const prompt = renderPrompt(promptTemplate, promptVars);
     const promptPath = path.join(record, "prompt.md");
     fs.writeFileSync(promptPath, prompt, "utf8");
     const workspaceRel = path.relative(projectDir, workspace) || workspace;
@@ -442,19 +452,63 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     const proposalPath = path.join(prepared.workspace, "proposal.md");
     let outcome: ScoreOutcome;
     let evalRun: CommandResult | null = null;
+    // Diagnostic timeout fields, present only for marker-2 assessed timeouts.
+    let partial: true | undefined;
+    let agentTimeout: { duration_ms: number; had_output: boolean } | undefined;
+    let timeoutAssessment: { score: number | null; raw_score: number | null; valid: boolean; fail_class: string; error: string | null } | undefined;
     if (signal.aborted) throw new Error("attempt interrupted after generation");
     if (agentRun.timedOut) {
       // Say how long it ran and whether it ever printed: a silent timeout with an empty agent.log is a
       // different diagnosis (blocked before startup: session/daemon, provider queue) from a slow one.
+      // Output presence means only that the process emitted bytes, not useful progress.
       const seconds = Math.round(agentRun.durationMs / 100) / 10;
-      const silent = (agentRun.stdoutTail + agentRun.stderrTail).trim() === "";
-      outcome = {
-        score: null,
-        raw_score: null,
-        valid: false,
-        fail_class: "timeout",
-        error: `discovery agent timed out after ${seconds}s${silent ? " with no output at all (empty agent.log)" : ""}`,
-      };
+      const hadOutput =
+        agentRun.hadOutput ?? (agentRun.stdoutTail + agentRun.stderrTail).trim() !== "";
+      const agentError = `discovery agent timed out after ${seconds}s${hadOutput ? " with output (see agent.log)" : " with no output at all (empty agent.log)"}`;
+      if (checkpoint.timeout_recovery_version !== 2) {
+        outcome = {
+          score: null,
+          raw_score: null,
+          valid: false,
+          fail_class: "timeout",
+          error: agentError,
+        };
+      } else {
+        // Phase 2: assess the preserved workspace with the existing scorer, even
+        // when the agent never wrote proposal.md and regardless of stdout output.
+        // The immutable agent snapshot stays intact; evaluation runs in the attempt
+        // workspace, as for complete attempts.
+        fs.rmSync(path.join(prepared.workspace, task.score_path), { force: true });
+        if (resumedEvaluation) { checkpoint.extra_eval_calls += 1; commit(); }
+        progress.stage(prepared.cell, prepared.parentCell, prepared.round, "evaluation", pending.retry);
+        evalRun = await runShellCommand(task.score_program, {
+          cwd: prepared.workspace,
+          timeoutMs: task.evaluator_timeout_ms,
+          logPath: path.join(recordDir, "eval.log"),
+          signal,
+          onOutput: (event) => progress.output(prepared.cell, true, event),
+          onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
+        });
+        pending.process = undefined;
+        // Cancelled evaluation stays recoverable: do not publish a completed assessment.
+        if (evalRun.aborted || signal.aborted) throw new Error("attempt interrupted during evaluation");
+        const evalOutcome = interpretEvaluation(task, evalRun, readScoreFile(prepared.workspace, task));
+        const classified = classifyAgentTimeout(
+          agentError,
+          { duration_ms: agentRun.durationMs, had_output: hadOutput },
+          evalOutcome,
+        );
+        outcome = {
+          score: null,
+          raw_score: null,
+          valid: false,
+          fail_class: classified.fail_class,
+          error: classified.error,
+        };
+        partial = true;
+        agentTimeout = classified.agent_timeout;
+        timeoutAssessment = classified.timeout_assessment;
+      }
     } else if (agentRun.spawnError) {
       outcome = { score: null, raw_score: null, valid: false, fail_class: "agent_error", error: agentRun.spawnError };
     } else if (!agentRun.ok) {
@@ -515,6 +569,9 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       raw_score: outcome.raw_score,
       artifacts: [prepared.promptPath, prepared.logPath].map((p) => path.relative(projectDir, p)),
       duration_ms: Date.now() - started,
+      ...(partial !== undefined ? { partial } : {}),
+      ...(agentTimeout !== undefined ? { agent_timeout: agentTimeout } : {}),
+      ...(timeoutAssessment !== undefined ? { timeout_assessment: timeoutAssessment } : {}),
     };
     const updated = tree.setOutcome(prepared.cell, node);
     return { cell: prepared.cell, node: { ...node, meta: updated.meta } };
@@ -525,12 +582,31 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     if (signal.aborted) throw new Error("live episode aborted");
     let batch = checkpoint.batches[batchIndex++];
     if (batch && !matches(batch, cells, round)) throw new Error(`policy diverged at batch ${batchIndex}`);
+    const perBatchGuidance =
+      checkpoint.timeout_recovery_version === 1 || checkpoint.timeout_recovery_version === 2;
     if (!batch) {
-      batch = { round, cells: [...cells], attempts: cells.map((cell) => ({ ...planTarget(cell), stage: "preparing", retry: 0, record: null })) };
+      // Capture the evaluated history before the batch starts and render guidance
+      // once: every sibling shares the same initial context, so a fast sibling's
+      // result cannot change a slower sibling's prompt.
+      const directionGuidance = perBatchGuidance
+        ? (task.guidance === "summary" ? renderDirectionGuidance(tree.list()) : "")
+        : undefined;
+      batch = {
+        round,
+        cells: [...cells],
+        attempts: cells.map((cell) => ({ ...planTarget(cell), stage: "preparing", retry: 0, record: null })),
+        ...(perBatchGuidance && directionGuidance !== undefined ? { direction_guidance: directionGuidance } : {}),
+      };
       checkpoint.batches.push(batch);
       commit(); // Entire ordered request is durable BEFORE dispatch.
     }
-    const settled = await Promise.allSettled(batch.attempts.map(async (pending) => {
+    // Reuse the saved guidance for interrupted batches. Never recompute from a
+    // tree that already contains completed siblings from this same batch.
+    const batchGuidance = perBatchGuidance
+      ? (batch.direction_guidance ?? (task.guidance === "summary" ? (basePromptVars.direction_guidance ?? "") : ""))
+      : undefined;
+    const currentBatch = batch;
+    const settled = await Promise.allSettled(currentBatch.attempts.map(async (pending) => {
       if (pending.record) {
         progress.stage(pending.cell, pending.parentCell, round, pending.record.node.error ? "failed" : "complete", pending.retry,
           pending.record.node.score ?? null, pending.record.node.error ?? null);
@@ -551,7 +627,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
         }
         pending.stage = "preparing"; pending.agentRun = undefined; commit();
         progress.stage(pending.cell, pending.parentCell, round, "preparing", pending.retry);
-        try { prepared = await materialize(pending, round); }
+        try { prepared = await materialize(pending, round, batchGuidance); }
         catch (error) {
           if (signal.aborted) throw error;
           const record = recordPrepareFailure(pending.cell, error);

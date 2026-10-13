@@ -607,3 +607,33 @@ test("tree root falls back to the measured seed when no cycle-1 baseline exists"
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("partial diagnostic assessments never enter ranking, baselines or apply eligibility", () => {
+  const project = makeRankedProject();
+  try {
+    // A timeout_scored node with a high diagnostic score must not become a candidate,
+    // even though its partial value beats every complete score on record.
+    const foreign = new DiscoveryTree({ baselineScore: null, branchCount: 1, refineCount: 1 });
+    foreign.addBranchSlot(0);
+    foreign.setOutcome("b0a0", {
+      evaluated: true, valid: false, fail_class: "timeout_scored", error: "discovery agent timed out after 480s with output (see agent.log)",
+      score: null, raw_score: null, partial: true,
+      agent_timeout: { duration_ms: 480000, had_output: true },
+      timeout_assessment: { score: 9999, raw_score: 9999, valid: true, fail_class: "ok", error: null },
+    });
+    const ws = path.join(project.dreamRoot, "work", "r0002", "b0a0");
+    fs.mkdirSync(ws, { recursive: true });
+    fs.writeFileSync(path.join(ws, "prog.py"), "print('partial')\n", "utf8");
+    writeJson(path.join(project.dreamRoot, "trace_pool", "iter0002", "tree.json"), foreign.toJSON());
+    writeJson(path.join(project.dreamRoot, "trace_pool", "iter0002", "live_cycle_manifest.json"), {
+      iteration: 2, status: "complete", task_fingerprint: scoringFingerprint(project.task),
+    });
+    const ranking = rankCandidates({ dreamRoot: project.dreamRoot, task: project.task, projectDir: project.projectDir });
+    assert.ok(!ranking.candidates.some((c) => c.score === 9999), "diagnostic partials are not candidates");
+    assert.equal(ranking.pending.cell, "b0a0", "the complete leader still wins");
+    const report = improvements(project.dreamRoot, project.task, project.projectDir);
+    assert.ok(!report.best || report.best.score !== 9999, "diagnostic partials never become the improvement best");
+  } finally {
+    fs.rmSync(project.dir, { recursive: true, force: true });
+  }
+});
