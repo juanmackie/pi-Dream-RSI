@@ -29,6 +29,7 @@ export interface SeedMeasurement {
   score: number | null;
   raw_score: number | null;
   fail_class: string;
+  valid?: boolean;
   error: string | null;
   measured_at: string;
   /** The workspace the measurement ran in, relative to the project when possible. */
@@ -122,6 +123,8 @@ export async function measureSeed(options: {
   projectDir: string;
   task: TaskConfig;
   log?: (message: string) => void;
+  beforeEvaluatorSpawn?: (key: string) => void;
+  exclude?: string[];
 }): Promise<SeedMeasurement | null> {
   const { dreamRoot, projectDir, task } = options;
   const log = options.log ?? (() => {});
@@ -135,11 +138,15 @@ export async function measureSeed(options: {
       task,
       scratch: path.join(historyDir(dreamRoot), "seed-workspace"),
       logPath: path.join(historyDir(dreamRoot), "seed", "score.log"),
+      beforeEvaluatorSpawn: options.beforeEvaluatorSpawn,
+      evaluatorKey: "seed-measurement",
+      exclude: options.exclude,
     });
     const measurement: SeedMeasurement = {
       score: outcome.score,
       raw_score: outcome.raw_score,
       fail_class: outcome.fail_class,
+      valid: outcome.valid,
       error: outcome.error,
       measured_at: new Date().toISOString(),
       workspace: path.relative(projectDir, seed) || seed,

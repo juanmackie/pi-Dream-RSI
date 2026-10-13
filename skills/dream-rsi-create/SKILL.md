@@ -1,6 +1,6 @@
 ---
 name: dream-rsi-create
-description: Set up a Dream-RSI task in this project and recommend the best candidate for the goal. Use when asked to "set up dream-rsi", "create a dream-rsi task", "start a dream-rsi loop", "optimize X with dream-rsi", to reconfigure an existing task (`/dream-rsi create --reconfigure`), or when `/dream-rsi create <goal>` was invoked and no task.json exists yet.
+description: Set up, reconfigure, or report a manual Dream-RSI task in this project. Use for `/dream-rsi create`, "set up dream-rsi", or task reconfiguration. For an automatic bounded improvement campaign use `dream-rsi-improve`.
 ---
 
 # Setting up a Dream-RSI task
@@ -11,6 +11,11 @@ scored how) and a **trustworthy scorer**. Your job here is to produce both, veri
 before spending a cycle.
 
 Read `skills/dream-rsi/SKILL.md` for the loop itself. This skill is only the on-ramp.
+
+`/dream-rsi improve <goal>` is a separate full-campaign workflow. It builds a target-specific task and keeps
+its campaign state separate from any existing `.dream-rsi/task.json`. Use
+`skills/dream-rsi-improve/SKILL.md` for that request. `/dream-rsi create` keeps the setup behavior below and
+stops before spending a cycle.
 
 ## Modes
 

@@ -74,7 +74,7 @@ export class DashboardView {
     const s = this.snapshot;
     if (!s) return ["Dream-RSI: no recorded progress. Esc closes."];
     const cells = this.cells(); const selected = cells[this.nodeIndex]; const attempt = s.attempts[selected];
-    const rows = ["Dream-RSI watch   ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close", ...progressSummary(s).split("\n"), ""];
+    const rows = [`Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close`, ...progressSummary(s).split("\n"), ""];
     const start = Math.max(0, this.nodeIndex - 5);
     for (const cell of cells.slice(start, start + 10)) {
       const a = s.attempts[cell]; const node = s.tree?.cells.find((n) => n.meta.cell_id === cell) as
@@ -116,19 +116,24 @@ export class DashboardView {
 }
 
 export class Dashboard {
-  private active = new Map<number, ProgressSnapshot>();
+  private active = new Map<string, ProgressSnapshot>();
   private lastRender = 0;
   private closers = new Set<() => void>();
   private ctx: ExtensionContext;
   constructor(ctx: ExtensionContext) { this.ctx = ctx; }
   observe = (snapshot: ProgressSnapshot): void => {
     if (this.ctx.mode !== "tui") return;
-    this.active.set(snapshot.iteration, snapshot);
+    const key = `${snapshot.project}:${snapshot.iteration}`;
+    this.active.set(key, snapshot);
     const final = snapshot.status !== "running";
     if (!final && Date.now() - this.lastRender < 250) return;
     this.lastRender = Date.now();
-    this.ctx.ui.setWidget("dream-rsi", [...this.active.values()].flatMap((s) => progressSummary(s).split("\n").map(clean)));
-    if (final) this.active.delete(snapshot.iteration);
+    if (final) this.active.delete(key);
+    const rows = [...this.active.values()].flatMap((s) => {
+      const source = path.basename(path.dirname(s.project)) === "campaigns" ? "campaign" : "legacy";
+      return progressSummary(s).split("\n").map((row, index) => clean(index === 0 ? `${source} ${row}` : row));
+    });
+    this.ctx.ui.setWidget("dream-rsi", rows.length > 0 ? rows : undefined);
   };
   async watch(root: string, iteration?: number): Promise<string | undefined> {
     if (this.ctx.mode !== "tui") {

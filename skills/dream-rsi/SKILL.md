@@ -1,6 +1,6 @@
 ---
 name: dream-rsi
-description: Run, inspect or resume the Dream-RSI loop (arXiv 2609.14858) — an executable exploration policy drives discovery trees of coding-agent attempts, and every offline phase improves that policy by replaying candidate versions over the frozen history. Use when asked to "run dream-rsi", "watch dream-rsi", "resume an interrupted dream-rsi cycle", "run another cycle", "improve the exploration policy", "recursive self-improvement loop", or to continue a configured loop. Setup is a separate skill (`dream-rsi-create`).
+description: Run, inspect or resume a configured manual Dream-RSI exploration-policy loop. Use when asked to "run dream-rsi", "watch dream-rsi", "resume an interrupted dream-rsi cycle", "run another cycle", "improve the exploration policy", or continue a configured loop. For a bounded code-target campaign use `dream-rsi-improve`; for read-only target assessment use `dream-rsi-assess`; task setup is `dream-rsi-create`.
 ---
 
 # Dream-RSI
@@ -8,6 +8,11 @@ description: Run, inspect or resume the Dream-RSI loop (arXiv 2609.14858) — an
 Recursive self-improvement of an **exploration policy** over a **discovery tree**. Not a keep/discard
 ladder: the artifact that improves is the policy *code*, and it improves by **dreaming** — deterministic
 offline replay of candidate policies against worlds recorded from real runs.
+
+For `/dream-rsi improve <goal>`, read `skills/dream-rsi-improve/SKILL.md`. That route improves a selected
+project target and lets the campaign controller run, verify, promote, and repeat within fixed limits. For
+`/dream-rsi assess [target]`, read `skills/dream-rsi-assess/SKILL.md`; assessment is read-only. The manual
+commands below keep their existing task-based behavior.
 
 ```
 π_t --online--> discovery tree T_t --freeze--> replay world i=t
@@ -32,6 +37,11 @@ offline replay of candidate policies against worlds recorded from real runs.
   The tree root is the measured seed score when no cycle-1 baseline exists yet, so cost tasks do not
   lose to idle by default.
 
+The implementation preserves the paper's v1 Eq. 1. The [v2 revision](https://arxiv.org/html/2609.14858v2)
+uses normalized hypervolume over the quality–call frontier minus a `lambda`-weighted parallelism penalty.
+That changed objective is not implemented by this manual runtime; the [v1 paper](https://arxiv.org/pdf/2609.14858v1)
+is the implementation reference.
+
 ## Tools
 
 | Tool | What it does |
@@ -41,18 +51,21 @@ offline replay of candidate policies against worlds recorded from real runs.
 | `dream_rsi_resume` | Continue an interrupted live tree using its original effective settings and remaining budget, including later rounds. Keeps completed attempts; restarts unfinished generators from the committed parent or evaluates a saved completed generator. Report kept/unfinished attempts and remaining budgets before running; retries can add calls. Omit `iteration` for the latest recoverable tree. |
 | `dream_rsi_dream` | Offline phase: replay `M` policy versions over completed compatible worlds, sweep beta, revise staged policies, select argmax `V` and deploy the winner. Releases interrupted claims while preserving checkpoints, then refuses while a phase is genuinely in flight or its manifest is unreadable. M−1 revision-agent calls regardless of world count; replay work and history-reading tokens grow with history. |
 | `dream_rsi_apply` | Copy a recorded candidate's `eval_program` over the user's code. Requires `confirm: true` and copies only the declared program (plus paths the user names). First it runs the scorer on scratch copies of the user's code without and with the files (two scorer runs) and writes only when the result measures better. Writes all files or none, keeps the replaced versions, never commits. |
-| `dream_rsi_status` | Iterations with best score + baked beta, completed worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), persisted live progress, recoverable checkpoints and the best candidate on record. |
+| `dream_rsi_status` | Iterations with best score + baked beta, completed worlds, policy versions, last sweep (`pareto.reward`, AUC, parallel penalty), persisted live progress, recoverable checkpoints and the best candidate on record; also shows campaign status/progress when present. |
+| `dream_rsi_improve` | Start, inspect, stop or resume an isolated bounded campaign. An explicit improve request authorizes the controller to verify and apply in-scope wins, then repeat within saved limits. Assessment stays read-only. |
 
-`dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` are **gated**: they only become callable in Dream-RSI
-mode, enabled by `dream_rsi_init` or the `create`, `live`, `dream`, `run` and `resume` commands. The bare
-`/dream-rsi` shows help without enabling mode.
+The manual `dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` tools are **gated**: they
+only become callable in Dream-RSI mode, enabled by `dream_rsi_init` or the `create`, `live`, `dream`, `run` and
+`resume` commands. The separate campaign tool's `start` and `resume` actions also require explicit improvement
+intent; `status` and `stop` remain available while mode is off. The bare `/dream-rsi` shows help without enabling
+mode.
 
 | Command | Use |
 |---------|-----|
 | `/dream-rsi create [--reconfigure\|--fresh] [goal]` | Set up, report, reconfigure or archive a task; flags precede the goal. |
 | `/dream-rsi suggest [goal]` (alias `best`) | Rank candidates; `fastest`, `safest`, `simplest` choose the preference. |
 | `/dream-rsi status` | Read state, live progress and recoverable checkpoints. |
-| `/dream-rsi watch [iteration]` | Read-only tree/log view; default latest active cycle, then latest recorded. |
+| `/dream-rsi watch [campaign|legacy] [iteration]` | Read-only tree/log view. Default follows a running/paused campaign, then legacy history; select either root explicitly. `Ctrl+Shift+D` follows the same default. |
 | `/dream-rsi resume [iteration]` | Ask the agent to continue the selected interrupted live tree; default latest recoverable. |
 | `/dream-rsi live [n]` | Start new online cycles, default 1; `n` is 1–8, clamped to the shared task cap. |
 | `/dream-rsi dream` | Improve the policy from completed compatible worlds. |
@@ -60,18 +73,26 @@ mode, enabled by `dream_rsi_init` or the `create`, `live`, `dream`, `run` and `r
 | `/dream-rsi off` | Disable gated tools while retaining saved state and running work. |
 | `/dream-rsi help` (alias `?`, also the bare command) | Show syntax, defaults and dashboard controls. |
 
-Free text routes to setup in an unconfigured project and suggestions in a configured one. Tab completes
-subcommands, setup flags and ranking preferences. Help, status and watching start no agent turn;
-RPC/JSON/print hosts receive session messages for these read-only reports.
+`/dream-rsi improve` and `/dream-rsi assess` use separate skills and command flows. An improvement campaign
+does not reconfigure an unrelated `.dream-rsi/task.json`. The create/live/dream/run/resume tools below remain the
+manual task-based loop.
+
+Assessment is read-only and works before manual task setup. Explicit requests to improve a target start campaign
+intake; generic questions do not start candidate work. In a configured manual task, free-text goals can rank
+recorded candidates. Tab completes subcommands, setup flags and ranking preferences. While a campaign is active,
+use `/dream-rsi watch legacy` to inspect manual-loop history; `/dream-rsi watch campaign` keeps completed
+campaign history available. The worker widget and watch overlay show campaign progress. Help, status and watching
+start no agent turn; RPC/JSON/print hosts receive session messages for these read-only reports.
 
 ## Visibility and recovery
 
-Use `/dream-rsi watch [iteration]` or `Ctrl+Shift+D` to inspect the live tree, node lifecycle, tool activity,
+Use `/dream-rsi watch [campaign|legacy] [iteration]` or `Ctrl+Shift+D` to inspect the live tree, node lifecycle, tool activity,
 and bounded agent/evaluator log tails without spending agent time. A widget appears during live and dream
 phases in terminal mode. Left/right selects cycles, up/down selects nodes, `d` switches live/dream, and Tab
 changes between tree, tools, agent output and evaluator output. Page Up loads older logs, Page Down returns
 to the tail, and Esc closes the view while work continues. Tails are bounded to 200 lines/64 KiB; full logs
-stay on disk. RPC/JSON/print hosts use text and structured progress instead.
+stay on disk. The default follows a running or paused campaign, then legacy history; choose `campaign` or `legacy`
+explicitly to inspect either tree. RPC/JSON/print hosts use text and structured progress instead.
 
 After interruption, `dream_rsi_status` lists recoverable iterations. Use `dream_rsi_resume iteration=<n>`
 only when the user asks to continue that cycle; `/dream-rsi resume [iteration]` is the command entry point.
@@ -196,7 +217,9 @@ the preference: `fastest` (strict score), `safest` (keeps ≥95% of the best win
 
 - **Never hand-edit `policy/method.ts` yourself** during the loop. Editing the policy *is* the dreaming
   phase; a manual edit outside the evaluated/selected version set breaks the `V* ≥ V_0` guarantee.
-- **Never apply a candidate unasked.** No commit, no branch, no "I went ahead and copied it".
+- **Manual apply needs an explicit request.** No commit, no branch, no "I went ahead and copied it". An
+  explicit `/dream-rsi improve` request uses the separate bounded campaign flow and authorizes promotion of
+  verified in-scope wins under that campaign's limits.
 - **Attempts must not run the scorer** unless the problem statement says otherwise; the runtime owns
   scoring, and an attempt that games the scorer poisons the world it becomes.
 - **Prefix-only**: policy decisions may use revealed observations, the baseline, legal sets, structural

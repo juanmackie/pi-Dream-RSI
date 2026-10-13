@@ -43,22 +43,69 @@ function initParams(project, extra = {}) {
   };
 }
 
-test("registers six tools, one command and the lifecycle hooks", async () => {
+test("registers the command, campaign controller and lifecycle hooks", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_resume", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_init", "dream_rsi_live", "dream_rsi_resume", "dream_rsi_dream", "dream_rsi_apply", "dream_rsi_status", "dream_rsi_improve"]);
     assert.deepEqual([...harness.commands.keys()], ["dream-rsi"]);
-    for (const event of ["session_start", "session_tree", "session_shutdown", "before_agent_start", "agent_start", "resources_discover"]) {
+    for (const event of ["session_start", "session_tree", "session_shutdown", "before_agent_start", "agent_start", "resources_discover", "input"]) {
       assert.equal(typeof harness.handlers.get(event), "function", `${event} hook registered`);
     }
     // The skill is contributed by the extension itself, so it is discoverable however we were loaded.
     const resources = await harness.handlers.get("resources_discover")({ cwd: project.projectDir, reason: "startup" }, null);
     assert.deepEqual(resources.skillPaths, [path.join(EXT, "..", "..", "skills")]);
     assert.ok(exists(path.join(resources.skillPaths[0], "dream-rsi", "SKILL.md")));
+    assert.ok(exists(path.join(resources.skillPaths[0], "dream-rsi-assess", "SKILL.md")));
+    assert.ok(exists(path.join(resources.skillPaths[0], "dream-rsi-improve", "SKILL.md")));
   } finally {
     project.cleanup();
   }
+});
+
+test("campaign intake validates a direct target and lower-only call caps without configuring legacy state", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const improve = harness.tools.get("dream_rsi_improve");
+    const idle = await improve.execute("status-empty", { action: "status" }, undefined, undefined, context);
+    assert.match(idle.content[0].text, /No improvement campaign/);
+    const gated = await improve.execute("start-off", { action: "start", goal: "Improve score" }, undefined, undefined, context);
+    assert.match(gated.content[0].text, /requires an explicit improvement request/);
+    await harness.handlers.get("input")({ type: "input", source: "interactive", text: "Use Dream-RSI to improve the fixture benchmark" }, context);
+    const invalid = await improve.execute("bad-cap", {
+      action: "start",
+      goal: "Increase verified score while keeping correctness",
+      task: {
+        name: "external fixture",
+        workspace: "seed",
+        eval_program: "solution.py",
+        score_program: project.task.score_program,
+        agent_command: "node",
+        agent_args: [project.script("agent-ok.mjs")],
+      },
+      verifier_inputs: ["score-ok.mjs"],
+      max_cycles: 6,
+    }, undefined, undefined, context);
+    assert.match(invalid.content[0].text, /max_cycles must be an integer from 1 to 5/);
+    const invalidGain = await improve.execute("bad-gain", {
+      action: "start",
+      goal: "Increase verified score while keeping correctness",
+      task: {
+        name: "external fixture",
+        workspace: "seed",
+        eval_program: "solution.py",
+        score_program: project.task.score_program,
+        agent_command: "node",
+        agent_args: [project.script("agent-ok.mjs")],
+      },
+      verifier_inputs: ["score-ok.mjs"],
+      minimum_gain: -0.01,
+    }, undefined, undefined, context);
+    assert.match(invalidGain.content[0].text, /minimum_gain must be a finite, non-negative normalized-score delta/);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "task.json")), false, "direct campaign intake never writes legacy task.json");
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false, "invalid intake does not create campaign state");
+  } finally { project.cleanup(); }
 });
 
 test("command completion discovers watch/resume, setup flags and ranking preferences", async () => {
@@ -68,15 +115,67 @@ test("command completion discovers watch/resume, setup flags and ranking prefere
     const complete = harness.commands.get("dream-rsi").getArgumentCompletions;
     const verbs = complete("").map((item) => item.value);
     assert.ok(verbs.includes("watch"));
+    assert.ok(verbs.includes("assess"));
+    assert.ok(verbs.includes("improve"));
     assert.ok(verbs.includes("resume"));
     assert.deepEqual(complete("res").map((item) => item.value), ["resume"]);
     assert.deepEqual(complete("create --f").map((item) => item.value), ["create --fresh"]);
     assert.deepEqual(complete("suggest sa").map((item) => item.value), ["suggest safest"]);
     assert.deepEqual(complete("best si").map((item) => item.value), ["best simplest"]);
+    assert.deepEqual(complete("ass").map((item) => item.value), ["assess"]);
+    assert.deepEqual(complete("imp").map((item) => item.value), ["improve"]);
     assert.equal(complete("watch 1"), null);
     assert.equal(complete("improve my program"), null, "free-text goals remain free text");
     assert.equal(harness.sentMessages.length, 0);
     assert.equal(fs.existsSync(project.dreamRoot), false, "completion does not create task state");
+  } finally { project.cleanup(); }
+});
+
+test("assess is read-only and works without a configured Dream-RSI task", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.commands.get("dream-rsi").handler("assess src/cache.ts", context);
+    assert.equal(harness.sentMessages.length, 1);
+    assert.equal(harness.sentMessages[0].content, "/skill:dream-rsi-assess src/cache.ts");
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), false);
+    assert.equal(harness.activeTools.includes("dream_rsi_apply"), false);
+    assert.equal(fs.existsSync(project.dreamRoot), false);
+  } finally { project.cleanup(); }
+});
+
+test("only explicit Dream-RSI improve intent enables campaign mode from ordinary input", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const input = harness.handlers.get("input");
+    for (const text of [
+      "What should we improve?",
+      "How does improvement work?",
+      "Assess what to optimize with Dream-RSI",
+      "What should we improve with Dream-RSI?",
+    ]) {
+      await input({ type: "input", source: "interactive", text }, context);
+      assert.equal(harness.activeTools.includes("dream_rsi_live"), false, `${text} stays read-only`);
+    }
+    await input({ type: "input", source: "extension", text: "Use Dream-RSI to improve this project" }, context);
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), false, "extension-generated prompts do not grant authorization");
+    await input({ type: "input", source: "interactive", text: "Use Dream-RSI to improve this project" }, context);
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), true, "explicit Dream-RSI improvement request enables mode");
+    assert.equal(fs.existsSync(project.dreamRoot), false, "enabling mode creates no task or campaign state");
+  } finally { project.cleanup(); }
+});
+
+test("explicit improve request routes to intake and enables the campaign controller", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.commands.get("dream-rsi").handler("improve src/cache.ts", context);
+    assert.equal(harness.sentMessages.length, 1);
+    assert.equal(harness.sentMessages[0].content, "/skill:dream-rsi-improve src/cache.ts");
+    assert.equal(harness.activeTools.includes("dream_rsi_improve"), true);
+    assert.equal(harness.activeTools.includes("dream_rsi_live"), true);
+    assert.equal(fs.existsSync(project.dreamRoot), false, "intake does not create a campaign before the skill calls the controller");
   } finally { project.cleanup(); }
 });
 
@@ -796,14 +895,17 @@ test("suggest ranks on demand, honours a preference, and refuses without a task"
   }
 });
 
-test("free text in an unconfigured project starts the interview with that goal", async () => {
+test("an explicit improvement request in an unconfigured project starts improvement intake", async () => {
   const project = makeProject();
   try {
     const { context, harness } = await boot(project);
     await harness.commands.get("dream-rsi").handler("speed up my benchmark", context);
     assert.equal(harness.sentMessages.length, 1);
-    assert.match(harness.sentMessages[0].content, /^\/skill:dream-rsi-create speed up my benchmark$/);
+    assert.match(harness.sentMessages[0].content, /^\/skill:dream-rsi-improve speed up my benchmark$/);
     assert.deepEqual(harness.sentMessages[0].options, { expandPromptTemplates: true });
+    harness.sentMessages.length = 0;
+    await harness.commands.get("dream-rsi").handler("what is in this repo", context);
+    assert.equal(harness.sentMessages.length, 0, "generic free text starts no improvement workflow");
   } finally {
     project.cleanup();
   }
@@ -940,7 +1042,7 @@ test("tool parameter schemas stay validatable and strict", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.equal(harness.tools.size, 6);
+    assert.equal(harness.tools.size, 7);
     for (const [name, tool] of harness.tools) {
       const schema = tool.parameters;
       assert.equal(schema.type, "object", `${name}: parameters must be an object schema`);

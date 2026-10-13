@@ -70,6 +70,11 @@ export interface LiveEpisodeOptions {
   policyTimeoutMs?: number;
   log?: (message: string) => void;
   signal?: AbortSignal;
+  /** Durable budget reservations called immediately before actual child starts. */
+  beforeAgentSpawn?: (key: string) => void;
+  beforeEvaluatorSpawn?: (key: string) => void;
+  /** Additional protected directories to keep out of full-workspace campaign snapshots. */
+  workspaceExcludes?: string[];
   /** Project-level claim owner, so another session cannot reclaim this in-flight cycle. */
   owner?: PhaseOwner;
   resume?: boolean;
@@ -296,7 +301,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     if (!fs.existsSync(seedSource)) throw new Error(`task workspace does not exist: ${seedSource}`);
     progress.activity("snapshotting seed workspace");
     const seedHash = await snapshotSeed(seedSource, seedWorkspace,
-      [dreamRoot, ...task.copy_exclude.map((e) => path.resolve(projectDir, e))]);
+      [dreamRoot, ...(rawOptions.workspaceExcludes ?? []), ...task.copy_exclude.map((e) => path.resolve(projectDir, e))]);
     if (signal.aborted) throw new Error("live episode aborted during seed snapshot");
     const hashes = freezePolicy(originalPolicy, path.join(path.dirname(seedWorkspace), "frozen"));
     cp = { version: 1, project: path.resolve(projectDir), task, manifest, policy: Object.keys(hashes)[0], policy_hashes: hashes,
@@ -374,7 +379,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
   ): Promise<PreparedAttempt> => {
     const prepareStarted = Date.now();
     const workspace = nodeWorkspace(dreamRoot, iteration, target.cell);
-    const copyExclude = [dreamRoot, ...(task.copy_exclude ?? []).map((entry) => path.resolve(projectDir, entry))];
+    const copyExclude = [dreamRoot, ...(options.workspaceExcludes ?? []), ...(task.copy_exclude ?? []).map((entry) => path.resolve(projectDir, entry))];
     await copyWorkspace(target.parentWorkspace, workspace, { exclude: copyExclude });
     const parentProposal = target.parentCell === "root" ? null : tree.get(target.parentCell)?.proposal ?? null;
     if (parentProposal) {
@@ -453,6 +458,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       timeoutMs: task.agent_timeout_ms,
       logPath: prepared.logPath,
       signal,
+      beforeSpawn: () => options.beforeAgentSpawn?.(`live:${iteration}:${prepared.cell}:retry:${pending.retry}`),
       onOutput: (event) => progress.output(prepared.cell, false, event),
       onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
     });
@@ -503,6 +509,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
           timeoutMs: task.evaluator_timeout_ms,
           logPath: path.join(recordDir, "eval.log"),
           signal,
+          beforeSpawn: () => options.beforeEvaluatorSpawn?.(`live:${iteration}:${prepared.cell}:eval:${checkpoint.extra_eval_calls}`),
           onOutput: (event) => progress.output(prepared.cell, true, event),
           onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
         });
@@ -558,6 +565,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
         timeoutMs: task.evaluator_timeout_ms,
         logPath: path.join(recordDir, "eval.log"),
         signal,
+        beforeSpawn: () => options.beforeEvaluatorSpawn?.(`live:${iteration}:${prepared.cell}:eval:${checkpoint.extra_eval_calls}`),
         onOutput: (event) => progress.output(prepared.cell, true, event),
         onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
       });

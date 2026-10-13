@@ -1,11 +1,33 @@
 # pi-dream-rsi
 
-A pi extension that runs the **Dream-RSI** method from *Recursive Self-Improvement through Evolving Worlds*
-(arXiv [2609.14858](https://arxiv.org/pdf/2609.14858)): a loop where coding agents try candidate programs in
-parallel, your scorer grades them, and the code that decides *what to try next* gets rewritten from what actually
-worked.
+A pi extension that runs the **Dream-RSI** method from *Recursive Self-Improvement through Evolving Worlds*.
+The implementation reference is [arXiv v1](https://arxiv.org/pdf/2609.14858v1); see the
+[v2 objective note](#replay-objective-version). Coding agents try candidate programs in parallel, your scorer
+grades them, and the code that decides *what to try next* gets rewritten from what actually worked.
 
 Created by **Juan Mackie** — [juanmackie.com](https://juanmackie.com)
+
+## Quick start
+
+See what this project can improve before running anything:
+
+```text
+/dream-rsi assess
+```
+
+Assessment inspects the current project and returns up to three evidence-backed goals with their likely
+scope and evaluation plan. It is read-only. Choose a goal to start the bounded campaign:
+
+```text
+/dream-rsi improve "reduce the median runtime of the parser without changing its output"
+```
+
+An improve request prepares and checks a target-specific evaluator, scores the unchanged target twice for
+a consistency check, then runs the campaign and applies only in-scope gains above its `minimum_gain`
+threshold (zero by default). It repeats across cycles within its call and time limits. The two baseline scores
+are not a statistical noise estimate; if the goal cannot be measured defensibly, intake stops for clarification.
+These commands are separate from the existing manual
+`/dream-rsi create`, `live`, `dream` and `run` workflow below.
 
 Compare it with the usual autonomous-research loop. Those try one thing, keep it or revert it, and repeat. The
 cleverness never compounds — every round starts as dumb as the first one. Here the thing that compounds is the
@@ -43,6 +65,15 @@ recorded, so a version can be scored on a world in milliseconds. Versions that m
 ```
 V = max s_v  -  beta1 * N  +  beta2 * N / max(1, k*)     # quality, minus work, plus batching
 ```
+
+### Replay objective version
+
+The manual exploration-policy runtime in this repository preserves the paper's v1 Eq. 1 above: best score,
+per-node cost, and a parallel-batching bonus controlled by `beta1` and `beta2`. The paper's
+[v2 revision](https://arxiv.org/html/2609.14858v2), posted 6 October 2026, changes Eq. 1 to normalized
+hypervolume over the quality–call frontier minus a parallelism penalty weighted by `lambda`. That is a different
+replay objective; v2's equation is not what this runtime currently computes. Updating to it requires an explicit
+algorithm and evaluation change, not just changing this description.
 
 `N` is how many nodes it revealed, `k*` how many decision rounds it used. A policy-development agent then reads
 the traces and the numbers and rewrites the policy code; that new version is replayed on the same history.
@@ -179,44 +210,52 @@ pi -e "/absolute/path/to/pi-dream-rsi"
 cp -r pi-dream-rsi .pi/extensions/pi-dream-rsi   # or ~/.pi/agent/extensions/pi-dream-rsi
 ```
 
-You get `/dream-rsi` (including `create`, `suggest`, `watch` and `resume`), the `Ctrl+Shift+D` dashboard shortcut,
-the `dream-rsi` and `dream-rsi-create` skills, and the
-`dream_rsi_*` tools. The extension contributes its own skill
+You get `/dream-rsi` (including `assess`, `improve`, `create`, `suggest`, `watch` and `resume`), the
+`Ctrl+Shift+D` dashboard shortcut, the `dream-rsi`, `dream-rsi-assess`, `dream-rsi-improve` and
+`dream-rsi-create` skills, and the `dream_rsi_*` tools. The extension contributes its own skill
 path, so the skill shows up however you loaded it. No runtime dependencies. Needs Node ≥ 22.18 (22.6+ with
 `--experimental-strip-types`) because policies are TypeScript executed in a worker thread — on an older runtime
 you get that sentence instead of a broken worker.
 
-Setup and read-only help/watch work before a task is configured. Phases and candidate ranking need a task,
-and *where* it is configured matters: every command and tool operates on
-`<cwd>/.dream-rsi/`, so `/dream-rsi run` in an unconfigured directory stops with
+Assessment and read-only help/watch work before a manual task is configured. A bounded improvement campaign
+can build its own target task and evaluator without changing a legacy task. The manual phases and candidate
+ranking need a task, and *where* it is configured matters: manual commands operate on `<cwd>/.dream-rsi/`, so
+`/dream-rsi run` in an unconfigured directory stops with
 `No Dream-RSI task in this project: …/task.json is missing.` See **First run** below.
 
 `/dream-rsi` alone prints help; `/dream-rsi status` prints state.
 
-## First run
+## Choose a workflow
 
-There are two ways in, and they are not interchangeable:
+There are three distinct ways to use Dream-RSI:
 
-- **`/dream-rsi create <goal>`** — the on-ramp. In a project with no task it turns mode on and loads the
-  `dream-rsi-create` skill, which interviews you (objective, seed workspace, candidate program, scorer,
-  budgets, agent), wires up the task, measures your code as the baseline, probes the attempt agent, and stops
-  before spending a cycle. In a project that already has a task it asks what you meant — show the config and
-  **the best candidate for that goal**, reconfigure the task through a fresh interview, or start an unrelated
-  task (the old state is archived, not deleted). `--reconfigure` and `--fresh` answer that question without the
-  dialog, for print/scripted use.
+- **Assess, then improve a target.** `/dream-rsi assess [target]` inspects the current project by default and
+  returns up to three evidence-backed improvement goals without changing files or running project commands.
+  `/dream-rsi improve <goal>` starts a separate bounded campaign after intake defines a trustworthy evaluator.
+  The controller then owns online search, policy replay, candidate verification, in-scope patch application and
+  repetition. It records campaign state under `.dream-rsi/campaigns/` and leaves any existing manual
+  `.dream-rsi/task.json` untouched. A direct request to improve or optimize a target also loads this intake; a
+  general question or assessment does not start it.
 
-- **You, at the prompt.** `/dream-rsi create [--reconfigure|--fresh] [goal]` sets up, reconfigures or reports,
-  `/dream-rsi suggest [goal]` ranks candidates, `/dream-rsi status` shows state, and `/dream-rsi watch [iteration]`
-  inspects trees and logs. `/dream-rsi live [n]`, `dream`, `run [n]` and `resume [iteration]` enable mode and
-  ask the agent to run the selected work. `/dream-rsi off` disables gated tools while running work continues.
-  `help` (alias `?`, also the bare command) shows help without changing mode. Free text is treated as a goal.
-- **The agent.** The `dream_rsi_*` tools. `dream_rsi_init` writes the configuration, `dream_rsi_live`/
-  `dream_rsi_dream` run the phases, `dream_rsi_resume` continues an interrupted live tree,
-  `dream_rsi_apply` copies a candidate back, and `dream_rsi_status` reports.
+- **Configure the manual policy loop.** `/dream-rsi create <goal>` is the on-ramp for the task-based workflow.
+  With no task, it interviews you about the objective, seed workspace, candidate program, scorer, budgets and
+  agent, measures your code as the baseline, probes the attempt agent, and stops before a cycle. With an
+  existing task, it can report the configuration and candidates, reconfigure through an interview, or start a
+  fresh unrelated task. `--reconfigure` and `--fresh` answer directly. Manual `live`, `dream`, `run`, and
+  `resume` commands still use `<cwd>/.dream-rsi/task.json`.
 
-**`create` and free text route themselves** to setup or an existing task. `suggest`/`best`, `live`, `dream`,
-`run` and `resume` need `<cwd>/.dream-rsi/task.json`. `/dream-rsi create <goal>` writes it via the interview;
-commands that need it report this when it is missing:
+- **Inspect or continue a manual task.** `/dream-rsi suggest [goal]` ranks its candidates, `/dream-rsi status`
+  reports state, and `/dream-rsi watch [campaign|legacy] [iteration]` opens the tree/log view. `Ctrl+Shift+D`
+  follows an active campaign, then legacy history. Manual `live [n]`, `dream`, `run [n]`, and `resume [iteration]`
+  enable mode and ask the agent to run the selected work. `/dream-rsi off` disables gated manual tools while
+  running work continues. Help (`?`, or the bare command) changes no mode.
+
+The campaign and manual workflows have different write behavior. An explicit `/dream-rsi improve` request
+authorizes the campaign controller to apply verified, in-scope gains within its fixed limits. Manual candidates
+remain unapplied until you call `dream_rsi_apply confirm=true`. Assessment and generic questions are read-only.
+
+Only the manual phases and candidate ranking require `<cwd>/.dream-rsi/task.json`. In an unconfigured
+directory, `/dream-rsi run` reports:
 
 ```text
 No Dream-RSI task in this project: <cwd>/.dream-rsi/task.json is missing.
@@ -225,13 +264,9 @@ or copy a task.json you configured elsewhere into <cwd>/.dream-rsi.
 Current directory: <cwd>
 ```
 
-Which usually means one of two things: you are in the wrong directory (the task lives in the project you want to
-optimize, not in this one), or nobody has configured it yet. If it's the second, `/dream-rsi create <goal>` — or
-just say what you want optimized and let the `dream-rsi-create` skill ask the questions:
-
-```text
-set up Dream-RSI: seed workspace task/seed, candidate file solution.cpp, scorer `node /abs/path/score.mjs`
-```
+That means either you are in the wrong directory or no manual task exists here yet. Use `/dream-rsi create <goal>`
+to configure the manual loop. To optimize a target through a bounded campaign, use `/dream-rsi improve <goal>`;
+it prepares its own task and evaluator.
 
 Or drive the tools yourself (budgets here are the paper's task shape; the shipped defaults are smaller — `W=4,
 K1=6, K2=8, M=3`):
@@ -262,25 +297,58 @@ Everything above is also in the `dream-rsi` skill, which the agent reads on its 
 | `dream_rsi_resume` | remaining original budget + retries | Continue an interrupted live tree with its original effective settings and budget. Completed attempts are reused (including completed timeout assessments, without another scorer call); a saved completed generator only needs evaluation. Later rounds can start new attempts within the original budget. Retries add calls and are reported separately. |
 | `dream_rsi_dream` | `M − 1` agent calls | Offline phase: replay `M` policy versions over completed worlds, sweep beta, rewrite the policy, deploy the winner. Releases interrupted claims while preserving checkpoints, then refuses while a phase is genuinely in flight or its manifest is unreadable. Only worlds under the current scoring contract are replayed. Revision-call count is fixed; replay work and history-reading tokens grow with history. |
 | `dream_rsi_apply` | two scorer runs | Copies a candidate's `eval_program` over your code, but only after your code measures better with it than without it. Needs `confirm: true`; writes all files or none; never commits. |
-| `dream_rsi_status` | nothing | Iterations, completed worlds, policy versions, last sweep, persisted live progress, recoverable checkpoints and candidates waiting to be applied. |
+| `dream_rsi_status` | nothing | Legacy iterations, completed worlds, policy versions, last sweep, persisted live progress, recoverable checkpoints and candidates waiting to be applied; also the isolated campaign summary and progress when one exists. |
+| `dream_rsi_improve` | bounded campaign budget | `start` runs the complete live → replay/revise → verify full patch → apply → repeat controller; `status`, `stop` and `resume` operate on the saved campaign. Explicit improve intent authorizes verified in-scope application. |
 
-`dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` only become callable in Dream-RSI mode.
+Manual `dream_rsi_live`, `dream_rsi_resume`, `dream_rsi_dream` and `dream_rsi_apply` are gated behind Dream-RSI
+mode. The separate `dream_rsi_improve` tool is available for campaign status/stop; `start` and `resume` require
+explicit improvement intent. `dream_rsi_assess` is a skill-driven read-only command, not a tool.
 
 | Command | What it does |
 |---------|--------------|
 | `/dream-rsi create [--reconfigure\|--fresh] [goal]` | Interview (fresh project), or on a configured project ask: report + best candidate for `<goal>`, reconfigure, or start fresh. Flags before the goal skip the dialog. |
+| `/dream-rsi assess [target]` | Read-only inspection; rank up to three evidence-backed improvement goals. Works without a configured manual task. |
+| `/dream-rsi improve <goal>` | Prepare and run an isolated bounded campaign that verifies and applies in-scope wins, then repeats. Does not reconfigure the legacy task. |
 | `/dream-rsi suggest <goal>` | Rank the candidates on demand. `best` is an alias. Preferences: `fastest`, `safest`, `simplest`. |
-| `/dream-rsi watch [iteration]` | Open the tree/log dashboard; defaults to the latest active cycle, then latest recorded. `Ctrl+Shift+D` opens it during a run. |
+| `/dream-rsi watch [campaign|legacy] [iteration]` | Open the tree/log dashboard. The default watches a running or paused campaign, then returns to legacy history when the campaign is terminal; choose `campaign` or `legacy` explicitly to browse either root. `Ctrl+Shift+D` follows the same default. |
 | `/dream-rsi resume [iteration]` | Ask the agent to resume the selected interrupted live cycle, or the latest recoverable one. |
 | `/dream-rsi status` | The same state `dream_rsi_status` shows. |
 | `/dream-rsi live [n]` \| `dream` | Ask the agent for one phase. Live defaults to 1 new cycle; `n` is 1–8 parallel cycles, clamped to the shared task cap. |
 | `/dream-rsi run [n]` | Ask the agent for `n` new full cycles, live then dream. Default 1; range 1–100. |
 | `/dream-rsi off` | Disable gated tools; saved state and running work are kept. |
 | `/dream-rsi [help\|?]` | Show syntax, defaults and dashboard controls without changing mode. |
-| *anything else* | Treated as a goal: interview in a fresh project, suggestion in a configured one. |
+| *other input* | A direct request to improve/optimize routes to campaign intake; generic questions do not start work. In a configured manual task, goal text can rank recorded candidates. |
 
 Tab completes subcommands, `create` flags and `suggest`/`best` preferences. In RPC/JSON/print mode, help,
 status and command errors are delivered as session messages without starting an agent turn.
+
+### Campaign limits and evaluation
+
+An improve campaign uses a separate task and immutable declared verifier. Intake sets the goal, target, scope,
+correctness gates and evaluator before the controller starts. Scorer code, fixtures and configuration must be
+declared through `verifier_inputs` and kept outside candidate-editable paths. Use project-relative paths for
+protected project files or canonical absolute paths for external verifier files. The controller fingerprints
+them and rejects changes during the run. Candidate patches include added, updated and deleted files and are
+verified as a whole against the current target before application. The target must remain inside the declared scope.
+
+| Campaign limit | Default |
+|---|---:|
+| Completed cycles | 5 |
+| Workers `W` / online rounds `K1` / replay rounds `K2` / policy versions `M` / parallel worlds | 2 / 3 / 4 / 2 / 1 |
+| Agent starts | 36 |
+| Evaluator starts | 100 |
+| Campaign deadline | 60 minutes from controller start (after intake) |
+| Completed cycles without a verified gain | 2 |
+| Candidate verifications / applied patches | At most 3 / at most 1 per cycle |
+
+The agent-start cap includes the initial probe, retries and policy revisions; the evaluator cap includes the two
+unchanged-target baseline checks. Intake work is separate from the campaign caps. Requested lower cycle, agent or
+evaluator caps are honored; resume uses the saved remaining budgets and original deadline. `minimum_gain` defaults
+to zero and is a strict normalized-score gain required for promotion. The two baseline checks must both be valid
+and finite and agree within that tolerance. Two checks are only a consistency test, not a statistical noise
+estimate. For a noisy evaluator, intake must use a repeated paired protocol and a justified tolerance. Tests
+establish correctness, not improvement; if acceptance cases are already saturated and no separate metric has
+measurable headroom, intake stops to clarify the goal instead of inventing progress.
 
 Starting a fresh task archives the current one instead of deleting it: `task.json`, `policy/`,
 `policy_versions/`, `history/`, `trace_pool/`, `work/` and `runtime/` are renamed into
@@ -291,13 +359,16 @@ change.
 ## Watching and resuming a cycle
 
 Live and dream phases automatically show a terminal widget with the cycle, round budget, active workers,
-completed attempts, best score and latest activity. `/dream-rsi watch` or `Ctrl+Shift+D` opens an overlay
-while work continues. Left/right selects a cycle; up/down selects a tree node; Tab switches between tree,
+completed attempts, best score and latest activity. Campaign workers feed the same widget. `/dream-rsi watch`
+or `Ctrl+Shift+D` opens an overlay while work continues. The shortcut and bare `watch` follow a running or
+paused improvement campaign; after it ends they return to the legacy task history. Use `/dream-rsi watch legacy`
+to inspect manual-loop history during a campaign, or `/dream-rsi watch campaign` to inspect a campaign after it
+ends. Left/right selects a cycle; up/down selects a tree node; Tab switches between tree,
 tool activity, agent output and evaluator output; `d` switches between live and dream progress.
 Page Up loads older log pages from disk, Page Down returns to
 the tail, and Esc closes the view. Closing the view leaves the cycle running. Another pi session opened
 in the same project can watch its persisted progress. Historical worlds, including worlds from older
-versions, can also be inspected with `/dream-rsi watch 1`.
+versions can also be inspected with `/dream-rsi watch legacy 1`; use `/dream-rsi watch campaign 1` for a campaign tree.
 
 Terminal dashboards run only in `tui` mode. RPC, JSON and print hosts receive text updates and structured
 `details.progress`; `dream_rsi_status` includes persisted live progress and recoverable iterations. Watching is
@@ -410,10 +481,12 @@ Evaluator retries preserve their previous workspace and log under `eval_retry_<n
 Checkpoints and their seed, policy and attempt snapshots must stay together; active and recoverable trees
 are protected from workspace retention.
 
-## Applying an improvement (nothing is automatic)
+## Applying a manual candidate (confirmation required)
 
-**Dream-RSI never writes to your code.** Every candidate lives inside `.dream-rsi/work/r<iter>/<cell>/`, the
-scorer runs on that copy, and your own files keep their timestamps. What *is* automatic is the search policy
+This section describes the manual task workflow. Its candidates live inside `.dream-rsi/work/r<iter>/<cell>/`;
+the scorer runs on that copy, and your source tree remains untouched until you call `dream_rsi_apply` with
+`confirm: true`. The controller's automatic verified patch application belongs to the separate
+`/dream-rsi improve` campaign described above. In the manual loop, what is automatic is the search policy
 (`.dream-rsi/policy/method.ts`, deployed only when it wins the replay comparison) — not your program.
 
 So the loop has to tell you when there is something worth taking, and *which* one. It does, in five places:
@@ -439,9 +512,9 @@ So the loop has to tell you when there is something worth taking, and *which* on
 On the mnemosyne run this is the difference between `fastest` (a memoization win that trades a 20 ms staleness
 window the assertions cannot see) and `safest` (a candidate that keeps freshness and gives up 1.5% of the win).
 
-A candidate is reported only if it beats your measured baseline (or the last thing you applied) by at least
-**1%** — noise-level differences stay quiet. The registry is append-only: `history/applied.jsonl` records what
-you took, so the same candidate is not offered twice.
+A manual candidate is reported only if it beats your measured baseline (or the last thing you applied) by at
+least **1%**. This fixed reporting threshold does not estimate evaluator noise. The registry is append-only:
+`history/applied.jsonl` records what you took, so the same candidate is not offered twice.
 
 ### Taking it
 
@@ -479,8 +552,8 @@ What it does and does not do:
 unverified. The check is one run before and one run after: it catches a broken or worse result, but it does not
 make a noisy scorer reliable.
 
-**A new cycle starts from your code as it is.** Cycles do not build on a candidate until you apply it, so apply
-the pending candidate before the next `dream_rsi_live` when the next cycle must continue from it.
+**A new manual cycle starts from your code as it is.** Manual cycles do not build on a candidate until you apply
+it, so apply the pending candidate before the next `dream_rsi_live` when the next cycle must continue from it.
 
 Or do it by hand, which is the same thing:
 
@@ -604,7 +677,7 @@ from it here.
 ## References
 
 - *Dream-RSI: Recursive Self-Improvement through Evolving Worlds*, arXiv
-  [2609.14858](https://arxiv.org/pdf/2609.14858) (copy in this repo at `2609.14858v1.pdf`). Appendix B's prompts
+  [2609.14858 v1](https://arxiv.org/pdf/2609.14858v1) (copy in this repo at `2609.14858v1.pdf`). Appendix B's prompts
   ship nearly verbatim in `prompts/`. The method is the paper's authors' work; this package is an independent
   implementation of it.
 - Built for [pi](https://pi.dev/), following its extension API

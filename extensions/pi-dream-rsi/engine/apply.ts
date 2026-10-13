@@ -88,11 +88,14 @@ export async function scoreSeedCopy(options: {
   logPath: string;
   overlay?: Pick<ApplyFile, "relative" | "from">[];
   signal?: AbortSignal;
+  beforeEvaluatorSpawn?: (key: string) => void;
+  evaluatorKey?: string;
+  exclude?: string[];
 }): Promise<ScoreOutcome> {
   const { dreamRoot, projectDir, task, scratch } = options;
   const seed = path.resolve(projectDir, task.workspace);
   try {
-    await copyWorkspace(seed, scratch, { exclude: [dreamRoot, path.join(projectDir, ".git")] });
+    await copyWorkspace(seed, scratch, { exclude: [dreamRoot, path.join(projectDir, ".git"), ...(options.exclude ?? [])] });
     for (const file of options.overlay ?? []) {
       // The copy keeps the seed's symlinks. A link that leaves the copy would let this write reach
       // the real workspace before anything was verified.
@@ -109,6 +112,7 @@ export async function scoreSeedCopy(options: {
       timeoutMs: task.evaluator_timeout_ms,
       logPath: options.logPath,
       signal: options.signal,
+      beforeSpawn: () => options.beforeEvaluatorSpawn?.(options.evaluatorKey ?? "apply-score"),
     });
     return interpretEvaluation(task, command, readScoreFile(scratch, task));
   } finally {
@@ -178,8 +182,9 @@ export async function verifyApply(options: {
   /** Scorer logs land here as `before.log` and `after.log`. */
   evidenceDir: string;
   signal?: AbortSignal;
+  beforeEvaluatorSpawn?: (key: string) => void;
 }): Promise<ApplyVerification> {
-  const { dreamRoot, projectDir, task, files, evidenceDir, signal } = options;
+  const { dreamRoot, projectDir, task, files, evidenceDir, signal, beforeEvaluatorSpawn } = options;
   const scratch = path.join(workRoot(dreamRoot), `apply-verify-${process.pid}-${Date.now()}`);
   // A cancelled run is not a verdict: stop instead of comparing a score with a killed evaluator.
   const stopIfCancelled = (): void => {
@@ -187,13 +192,15 @@ export async function verifyApply(options: {
   };
   stopIfCancelled();
   const before = await scoreSeedCopy({
-    dreamRoot, projectDir, task, signal,
+    dreamRoot, projectDir, task, signal, beforeEvaluatorSpawn,
+    evaluatorKey: "apply-before",
     scratch: `${scratch}-before`,
     logPath: path.join(evidenceDir, "before.log"),
   });
   stopIfCancelled();
   const after = await scoreSeedCopy({
-    dreamRoot, projectDir, task, signal,
+    dreamRoot, projectDir, task, signal, beforeEvaluatorSpawn,
+    evaluatorKey: "apply-after",
     scratch: `${scratch}-after`,
     logPath: path.join(evidenceDir, "after.log"),
     overlay: files,

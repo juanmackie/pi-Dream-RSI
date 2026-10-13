@@ -21,7 +21,7 @@ import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-work
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { readTask, validateTask, writeTask, defaultTask, programFingerprint, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
+import { readTask, validateTask, writeTask, defaultTask, normalizeTask, programFingerprint, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import { Dashboard } from "./dashboard.ts";
 import { buildAgentArgs } from "./agent/runner.ts";
 import { readCheckpoint, recoverableIterations } from "./engine/checkpoint.ts";
@@ -30,6 +30,7 @@ import { allocator, dreamIsActive, phaseIsActive, pidIsAlive } from "./engine/ow
 import { writeCurrentManifest, readJson, currentManifestPath, type LiveCycleManifest } from "./engine/world.ts";
 import { runLiveEpisode } from "./engine/live.ts";
 import { planNextGrid, runDreamPhase } from "./engine/dream.ts";
+import { readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignStatus } from "./engine/campaign.ts";
 import { loadPrompt } from "./engine/prompt.ts";
 import {
   activeRuns,
@@ -156,6 +157,60 @@ const statusParams = {
   properties: {
     detail: { type: "string", description: "'summary' (default) or 'full' for the per-version score table." },
   },
+  additionalProperties: false,
+};
+
+const campaignTaskParams = {
+  type: "object",
+  properties: {
+    name: { type: "string", description: "Campaign task name." },
+    workspace: { type: "string", description: "Seed workspace directory, relative to project_dir." },
+    eval_program: { type: "string", description: "Candidate program path, relative to workspace." },
+    score_program: { type: "string", description: "Fixed scoring command that writes the configured score file." },
+    problem_file: { type: "string", description: "Optional problem statement path, relative to project_dir." },
+    score_path: { type: "string", description: "Score JSON path (default eval/score.json)." },
+    score_field: { type: "string", description: "Numeric score field (default score)." },
+    valid_field: { type: "string", description: "Boolean correctness field (default valid)." },
+    fail_class_field: { type: "string", description: "Failure-class field (default fail_class)." },
+    error_field: { type: "string", description: "Error field (default error)." },
+    higher_is_better: { type: "boolean", description: "False when the score is a cost." },
+    workers: { type: "number", description: "Parallel attempts (campaign default 2)." },
+    max_loops: { type: "number", description: "Concurrent online episodes cap (campaign default 1)." },
+    k1: { type: "number", description: "Online rounds (campaign default 3)." },
+    k2: { type: "number", description: "Replay rounds (campaign default 4)." },
+    revisions: { type: "number", description: "Policy revisions per dream (campaign default 2)." },
+    beta1: { type: "number", description: "Optional base exploration beta." },
+    beta2: { type: "number", description: "Optional refinement beta." },
+    beta_grid: { type: "array", items: { type: "number" }, description: "Optional beta values used by replay." },
+    default_beta: { type: "number", description: "Initial exploration beta." },
+    agent_timeout_ms: { type: "number", description: "Maximum time allowed for one agent call." },
+    evaluator_timeout_ms: { type: "number", description: "Maximum time allowed for one evaluator call." },
+    copy_exclude: { type: "array", items: { type: "string" }, description: "Workspace-relative paths omitted from copied attempts." },
+    work_retention: { type: "number", description: "Number of recent attempt workspaces to retain." },
+    guidance: { type: "string", enum: ["off", "summary"], description: "Whether to include bounded prior-work guidance in agent prompts." },
+    agent_command: { type: "string", description: "Agent CLI executable." },
+    agent_args: { type: "array", items: { type: "string" }, description: "Arguments passed to the agent CLI." },
+    model: { type: "string", description: "Optional model name passed to the agent CLI." },
+  },
+  required: ["name", "workspace", "eval_program", "score_program"],
+  additionalProperties: false,
+};
+
+const improveParams = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["start", "status", "stop", "resume"], description: "Campaign action to start, inspect, stop or resume." },
+    goal: { type: "string", description: "Concrete improvement goal. Required for start." },
+    project_dir: { type: "string", description: "Local project or managed clone path; defaults to the current project." },
+    task: { ...campaignTaskParams, description: "Direct task/evaluator configuration for this isolated campaign. Does not change the legacy task." },
+    scope: { type: "array", items: { type: "string" }, description: "Workspace-relative files the campaign may change and apply." },
+    verifier_inputs: { type: "array", items: { type: "string" }, description: "Required evaluator/test inputs outside the editable workspace; use project-relative paths or canonical absolute paths. Their content is hashed and they are excluded from promotion." },
+    max_cycles: { type: "integer", minimum: 1, maximum: 5, description: "Optional lower cycle cap (campaign default 5). Use this to honor a request such as 'run 2 cycles'." },
+    max_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Optional lower spawned-agent cap (campaign default 36)." },
+    max_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Optional lower evaluator-run cap (campaign default 100)." },
+    minimum_gain: { type: "number", minimum: 0, description: "Optional finite normalized-score delta; the baseline must repeat within this tolerance, and a candidate must beat it to qualify." },
+  },
+  required: ["action"],
   additionalProperties: false,
 };
 
@@ -1070,23 +1125,128 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
       const root = dreamRoot(ctx);
       const state = stateFor(ctx);
+      const campaign = readCampaignStatus(root);
       if (!fs.existsSync(path.join(root, "task.json"))) {
-        return { content: [{ type: "text", text: `No Dream-RSI task at ${root}. Use dream_rsi_init to configure one.` }], details: {} };
+        return campaign
+          ? {
+              content: [{ type: "text", text: renderCampaignStatus(campaign) }],
+              details: { campaign, campaignProgress: progressSnapshots(campaign.campaignRoot) },
+            }
+          : { content: [{ type: "text", text: `No Dream-RSI task at ${root}. Use dream_rsi_init to configure one.` }], details: {} };
       }
       const ranking = suggestionFor(ctx);
       const summary = statusSummary(root, { full: params.detail === "full", sessionIteration: state.iteration });
       const lines = [summary, renderSuggestion(ranking, { compact: true })];
+      if (campaign) lines.push("", renderCampaignStatus(campaign));
       if (ranking.seed) lines.push(`  baseline: your code measures ${ranking.seed.raw_score ?? "n/a"} (${ranking.seed.fail_class}${ranking.seed.fail_class === "ok" ? "" : `: ${ranking.seed.error}`})`);
       setStatus(ctx, ranking);
       return { content: [{ type: "text", text: lines.join("\n") }], details: { root, improvements: ranking, recoverable: recoverableIterations(root),
-        progress: progressIterations(root).map((i) => readProgress(root, i)).filter(Boolean) } };
+        progress: progressIterations(root).map((i) => readProgress(root, i)).filter(Boolean),
+        ...(campaign ? { campaignProgress: progressSnapshots(campaign.campaignRoot) } : {}) } };
+    },
+  });
+
+  pi.registerTool({
+    name: "dream_rsi_improve",
+    label: "Dream-RSI Improve",
+    description:
+      "Start, inspect, stop or resume an isolated, budgeted Dream-RSI improvement campaign. A start supplies its own goal, project directory and task/evaluator config, so it never reconfigures the legacy .dream-rsi task.",
+    promptSnippet: "Control the active isolated Dream-RSI campaign. Start only for an explicit improvement request; assess requests are read-only.",
+    promptGuidelines: [
+      "For dream_rsi_improve, use action=start only after the user explicitly asks to improve or optimize a target and intake has defined a measurable goal, correctness gate, task workspace, candidate program and fixed evaluator outside the candidate workspace, declared in verifier_inputs. Absolute external verifier paths are allowed.",
+      "For dream_rsi_improve, pass the direct task and project_dir from intake. Do not read or overwrite a different task in the base .dream-rsi directory.",
+      "For dream_rsi_improve, assess a target-only request and offer measurable goals first. Do not call start from /dream-rsi assess or a generic question.",
+      "For dream_rsi_improve, start/resume is enabled only after an explicit improve request has activated Dream-RSI mode; status and stop remain controllable while mode is off.",
+      "For dream_rsi_improve, use status, stop and resume against the active campaign. Resume uses its frozen goal, task, scope and verifier inputs.",
+      "For dream_rsi_improve, use minimum_gain only when the evaluator has a defensible deterministic normalized-score tolerance; the controller requires two valid baseline scores within it and also requires a candidate to exceed it.",
+      "For dream_rsi_improve, the campaign applies at most one in-scope candidate per cycle, only after its verifier measures a strict improvement. Report the final stop reason and call budget.",
+    ],
+    parameters: improveParams,
+    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
+      const baseRoot = dreamRoot(ctx);
+      const action = typeof params.action === "string" ? params.action : "";
+      if (action === "status") {
+        const campaign = readCampaignStatus(baseRoot);
+        return campaign
+          ? { content: [{ type: "text", text: renderCampaignStatus(campaign) }], details: { campaign } }
+          : { content: [{ type: "text", text: `No improvement campaign is recorded under ${baseRoot}.` }], details: { campaign: null } };
+      }
+      if (action === "stop") {
+        const campaign = stopCampaign(baseRoot);
+        return campaign
+          ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign)}` }], details: { campaign } }
+          : { content: [{ type: "text", text: `No active improvement campaign under ${baseRoot}.` }], details: { campaign: null } };
+      }
+      if (action !== "start" && action !== "resume") {
+        return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
+      }
+      if (!stateFor(ctx).mode) {
+        return { content: [{ type: "text", text: "Start/resume requires an explicit improvement request. Use /dream-rsi improve <target/goal> or ask directly to improve a target; assessment and generic questions do not enable campaign execution." }], details: { ok: false } };
+      }
+
+      const projectDir = action === "start"
+        ? resolveCampaignProjectDir(params.project_dir, ctx.cwd)
+        : readCampaignStatus(baseRoot)?.projectDir ?? null;
+      if (!projectDir) {
+        return { content: [{ type: "text", text: action === "resume" ? "No resumable campaign with a saved project directory." : "project_dir must name an existing local project directory." }], details: { ok: false } };
+      }
+      if (action === "start") {
+        const goal = typeof params.goal === "string" ? params.goal.trim() : "";
+        if (!goal) return { content: [{ type: "text", text: "action=start requires a concrete measurable goal." }], details: { ok: false } };
+        const parsed = parseCampaignTask(params.task, ctx);
+        if (parsed.errors.length > 0 || !parsed.task) {
+          return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
+        }
+        const task = { ...parsed.task, agent: runAgentConfig(ctx, parsed.task.agent) };
+        const errors = validateCampaignPaths(projectDir, task);
+        if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
+        const scope = readStringArray(params.scope, "scope");
+        const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
+        if (scope.error || verifierInputs.error) {
+          const errors = [scope.error, verifierInputs.error].filter((error): error is string => error !== null);
+          return { content: [{ type: "text", text: errors.join("\n") }], details: { ok: false, errors } };
+        }
+        const campaignScope = scope.values?.length ? scope.values : [task.eval_program];
+        const inputErrors = validateCampaignInputs(baseRoot, projectDir, task, campaignScope, verifierInputs.values);
+        if (inputErrors.length > 0) return { content: [{ type: "text", text: `Campaign inputs are invalid:\n- ${inputErrors.join("\n- ")}` }], details: { ok: false, errors: inputErrors } };
+        const limitResult = parseCampaignLimits(params);
+        if (limitResult.error) return { content: [{ type: "text", text: limitResult.error }], details: { ok: false } };
+        const gainResult = parseCampaignMinimumGain(params.minimum_gain);
+        if (gainResult.error) return { content: [{ type: "text", text: gainResult.error }], details: { ok: false } };
+        setMode(ctx, true);
+        const result = await runCampaign({
+          baseRoot,
+          projectDir,
+          task,
+          goal,
+          scope: campaignScope,
+          ...(verifierInputs.values ? { verifierInputs: verifierInputs.values } : {}),
+          ...(limitResult.limits ? { limits: limitResult.limits } : {}),
+          ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
+          signal,
+          onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+          onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+          onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+        });
+        return { content: [{ type: "text", text: renderCampaignStatus(result) }], details: { campaign: result } };
+      }
+      setMode(ctx, true);
+      const result = await resumeCampaign({
+        baseRoot,
+        projectDir,
+        signal,
+        onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+        onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+        onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+      });
+      return { content: [{ type: "text", text: renderCampaignStatus(result) }], details: { campaign: result } };
     },
   });
 
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: create [--reconfigure|--fresh] [goal] | suggest/best [goal] | status | watch [iteration] | resume [iteration] | live [n] | dream | run [n] | off | help",
+    description: "Dream-RSI: assess [target] | improve [target/goal] | create [--reconfigure|--fresh] [goal] | suggest/best [goal] | status | watch [campaign|legacy] [iteration] | resume [iteration] | stop | live [n] | dream | run [n] | off | help",
     getArgumentCompletions: commandCompletions,
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
@@ -1138,13 +1298,52 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       };
 
       if (verb === "watch") {
-        if (rest && !validIteration(rest)) { report("watch expects a positive, safely representable integer iteration number", "error"); return; }
-        const summary = await dashboardFor(ctx).watch(root, rest ? Number(rest) : undefined);
+        const campaign = readCampaignStatus(root);
+        const [first, second, ...extra] = rest.split(/\s+/).filter(Boolean);
+        const target = first === "campaign" || first === "legacy" ? first : null;
+        const iterationText = target ? second : first;
+        const hasExtraArguments = target ? extra.length > 0 : second !== undefined || extra.length > 0;
+        if (hasExtraArguments || (iterationText && !validIteration(iterationText))) {
+          report("watch expects [campaign|legacy] and a positive, safely representable integer iteration number", "error");
+          return;
+        }
+        if (target === "campaign" && !campaign) {
+          report("No improvement campaign is recorded here.", "error");
+          return;
+        }
+        const watchRoot = resolveWatchRoot(root, campaign, target);
+        const summary = await dashboardFor(ctx).watch(watchRoot, iterationText ? Number(iterationText) : undefined);
         if (summary) pi.sendMessage({ customType: "dream-rsi/watch", content: summary, display: true }, { triggerTurn: false });
+        return;
+      }
+      if (verb === "assess") {
+        sendWhenReady(`/skill:dream-rsi-assess ${rest}`.trim());
+        return;
+      }
+      if (verb === "improve") {
+        setMode(ctx, true);
+        sendWhenReady(`/skill:dream-rsi-improve ${rest}`.trim());
+        report("Dream-RSI improvement intake started. A target without a measurable goal is assessed first.", "info");
+        return;
+      }
+      if (verb === "stop") {
+        const campaign = stopCampaign(root);
+        report(campaign ? `Stop requested.\n${renderCampaignStatus(campaign)}` : "No active improvement campaign is recorded here.", campaign ? "info" : "error");
         return;
       }
       if (verb === "resume") {
         if (rest && !validIteration(rest)) { report("resume expects a positive, safely representable integer iteration number", "error"); return; }
+        const campaign = readCampaignStatus(root);
+        if (campaign?.state.kind === "paused") {
+          setMode(ctx, true);
+          sendWhenReady("/skill:dream-rsi-improve resume");
+          report("Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.", "info");
+          return;
+        }
+        if (campaign?.state.kind === "running") {
+          report("The Dream-RSI improvement campaign is already running. Use /dream-rsi status or watch to inspect it, or /dream-rsi stop to pause it.", "info");
+          return;
+        }
         if (!configured) { missingTask(); return; }
         setMode(ctx, true);
         sendWhenReady(`Resume the interrupted Dream-RSI live cycle${rest ? ` ${rest}` : " with the latest recoverable checkpoint"} using dream_rsi_resume${rest ? ` iteration=${rest}` : ""}. Report the saved settings, kept attempts and remaining budgets before running.`);
@@ -1156,7 +1355,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return;
       }
       if (verb === "status") {
-        report(configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`, "info");
+        const campaign = readCampaignStatus(root);
+        const legacy = configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`;
+        report(campaign ? `${legacy}\n\n${renderCampaignStatus(campaign)}` : legacy, "info");
         return;
       }
       if (verb === "create") {
@@ -1282,11 +1483,17 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         report(renderCommandHelp(root, configured), "info");
         return;
       }
-      // Anything else is a goal: pick up where the project is, don't make the user learn verbs.
+      // Keep bare text from starting an improvement campaign. A configured task treats it as a
+      // read-only candidate-ranking preference; an explicit optimization request may start intake.
       if (!configured) {
+        const freeText = `${verb} ${rest}`.trim();
+        if (!/\b(improve|optimi[sz]e|speed\s+up|accelerate|reduce|lower|increase|raise|tune)\b/i.test(freeText)) {
+          report(`Nothing is configured here. Use /dream-rsi assess to inspect targets or /dream-rsi improve <goal> to start an explicit improvement request.`, "info");
+          return;
+        }
         setMode(ctx, true);
-        report("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
-        sendWhenReady(`/skill:dream-rsi-create ${verb} ${rest}`.replace(/\s+/g, " ").trim());
+        report("Dream-RSI improvement intake started", "info");
+        sendWhenReady(`/skill:dream-rsi-improve ${freeText}`.replace(/\s+/g, " ").trim());
         return;
       }
       showSuggestion(`${verb} ${rest}`.trim());
@@ -1295,7 +1502,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
   // -- lifecycle -----------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+d", { description: "Watch Dream-RSI tree and worker output", handler: async (ctx) => { await dashboardFor(ctx).watch(dreamRoot(ctx)); } });
+  pi.registerShortcut("ctrl+shift+d", { description: "Watch Dream-RSI tree and worker output", handler: async (ctx) => {
+    const baseRoot = dreamRoot(ctx);
+    const campaign = readCampaignStatus(baseRoot);
+    await dashboardFor(ctx).watch(resolveWatchRoot(baseRoot, campaign));
+  } });
+  pi.on("input", async (event, ctx) => {
+    if (event.source !== "extension" && explicitlyRequestsImprovement(event.text)) setMode(ctx, true);
+    return { action: "continue" };
+  });
   pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
   pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
   // Contribute the skill from this package, so the loop is documented to the agent even when the
@@ -1401,18 +1616,21 @@ function renderExistingConfig(root: string, cwd: string, sessionIteration: numbe
 function renderCommandHelp(root: string, configured: boolean): string {
   return [
     "Dream-RSI (arXiv 2609.14858)",
+    "  /dream-rsi assess [target] inspect the project and rank measurable improvement targets (read-only)",
+    "  /dream-rsi improve [target/goal] start a bounded improvement campaign",
     "  /dream-rsi create [goal]    set up a task here (loads the dream-rsi-create skill); on a configured",
     "                              project, ask whether to report, reconfigure or start fresh",
     "  /dream-rsi create --reconfigure|--fresh [goal]",
     "                              the same choice without the dialog (print/scripted use)",
     "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest (alias: best)",
     "  /dream-rsi status           iterations, worlds, policies, sweep, progress and recoverable checkpoints",
-    "  /dream-rsi watch [iteration] browse trees/logs; default: latest active cycle, then latest recorded",
+    "  /dream-rsi watch [campaign|legacy] [iteration] browse trees/logs; active campaign is default, otherwise legacy",
     "                              Ctrl+Shift+D opens the same view; arrows select cycles/nodes,",
     "                              d switches live/dream, Tab changes panes, PgUp/PgDn page logs, Esc closes",
     "                              RPC/JSON/print hosts receive text; watching spends no agent time",
     "  /dream-rsi resume [iteration] ask the agent to continue an interrupted tree; default: latest recoverable",
     "                              keeps completed attempts, original settings and remaining budget; retries add calls",
+    "  /dream-rsi stop             stop the active improvement campaign",
     "  /dream-rsi live [n]         ask the agent for new online cycles; default: 1, range: 1–8, shared task cap",
     "  /dream-rsi dream            ask the agent for one offline policy-improvement phase",
     "  /dream-rsi run [n]          ask the agent for n full cycles (live then dream); default: 1, range: 1–100",
@@ -1420,8 +1638,8 @@ function renderCommandHelp(root: string, configured: boolean): string {
     "  /dream-rsi help | ?         show this help (also /dream-rsi alone; leaves mode unchanged)",
     "",
     configured
-      ? `Configured here (task file: ${path.join(root, "task.json")}). Anything else you type is treated as a goal for a suggestion.`
-      : `Nothing configured here yet: \`/dream-rsi create <goal>\` starts the interview (or any text does), and writes ${path.join(root, "task.json")}.`,
+      ? `Configured here (task file: ${path.join(root, "task.json")}). \`suggest\` ranks recorded candidates; \`assess\` finds new targets.`
+      : `Nothing configured here yet. Use \`assess\` to inspect, or \`improve\` / \`create\` for an explicit improvement request.`,
     `  root: ${root}`,
   ].join("\n");
 }
@@ -1431,11 +1649,14 @@ function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   let choices = [
     { value: "create", label: "create [goal]", description: "Set up, reconfigure or archive a task" },
+    { value: "assess", label: "assess [target]", description: "Read-only scan for measurable improvement targets" },
+    { value: "improve", label: "improve [target/goal]", description: "Start a bounded improvement campaign" },
     { value: "suggest", label: "suggest [goal]", description: "Rank recorded candidates" },
     { value: "best", label: "best [goal]", description: "Alias for suggest" },
     { value: "status", label: "status", description: "State, progress and recoverable checkpoints" },
-    { value: "watch", label: "watch [iteration]", description: "Inspect trees and logs without agent calls" },
+    { value: "watch", label: "watch [campaign|legacy] [iteration]", description: "Inspect campaign or legacy trees and logs without agent calls" },
     { value: "resume", label: "resume [iteration]", description: "Continue an interrupted live tree with saved settings" },
+    { value: "stop", label: "stop", description: "Stop the active improvement campaign" },
     { value: "live", label: "live [n]", description: "Start new online cycles; default 1, up to 8 (shared task cap)" },
     { value: "dream", label: "dream", description: "Improve the policy using completed worlds" },
     { value: "run", label: "run [n]", description: "Start full live/dream cycles; default 1, up to 100" },
@@ -1454,6 +1675,257 @@ function commandCompletions(prefix: string) {
 
 function validIteration(value: string): boolean {
   return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
+}
+
+function explicitlyRequestsImprovement(text: string): boolean {
+  const input = text.trim();
+  if (/^\/dream-rsi\s+(assess|status|watch|suggest|best|help|\?)\b/i.test(input)) return false;
+  if (/\b(assess|evaluate|what should|how does|why does|suggest|recommend)\b.{0,100}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
+  if (/\b(what|how|why|should|could|can)\b.{0,80}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
+  return (
+    /\b(use|run|start|ask)\b.{0,50}\bdream[- ]rsi\b.{0,60}\b(improve|optimi[sz]e)\b/i.test(input) ||
+    /\bdream[- ]rsi\b.{0,50}\b(improve|optimi[sz]e)\b/i.test(input) ||
+    /\b(improve|optimi[sz]e)\b.{0,100}\b(with|using|via)\s+dream[- ]rsi\b/i.test(input)
+  );
+}
+
+function resolveCampaignProjectDir(value: unknown, cwd: string): string | null {
+  if (value !== undefined && typeof value !== "string") return null;
+  const target = path.resolve(cwd, normalizePathArg(typeof value === "string" ? value : cwd));
+  try {
+    return fs.statSync(target).isDirectory() ? target : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseCampaignTask(value: unknown, ctx: ExtensionContext): { task: TaskConfig | null; errors: string[] } {
+  if (!isRecord(value)) return { task: null, errors: ["task must be an object with name, workspace, eval_program and score_program"] };
+  const raw = value;
+  const betaGrid = numberArray(raw.beta_grid);
+  const copyExclude = stringArray(raw.copy_exclude);
+  const agentArgs = stringArray(raw.agent_args);
+  const malformed = [
+    ...(raw.beta_grid !== undefined && !betaGrid ? ["beta_grid must be an array of numbers"] : []),
+    ...(raw.copy_exclude !== undefined && !copyExclude ? ["copy_exclude must be an array of strings"] : []),
+    ...(raw.agent_args !== undefined && !agentArgs ? ["agent_args must be an array of strings"] : []),
+  ];
+  if (malformed.length > 0) return { task: null, errors: malformed };
+  try {
+    const task: TaskConfig = normalizeTask({
+      name: typeof raw.name === "string" ? raw.name : "",
+      workspace: typeof raw.workspace === "string" ? normalizePathArg(raw.workspace) : "",
+      eval_program: typeof raw.eval_program === "string" ? normalizePathArg(raw.eval_program) : "",
+      score_program: typeof raw.score_program === "string" ? raw.score_program : "",
+      ...(typeof raw.problem_file === "string" ? { problem_file: normalizePathArg(raw.problem_file) } : {}),
+      ...(typeof raw.score_path === "string" ? { score_path: raw.score_path } : {}),
+      ...(typeof raw.score_field === "string" ? { score_field: raw.score_field } : {}),
+      ...(typeof raw.valid_field === "string" ? { valid_field: raw.valid_field } : {}),
+      ...(typeof raw.fail_class_field === "string" ? { fail_class_field: raw.fail_class_field } : {}),
+      ...(typeof raw.error_field === "string" ? { error_field: raw.error_field } : {}),
+      ...(typeof raw.higher_is_better === "boolean" ? { higher_is_better: raw.higher_is_better } : {}),
+      ...(typeof raw.workers === "number" ? { workers: raw.workers } : {}),
+      ...(typeof raw.max_loops === "number" ? { max_loops: raw.max_loops } : {}),
+      ...(typeof raw.k1 === "number" ? { k1: raw.k1 } : {}),
+      ...(typeof raw.k2 === "number" ? { k2: raw.k2 } : {}),
+      ...(typeof raw.revisions === "number" ? { revisions: raw.revisions } : {}),
+      ...(typeof raw.beta1 === "number" ? { beta1: raw.beta1 } : {}),
+      ...(typeof raw.beta2 === "number" ? { beta2: raw.beta2 } : {}),
+      ...(betaGrid ? { beta_grid: betaGrid } : {}),
+      ...(typeof raw.default_beta === "number" ? { default_beta: raw.default_beta } : {}),
+      ...(typeof raw.agent_timeout_ms === "number" ? { agent_timeout_ms: raw.agent_timeout_ms } : {}),
+      ...(typeof raw.evaluator_timeout_ms === "number" ? { evaluator_timeout_ms: raw.evaluator_timeout_ms } : {}),
+      ...(copyExclude ? { copy_exclude: copyExclude } : {}),
+      ...(typeof raw.work_retention === "number" ? { work_retention: raw.work_retention } : {}),
+      ...(raw.guidance === "off" || raw.guidance === "summary" ? { guidance: raw.guidance } : {}),
+      agent: {
+        ...defaultTask().agent,
+        ...(typeof raw.agent_command === "string" ? { command: raw.agent_command } : {}),
+        ...(agentArgs ? { args: agentArgs } : {}),
+        model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
+        thinking: (ctx.thinkingLevel as TaskConfig["agent"]["thinking"] | undefined) ?? null,
+      },
+    });
+    return { task, errors: validateTask(task) };
+  } catch (error) {
+    return { task: null, errors: [(error as Error).message] };
+  }
+}
+
+function validateCampaignPaths(projectDir: string, task: TaskConfig): string[] {
+  const errors: string[] = [];
+  const workspace = resolveWithinRoot(projectDir, task.workspace);
+  if (!workspace || !fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) errors.push(`workspace must exist inside the project directory: ${task.workspace}`);
+  if (task.problem_file) {
+    const problemFile = resolveWithinRoot(projectDir, task.problem_file);
+    if (!problemFile || !fs.existsSync(problemFile)) errors.push(`problem_file must exist inside the project directory: ${task.problem_file}`);
+  }
+  if (!workspace) return errors;
+  const candidate = resolveWithinRoot(workspace, task.eval_program);
+  if (!candidate || !fs.existsSync(candidate)) errors.push(`eval_program must exist inside the campaign workspace: ${task.eval_program}`);
+  return errors;
+}
+
+function validateCampaignInputs(baseRoot: string, projectDir: string, task: TaskConfig, scope?: string[], verifierInputs?: string[]): string[] {
+  const errors: string[] = [];
+  const workspace = path.resolve(projectDir, task.workspace);
+  let realWorkspace: string | null = null;
+  try { realWorkspace = fs.realpathSync(workspace); } catch { /* validateCampaignPaths reports the missing workspace */ }
+  let realTrustedRoot: string | null = null;
+  try { realTrustedRoot = fs.realpathSync(baseRoot); } catch { /* it is created when the campaign starts */ }
+  if (!verifierInputs || verifierInputs.length === 0) errors.push("verifier_inputs must declare at least one fixed evaluator or test input outside the editable workspace");
+  for (const relative of scope ?? []) {
+    if (path.isAbsolute(relative) || !resolveWithinRoot(workspace, relative)) errors.push(`scope entry must stay inside the campaign workspace: ${relative}`);
+  }
+  for (const input of verifierInputs ?? []) {
+    let resolved: string | null = null;
+    if (path.isAbsolute(input)) {
+      try {
+        const actual = fs.realpathSync(input);
+        if (path.resolve(input).toLowerCase() !== actual.toLowerCase()) {
+          errors.push(`absolute verifier input must be canonical (real) path: ${input}`);
+          continue;
+        }
+        resolved = actual;
+      } catch {
+        errors.push(`absolute verifier input does not exist: ${input}`);
+        continue;
+      }
+    } else {
+      resolved = resolveWithinRoot(projectDir, input);
+    }
+    if (!resolved || !fs.existsSync(resolved)) {
+      errors.push(`verifier input does not exist or escapes the project directory: ${input}`);
+      continue;
+    }
+    const actual = fs.realpathSync(resolved);
+    const insideWorkspace = realWorkspace !== null && isPathWithin(realWorkspace, actual);
+    const insideTrustedRoot = realTrustedRoot !== null && isPathWithin(realTrustedRoot, actual);
+    if (insideWorkspace && !insideTrustedRoot) {
+      errors.push(`verifier input must be outside the editable workspace or inside the trusted host .dream-rsi subtree: ${input}`);
+    }
+  }
+  return errors;
+}
+
+function isPathWithin(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function readStringArray(value: unknown, name: string): { values?: string[]; error: string | null } {
+  if (value === undefined) return { error: null };
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
+    return { error: `${name} must be an array of non-empty strings` };
+  }
+  return { values: value.map((entry) => entry.trim()), error: null };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function numberArray(value: unknown): number[] | null {
+  return Array.isArray(value) && value.every((entry): entry is number => typeof entry === "number") ? value : null;
+}
+
+function stringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string") ? value : null;
+}
+
+function progressSnapshots(root: string): ProgressSnapshot[] {
+  return progressIterations(root).flatMap((iteration) =>
+    (["live", "dream"] as const)
+      .map((phase) => readProgress(root, iteration, phase))
+      .filter((snapshot): snapshot is ProgressSnapshot => snapshot !== null),
+  );
+}
+
+function resolveWatchRoot(baseRoot: string, campaign: CampaignStatus | null, target?: "campaign" | "legacy" | null): string {
+  if (target === "legacy") return baseRoot;
+  if (target === "campaign") return campaign?.campaignRoot ?? baseRoot;
+  return campaign && (campaign.state.kind === "running" || campaign.state.kind === "paused")
+    ? campaign.campaignRoot
+    : baseRoot;
+}
+
+function campaignPhaseProgress(
+  dashboard: Dashboard,
+  baseRoot: string,
+  onUpdate: ((update: any) => void) | undefined,
+  isClosing: () => boolean,
+): (progress: ProgressSnapshot) => void {
+  return (progress) => {
+    if (!isClosing()) dashboard.observe(progress);
+    onUpdate?.({
+      content: [{ type: "text", text: progressSummary(progress) }],
+      details: { campaign: readCampaignStatus(baseRoot), progress },
+    });
+  };
+}
+
+function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<typeof runCampaign>>): string {
+  const state = campaign.state;
+  const cycle = campaign.completedCycles.length;
+  const activeIteration = state.kind === "running" || state.kind === "paused" ? state.iteration : null;
+  const lines = [
+    `Improvement campaign: ${state.kind}${state.kind === "running" || state.kind === "paused" ? ` (${state.phase})` : ""}`,
+    `  goal: ${campaign.goal}`,
+    `  target: ${campaign.projectDir}${campaign.scope.length ? ` [${campaign.scope.join(", ")}]` : ""}`,
+    `  cycles: ${cycle}/${campaign.limits.maxCycles}${activeIteration === null ? "" : `; working on ${activeIteration}`}; no-gain cycles: ${campaign.noGainCycles}`,
+    `  verified best: ${campaign.bestScore}`,
+    `  calls: ${campaign.agentStarts}/${campaign.limits.maxAgentStarts} agent starts, ${campaign.evaluatorRuns}/${campaign.limits.maxEvaluatorRuns} evaluator runs`,
+    `  deadline: ${campaign.deadlineAt}`,
+  ];
+  if (state.kind === "paused" || state.kind === "complete" || state.kind === "failed") lines.push(`  stopped because: ${state.reason}`);
+  if ("stopReason" in campaign && campaign.stopReason) lines.push(`  stop reason: ${campaign.stopReason}`);
+  return lines.join("\n");
+}
+
+function campaignProgress(ctx: ExtensionContext, baseRoot: string, onUpdate: ((update: any) => void) | undefined, isClosing: () => boolean): (progress: string) => void {
+  return (progress) => {
+    const campaign = readCampaignStatus(baseRoot);
+    if (!isClosing()) {
+      ctx.ui.setStatus("dream-rsi", `dream-rsi: ${campaign?.state.kind === "running" ? campaign.state.phase : "improving"} (${campaign?.completedCycles.length ?? 0}/${campaign?.limits.maxCycles ?? 5})`);
+    }
+    onUpdate?.({ content: [{ type: "text", text: `Dream-RSI campaign: ${progress}` }], details: { campaign } });
+  };
+}
+
+function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void) | undefined, isClosing: () => boolean): (campaign: CampaignStatus) => void {
+  return (campaign) => {
+    if (!isClosing()) {
+      const phase = campaign.state.kind === "running" ? campaign.state.phase : campaign.state.kind;
+      ctx.ui.setStatus("dream-rsi", `dream-rsi: ${phase} (${campaign.completedCycles.length}/${campaign.limits.maxCycles})`);
+    }
+    onUpdate?.({ content: [{ type: "text", text: renderCampaignStatus(campaign) }], details: { campaign } });
+  };
+}
+
+function parseCampaignLimits(params: Record<string, unknown>): { limits?: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number }; error?: string } {
+  const fields = [
+    ["max_cycles", "maxCycles", 5],
+    ["max_agent_starts", "maxAgentStarts", 36],
+    ["max_evaluator_runs", "maxEvaluatorRuns", 100],
+  ] as const;
+  const limits: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number } = {};
+  for (const [input, output, maximum] of fields) {
+    const value = params[input];
+    if (value === undefined) continue;
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > maximum) {
+      return { error: `${input} must be an integer from 1 to ${maximum}` };
+    }
+    limits[output] = value;
+  }
+  return { ...(Object.keys(limits).length > 0 ? { limits } : {}) };
+}
+
+function parseCampaignMinimumGain(value: unknown): { minimumGain?: number; error?: string } {
+  if (value === undefined) return {};
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return { error: "minimum_gain must be a finite, non-negative normalized-score delta" };
+  }
+  return { minimumGain: value };
 }
 
 function recoveryNotice(iterations: number[]): string {

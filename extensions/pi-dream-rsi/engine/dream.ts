@@ -64,6 +64,10 @@ export interface DreamOptions {
   evaluateOnly?: boolean;
   /** Cancellation: stops replay workers and the development agent, and blocks deployment. */
   signal?: AbortSignal;
+  /** Durable campaign reservation immediately before each policy revision child starts. */
+  beforeAgentSpawn?: (key: string) => void;
+  /** Durable evaluator reservation for the campaign's seed/apply scorer runs. */
+  beforeEvaluatorSpawn?: (key: string) => void;
 }
 
 export interface VersionEvaluation {
@@ -493,6 +497,7 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
         timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
         logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
         signal: options.signal,
+        beforeSpawn: () => options.beforeAgentSpawn?.(`dream:${iteration}:revision:${revision + 1}`),
         onOutput: (event) => progress.output(cell, false, event),
       });
       progress.stage(cell, "root", revision + 1, agentRun.ok ? "complete" : "failed", 0, null, agentRun.spawnError);

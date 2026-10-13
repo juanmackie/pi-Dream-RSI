@@ -42,6 +42,8 @@ export interface CommandResult {
 
 export interface RunOptions {
   onOutput?: (event: OutputEvent) => void;
+  /** Synchronous durable budget reservation immediately before the child process is spawned. */
+  beforeSpawn?: () => void;
   /** Durable child ownership; unlike output observers, errors cancel execution. */
   onSpawn?: (pid: number) => void;
   outputFormat?: "text" | "pi-json";
@@ -207,6 +209,7 @@ async function collect(
       const argv = options.shell
         ? [`${command}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
+      options.beforeSpawn?.();
       child = spawn(argv[0] as string, argv[1] as string[], {
         cwd: options.cwd,
         shell: options.shell,
