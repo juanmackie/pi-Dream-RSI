@@ -1,15 +1,13 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
-import { createJiti } from "jiti";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const setup = JSON.parse(fs.readFileSync(path.join(root, ".audit", "self-setup-report.json"), "utf8"));
 const intake = JSON.parse(fs.readFileSync(setup.intake, "utf8"));
-const jiti = createJiti(import.meta.url);
-const { normalizeTask } = await jiti.import(path.join(root, "extensions/pi-dream-rsi/engine/task.ts"));
-const { checkCampaignEvaluator } = await jiti.import(path.join(root, "extensions/pi-dream-rsi/engine/campaign.ts"));
+const { normalizeTask } = await import(pathToFileURL(path.join(root, "extensions/pi-dream-rsi/engine/task.ts")).href);
+const { checkCampaignEvaluator } = await import(pathToFileURL(path.join(root, "extensions/pi-dream-rsi/engine/campaign.ts")).href);
 const report = await checkCampaignEvaluator({
   baseRoot: path.join(root, ".dream-rsi"),
   projectDir: intake.project_dir,
