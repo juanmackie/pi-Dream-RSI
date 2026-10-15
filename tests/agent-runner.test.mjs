@@ -70,6 +70,25 @@ test("a null session resolver preserves the saved custom CLI flags", async () =>
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("runAgent quotes an executable path containing spaces on Windows shell invocation", {
+  skip: process.platform !== "win32" ? "Windows shell quoting only" : !process.execPath.includes(" ") ? "Node executable path has no spaces" : false,
+}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-executable-space-"));
+  try {
+    const script = path.join(dir, "capture.mjs");
+    const output = path.join(dir, "ran.txt");
+    fs.writeFileSync(script, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(output)}, "ok");\n`);
+    const result = await runAgent({
+      agent: { command: process.execPath, args: [script], model: null, thinking: null, prompt_via: "stdin" },
+      cwd: dir,
+      prompt: "run",
+      timeoutMs: 10_000,
+    });
+    assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+    assert.equal(fs.readFileSync(output, "utf8"), "ok");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("runAgent resolves session configuration separately at each call", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-resolver-"));
   try {

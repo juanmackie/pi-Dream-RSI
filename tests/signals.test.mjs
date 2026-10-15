@@ -88,6 +88,23 @@ test("session signals aggregate safe command heads, correlate edits, and redact 
   }
 });
 
+test("PowerShell script text supplies the duration command head when command is absent", async () => {
+  const projectDir = tempDir();
+  const sessionDir = path.join(projectDir, "sessions");
+  writeSession(sessionDir, projectDir, [
+    toolEntry("powershell-run", "powershell", { script: "npm test -- --runInBand" }, NOW.getTime()),
+    toolResult("powershell-run", "powershell", "completed", NOW.getTime() + 4200, { details: { durationMs: 4200 } }),
+  ]);
+  try {
+    const result = await collectSignals({ projectDir, sessionDir, now: NOW });
+    const duration = result.weaknesses.find((item) => item.kind === "slow-command");
+    assert.equal(duration?.evidence[0]?.ref, "npm test");
+    assert.match(duration?.summary ?? "", /4200 ms/);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
 test("no-log mode never inspects the session directory", async () => {
   const projectDir = tempDir();
   const sessionDir = path.join(projectDir, "sessions");

@@ -61,7 +61,7 @@ The default campaign limits are:
 | Replay rounds (`K2`) | 4 |
 | Policy versions (`M`) | 2 |
 | Parallel worlds (`loops`) | 1 |
-| Agent starts | 36, including the initial probe, retries, and policy revisions |
+| Agent starts | 36, including the initial probe, retries, policy revisions, and reviews |
 | Evaluator starts | 100, including baseline checks, candidate pairs, and gates |
 | Campaign deadline | 60 minutes from controller start (after intake) |
 | Consecutive completed cycles without a verified gain | 2 |
@@ -85,5 +85,7 @@ Use `dream_rsi_improve` actions as follows:
 - `resume` continues the active campaign with its saved task, target, evaluator, remaining call budget, and deadline.
 
 The controller stops at the first of these conditions: two completed cycles have no verified gain against the latest promoted target, five cycles finish, the agent or evaluator cap runs out, or the deadline expires. A failed or unavailable evaluator is not a plateau. Report it as `unverifiable`, explain the failure, and ask for the measurement decision needed before starting a new campaign. Do not describe a failed campaign as paused or resume it without resolving the evaluator issue.
+
+When the campaign stops, report applied changes, measured gains, gate and review outcomes, the stop reason, and actual agent and evaluator counts. List the remaining ranked levers with ready `/dream-rsi improve "<goal>"` commands. End after reporting; each further lever needs a new improvement request.
 
 If the baseline cannot be scored, generated acceptance cases have no headroom, or the project cannot support a defensible improvement measure, do not call `start`. Explain the evidence and ask the user to choose a measurable goal or review a proposal without automatic promotion. A noisy baseline can use the default calibration when `minimum_gain` is omitted.

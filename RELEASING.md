@@ -96,16 +96,14 @@ curl -s -o /dev/null -w "%{http_code}\n" https://pi.dev/packages/pi-dream-rsi
   invokes `prepublishOnly`, which runs the typecheck and full test suite before upload; a failed check blocks release.
 - Keep automated `npm publish` permission limited to the `publish.yml` trusted publisher. Publishing a second
   tarball for the same version is rejected by npm.
-- README, four skills, command help/completions and tool descriptions must agree on all seven tools, assessment
-  and campaign lifecycle, dashboard root selection, mode gating, campaign limits and interrupted live-tree
-  recovery. Historical plans are labelled as such.
-- Linux and Windows CI must pass on the commit being released; recovery tests exercise process cleanup and
-  durable checkpoints. On a scratch task, check `/dream-rsi help`, headless status and `Ctrl+Shift+D` while
-  work runs. Interrupt and explicitly resume a live tree; confirm completed attempts are kept, original
-  settings stay fixed, and only the completed world enters dream replay.
-- `npm pack --dry-run` must include `dashboard.ts`, agent output decoding, progress/checkpoint/ownership and
-  campaign modules, prompts and all four skills. Terminal UI APIs come from the pi host; there are no package
-  runtime deps.
+- The README, skills, command help, and tool descriptions must agree on assessment, campaign intake, evaluator
+  checks, calibrated baselines, paired verification, gates, review, apply, and campaign controls. They must
+  also explain that legacy manual data remains unused.
+- Linux and Windows CI must pass on the commit being released. On a scratch project, check assessment, campaign
+  status, stop and resume, and the watch dashboard. Confirm that a rejected or unverified candidate is never
+  applied and that the journal records an accepted patch.
+- `npm pack --dry-run` must include the extension, prompts, skills, README, and `docs/`. Terminal UI APIs come
+  from the pi host. The package has no runtime npm dependencies.
 
 ## Development setup
 
@@ -116,8 +114,7 @@ pi install "C:/Users/juanm/Documents/GitHub/pi Dream-RSI"   # dev: working tree,
 pi install npm:pi-dream-rsi                                # users: unpinned, so `pi update --extensions` works
 ```
 
-- Install **one** form at a time. A local path plus an `npm:` entry loads the package twice (extensions and
-  skills both), and a `.dream-rsi` loop would then have two copies of the policy surface competing.
+- Install one form at a time. A local path plus an `npm:` entry loads the extension and skills from both copies.
 - Verify what users actually get with a throwaway install that leaves settings untouched:
 
 ```bash

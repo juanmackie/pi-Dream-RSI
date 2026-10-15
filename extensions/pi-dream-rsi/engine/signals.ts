@@ -220,7 +220,7 @@ function collectOneSession(projectDir: string, content: string): SessionFacts | 
     callResults.set(call.id, { call, result });
     const duration = call.name === "bash" || call.name === "powershell" ? getDuration(call, result) : null;
     if (duration !== null) {
-      const head = commandHead(call.args.command);
+      const head = commandHead(call.args.command ?? call.args.script);
       const old = durations.get(head) ?? { count: 0, total: 0, max: 0 };
       durations.set(head, { count: old.count + 1, total: old.total + duration, max: Math.max(old.max, duration) });
     }

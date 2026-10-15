@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import test from "node:test";
 
@@ -49,18 +51,35 @@ test("check keeps unrepresentable score spreads out of its JSON report", async (
 
 test("check diagnoses relative evaluator paths that only resolve from the target", async () => {
   const project = makeProject();
+  let scratchScript;
   try {
     const campaign = await jump("engine/campaign.ts");
     const workspace = path.join(project.projectDir, "nested");
     fs.mkdirSync(workspace);
     fs.writeFileSync(path.join(workspace, "solution.py"), "print('nested')\n");
-    const task = { ...project.task, workspace: "nested", score_program: "node ../score-ok.mjs" };
+    const relativeName = `relative-check-${crypto.randomUUID()}.mjs`;
+    const declaredScript = path.join(project.projectDir, relativeName);
+    scratchScript = path.join(os.tmpdir(), relativeName);
+    const marker = path.join(project.dir, "escaped-script-started.txt");
+    fs.writeFileSync(declaredScript, "process.exit(0);\n");
+    fs.writeFileSync(scratchScript, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "started"); process.exit(0);\n`);
+    const task = { ...project.task, workspace: "nested", score_program: `node ../${relativeName}` };
     const report = await campaign.checkCampaignEvaluator({
       baseRoot: project.dreamRoot, projectDir: project.projectDir, task,
-      verifierInputs: [path.join(project.projectDir, "score-ok.mjs")], runs: 1,
+      verifierInputs: [declaredScript], gates: ["node -e \"process.exit(0)\""], runs: 2,
     });
     assert.ok(report.diagnoses.some((message) => /use an absolute path/i.test(message)));
-  } finally { project.cleanup(); }
+    assert.equal(fs.existsSync(marker), false, "the escaped relative scorer is diagnosed without execution");
+    assert.equal(report.runs.length, 2);
+    assert.ok(report.runs.every((run) => run.code === null && run.failClass === "configuration_error" && !run.valid));
+    assert.equal(report.gateRuns.length, 1);
+    assert.equal(report.gateRuns[0].code, null);
+    assert.equal(report.gateRuns[0].passed, false);
+    assert.ok(fs.existsSync(report.reportPath), "configuration failures still produce the check report");
+  } finally {
+    if (scratchScript) fs.rmSync(scratchScript, { force: true });
+    project.cleanup();
+  }
 });
 
 test("check diagnoses missing interpreters and clamps evaluator timeout", async () => {

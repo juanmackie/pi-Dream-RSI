@@ -1,6 +1,6 @@
 {
   "name": "pi-dream-rsi",
-  "version": "0.8.1",
+  "version": "1.0.0",
   "type": "module",
   "description": "Dream-RSI for pi: project self-assessment, bounded verifier-driven code improvement, and recursive exploration-policy optimization.",
   "keywords": [
@@ -48,6 +48,7 @@
     "extensions",
     "skills",
     "prompts",
+    "docs",
     "README.md",
     "LICENSE",
     "package.json"

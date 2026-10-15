@@ -393,13 +393,25 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
   if (!Number.isSafeInteger(runs) || runs < 1 || runs > 5) throw new Error("check runs must be an integer between 1 and 5");
   if (gates.some((gate) => typeof gate !== "string" || gate.trim() === "")) throw new Error("gate commands must be non-empty strings");
   assertTrustedVerifier(projectDir, targetRoot, baseRoot, task, verifierInputs);
-  const diagnoses = relativeEvaluatorPathDiagnoses(task, targetRoot);
+  const pathDiagnoses = relativeEvaluatorPathDiagnoses(task, targetRoot);
+  const diagnoses = [...pathDiagnoses];
   if (requestedTimeoutMs > CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS) diagnoses.push(`requested evaluator timeout was capped at ${CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS / 1000} s`);
   const checkDir = path.join(baseRoot, "checks");
   const scratchParent = os.tmpdir();
   const runResults: CampaignCheckRun[] = [];
   for (let index = 0; index < runs; index += 1) {
     if (options.signal?.aborted) throw new Error("evaluator check was cancelled");
+    if (pathDiagnoses.length > 0) {
+      runResults.push({
+        durationMs: 0,
+        code: null,
+        valid: false,
+        failClass: "configuration_error",
+        score: null,
+        error: pathDiagnoses.join("; "),
+      });
+      continue;
+    }
     const commandCapture: { value?: CommandResult } = {};
     const outcome = await scoreSeedCopy({
       dreamRoot: baseRoot,
@@ -440,6 +452,10 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
   const gateRuns: CampaignCheckReport["gateRuns"] = [];
   for (const [index, gate] of gates.entries()) {
     if (options.signal?.aborted) throw new Error("evaluator check was cancelled");
+    if (pathDiagnoses.length > 0) {
+      gateRuns.push({ command: gate, code: null, passed: false, error: `not run because the score_program path is unsafe: ${pathDiagnoses.join("; ")}` });
+      continue;
+    }
     const result = await runCampaignGate({
       sourceRoot: targetRoot,
       scratch: path.join(scratchParent, `dream-rsi-check-gate-${crypto.randomUUID()}`),

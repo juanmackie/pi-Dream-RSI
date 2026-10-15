@@ -106,7 +106,7 @@ export function quoteForShell(arg: string): string {
 async function collect(
   command: string,
   args: string[],
-  options: RunOptions & { shell: boolean; stdin?: string },
+  options: RunOptions & { shell: boolean; stdin?: string; quoteExecutable?: boolean },
 ): Promise<CommandResult> {
   const started = Date.now();
   if (options.logPath) fs.mkdirSync(path.dirname(options.logPath), { recursive: true });
@@ -204,10 +204,11 @@ async function collect(
       const env: NodeJS.ProcessEnv = { ...process.env };
       for (const key of STRIPPED_SESSION_ENV) delete env[key];
       Object.assign(env, options.env ?? {});
-      // With a shell we pass one pre-quoted command line: Node would otherwise concatenate `args`
-      // unescaped (and warn about it). `command` is never quoted (it may itself be a command line).
+      // With a shell, quote each argument before joining it. Agent executables can opt into quoting;
+      // runShellCommand keeps its caller-owned command line intact.
+      const commandText = options.quoteExecutable ? quoteForShell(command) : command;
       const argv = options.shell
-        ? [`${command}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
+        ? [`${commandText}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
       options.beforeSpawn?.();
       child = spawn(argv[0] as string, argv[1] as string[], {
@@ -446,9 +447,9 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
   options = { ...options, outputFormat: json ? "pi-json" : "text" };
   const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
   if (agent.prompt_via === "arg") {
-    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, env });
+    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, quoteExecutable: shell, env });
   }
-  return collect(command, invocationArgs, { ...options, shell, env, stdin: options.prompt });
+  return collect(command, invocationArgs, { ...options, shell, quoteExecutable: shell, env, stdin: options.prompt });
 }
 
 /**
