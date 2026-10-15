@@ -1,11 +1,75 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, matchesKey, Key } from "@earendil-works/pi-tui";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth, matchesKey, Key } from "@earendil-works/pi-tui";
 import { progressIterations, progressSummary, readProgress, type ProgressSnapshot } from "./engine/progress.ts";
 import { attemptDir, roundDir } from "./engine/world.ts";
 
 const clean = (s: string): string => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f]/g, " ");
+type RowKind = "title" | "section" | "row" | "selected" | "ok" | "warn" | "error" | "muted";
+interface DashboardRow { kind: RowKind; text: string; log?: boolean; tree?: boolean }
+interface CampaignDisplayMetadata {
+  id: string;
+  maxCycles: number;
+  phase?: string;
+  iteration?: number;
+  completedCycles: number[];
+}
+
+function rowKind(text: string): RowKind {
+  if (/^(Tool activity|Agent log|Evaluator log)/i.test(text)) return "section";
+  if (/\b(error|timeout|fail(?:ed|ure)?|rejected)\b/i.test(text)) return "error";
+  if (/\b(agent|evaluation|running|preparing)\b/i.test(text)) return "warn";
+  if (/\b(ok|applied|complete|success)\b/i.test(text)) return "ok";
+  if (/\b(unopened|n\/a)\b/i.test(text)) return "muted";
+  return "row";
+}
+
+function campaignDisplayMetadata(root: string, fallbackCycle: number, cycleCount: number): CampaignDisplayMetadata {
+  let id = path.basename(root);
+  let maxCycles = Math.max(cycleCount, 1);
+  let phase: string | undefined;
+  let iteration: number | undefined;
+  let completedCycles: number[] = [];
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(path.join(root, "campaign.json"), "utf8"));
+    if (typeof value === "object" && value !== null) {
+      const record = value as { id?: unknown; limits?: { maxCycles?: unknown }; state?: { kind?: unknown; phase?: unknown; iteration?: unknown }; completedCycles?: unknown };
+      if (typeof record.id === "string" && record.id.length > 0) id = record.id;
+      if (typeof record.limits?.maxCycles === "number" && Number.isFinite(record.limits.maxCycles) && record.limits.maxCycles > 0) maxCycles = Math.floor(record.limits.maxCycles);
+      if (typeof record.state?.phase === "string") phase = record.state.phase;
+      else if (typeof record.state?.kind === "string") phase = record.state.kind;
+      if (typeof record.state?.iteration === "number" && Number.isFinite(record.state.iteration)) iteration = record.state.iteration;
+      if (Array.isArray(record.completedCycles)) completedCycles = record.completedCycles.filter((cycle): cycle is number => typeof cycle === "number" && Number.isFinite(cycle));
+    }
+  } catch { /* A missing campaign record falls back to the observed progress. */ }
+  return { id: id.slice(0, 8), maxCycles, phase, iteration: iteration ?? fallbackCycle, completedCycles };
+}
+
+function selectedRejections(root: string, iteration: number, cell: string): { stage: string; reasons: string[] }[] {
+  if (!cell) return [];
+  const file = path.join(root, "history", "rejections.jsonl");
+  const { text } = readLogPage(file);
+  const cycles = progressIterations(root);
+  const metadata = campaignDisplayMetadata(root, iteration, cycles.length);
+  const allowUnscoped = cycles.length <= 1 && metadata.maxCycles <= 1 && iteration === 1 && metadata.completedCycles.length <= 1;
+  const matches = text.split("\n").flatMap((line) => {
+    try {
+      const value: unknown = JSON.parse(line);
+      if (typeof value !== "object" || value === null) return [];
+      const item = value as { cell?: unknown; stage?: unknown; reasons?: unknown; iteration?: unknown };
+      if (item.cell !== cell || typeof item.stage !== "string" || !Array.isArray(item.reasons)) return [];
+      if (typeof item.iteration === "number" ? item.iteration !== iteration : !allowUnscoped) return [];
+      const reasons = item.reasons.filter((reason): reason is string => typeof reason === "string");
+      return reasons.length > 0 ? [{ stage: item.stage, reasons }] : [];
+    } catch { return []; }
+  });
+  return matches.slice(-3);
+}
+
+function restoreBackground(text: string, bgAnsi: string): string {
+  return text.replace(/\x1b\[0m/g, `\x1b[0m${bgAnsi}`);
+}
 /** Disk reads are bounded even for multi-gigabyte logs. Older pages are loaded only on request. */
 export function readLogPage(file: string, before?: number): { text: string; start: number } {
   try {
@@ -70,11 +134,15 @@ export class DashboardView {
     return path.join(attemptDir(this.root, this.iteration, cell), this.pane === 2 ? "eval.log" : "agent.log");
   }
   invalidate(): void {}
-  render(width: number): string[] {
+  private rows(): DashboardRow[] {
     const s = this.snapshot;
-    if (!s) return ["Dream-RSI: no recorded progress. Esc closes."];
+    if (!s) return [{ kind: "muted", text: "Dream-RSI: no recorded progress. Esc closes." }];
     const cells = this.cells(); const selected = cells[this.nodeIndex]; const attempt = s.attempts[selected];
-    const rows = [`Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close`, ...progressSummary(s).split("\n"), ""];
+    const rows: DashboardRow[] = [
+      { kind: "title", text: `Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close` },
+      ...progressSummary(s).split("\n").map((text) => ({ kind: rowKind(text), text })),
+      { kind: "row", text: "" },
+    ];
     const start = Math.max(0, this.nodeIndex - 5);
     for (const cell of cells.slice(start, start + 10)) {
       const a = s.attempts[cell]; const node = s.tree?.cells.find((n) => n.meta.cell_id === cell) as
@@ -90,7 +158,8 @@ export class DashboardView {
       // Show timeout diagnostics explicitly; other fail classes keep the concise stage view.
       const fail = (node as { fail_class?: string } | undefined)?.fail_class;
       const failNote = fail === "timeout_scored" || fail === "timeout" ? ` ${fail}` : "";
-      rows.push(`${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? (node as { meta?: { parent_id?: string | null } } | undefined)?.meta?.parent_id ?? "root"}  ${a?.stage ?? "unopened"}${failNote}  score=${ordinary}${partialNote}${a?.retry ? ` retry=${a.retry}` : ""}`);
+      const text = `${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? (node as { meta?: { parent_id?: string | null } } | undefined)?.meta?.parent_id ?? "root"}  ${a?.stage ?? "unopened"}${failNote}  score=${ordinary}${partialNote}${a?.retry ? ` retry=${a.retry}` : ""}`;
+      rows.push({ kind: cell === selected ? "selected" : rowKind(text), text, tree: true });
     }
     if (attempt) {
       const elapsed = attempt.stage === "agent" || attempt.stage === "evaluation" || attempt.stage === "preparing" ? Date.now() : attempt.updated_at;
@@ -103,15 +172,105 @@ export class DashboardView {
         selectedNode?.timeout_assessment && selectedNode.fail_class === "timeout"
           ? ` | assessment ${selectedNode.timeout_assessment.fail_class}${selectedNode.timeout_assessment.error ? `: ${selectedNode.timeout_assessment.error}` : ""}`
           : "";
-      rows.push("", `${selected}: round ${attempt.round} | elapsed ${Math.max(0, Math.round((elapsed - attempt.started_at) / 1000))}s | ${attempt.error ?? ""}${evalFailure}`);
+      rows.push({ kind: "row", text: "" }, { kind: rowKind(attempt.error ?? evalFailure), text: `${selected}: round ${attempt.round} | elapsed ${Math.max(0, Math.round((elapsed - attempt.started_at) / 1000))}s | ${attempt.error ?? ""}${evalFailure}` });
     }
-    if (this.pane === 0) rows.push("", "Tool activity", ...(attempt?.tools.length ? attempt.tools.slice(-8) : ["(no tool activity)"]));
+    if (this.pane === 0) {
+      const tools = attempt?.tools.length ? attempt.tools.slice(-8) : ["(no tool activity)"];
+      rows.push({ kind: "row", text: "" }, { kind: "section", text: "Tool activity" }, ...tools.map((text) => ({ kind: rowKind(text), text, log: true })));
+    }
     else {
-      rows.push("", `${this.pane === 1 ? "Agent" : "Evaluator"} log ${this.page ? "(older page)" : "(tail)"}`);
+      rows.push({ kind: "row", text: "" }, { kind: "section", text: `${this.pane === 1 ? "Agent" : "Evaluator"} log ${this.page ? "(older page)" : "(tail)"}` });
       const tail = this.page?.text ?? (this.pane === 1 ? attempt?.agent_tail : attempt?.eval_tail);
-      rows.push(...(tail || readLogPage(this.logFile()).text).split("\n").slice(-14));
+      rows.push(...(tail || readLogPage(this.logFile()).text).split("\n").slice(-14).map((text) => ({ kind: rowKind(text), text, log: true })));
     }
-    return rows.map((r) => truncateToWidth(clean(r), Math.max(1, width)));
+    rows.push(...selectedRejections(this.root, this.iteration, selected).flatMap(({ stage, reasons }) => [
+      { kind: "section" as const, text: `Rejection · ${stage}` },
+      ...reasons.map((text) => ({ kind: "error" as const, text })),
+    ]));
+    return rows;
+  }
+  plain(width: number): string[] {
+    return this.rows().map(({ text }) => truncateToWidth(clean(text), Math.max(1, width)));
+  }
+  render(width: number): string[] { return this.plain(width); }
+
+  framed(width: number, theme: Theme | undefined, maxRows: number): string[] {
+    if (typeof theme?.fg !== "function" || width < 4) return this.plain(width);
+    const cycleCount = progressIterations(this.root).length;
+    const metadata = campaignDisplayMetadata(this.root, this.iteration || cycleCount || 1, cycleCount);
+    const currentCycle = metadata.iteration ?? this.iteration ?? 1;
+    const currentPhase = metadata.phase ?? this.snapshot?.phase ?? "ready";
+    const title = `Dream-RSI · ${metadata.id} · cycle ${currentCycle}/${metadata.maxCycles} · ${currentPhase}`;
+    const currentRows = this.rows();
+    const body = this.snapshot ? currentRows.slice(1) : currentRows;
+    if (!this.snapshot) body[0] = { kind: "muted", text: "No recorded progress. Esc closes." };
+    const footer: DashboardRow = { kind: "muted", text: "←/→ cycle · ↑/↓ node · d phase · Tab pane · PgUp/PgDn logs · Esc close" };
+    const cap = Math.max(1, Math.floor(maxRows));
+    const height = Math.min(cap, Math.max(body.length + 3, 20));
+    if (height < 3) {
+      const short = cap <= 1
+        ? [truncateToWidth(clean(title), Math.max(1, width))]
+        : [truncateToWidth(clean(title), Math.max(1, width)), truncateToWidth("╰" + "─".repeat(Math.max(0, width - 2)) + "╯", Math.max(1, width))];
+      return short.slice(0, cap);
+    }
+    const bodyCapacity = Math.max(0, height - 2);
+    while (body.length + 1 > bodyCapacity) {
+      const logIndex = body.findIndex((row) => row.log);
+      if (logIndex >= 0) { body.splice(logIndex, 1); continue; }
+      const dropIndex = body.findIndex((row) => row.tree && row.kind !== "selected");
+      if (dropIndex >= 0) { body.splice(dropIndex, 1); continue; }
+      const otherIndex = body.findIndex((row) => row.kind !== "selected" && row.kind !== "section");
+      if (otherIndex >= 0) { body.splice(otherIndex, 1); continue; }
+      body.pop();
+    }
+    const interior: DashboardRow[] = [...body, footer];
+    while (interior.length < bodyCapacity) interior.push({ kind: "row", text: "" });
+    const border = (value: string): string => theme.fg("border", value);
+    const innerWidth = Math.max(0, width - 2);
+    const titleText = truncateToWidth(theme.bold(theme.fg("accent", clean(title))), Math.max(0, width - 3), "", false);
+    const titlePadding = Math.max(0, width - 3 - visibleWidth(titleText));
+    const topRaw = `${border("╭")}${border("─")}${titleText}${border("─".repeat(titlePadding))}${border("╮")}`;
+    const bottomRaw = `${border("╰")}${border("─").repeat(Math.max(0, width - 2))}${border("╯")}`;
+    const paintBg = (text: string, background: "customMessageBg" | "selectedBg" = "customMessageBg"): string => {
+      const bg = theme.getBgAnsi(background);
+      const wrapped = theme.bg(background, text);
+      return `${restoreBackground(wrapped, bg)}\x1b[0m`;
+    };
+    const frameLine = (raw: string): string => {
+      const fitted = truncateToWidth(raw, width, "", true);
+      return paintBg(fitted, "customMessageBg");
+    };
+    const renderRow = (row: DashboardRow): string => {
+      const raw = clean(row.text);
+      const defaultColor: "accent" | "success" | "warning" | "error" | "muted" | "text" = row.kind === "section" || row.kind === "title" ? "accent"
+        : row.kind === "ok" ? "success"
+          : row.kind === "warn" ? "warning"
+            : row.kind === "error" ? "error"
+              : row.kind === "muted" ? "muted" : "text";
+      const colorStatus = (status: string): "warning" | "success" | "muted" | "error" => {
+        if (/^(running|agent|evaluation|preparing)$/i.test(status)) return "warning";
+        if (/^(ok|applied|complete|success)$/i.test(status)) return "success";
+        if (/^(unopened|n\/a)$/i.test(status)) return "muted";
+        return "error";
+      };
+      const statusPattern = /\b(running|agent|evaluation|preparing|ok|applied|complete|success|unopened|n\/a|failed|failure|error|timeout|rejected)\b/gi;
+      const chunks: string[] = [];
+      let offset = 0;
+      for (const match of raw.matchAll(statusPattern)) {
+        const index = match.index ?? 0;
+        if (index > offset) chunks.push(theme.fg(defaultColor, raw.slice(offset, index)));
+        chunks.push(theme.fg(colorStatus(match[0]), match[0]));
+        offset = index + match[0].length;
+      }
+      if (offset < raw.length) chunks.push(theme.fg(defaultColor, raw.slice(offset)));
+      const colored = chunks.join("");
+      const fitted = truncateToWidth(colored, innerWidth, "…", true);
+      const background = row.kind === "selected" ? "selectedBg" : "customMessageBg";
+      const inner = paintBg(fitted, background);
+      const whole = `${border("│")}${inner}${border("│")}`;
+      return paintBg(whole, "customMessageBg");
+    };
+    return [frameLine(topRaw), ...interior.map(renderRow), frameLine(bottomRaw)];
   }
 }
 
@@ -129,10 +288,7 @@ export class Dashboard {
     if (!final && Date.now() - this.lastRender < 250) return;
     this.lastRender = Date.now();
     if (final) this.active.delete(key);
-    const rows = [...this.active.values()].flatMap((s) => {
-      const source = path.basename(path.dirname(s.project)) === "campaigns" ? "campaign" : "legacy";
-      return progressSummary(s).split("\n").map((row, index) => clean(index === 0 ? `${source} ${row}` : row));
-    });
+    const rows = [...this.active.values()].flatMap((s) => progressSummary(s).split("\n").map(clean));
     this.ctx.ui.setWidget("dream-rsi", rows.length > 0 ? rows : undefined);
   };
   async watch(root: string, iteration?: number): Promise<string | undefined> {
@@ -141,13 +297,13 @@ export class Dashboard {
       const summary = view.render(120).join("\n");
       this.ctx.ui.notify(summary, "info"); return summary;
     }
-    await this.ctx.ui.custom<void>((tui, _theme, _keys, done) => {
+    await this.ctx.ui.custom<void>((tui, theme, _keys, done) => {
       const view = new DashboardView(root, iteration);
       let closed = false;
       const close = (): void => { if (closed) return; closed = true; clearInterval(timer); this.closers.delete(close); done(); };
       const timer = setInterval(() => { view.refresh(); tui.requestRender(); }, 250);
       this.closers.add(close);
-      return { render: (width: number) => view.render(width), invalidate: () => view.invalidate(),
+      return { render: (width: number) => typeof theme?.fg === "function" ? view.framed(width, theme, Math.floor((tui.terminal?.rows ?? 40) * 0.9)) : view.plain(width), invalidate: () => view.invalidate(),
         handleInput: (data: string) => {
           if (matchesKey(data, Key.escape)) close(); else { view.handleInput(data); tui.requestRender(); }
         }, dispose: close };

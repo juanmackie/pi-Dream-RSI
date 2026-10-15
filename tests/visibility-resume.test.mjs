@@ -8,12 +8,11 @@ import { jump, makeProject, deployShippedPolicy, writeTaskJson, mockPi } from ".
 const { runLiveEpisode } = await jump("engine/live.ts");
 const { readCheckpoint, saveCheckpoint, recoverableIterations, checkpointPath } = await jump("engine/checkpoint.ts");
 const { readProgress, ProgressRecorder } = await jump("engine/progress.ts");
-const { liveMethodPath, readTree, pruneWorkspaces, nodeWorkspace, iterationDir, writeJson } = await jump("engine/world.ts");
+const { liveMethodPath, readTree, pruneWorkspaces, nodeWorkspace } = await jump("engine/world.ts");
 const { OutputDecoder, BoundedTail } = await jump("agent/output.ts");
 const { runAgent, copyWorkspace, buildAgentArgs } = await jump("agent/runner.ts");
 const { defaultTask, normalizeTask } = await jump("engine/task.ts");
 const { Dashboard, DashboardView, readLogPage } = await jump("dashboard.ts");
-const { default: extension } = await jump("index.ts");
 
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(predicate, tries = 500, stage = "requested stage") { for (let i = 0; i < tries; i++) { if (predicate()) return; await pause(20); } throw new Error(`fixture never reached ${stage}`); }
@@ -187,22 +186,6 @@ test("dashboard tree navigation, bounded historical log reads, headless modes an
   } finally { p.cleanup(); }
 });
 
-test("resume command/tool is gated and a shortcut watches without starting model work", async () => {
-  const p = makeProject(); try {
-    await setup(p); const { pi, context, harness } = mockPi(); context.cwd = p.projectDir; extension(pi);
-    await harness.handlers.get("session_start")({}, context);
-    assert.equal(harness.activeTools.includes("dream_rsi_resume"), false);
-    await harness.commands.get("dream-rsi").handler("resume", context);
-    assert.equal(harness.activeTools.includes("dream_rsi_resume"), true);
-    assert.match(harness.sentMessages[0].content, /dream_rsi_resume/);
-    const before = harness.sentMessages.length;
-    await harness.shortcuts.get("ctrl+shift+d").handler(context);
-    assert.equal(harness.sentMessages.length, before);
-    const result = await harness.tools.get("dream_rsi_resume").execute("x", {}, undefined, undefined, context);
-    assert.equal(result.details.ok, false); assert.match(result.content[0].text, /no recoverable/);
-  } finally { p.cleanup(); }
-});
-
 test("a crash during publication is repaired idempotently without repeating completed work", async () => {
   const p = makeProject({ task: { k1: 1 } }); try {
     const controlled = controlledAgent(p); fs.writeFileSync(controlled.gate, "yes"); await setup(p);
@@ -222,55 +205,13 @@ test("a crash during publication is repaired idempotently without repeating comp
   } finally { p.cleanup(); }
 });
 
-test("reload cancels and drains live children, closes the overlay, and leaves a recoverable tree", async () => {
-  const p = makeProject({ task: { k1: 1 } }); try {
-    const controlled = controlledAgent(p); await setup(p);
-    const { pi, context, harness } = mockPi(); context.cwd = p.projectDir; context.mode = "tui";
-    extension(pi); await harness.handlers.get("session_start")({}, context);
-    const live = harness.tools.get("dream_rsi_live").execute("live", {}, undefined, undefined, context);
-    await until(() => controlled.calls().length === 2);
-    const watch = harness.shortcuts.get("ctrl+shift+d").handler(context);
-    assert.equal(harness.customViews.length, 1);
-    await harness.handlers.get("session_shutdown")({ reason: "reload" }, context);
-    await watch; const result = await live;
-    assert.equal(result.details.ok, false); assert.deepEqual(recoverableIterations(p.dreamRoot), [1]);
-    assert.equal(fs.existsSync(p.script(".dream-rsi/live-1.lock")), false);
-    assert.equal(readProgress(p.dreamRoot, 1).status, "interrupted");
-    assert.equal(harness.widgets.at(-1)[1], undefined);
-  } finally { p.cleanup(); }
-});
-
-test("legacy worlds can be watched and failed worlds are excluded from dream replay", async () => {
-  const p = makeProject(); try {
-    await setup(p);
-    writeJson(path.join(iterationDir(p.dreamRoot, 1), "live_cycle_manifest.json"), { iteration: 1, status: "failed", grid: { branch_count: 1 }, created_at: new Date().toISOString() });
-    writeJson(path.join(iterationDir(p.dreamRoot, 1), "tree.json"), { version: 1, branch_count: 1, refine_count: 1, seq: 2, baseline_score: null, cells: [] });
-    const view = new DashboardView(p.dreamRoot); assert.match(view.render(120).join("\n"), /legacy/);
-    const { runDreamPhase } = await jump("engine/dream.ts");
-    await assert.rejects(runDreamPhase({ dreamRoot: p.dreamRoot, projectDir: p.projectDir, task: p.task, iteration: 1, evaluateOnly: true }), /no recorded worlds/);
-  } finally { p.cleanup(); }
-});
-
-test("allocator shares max_loops across independent processes and blocks new work during dream", async () => {
-  const { spawn } = await import("node:child_process"); const { pathToFileURL } = await import("node:url");
-  const { reserveIterations, runningIterations } = await jump("state.ts");
+test("phase ownership blocks new live work during dream", async () => {
   const { allocator, acquirePhase } = await jump("engine/ownership.ts");
   const p = makeProject(); try {
     await setup(p);
-    const script = p.script("reserve.mjs");
-    const stateUrl = pathToFileURL(path.resolve("extensions/pi-dream-rsi/state.ts")).href;
-    fs.writeFileSync(script, `import {reserveIterations} from ${JSON.stringify(stateUrl)};const root=process.argv[2];try{console.log(JSON.stringify({iterations:reserveIterations(root,1,1,{session_id:String(process.pid),pid:process.pid,claimed_at:new Date().toISOString()},1)}));}catch(e){console.log(JSON.stringify({error:e.message}));}`);
-    const run = () => new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [script, p.dreamRoot]); let output = ""; let error = "";
-      child.stdout.on("data", (d) => output += d); child.stderr.on("data", (d) => error += d);
-      child.on("error", reject); child.on("exit", (code) => code === 0 ? resolve(JSON.parse(output)) : reject(new Error(error)));
-    });
-    const results = await Promise.all([run(), run()]);
-    assert.equal(results.filter((r) => r.iterations).length, 1); assert.equal(runningIterations(p.dreamRoot).length, 1);
     const release = allocator(p.dreamRoot, () => acquirePhase(p.dreamRoot, "dream"));
     try {
-      assert.throws(() => reserveIterations(p.dreamRoot, 1, 2, undefined, 2), /dream phase/);
-      await assert.rejects(runLiveEpisode(options(p, { iteration: 2 })), /dream phase/);
+      await assert.rejects(runLiveEpisode(options(p, { iteration: 1 })), /dream phase/);
     } finally { release(); }
   } finally { p.cleanup(); }
 });

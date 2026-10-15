@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { visibleWidth } from "@earendil-works/pi-tui";
 
 import { jump, makeProject, mockPi } from "./fixtures.mjs";
 
 const { default: dreamRsi } = await jump("index.ts");
-const { ProgressRecorder } = await jump("engine/progress.ts");
-const { Dashboard } = await jump("dashboard.ts");
+const { ProgressRecorder, progressPath } = await jump("engine/progress.ts");
+const { Dashboard, DashboardView } = await jump("dashboard.ts");
 
 function recordCampaign(project) {
   const id = "12345678-1234-1234-1234-123456789abc";
@@ -59,28 +60,24 @@ async function inspectWatch(harness, pending, expectedActivity) {
   await pending;
 }
 
-test("watch selectors and Ctrl+Shift+D retain access to active campaign and legacy trees", async () => {
+test("watch and Ctrl+Shift+D only open the active campaign", async () => {
   const project = makeProject();
   try {
-    seedProgress(project.dreamRoot, "legacy-tree-marker");
     const { pi, context, harness } = mockPi();
     context.cwd = project.projectDir;
     context.mode = "tui";
     dreamRsi(pi);
     await harness.handlers.get("session_start")({}, context);
 
-    let pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
+    await harness.commands.get("dream-rsi").handler("watch", context);
+    assert.match(harness.notifications.at(-1), /No campaign yet\. Run \/dream-rsi assess\./);
+    assert.equal(harness.customViews.length, 0, "watch without a campaign does not open legacy state");
+    await harness.shortcuts.get("ctrl+shift+d").handler(context);
+    assert.equal(harness.customViews.length, 0, "the shortcut also requires a campaign");
 
     const campaign = recordCampaign(project);
     seedProgress(campaign.campaignRoot, "campaign-tree-marker");
-    pending = harness.commands.get("dream-rsi").handler("watch", context);
-    await inspectWatch(harness, pending, "campaign-tree-marker");
-
-    pending = harness.commands.get("dream-rsi").handler("watch legacy", context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
-
-    pending = harness.commands.get("dream-rsi").handler("watch campaign", context);
+    let pending = harness.commands.get("dream-rsi").handler("watch", context);
     await inspectWatch(harness, pending, "campaign-tree-marker");
 
     pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
@@ -90,12 +87,12 @@ test("watch selectors and Ctrl+Shift+D retain access to active campaign and lega
     current.state = { kind: "complete", reason: "fixture complete" };
     fs.writeFileSync(campaign.campaignFile, JSON.stringify(current));
     pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
-
-    const shortcutCount = harness.customViews.length;
-    pending = harness.commands.get("dream-rsi").handler("watch campaign", context);
     await inspectWatch(harness, pending, "campaign-tree-marker");
-    assert.equal(harness.customViews.length, shortcutCount + 1, "explicit campaign selection remains available after completion");
+
+    const completedWatchCount = harness.customViews.length;
+    pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
+    await inspectWatch(harness, pending, "campaign-tree-marker");
+    assert.equal(harness.customViews.length, completedWatchCount + 1, "completed campaigns remain watchable");
   } finally {
     project.cleanup();
   }
@@ -119,17 +116,97 @@ test("worker widget keeps same-cycle campaign and legacy progress distinct and c
     await new Promise((resolve) => setTimeout(resolve, 260));
     dashboard.observe(campaignProgress.snapshot);
     const both = harness.widgets.at(-1)?.[1]?.join("\n") ?? "";
-    assert.match(both, /legacy live 1:/);
-    assert.match(both, /campaign live 1:/);
+    assert.match(both, /live 1:/);
+    assert.equal((both.match(/live 1:/g) ?? []).length, 2);
     assert.match(both, /legacy worker is running/);
     assert.match(both, /campaign worker is running/);
 
     campaignProgress.finish("complete");
     dashboard.observe(campaignProgress.snapshot);
     const remaining = harness.widgets.at(-1)?.[1]?.join("\n") ?? "";
-    assert.match(remaining, /legacy worker is running/);
+    assert.match(remaining, /worker is running/);
     assert.doesNotMatch(remaining, /campaign worker is running/);
     dashboard.dispose();
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("framed watch fits its row cap, restores backgrounds, highlights selection and scopes rejection reasons", async () => {
+  const project = makeProject();
+  try {
+    const campaign = recordCampaign(project);
+    const recordPath = path.join(campaign.campaignRoot, "campaign.json");
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    record.state = { kind: "running", phase: "promote", iteration: 2 };
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+
+    const recorder = new ProgressRecorder(campaign.campaignRoot, 1, "live", 3, 2);
+    const cells = Array.from({ length: 10 }, (_, index) => {
+      const cell = `b${index}a0`;
+      recorder.stage(cell, "root", 1, index === 0 ? "running" : "complete", 0, index);
+      return { meta: { cell_id: cell, parent_id: "root", seq: index + 1 }, evaluated: true, score: index, fail_class: "ok" };
+    });
+    recorder.snapshot.tree = { cells };
+    recorder.snapshot.attempts.b0a0.agent_tail = Array.from({ length: 40 }, (_, i) => `log line ${i}`).join("\n");
+    fs.writeFileSync(progressPath(campaign.campaignRoot, 1), JSON.stringify(recorder.snapshot));
+    const rejectionPath = path.join(campaign.campaignRoot, "history", "rejections.jsonl");
+    fs.mkdirSync(path.dirname(rejectionPath), { recursive: true });
+    fs.writeFileSync(rejectionPath, [
+      { iteration: 1, cell: "b0a0", stage: "gate", reasons: ["unit test failed"] },
+      { iteration: 2, cell: "b0a0", stage: "review", reasons: ["wrong-cycle secret"] },
+      { cell: "b0a0", stage: "review", reasons: ["unscoped legacy secret"] },
+    ].map((item) => JSON.stringify(item)).join("\n") + "\n");
+
+    const { pi, context, harness } = mockPi();
+    context.cwd = project.projectDir;
+    context.mode = "tui";
+    dreamRsi(pi);
+    await harness.handlers.get("session_start")({}, context);
+    const pending = harness.commands.get("dream-rsi").handler("watch", context);
+    await new Promise(setImmediate);
+    const item = harness.customViews.at(-1);
+    assert.ok(item, "watch creates the framed view");
+    item.view.handleInput("\t");
+    try {
+      const rows = item.view.render(80);
+      const plainRows = rows.map((row) => row.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ""));
+
+      assert.ok(rows.length <= 27, `frame height ${rows.length} stays within 90% of 30 rows`);
+      assert.ok(rows.length >= 20, `frame height ${rows.length} remains stable for content`);
+      assert.ok(rows.every((row) => visibleWidth(row) === 80), "every framed row fills the requested width");
+      assert.ok(plainRows[0].startsWith("╭"), "top border uses a rounded corner");
+      assert.ok(plainRows.at(-1).startsWith("╰"), "bottom border stays visible and uses a rounded corner");
+      assert.match(plainRows[0], /Dream-RSI · 12345678 · cycle 2\/5 · promote/);
+      assert.match(rows.join("\n"), /\x1b\[48;5;24m/, "selected row uses selectedBg");
+      assert.match(rows.join("\n"), /\x1b\[0m\x1b\[48;5;236m/, "custom message background is restored after SGR resets");
+      assert.match(rows.join("\n"), /\x1b\[38;5;33mrunning\x1b\[0m/, "selected running status keeps warning color");
+      assert.match(plainRows.join("\n"), /unit test failed/);
+      assert.doesNotMatch(plainRows.join("\n"), /wrong-cycle secret|unscoped legacy secret/,
+        "rejection details from other or unknown cycles do not leak onto the selected cycle");
+      assert.match(plainRows.join("\n"), /log line 39/, "trimmed log pane keeps its newest content");
+      assert.doesNotMatch(plainRows.join("\n"), /log line 26/, "old log rows are trimmed before dashboard content");
+
+      recorder.stage("b0a0", "root", 1, "evaluation", 0, 0);
+      fs.writeFileSync(progressPath(campaign.campaignRoot, 1), JSON.stringify(recorder.snapshot));
+      const evaluationView = new DashboardView(campaign.campaignRoot, 1);
+      assert.match(evaluationView.framed(80, item.theme, 27).join("\n"), /\x1b\[38;5;33mevaluation\x1b\[0m/, "selected evaluation stage keeps warning color");
+
+      recorder.stage("b0a0", "root", 1, "failed", 0, 0);
+      fs.writeFileSync(progressPath(campaign.campaignRoot, 1), JSON.stringify(recorder.snapshot));
+      const failedView = new DashboardView(campaign.campaignRoot, 1);
+      assert.match(failedView.framed(80, item.theme, 27).join("\n"), /\x1b\[38;5;31mfailed\x1b\[0m/, "selected failure status keeps error color");
+
+      item.tui.terminal.rows = 12;
+      const resized = item.view.render(80);
+      assert.ok(resized.length <= 10, "resizing the terminal applies the current 90% height cap");
+      assert.ok(resized.at(-1).includes("╰"), "bottom border remains visible after resize");
+
+      assert.ok(failedView.framed(80, item.theme, 2).length <= 2, "tiny caps return promptly without exceeding the cap");
+    } finally {
+      item.view.handleInput("\x1b");
+      await pending;
+    }
   } finally {
     project.cleanup();
   }

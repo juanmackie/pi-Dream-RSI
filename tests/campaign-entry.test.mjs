@@ -36,6 +36,7 @@ process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   const secretPresent = existsSync(".dream-rsi/legacy-secret.txt");
   appendFileSync(process.argv[2], JSON.stringify({ secretPresent, promptPrefix: prompt.slice(0, 35) }) + "\\n");
+  if (/adversarial review/i.test(prompt)) { writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] })); return; }
   if (prompt.includes("Do not change files.")) { process.stdout.write("I can inspect the target.\\n"); return; }
   if (prompt.includes("prefix-only exploration policy")) { process.stdout.write("Policy remains unchanged.\\n"); return; }
   const source = readFileSync("solution.py", "utf8");
@@ -73,7 +74,7 @@ process.stdin.on("end", () => {
       beta_grid: [0, 0.6],
       default_beta: 0.6,
       agent_timeout_ms: 20_000,
-      evaluator_timeout_ms: 20_000,
+      evaluator_timeout_ms: 300_000,
       agent_command: "node",
       agent_args: [agent, observed],
     };
@@ -90,6 +91,8 @@ process.stdin.on("end", () => {
 
     assert.equal(result.details.campaign.state.kind, "complete", result.content[0].text);
     assert.deepEqual(result.details.campaign.completedCycles, [1, 2], "the second campaign cycle starts after the first promotion");
+    const campaignRecord = JSON.parse(fs.readFileSync(path.join(result.details.campaign.campaignRoot, "campaign.json"), "utf8"));
+    assert.equal(campaignRecord.task.evaluator_timeout_ms, 300_000, "campaign preserves the requested evaluator timeout up to its safe ceiling");
     assert.ok((fs.readFileSync(path.join(project.projectDir, "solution.py"), "utf8").match(/x/g) ?? []).length > 2,
       "verified improvements from both cycles were promoted into the full-repo workspace");
     const applied = fs.readFileSync(path.join(result.details.campaign.campaignRoot, "history", "applied.jsonl"), "utf8")
@@ -124,18 +127,17 @@ process.stdin.on("end", () => {
     const command = harness.commands.get("dream-rsi");
     context.mode = "print";
     await command.handler("watch", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /LEGACY_MANUAL_HISTORY/,
-      "default watch returns to legacy manual history after the campaign stops");
+    assert.match(harness.notifications.at(-1), /live 2:/,
+      "default watch opens the completed campaign dashboard");
     await command.handler("watch legacy 97", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /LEGACY_MANUAL_HISTORY/,
-      "legacy manual history remains browseable with the explicit selector");
-    await command.handler("watch campaign 1", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /live 1:/,
-      "a completed campaign remains browseable by its explicit selector");
+    assert.equal(harness.notifications.at(-1), "watch legacy 97 was removed in 1.0. Use /dream-rsi improve <what you want>.",
+      "the legacy watch selector is retired without touching saved history");
 
-    const status = await harness.tools.get("dream_rsi_status").execute("status-with-campaign", {}, undefined, undefined, context);
-    assert.ok(status.details.campaignProgress.some((snapshot) => snapshot.project === result.details.campaign.campaignRoot),
-      "status exposes persisted campaign progress separately from legacy progress");
+    const status = await harness.tools.get("dream_rsi_improve").execute("status-with-campaign", { action: "status" }, undefined, undefined, context);
+    assert.equal(status.details.campaign.campaignRoot, result.details.campaign.campaignRoot,
+      "the campaign controller status reports the saved campaign");
+    assert.doesNotMatch(status.content[0].text, /LEGACY_MANUAL_HISTORY/,
+      "campaign status does not display the separate legacy progress snapshot");
   } finally {
     project.cleanup();
   }

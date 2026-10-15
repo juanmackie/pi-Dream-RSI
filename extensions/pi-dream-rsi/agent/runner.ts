@@ -106,7 +106,7 @@ export function quoteForShell(arg: string): string {
 async function collect(
   command: string,
   args: string[],
-  options: RunOptions & { shell: boolean; stdin?: string },
+  options: RunOptions & { shell: boolean; stdin?: string; quoteExecutable?: boolean },
 ): Promise<CommandResult> {
   const started = Date.now();
   if (options.logPath) fs.mkdirSync(path.dirname(options.logPath), { recursive: true });
@@ -204,10 +204,11 @@ async function collect(
       const env: NodeJS.ProcessEnv = { ...process.env };
       for (const key of STRIPPED_SESSION_ENV) delete env[key];
       Object.assign(env, options.env ?? {});
-      // With a shell we pass one pre-quoted command line: Node would otherwise concatenate `args`
-      // unescaped (and warn about it). `command` is never quoted (it may itself be a command line).
+      // With a shell, quote each argument before joining it. Agent executables can opt into quoting;
+      // runShellCommand keeps its caller-owned command line intact.
+      const commandText = options.quoteExecutable ? quoteForShell(command) : command;
       const argv = options.shell
-        ? [`${command}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
+        ? [`${commandText}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
       options.beforeSpawn?.();
       child = spawn(argv[0] as string, argv[1] as string[], {
@@ -287,6 +288,8 @@ export function runShellCommand(command: string, options: RunOptions): Promise<C
 
 export interface AgentRun extends RunOptions {
   agent: AgentConfig;
+  /** Resolve the saved agent against the active session immediately before this process starts. */
+  resolveAgent?: (saved: AgentConfig) => AgentConfig | null;
   prompt: string;
 }
 
@@ -297,16 +300,52 @@ export interface AgentRun extends RunOptions {
  * placeholder, `--model <id>` is appended — otherwise the configured model is silently ignored and
  * every attempt runs on whatever default the agent CLI happens to have.
  */
-export function buildAgentArgs(agent: AgentConfig): string[] {
+export function buildAgentArgs(agent: AgentConfig, options: { overrideExplicit?: boolean } = {}): string[] {
   const hasModelPlaceholder = agent.args.some((arg) => arg.includes("{model}"));
   const hasThinkingPlaceholder = agent.args.some((arg) => arg.includes("{thinking}"));
-  const args = agent.args.map((arg) =>
+  let args = agent.args.map((arg) =>
     arg.replaceAll("{model}", agent.model ?? "").replaceAll("{thinking}", agent.thinking ?? ""),
   );
-  if (agent.model && !hasModelPlaceholder) args.push("--model", agent.model);
-  // Same rule as the model: an explicit `--thinking` in `args` wins, a placeholder is already filled.
-  if (agent.thinking && !hasThinkingPlaceholder && !args.includes("--thinking")) {
-    args.push("--thinking", agent.thinking);
+  if (options.overrideExplicit) {
+    const replaced: string[] = [];
+    let sawModel = false;
+    let sawThinking = false;
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === undefined) break;
+      if (arg.startsWith("--model=")) {
+        sawModel = true;
+        replaced.push(agent.model ? `--model=${agent.model}` : arg);
+      } else if (arg === "--model") {
+        sawModel = true;
+        const next = args[index + 1];
+        replaced.push(arg);
+        if (next !== undefined && !next.startsWith("-")) {
+          replaced.push(agent.model ?? next);
+          index += 1;
+        } else if (agent.model) replaced.push(agent.model);
+      } else if (arg.startsWith("--thinking=")) {
+        sawThinking = true;
+        replaced.push(agent.thinking ? `--thinking=${agent.thinking}` : arg);
+      } else if (arg === "--thinking") {
+        sawThinking = true;
+        const next = args[index + 1];
+        replaced.push(arg);
+        if (next !== undefined && !next.startsWith("-")) {
+          replaced.push(agent.thinking ?? next);
+          index += 1;
+        } else if (agent.thinking) replaced.push(agent.thinking);
+      } else replaced.push(arg);
+    }
+    args = replaced;
+    if (agent.model && !sawModel && !hasModelPlaceholder) args.push("--model", agent.model);
+    if (agent.thinking && !sawThinking && !hasThinkingPlaceholder) args.push("--thinking", agent.thinking);
+  } else {
+    if (agent.model && !hasModelPlaceholder) args.push("--model", agent.model);
+    // Same rule as the model: an explicit `--thinking` in `args` wins, a placeholder is already filled.
+    if (agent.thinking && !hasThinkingPlaceholder && !args.includes("--thinking")) {
+      args.push("--thinking", agent.thinking);
+    }
   }
   const explicitMode = args.some((arg) => arg === "--mode" || arg.startsWith("--mode="));
   if (!explicitMode && (agent.output_format === "pi-json" || (agent.command === "pi" && agent.output_format !== "text"))) args.push("--mode", "json");
@@ -377,8 +416,9 @@ export function piSelfInvocation(options: PiSelfOptions = {}): { command: string
  * stripped inherited environment, so a task can hand the agent a variable it genuinely needs.
  */
 export function runAgent(options: AgentRun): Promise<CommandResult> {
-  const { agent } = options;
-  const args = buildAgentArgs(agent);
+  const resolved = options.resolveAgent?.(options.agent) ?? null;
+  const agent = resolved ?? options.agent;
+  const args = buildAgentArgs(agent, { overrideExplicit: resolved !== null });
   const unsafeModel = Boolean(agent.model && !MODEL_PATTERN.test(agent.model));
   const unsafeThinking = Boolean(agent.thinking && !THINKING_LEVELS.includes(agent.thinking));
   if (unsafeModel || unsafeThinking) {
@@ -407,9 +447,9 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
   options = { ...options, outputFormat: json ? "pi-json" : "text" };
   const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
   if (agent.prompt_via === "arg") {
-    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, env });
+    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, quoteExecutable: shell, env });
   }
-  return collect(command, invocationArgs, { ...options, shell, env, stdin: options.prompt });
+  return collect(command, invocationArgs, { ...options, shell, quoteExecutable: shell, env, stdin: options.prompt });
 }
 
 /**

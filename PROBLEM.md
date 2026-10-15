@@ -1,69 +1,46 @@
-# Task: Improve Dream-RSI exploration policy
+# Task: improve the Dream-RSI exploration policy
 
-`extensions/pi-dream-rsi/policy/method.ts` is the editable candidate program.
-Maximize measured exploration quality and efficiency over fixed replay worlds.
-The scorer runs the production replay engine; source structure, comments and
-candidate-reported result numbers earn no points.
+The editable candidate is `extensions/pi-dream-rsi/policy/method.ts`. Improve its replay score while keeping its decisions deterministic and within the policy contract.
 
-## Scoring contract: benchmark version 2
+## Campaign setup
 
-Invoke the trusted scorer by absolute path from the candidate workspace:
+Create the protected verifier snapshot and intake details from the repository root:
 
 ```sh
-node "/absolute/path/to/pi-Dream-RSI/.auto/score.mjs" --benchmark-version=2
-# Optional Python entry point:
-python3 "/absolute/path/to/pi-Dream-RSI/.auto/score.py" --benchmark-version=2
+node scripts/setup-self-campaign.mjs
 ```
 
-Both accept an optional workspace argument and write that workspace's
-`eval/score.json`. Keep the scorer, corpus and engine outside the candidate's
-editable workspace. Imports resolve relative to the trusted scorer. Only the
-candidate's `method.ts` is staged beside trusted policy helpers before execution.
+The script writes a content-addressed snapshot under `.dream-rsi/verifier/<sha256>/` and creates `.dream-rsi/self-campaign-<sha256>.json`. The intake file is a directly usable `dream_rsi_improve` payload with `action: "start"`, the task, scope, gates, and absolute paths for `verifier_inputs`; it has no extra top-level schema fields. Use it only after an explicit improve request activates the intent guard. Omit `minimum_gain` so Dream-RSI measures baseline noise.
 
-The quality score is the equally weighted mean of four production replay Eq. 1
-values:
+The campaign workspace is the repository root (`.`). Its candidate program and scope are `extensions/pi-dream-rsi/policy/method.ts`. The task uses a protected copy of this file as `problem_file`, and an absolute `score_program` under the same verifier snapshot. The snapshot includes `.auto/score.mjs`, its static import closure, the dynamically started worker and its imports, policy runtime files copied by filename, the package-root marker, and this problem statement. The editable `method.ts` is excluded. The snapshot hash covers the normalized relative paths and bytes of every input.
+
+The script reuses an existing snapshot only when every file still matches its manifest. It never replaces a changed snapshot or overwrites a different intake file. Intake data remains outside the hashed snapshot.
+
+## Scoring contract
+
+The scorer runs the trusted production replay engine over four fixed synthetic worlds. It uses replay objective v1:
 
 ```text
-V = attainment - 0.01 * probes + 0.01 * probes / max(1, rounds)
+V = best_score - beta1 * probes + beta2 * probes / max(1, rounds)
 score = mean(V_deep, V_breadth, V_recovery, V_plateau)
 ```
 
-Each world has baseline 0, two workers and four decision rounds. The corpus covers
-deep improvement, opening new directions, a repairable evaluator failure followed
-by success, and a plateau. Scores are fixed synthetic outcomes. A policy runs at
-its own default beta; each world runs twice in independent workers to check
-determinism. No wall-clock value contributes to quality.
+Each world begins at score zero and uses two workers with four decision rounds. The worlds cover deep improvement, opening new directions, a repairable evaluator failure followed by success, and a plateau. Scores are fixed. No wall-clock value contributes to the result.
 
-The output keeps `score`, `valid`, `fail_class` and `error`, and adds
-`benchmark_version: 2` and `per_world` diagnostics including attainment, probes,
-rounds and Eq. 1 value. An idle policy is valid but scores 0. Any guardrail,
-execution, batch-contract, timeout or determinism failure invalidates the complete
-evaluation with a non-`ok` fail class, even if an earlier world passed. Each policy
-run has a two-second deadline; the Python wrapper has a thirty-second outer limit.
+The output records `score`, `valid`, `fail_class`, and `error`, plus `benchmark_version` and per-world diagnostics. Each policy runs in independent workers to check replay determinism. A guardrail, execution, batch-contract, timeout, or determinism failure invalidates the whole evaluation. The policy worker has a two-second deadline.
+
+The policy gate runs the trusted policy contract scan against the candidate `extensions/pi-dream-rsi/policy/method.ts`. The `npm test` gate runs the repository suite against the candidate copy. The scorer also scans the candidate and its relative imports. Campaign verification compares the unchanged baseline with candidate patches in paired runs, then runs both gates and a separate adversarial review before applying a strict in-scope improvement.
 
 ## Correctness and edit boundaries
 
 - Export a loadable `OptimalPolicy` extending `LLMDesignedMethod` from `./api.ts`.
 - Implement `solve()` and honor the `plan_grid()` contract, including finite positive dimensions.
-- Use revealed observations and legal actions only. Preserve legal, duplicate-free batches bounded by the worker count.
+- Use revealed observations and legal actions only. Keep batches legal, duplicate-free, and within the worker limit.
 - Keep decisions deterministic. Forbidden I/O imports invalidate the policy.
+- Edit only `extensions/pi-dream-rsi/policy/method.ts`.
 
-In scope: only `extensions/pi-dream-rsi/policy/method.ts`.
-Off limits: scorer, corpus, test fixtures, dependencies, engine modules, policy
-helpers, migrations and `.dream-rsi/` state. Policy helpers are always taken from
-the trusted harness, regardless of candidate copies.
+The synthetic replay is an integrity and regression check. It does not establish that a policy generalizes to production tasks. Do not special-case fixture cell ids, scores, or branch counts. Describe trade-offs the scorer cannot measure in the candidate proposal.
 
-Do not special-case fixture cell ids, scores or branch counts. Synthetic replay
-is a scorer integrity and regression benchmark, not evidence of generalization
-to production tasks. Describe any trade-off the scorer cannot measure in
-`proposal.md`.
+## Older task data
 
-## Upgrading an existing optimization task
-
-Version 1 awarded structure points and could give both shipped and idle policies
-130. Those numbers are incompatible with version 2. Reconfigure `score_program`
-to the absolute command above, including `--benchmark-version=2`, and remeasure
-the seed with `dream_rsi_init remeasure_seed=true`. The changed command updates the
-existing scoring fingerprint, excluding old worlds and candidates from ranking
-and replay. Record a new live world before dreaming. Preserve old evidence; do
-not compare a legacy score against the new behavioral score.
+Earlier installations may contain `.dream-rsi/task.json`, worlds, and candidate history from the manual policy workflow. Campaigns leave that data untouched and do not rank or replay it. The new self-campaign uses its immutable verifier snapshot and does not require a migration or remeasurement command.

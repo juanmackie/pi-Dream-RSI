@@ -1,0 +1,226 @@
+[
+  {
+    "id": "pi-dream-rsi@1.0.0",
+    "name": "pi-dream-rsi",
+    "version": "1.0.0",
+    "size": 142636,
+    "unpackedSize": 510290,
+    "shasum": "bf8bfc39f202499ed9635dcfef31f7cf5da6e226",
+    "integrity": "sha512-5JUMmRag3Owr8LSYoBsy7MfeiA3o0WJZ4Bxu5G8f7OSr68HWJMQ7Fqk5CikxevQAGB3tNRQQdpJ6aSbfk3yXmA==",
+    "filename": "pi-dream-rsi-1.0.0.tgz",
+    "files": [
+      {
+        "path": "LICENSE",
+        "size": 1095,
+        "mode": 420
+      },
+      {
+        "path": "README.md",
+        "size": 6802,
+        "mode": 420
+      },
+      {
+        "path": "docs/method.md",
+        "size": 3485,
+        "mode": 420
+      },
+      {
+        "path": "docs/mind2web-scorer.md",
+        "size": 1966,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/agent/output.ts",
+        "size": 2435,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/agent/runner.ts",
+        "size": 30344,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/dashboard.ts",
+        "size": 19464,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/apply.ts",
+        "size": 10559,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/campaign-budget.ts",
+        "size": 4018,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/campaign-patch.ts",
+        "size": 30040,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/campaign.ts",
+        "size": 64584,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/checkpoint.ts",
+        "size": 8929,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/dream.ts",
+        "size": 31030,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/guidance.ts",
+        "size": 10008,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/improvements.ts",
+        "size": 10713,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/live.ts",
+        "size": 38708,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/ownership.ts",
+        "size": 3400,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/progress.ts",
+        "size": 6498,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/prompt.ts",
+        "size": 1195,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/replay.ts",
+        "size": 4744,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/reward.ts",
+        "size": 6312,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/signals.ts",
+        "size": 26978,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/task.ts",
+        "size": 12463,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/timeout.ts",
+        "size": 2897,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/tree.ts",
+        "size": 13914,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/engine/world.ts",
+        "size": 18856,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/index.ts",
+        "size": 42734,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/layout.ts",
+        "size": 1546,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/policy/api.ts",
+        "size": 7968,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/policy/host.ts",
+        "size": 8540,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/policy/method.ts",
+        "size": 9389,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/policy/observation-signal.ts",
+        "size": 5712,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/policy/runner.ts",
+        "size": 14655,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/state.ts",
+        "size": 5389,
+        "mode": 420
+      },
+      {
+        "path": "extensions/pi-dream-rsi/worker/policy-worker.ts",
+        "size": 7681,
+        "mode": 420
+      },
+      {
+        "path": "package.json",
+        "size": 1565,
+        "mode": 420
+      },
+      {
+        "path": "prompts/adversarial-review.md",
+        "size": 939,
+        "mode": 420
+      },
+      {
+        "path": "prompts/discovery-agent.md",
+        "size": 3173,
+        "mode": 420
+      },
+      {
+        "path": "prompts/policy-improvement.md",
+        "size": 13662,
+        "mode": 420
+      },
+      {
+        "path": "skills/dream-rsi-assess/SKILL.md",
+        "size": 3375,
+        "mode": 420
+      },
+      {
+        "path": "skills/dream-rsi-improve/SKILL.md",
+        "size": 11189,
+        "mode": 420
+      },
+      {
+        "path": "skills/dream-rsi/SKILL.md",
+        "size": 1336,
+        "mode": 420
+      }
+    ],
+    "entryCount": 42,
+    "bundled": []
+  }
+]

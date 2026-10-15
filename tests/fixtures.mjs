@@ -22,6 +22,10 @@ const SCRIPTS = {
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
+  if (/adversarial review/i.test(prompt)) {
+    writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
+    return;
+  }
   const depth = (readFileSync("solution.py", "utf8").match(/x/g) ?? []).length;
   appendFileSync("solution.py", "x".repeat(1 + (depth % 3)) + "\\n");
   writeFileSync("proposal.md", "# mechanism\\ndepth=" + depth + "\\nprompt_bytes=" + prompt.length + "\\n");
@@ -193,9 +197,8 @@ export function makeProject(options = {}) {
 }
 
 export async function writeTaskJson(project) {
-  const { writeTask } = await jump("engine/task.ts");
   fs.mkdirSync(project.dreamRoot, { recursive: true });
-  writeTask(project.dreamRoot, project.task);
+  fs.writeFileSync(path.join(project.dreamRoot, "task.json"), `${JSON.stringify(project.task, null, 2)}\n`, "utf8");
 }
 
 /** Deploy the shipped policy into the project, with its relative imports. */
@@ -221,6 +224,7 @@ export function mockPi() {
     shortcuts,
     widgets: [],
     customViews: [],
+    terminal: { rows: 30, columns: 80 },
     handlers,
     entries,
     statuses,
@@ -261,14 +265,24 @@ export function mockPi() {
     cwd: null,
     sessionManager: {
       getSessionId: () => "test-session",
+      getSessionDir: () => path.join(context.cwd ?? process.cwd(), ".pi-sessions"),
       getEntries: () => entries,
       getBranch: () => harness.branch ?? entries,
     },
     ui: {
       setWidget: (key, value) => harness.widgets.push([key, value]),
       custom: (factory, options) => new Promise((resolve) => {
-        const view = factory({ requestRender: () => {} }, {}, {}, resolve);
-        harness.customViews.push({ view, options });
+        const fgCodes = { border: 33, accent: 35, success: 32, warning: 33, error: 31, muted: 37, dim: 90, text: 37 };
+        const bgCodes = { customMessageBg: 236, selectedBg: 24, userMessageBg: 24, toolPendingBg: 24, toolSuccessBg: 24, toolErrorBg: 24, searchMatchBg: 24 };
+        const theme = {
+          fg: (color, text) => `\x1b[38;5;${fgCodes[color] ?? 37}m${text}\x1b[0m`,
+          bg: (color, text) => `\x1b[48;5;${bgCodes[color] ?? 24}m${text}\x1b[0m`,
+          bold: (text) => `\x1b[1m${text}\x1b[0m`,
+          getBgAnsi: (color) => `\x1b[48;5;${bgCodes[color] ?? 24}m`,
+        };
+        const tui = { requestRender: () => {}, terminal: harness.terminal };
+        const view = factory(tui, theme, {}, resolve);
+        harness.customViews.push({ view, options, theme, tui });
       }),
       notify: (message) => notifications.push(message),
       setStatus: (key, value) => statuses.push([key, value ?? null]),

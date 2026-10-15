@@ -4,7 +4,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
+import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import type { ApplyVerification } from "./apply.ts";
 import type { TaskConfig } from "./task.ts";
@@ -29,6 +29,26 @@ export interface CandidateDelete {
 }
 
 export type CandidatePatch = CandidateWrite | CandidateDelete;
+
+export interface CandidateVerificationPair {
+  before: ScoreOutcome;
+  after: ScoreOutcome;
+  gain: number | null;
+  rawGain: number | null;
+}
+
+export interface CandidatePatchVerification extends ApplyVerification {
+  pairs: CandidateVerificationPair[];
+  medianPairedGain: number | null;
+  medianAfter: number | null;
+  medianAfterRaw: number | null;
+}
+
+export interface GateRun {
+  command: string;
+  result: CommandResult;
+  passed: boolean;
+}
 
 const RESERVED = new Set([".git", ".dream-rsi"]);
 
@@ -225,27 +245,13 @@ function validScore(outcome: ScoreOutcome): outcome is ScoreOutcome & { score: n
   return outcome.valid === true && outcome.fail_class === "ok" && outcome.error === null && typeof outcome.score === "number" && Number.isFinite(outcome.score);
 }
 
-function outcomeText(outcome: ScoreOutcome): string {
-  return validScore(outcome) ? String(outcome.raw_score ?? outcome.score) : `no score (${outcome.fail_class}${outcome.error ? `: ${outcome.error}` : ""})`;
-}
-
 async function scoreCopy(options: {
   sourceRoot: string; scratch: string; task: TaskConfig; logPath: string; dreamRoot: string;
   signal?: AbortSignal; beforeSpawn?: (key: string) => void; evaluatorKey: string; patch?: CandidatePatch[];
 }): Promise<ScoreOutcome> {
   const { sourceRoot, scratch, task, logPath, signal, beforeSpawn, evaluatorKey } = options;
   try {
-    await copyWorkspace(sourceRoot, scratch, { exclude: [path.join(sourceRoot, ".git"), path.join(sourceRoot, ".dream-rsi")] });
-    for (const operation of options.patch ?? []) {
-      const target = resolveSafe(scratch, path.join(scratch, ...operation.relative.split("/")));
-      if (!target) throw new Error(`patch escaped verification workspace: ${operation.relative}`);
-      if (operation.kind === "delete") fs.rmSync(target, { force: true });
-      else {
-        if (digest(fs.readFileSync(operation.from)) !== operation.afterHash) throw new Error(`candidate patch input changed: ${operation.relative}`);
-        fs.mkdirSync(path.dirname(target), { recursive: true });
-        fs.copyFileSync(operation.from, target);
-      }
-    }
+    await preparePatchedCopy({ sourceRoot, scratch, patch: options.patch });
     const scorePath = resolveSafe(scratch, path.join(scratch, task.score_path));
     if (!scorePath) throw new Error(`score path escapes verification workspace: ${task.score_path}`);
     fs.rmSync(scorePath, { force: true });
@@ -262,6 +268,61 @@ async function scoreCopy(options: {
   }
 }
 
+/** Copy a source tree and apply the complete verified patch into a disposable workspace. */
+export async function preparePatchedCopy(options: {
+  sourceRoot: string;
+  scratch: string;
+  patch?: CandidatePatch[];
+}): Promise<void> {
+  await copyWorkspace(options.sourceRoot, options.scratch, {
+    exclude: [path.join(options.sourceRoot, ".git"), path.join(options.sourceRoot, ".dream-rsi")],
+  });
+  for (const operation of options.patch ?? []) {
+    const target = resolveSafe(options.scratch, path.join(options.scratch, ...operation.relative.split("/")));
+    if (!target) throw new Error(`patch escaped verification workspace: ${operation.relative}`);
+    if (operation.kind === "delete") fs.rmSync(target, { force: true });
+    else {
+      if (digest(fs.readFileSync(operation.from)) !== operation.afterHash) throw new Error(`candidate patch input changed: ${operation.relative}`);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.copyFileSync(operation.from, target);
+    }
+  }
+}
+
+/** Run one correctness command against a clean copy, optionally with the complete candidate patch. */
+export async function runCampaignGate(options: {
+  sourceRoot: string;
+  scratch: string;
+  command: string;
+  timeoutMs: number;
+  logPath?: string | null;
+  signal?: AbortSignal;
+  beforeSpawn?: (key: string) => void;
+  key: string;
+  patch?: CandidatePatch[];
+}): Promise<GateRun> {
+  try {
+    await preparePatchedCopy({ sourceRoot: options.sourceRoot, scratch: options.scratch, patch: options.patch });
+    const result = await runShellCommand(options.command, {
+      cwd: options.scratch,
+      timeoutMs: options.timeoutMs,
+      logPath: options.logPath ?? null,
+      signal: options.signal,
+      beforeSpawn: () => options.beforeSpawn?.(options.key),
+    });
+    return { command: options.command, result, passed: result.ok && !result.timedOut && !result.aborted };
+  } finally {
+    fs.rmSync(options.scratch, { recursive: true, force: true });
+  }
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const ordered = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(ordered.length / 2);
+  return ordered.length % 2 === 0 ? (ordered[middle - 1] + ordered[middle]) / 2 : ordered[middle];
+}
+
 /** Score the live target and the complete candidate patch in independent scratch workspaces. */
 export async function verifyCandidatePatch(options: {
   dreamRoot: string;
@@ -271,7 +332,10 @@ export async function verifyCandidatePatch(options: {
   evidenceDir: string;
   signal?: AbortSignal;
   beforeSpawn?: (key: string) => void;
-}): Promise<ApplyVerification> {
+  repeats?: 1 | 3;
+  minimumGain?: number;
+  requireValidBeforeAfter?: boolean;
+}): Promise<CandidatePatchVerification> {
   const { dreamRoot, projectDir, task, patch, evidenceDir, signal, beforeSpawn } = options;
   const targetRoot = path.resolve(projectDir, task.workspace);
   ensureDirectoryRoot(targetRoot);
@@ -279,12 +343,51 @@ export async function verifyCandidatePatch(options: {
   const scratchBase = path.join(evidenceDir, `candidate-${process.pid}-${Date.now()}`);
   const stop = (): void => { if (signal?.aborted) throw new Error("candidate verification was cancelled"); };
   stop();
-  const before = await scoreCopy({ sourceRoot: targetRoot, scratch: `${scratchBase}-before`, task, dreamRoot, logPath: path.join(evidenceDir, "before.log"), signal, beforeSpawn, evaluatorKey: "candidate-before" });
-  stop();
-  const after = await scoreCopy({ sourceRoot: targetRoot, scratch: `${scratchBase}-after`, task, dreamRoot, logPath: path.join(evidenceDir, "after.log"), signal, beforeSpawn, evaluatorKey: "candidate-after", patch });
-  stop();
-  const improved = validScore(after) && (!validScore(before) || after.score > before.score);
-  return { before, after, improved, reason: improved ? null : `with the complete patch the target measures ${outcomeText(after)}, against ${outcomeText(before)} without it` };
+  const expectedPairs = options.repeats ?? 1;
+  const minimumGain = options.minimumGain ?? 0;
+  const pairs: CandidateVerificationPair[] = [];
+  for (let index = 0; index < expectedPairs; index += 1) {
+    const before = await scoreCopy({
+      sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-before`, task, dreamRoot,
+      logPath: path.join(evidenceDir, `pair${index}-before.log`), signal, beforeSpawn,
+      evaluatorKey: `candidate-before:pair${index}`,
+    });
+    stop();
+    const after = await scoreCopy({
+      sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-after`, task, dreamRoot,
+      logPath: path.join(evidenceDir, `pair${index}-after.log`), signal, beforeSpawn,
+      evaluatorKey: `candidate-after:pair${index}`, patch,
+    });
+    stop();
+    const bothValid = validScore(before) && validScore(after);
+    const rawGain = validScore(before) && validScore(after) && typeof before.raw_score === "number" && typeof after.raw_score === "number"
+      ? (task.higher_is_better ? after.raw_score - before.raw_score : before.raw_score - after.raw_score)
+      : null;
+    const gain = bothValid ? after.score - before.score : null;
+    pairs.push({ before, after, gain, rawGain });
+    if (expectedPairs > 1 && (gain === null || (index === 0 && gain <= minimumGain))) break;
+  }
+  const gains = pairs.map((pair) => pair.gain).filter((gain): gain is number => gain !== null);
+  const medianPairedGain = median(gains);
+  const medianAfter = median(pairs.map((pair) => pair.after).filter(validScore).map((score) => score.score));
+  const medianAfterRaw = median(pairs.map((pair) => pair.after).filter(validScore).flatMap((score) => typeof score.raw_score === "number" ? [score.raw_score] : []));
+  const allValid = pairs.every((pair) => validScore(pair.after) && ((options.requireValidBeforeAfter || expectedPairs > 1) ? validScore(pair.before) : true));
+  const improved = expectedPairs === 1 && !options.requireValidBeforeAfter
+    ? validScore(pairs[0].after) && (!validScore(pairs[0].before) || pairs[0].after.score > pairs[0].before.score)
+    : pairs.length === expectedPairs && allValid && medianPairedGain !== null && medianPairedGain > minimumGain;
+  const first = pairs[0];
+  const last = pairs.at(-1) ?? first;
+  if (!first || !last) throw new Error("candidate verification produced no score pairs");
+  return {
+    before: first.before,
+    after: { ...last.after, score: medianAfter, raw_score: medianAfterRaw },
+    improved,
+    reason: improved ? null : `paired verification did not exceed minimum gain ${minimumGain}; valid before/after scores are required`,
+    pairs,
+    medianPairedGain,
+    medianAfter,
+    medianAfterRaw,
+  };
 }
 
 interface JournalEntry { relative: string; to: string; kind: CandidatePatch["kind"]; beforeHash: string | null; afterHash: string | null; beforeMode: number | null; beforeIdentity: string | null; afterIdentity: string | null; backup: string | null; tombstone: string | null; untouched: boolean; from?: string; }

@@ -60,6 +60,21 @@ export function readCheckpoint(root: string, iteration: number): LiveCheckpoint 
   if (cp.version !== 1 || cp.manifest.iteration !== iteration || !Array.isArray(cp.batches)) throw new Error("invalid live checkpoint");
   return cp;
 }
+/** Interrupted live trees that retain a checkpoint can be resumed by the internal live engine. */
+export function recoverableIterations(root: string): number[] {
+  try {
+    return fs.readdirSync(path.join(root, "trace_pool")).flatMap((entry) => {
+      const match = /^iter(\d+)_current$/.exec(entry);
+      if (!match) return [];
+      const iteration = Number(match[1]);
+      try {
+        const cp = readCheckpoint(root, iteration);
+        const published = readManifest(root, iteration)?.status === "complete";
+        return cp.status !== "complete" || !published ? [iteration] : [];
+      } catch { return []; }
+    }).sort((a, b) => b - a);
+  } catch { return []; }
+}
 /** Stable contents hash: detects deleted/edited recovery snapshots before any new paid call. */
 export async function workspaceHash(root: string): Promise<string> {
   const digest = createHash("sha256");
@@ -138,13 +153,4 @@ export async function validateCheckpoint(root: string, project: string, currentT
 }
 export async function snapshotSeed(from: string, to: string, excluded: string[]): Promise<string> {
   await copyWorkspace(from, to, { exclude: excluded }); return workspaceHash(to);
-}
-export function recoverableIterations(root: string): number[] {
-  try {
-    return fs.readdirSync(path.join(root, "trace_pool")).flatMap((e) => {
-      const m = /^iter(\d+)_current$/.exec(e); if (!m) return [];
-      try { const cp = readCheckpoint(root, Number(m[1])); const published = readManifest(root, Number(m[1]))?.status === "complete";
-        return cp.status !== "complete" || !published ? [Number(m[1])] : []; } catch { return []; }
-    }).sort((a, b) => b - a);
-  } catch { return []; }
 }
