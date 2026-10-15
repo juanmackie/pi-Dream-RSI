@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Dashboard } from "./dashboard.ts";
-import { campaignRuntimeDiagnostics, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
+import { campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignCheckReport, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { resolveWithinRoot } from "./engine/apply.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { defaultTask, normalizeTask, validateTask, type TaskConfig } from "./engine/task.ts";
@@ -53,7 +53,7 @@ const campaignTaskParams = {
 const improveParams = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["start", "status", "stop", "resume"], description: "Campaign action to start, inspect, stop or resume." },
+    action: { type: "string", enum: ["check", "start", "status", "stop", "resume"], description: "Check an evaluator or start, inspect, stop or resume a campaign." },
     goal: { type: "string", description: "Concrete improvement goal. Required for start." },
     project_dir: { type: "string", description: "Local project or managed clone path; defaults to the current project." },
     task: { ...campaignTaskParams, description: "Direct task/evaluator configuration for this isolated campaign. Does not change the legacy task." },
@@ -63,6 +63,8 @@ const improveParams = {
     max_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Optional lower spawned-agent cap (campaign default 36)." },
     max_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Optional lower evaluator-run cap (campaign default 100)." },
     minimum_gain: { type: "number", minimum: 0, description: "Optional finite normalized-score delta; the baseline must repeat within this tolerance, and a candidate must beat it to qualify." },
+    runs: { type: "integer", minimum: 1, maximum: 5, description: "Evaluator check repetitions (default 3, maximum 5)." },
+    gates: { type: "array", items: { type: "string" }, description: "Optional correctness commands, such as the project's test command. Their inputs belong in verifier_inputs." },
   },
   required: ["action"],
   additionalProperties: false,
@@ -122,7 +124,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "For dream_rsi_improve, assess a target-only request and offer measurable goals first. Do not call start from /dream-rsi assess or a generic question.",
       "For dream_rsi_improve, start/resume is enabled only after an explicit improve request has activated Dream-RSI mode; status and stop remain controllable while mode is off.",
       "For dream_rsi_improve, use status, stop and resume against the active campaign. Resume uses its frozen goal, task, scope and verifier inputs.",
-      "For dream_rsi_improve, use minimum_gain only when the evaluator has a defensible deterministic normalized-score tolerance; the controller requires two valid baseline scores within it and also requires a candidate to exceed it.",
+      "For dream_rsi_improve, run action=check before start and resolve its evaluator and gate diagnoses. Check uses fresh copies and writes no campaign record or seed history.",
+      "For dream_rsi_improve, omit minimum_gain to calibrate observed baseline noise. Set it only for a defensible explicit tolerance. Every gate input must be declared in verifier_inputs.",
       "For dream_rsi_improve, the campaign applies at most one in-scope candidate per cycle, only after its verifier measures a strict improvement. Report the final stop reason and call budget.",
     ],
     parameters: improveParams,
@@ -149,8 +152,37 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign, runtime)}` }], details: { campaign, runtime } }
           : { content: [{ type: "text", text: `No active improvement campaign under ${baseRoot}.\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
       }
-      if (action !== "start" && action !== "resume") {
-        return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
+      if (action !== "start" && action !== "resume" && action !== "check") {
+        return { content: [{ type: "text", text: "action must be check, start, status, stop or resume." }], details: { ok: false } };
+      }
+      if (action === "check") {
+        const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
+        if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
+        const parsed = parseCampaignTask(params.task, ctx);
+        if (parsed.errors.length > 0 || !parsed.task) return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
+        const task = { ...parsed.task, agent: runAgentConfig(ctx, parsed.task.agent) };
+        const errors = validateCampaignPaths(projectDir, task);
+        const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
+        const gates = readStringArray(params.gates, "gates");
+        const runs = params.runs === undefined ? 3 : params.runs;
+        if (verifierInputs.error || gates.error || !Number.isSafeInteger(runs) || runs < 1 || runs > 5) {
+          const messages = [verifierInputs.error, gates.error, (!Number.isSafeInteger(runs) || runs < 1 || runs > 5) ? "runs must be an integer from 1 to 5" : null].filter((message): message is string => message !== null);
+          return { content: [{ type: "text", text: messages.join("\n") }], details: { ok: false, errors: messages } };
+        }
+        if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
+        const inputErrors = validateCampaignInputs(baseRoot, projectDir, task, [task.eval_program], verifierInputs.values);
+        if (inputErrors.length > 0) return { content: [{ type: "text", text: `Campaign inputs are invalid:\n- ${inputErrors.join("\n- ")}` }], details: { ok: false, errors: inputErrors } };
+        const report = await checkCampaignEvaluator({
+          baseRoot,
+          projectDir,
+          task,
+          ...(verifierInputs.values ? { verifierInputs: verifierInputs.values } : {}),
+          ...(gates.values ? { gates: gates.values } : {}),
+          runs,
+          signal,
+        });
+        const text = renderCampaignCheckReport(report);
+        return { content: [{ type: "text", text }], details: { check: report } };
       }
 
       const projectDir = action === "start"
@@ -171,8 +203,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
         const scope = readStringArray(params.scope, "scope");
         const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
-        if (scope.error || verifierInputs.error) {
-          const errors = [scope.error, verifierInputs.error].filter((error): error is string => error !== null);
+        const gates = readStringArray(params.gates, "gates");
+        if (scope.error || verifierInputs.error || gates.error) {
+          const errors = [scope.error, verifierInputs.error, gates.error].filter((error): error is string => error !== null);
           return { content: [{ type: "text", text: errors.join("\n") }], details: { ok: false, errors } };
         }
         const campaignScope = scope.values?.length ? scope.values : [task.eval_program];
@@ -190,6 +223,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           goal,
           scope: campaignScope,
           ...(verifierInputs.values ? { verifierInputs: verifierInputs.values } : {}),
+          ...(gates.values ? { gates: gates.values } : {}),
           ...(limitResult.limits ? { limits: limitResult.limits } : {}),
           ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
           signal,
@@ -555,6 +589,19 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
   ];
   if (state.kind === "paused" || state.kind === "complete" || state.kind === "failed") lines.push(`  stopped because: ${state.reason}`);
   if ("stopReason" in campaign && campaign.stopReason) lines.push(`  stop reason: ${campaign.stopReason}`);
+  for (const rejection of campaign.rejections.slice(-3)) lines.push(`  rejected ${rejection.cell} (${rejection.stage}): ${rejection.reasons.join("; ")}`);
+  return lines.join("\n");
+}
+
+function renderCampaignCheckReport(report: CampaignCheckReport): string {
+  const lines = ["Evaluator check", ...report.runs.map((run, index) =>
+    `  run ${index + 1}: ${Math.ceil(run.durationMs / 1000)}s, exit ${run.code ?? "unknown"}, ${run.valid ? `score ${run.score}` : `${run.failClass}${run.error ? `: ${run.error}` : ""}`}`),
+  `  spread: ${report.spread ?? "unavailable"}`,
+  `  recommended evaluator_timeout_ms: ${report.recommendedEvaluatorTimeoutMs}`,
+  `  recommended minimum_gain: ${report.recommendedMinimumGain}`,
+  ...report.gateRuns.map((gate) => `  gate ${gate.passed ? "passed" : "failed"}: exit ${gate.code ?? "unknown"}${gate.error ? ` (${gate.error})` : ""}`),
+  ...(report.diagnoses.length ? report.diagnoses.map((diagnosis) => `  diagnosis: ${diagnosis}`) : ["  diagnoses: none"]),
+  `  report: ${report.reportPath}`];
   return lines.join("\n");
 }
 

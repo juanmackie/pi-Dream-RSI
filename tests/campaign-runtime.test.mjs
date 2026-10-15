@@ -39,6 +39,19 @@ test("campaign reserves the probe before spawn and stops at the actual agent-sta
   } finally { project.cleanup(); }
 });
 
+test("lower-is-better baseline initializes the best score below zero", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "cost-score.mjs");
+    fs.writeFileSync(scorer, `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score: 10, valid: true, fail_class: "ok", error: null }));\n`);
+    const task = { ...project.task, score_program: `node "${scorer}"`, higher_is_better: false };
+    const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 1 }), verifierInputs: [scorer] });
+    assert.equal(result.currentScore, -10);
+    assert.equal(result.bestScore, -10);
+  } finally { project.cleanup(); }
+});
+
 test("campaign status distinguishes a malformed active pointer from no campaign", async () => {
   const project = makeProject();
   try {
@@ -93,13 +106,138 @@ test("campaign stops before live when repeated baseline scores exceed the declar
   try {
     const campaign = await jump("engine/campaign.ts");
     const scorer = path.join(project.projectDir, "varying-score.mjs");
-    fs.writeFileSync(scorer, `import { mkdirSync, writeFileSync } from "node:fs";\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score: Math.random() * 1000, valid: true, fail_class: "ok", error: null }));\n`);
+    const counter = path.join(project.dir, "baseline-count.txt");
+    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst counter = ${JSON.stringify(counter)};\nconst n = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;\nwriteFileSync(counter, String(n));\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score: n * 100, valid: true, fail_class: "ok", error: null }));\n`);
     const task = { ...project.task, score_program: `node "${scorer}"` };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1 }), verifierInputs: [scorer], minimumGain: 0 });
     assert.equal(result.state.kind, "failed");
     assert.match(result.stopReason, /repeated baseline changed/);
     assert.equal(result.evaluatorRuns, 2);
     assert.equal(result.completedCycles.length, 0);
+  } finally { project.cleanup(); }
+});
+
+test("omitted minimum gain calibrates a noisy baseline with one additional measurement", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "varying-score.mjs");
+    const counter = path.join(project.dir, "calibration-count.txt");
+    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst counter = ${JSON.stringify(counter)};\nconst n = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;\nwriteFileSync(counter, String(n));\nconst score = [10,12,11][n - 1] ?? 11;\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score, valid: true, fail_class: "ok", error: null }));\n`);
+    const task = { ...project.task, score_program: `node "${scorer}"` };
+    const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 1 }), verifierInputs: [scorer] });
+    assert.equal(result.state.kind, "complete");
+    assert.equal(result.evaluatorRuns, 3);
+    const recordPath = path.join(result.campaignRoot, "campaign.json");
+    const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    assert.equal(record.minimumGainSource, "calibrated");
+    assert.equal(record.baselineScores.length, 3);
+    assert.deepEqual(record.baselineScores, [10, 12, 11]);
+    assert.equal(record.minimumGain, 3);
+  } finally { project.cleanup(); }
+});
+
+test("a candidate below the calibrated minimum gain is never applied", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "calibrated-threshold-score.mjs");
+    const counter = path.join(project.dir, "calibrated-threshold-count.txt");
+    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst counter = ${JSON.stringify(counter)};\nconst n = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;\nwriteFileSync(counter, String(n));\nconst source = readFileSync("solution.py", "utf8");\nconst score = n <= 3 ? [100,120,110][n - 1] : 100 + (source.match(/x/g) ?? []).length;\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score, valid: true, fail_class: "ok", error: null }));\n`);
+    const task = { ...project.task, score_program: `node "${scorer}"` };
+    const result = await campaign.runCampaign({
+      ...campaignOptions(project, task),
+      verifierInputs: [scorer],
+      limits: { maxCycles: 1, maxAgentStarts: 36, maxEvaluatorRuns: 100 },
+    });
+    assert.equal(result.state.kind, "complete", result.stopReason);
+    assert.ok(result.rejections.some((rejection) => rejection.stage === "candidate-score"));
+    const record = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign.json"), "utf8"));
+    assert.equal(record.minimumGain, 30);
+    assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false);
+  } finally { project.cleanup(); }
+});
+
+test("start rejects an evaluator path that escapes the scratch workspace", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const nested = path.join(project.projectDir, "nested");
+    fs.mkdirSync(nested);
+    fs.writeFileSync(path.join(nested, "solution.py"), "print('nested')\n");
+    const task = { ...project.task, workspace: "nested", score_program: "node ../score-ok.mjs" };
+    await assert.rejects(
+      campaign.runCampaign({ ...campaignOptions(project, task), verifierInputs: [path.join(project.projectDir, "score-ok.mjs")] }),
+      /use an absolute path/i,
+    );
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false);
+  } finally { project.cleanup(); }
+});
+
+test("failing unchanged-target gates stop before the probe and persist no target changes", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const gate = path.join(project.projectDir, "gate.mjs");
+    fs.writeFileSync(gate, "process.exit(4);\n");
+    const before = fs.readFileSync(path.join(project.seed, "solution.py"), "utf8");
+    const result = await campaign.runCampaign({ ...campaignOptions(project), verifierInputs: [path.join(project.projectDir, "score-ok.mjs"), gate], gates: [`node "${gate}"`] });
+    assert.equal(result.state.kind, "failed");
+    assert.match(result.stopReason, /gate/i);
+    assert.equal(result.agentStarts, 0);
+    assert.equal(fs.readFileSync(path.join(project.seed, "solution.py"), "utf8"), before);
+    assert.equal(fs.existsSync(path.join(project.projectDir, "solution.py")), false);
+  } finally { project.cleanup(); }
+});
+
+test("a gate that changes a declared input aborts before campaign work", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const gate = path.join(project.projectDir, "mutating-gate.mjs");
+    fs.writeFileSync(gate, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(gate)}, "process.exit(0);\\n");\n`);
+    const result = await campaign.runCampaign({ ...campaignOptions(project), verifierInputs: [path.join(project.projectDir, "score-ok.mjs"), gate], gates: [`node "${gate}"`] });
+    assert.equal(result.state.kind, "failed");
+    assert.match(result.stopReason, /identity changed during campaign/);
+    assert.equal(result.agentStarts, 0);
+    assert.equal(result.evaluatorRuns, 1);
+  } finally { project.cleanup(); }
+});
+
+test("stop cancels a baseline evaluator and prevents the repeat start", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const marker = path.join(project.dir, "baseline-started");
+    const scorer = path.join(project.projectDir, "slow-baseline.mjs");
+    fs.writeFileSync(scorer, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(marker)}, "started");\nsetInterval(() => {}, 1000);\n`);
+    const task = { ...project.task, score_program: `node "${scorer}"` };
+    const run = campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1 }), verifierInputs: [scorer] });
+    await waitFor(() => fs.existsSync(marker));
+    campaign.stopCampaign(project.dreamRoot);
+    const result = await run;
+    assert.equal(result.state.kind, "paused");
+    assert.equal(result.evaluatorRuns, 1);
+  } finally { project.cleanup(); }
+});
+
+test("candidate gate failure records a rejection and leaves the target untouched", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const gate = path.join(project.projectDir, "reject-added-marker.mjs");
+    fs.writeFileSync(gate, `import { readFileSync } from "node:fs";\nprocess.exit(readFileSync("solution.py", "utf8").includes("x") ? 3 : 0);\n`);
+    const before = fs.readFileSync(path.join(project.seed, "solution.py"), "utf8");
+    const result = await campaign.runCampaign({
+      ...campaignOptions(project),
+      gates: [`node "${gate}"`],
+      verifierInputs: [path.join(project.projectDir, "score-ok.mjs"), gate],
+      limits: { maxCycles: 1, maxAgentStarts: 36, maxEvaluatorRuns: 100 },
+    });
+    assert.equal(result.state.kind, "complete", result.stopReason);
+    assert.ok(result.rejections.some((rejection) => rejection.stage === "gate"));
+    assert.equal(fs.readFileSync(path.join(project.seed, "solution.py"), "utf8"), before);
+    assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false);
   } finally { project.cleanup(); }
 });
 

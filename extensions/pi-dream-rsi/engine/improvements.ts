@@ -79,6 +79,7 @@ export async function measureSeed(options: {
   task: TaskConfig;
   log?: (message: string) => void;
   beforeEvaluatorSpawn?: (key: string) => void;
+  signal?: AbortSignal;
   exclude?: string[];
 }): Promise<SeedMeasurement | null> {
   const { dreamRoot, projectDir, task } = options;
@@ -94,6 +95,7 @@ export async function measureSeed(options: {
       scratch: path.join(historyDir(dreamRoot), "seed-workspace"),
       logPath: path.join(historyDir(dreamRoot), "seed", "score.log"),
       beforeEvaluatorSpawn: options.beforeEvaluatorSpawn,
+      signal: options.signal,
       evaluatorKey: "seed-measurement",
       exclude: options.exclude,
     });

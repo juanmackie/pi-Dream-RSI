@@ -1,0 +1,94 @@
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import test from "node:test";
+
+import { jump, makeProject } from "./fixtures.mjs";
+
+test("check measures fresh copies and persists only a check report", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const result = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot,
+      projectDir: project.projectDir,
+      task: project.task,
+      verifierInputs: [path.join(project.projectDir, "score-ok.mjs")],
+      runs: 3,
+    });
+    assert.equal(result.runs.length, 3);
+    assert.ok(result.runs.every((run) => run.code === 0 && run.valid && run.score === 0 && run.durationMs >= 0));
+    assert.equal(result.spread, 0);
+    assert.equal(result.recommendedMinimumGain, 0);
+    assert.ok(fs.existsSync(result.reportPath));
+    assert.deepEqual(fs.readdirSync(path.join(project.dreamRoot, "checks")), [path.basename(result.reportPath)]);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "history", "seed", "score.json")), false);
+    assert.equal(fs.existsSync(path.join(project.seed, "eval", "score.json")), false);
+  } finally { project.cleanup(); }
+});
+
+test("check diagnoses relative evaluator paths that only resolve from the target", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const workspace = path.join(project.projectDir, "nested");
+    fs.mkdirSync(workspace);
+    fs.writeFileSync(path.join(workspace, "solution.py"), "print('nested')\n");
+    const task = { ...project.task, workspace: "nested", score_program: "node ../score-ok.mjs" };
+    const report = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot, projectDir: project.projectDir, task,
+      verifierInputs: [path.join(project.projectDir, "score-ok.mjs")], runs: 1,
+    });
+    assert.ok(report.diagnoses.some((message) => /use an absolute path/i.test(message)));
+  } finally { project.cleanup(); }
+});
+
+test("check diagnoses missing interpreters and clamps evaluator timeout", async () => {
+  const project = makeProject({ evaluatorTimeoutMs: 900_000 });
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "missing-command.mjs");
+    fs.writeFileSync(scorer, "process.exit(127);\n");
+    const task = { ...project.task, score_program: `node "${scorer}"` };
+    const report = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot, projectDir: project.projectDir, task,
+      verifierInputs: [scorer], runs: 1,
+    });
+    assert.ok(report.diagnoses.some((message) => /interpreter not found on PATH/i.test(message)));
+    assert.ok(report.diagnoses.some((message) => /300 s/i.test(message)));
+    assert.equal(report.runs[0].code, 127);
+  } finally { project.cleanup(); }
+});
+
+test("check records a real evaluator timeout diagnosis", async () => {
+  const project = makeProject({ evaluatorTimeoutMs: 1000 });
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "hang.mjs");
+    fs.writeFileSync(scorer, "setInterval(() => {}, 1000);\n");
+    const task = { ...project.task, score_program: `node "${scorer}"` };
+    const report = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot, projectDir: project.projectDir, task,
+      verifierInputs: [scorer], runs: 1,
+    });
+    assert.equal(report.runs[0].failClass, "timeout");
+    assert.ok(report.diagnoses.some((message) => /evaluator takes \d+ s/i.test(message)));
+  } finally { project.cleanup(); }
+});
+
+test("check reports gates that fail on the unchanged target", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const gate = path.join(project.projectDir, "gate.mjs");
+    fs.writeFileSync(gate, "process.exit(4);\n");
+    const report = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task,
+      verifierInputs: [path.join(project.projectDir, "score-ok.mjs"), gate], gates: [`node "${gate}"`], runs: 1,
+    });
+    assert.equal(report.gateRuns.length, 1);
+    assert.equal(report.gateRuns[0].passed, false);
+    assert.ok(report.diagnoses.some((message) => /gate failed on the unchanged target/i.test(message)));
+  } finally { project.cleanup(); }
+});

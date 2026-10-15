@@ -16,7 +16,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
+import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import { nodeWorkspace, workRoot } from "./world.ts";
 import type { TaskConfig } from "./task.ts";
@@ -85,12 +85,13 @@ export async function scoreSeedCopy(options: {
   task: TaskConfig;
   /** Where the throwaway copy goes. Must be free for this call: concurrent calls need different paths. */
   scratch: string;
-  logPath: string;
+  logPath?: string | null;
   overlay?: Pick<ApplyFile, "relative" | "from">[];
   signal?: AbortSignal;
   beforeEvaluatorSpawn?: (key: string) => void;
   evaluatorKey?: string;
   exclude?: string[];
+  onCommand?: (command: CommandResult) => void;
 }): Promise<ScoreOutcome> {
   const { dreamRoot, projectDir, task, scratch } = options;
   const seed = path.resolve(projectDir, task.workspace);
@@ -110,10 +111,11 @@ export async function scoreSeedCopy(options: {
     const command = await runShellCommand(task.score_program, {
       cwd: scratch,
       timeoutMs: task.evaluator_timeout_ms,
-      logPath: options.logPath,
+      logPath: options.logPath ?? null,
       signal: options.signal,
       beforeSpawn: () => options.beforeEvaluatorSpawn?.(options.evaluatorKey ?? "apply-score"),
     });
+    options.onCommand?.(command);
     return interpretEvaluation(task, command, readScoreFile(scratch, task));
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
