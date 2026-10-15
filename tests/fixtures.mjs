@@ -265,6 +265,7 @@ export function mockPi() {
     cwd: null,
     sessionManager: {
       getSessionId: () => "test-session",
+      getSessionDir: () => path.join(context.cwd ?? process.cwd(), ".pi-sessions"),
       getEntries: () => entries,
       getBranch: () => harness.branch ?? entries,
     },

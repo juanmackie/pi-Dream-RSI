@@ -7,10 +7,9 @@ description: Run a bounded Dream-RSI campaign that improves a chosen repository,
 
 Use this skill for an explicit improvement request. The request authorizes the controller to apply and repeat verified, in-scope wins within its stated limits. Do not ask for approval after each verified win.
 
-For `/dream-rsi assess` or a request to choose what to improve, read `skills/dream-rsi-assess/SKILL.md` and stop after the assessment.
+For `/dream-rsi assess`, read `skills/dream-rsi-assess/SKILL.md` and stop after the assessment.
 
-If the user asks to improve a target but gives no measurable goal, first assess that target and present up to
-three evidence-backed goals. Wait for the user to choose one; do not invent the goal or start a campaign yet.
+For a plain-language request to improve without a named lever, run the same read-only lever analysis described in `skills/dream-rsi-assess/SKILL.md`, including a call to `dream_rsi_signals`, then choose the highest-ranked ready lever and continue. Briefly state the chosen lever and why. Ask one focused question only when no lever is ready. Do not add an approval step when a ready lever exists; the explicit improve request authorizes the campaign.
 
 ## Resolve the target and goal
 
@@ -24,17 +23,19 @@ Inspect the target before configuring it. Read its goals, implementation, tests,
 
 Search for an existing benchmark, test harness, or project check that measures the requested outcome. The scoring command must invoke a fixed evaluator wrapper outside the candidate workspace. Because it runs from a scratch copy of that workspace, reference an external wrapper by its canonical absolute path. A workspace-local test command is editable by live agents before it scores their attempts, so it cannot serve as the trusted verifier by itself. Wrap and pin existing project tooling when it provides a trustworthy measure; keep evaluator code, acceptance fixtures, and configuration in a protected location outside candidate-editable paths. Pass their paths in `verifier_inputs`: use project-relative paths for files under the project, or canonical absolute paths for external trusted files. The controller records and freezes their identity. The candidate program remains the input under evaluation; the candidate must not be able to change the oracle or acceptance cases.
 
-If no suitable evaluator exists, derive one from the user's stated goal and the project's existing contracts. Keep generated acceptance cases separate from candidate files. Before `start`, call `dream_rsi_improve` with `action: "check"`. The check runs the evaluator on fresh copies, reports duration, exit code, score validity, spread, and path or timeout diagnoses, then writes a report under `.dream-rsi/checks/`. It does not start an agent, create a campaign, or write seed history. Resolve each diagnosis before starting.
+For every weakness-derived lever, ensure the evaluator has targeted cases for the requested behavior, even when reusing an existing evaluator. If no suitable evaluator exists, derive one from the user's stated goal and the project's existing contracts. Keep acceptance cases separate from candidate files. Declare all fixed verifier files in `verifier_inputs`, and leave measurable headroom in the baseline. Add a known-better control fixture outside candidate scope; verify that the metric recognizes it as better and rejects invalid behavior. Keep intake small and report measured baseline headroom without inventing a numerical impact. Before `start`, run `dream_rsi_improve` with `action: "check"` and resolve every diagnosis. The check runs the evaluator on fresh copies, reports duration, exit code, score validity, spread, and path or timeout diagnoses, then writes a report under `.dream-rsi/checks/`. It is guarded and does not start an agent, create a campaign, or write seed history.
 
 Passing tests are correctness evidence, not proof of improvement. Add a goal-specific metric such as latency, memory, output quality under explicit acceptance cases, or a count of completed requirements. If the baseline already satisfies every acceptance case and no separate metric has measurable headroom, stop and ask the user to choose another goal.
 
 Use a deterministic evaluator when possible. The controller runs three evaluator checks by default and recommends a timeout at three times the longest run, capped at 300 seconds. It recommends `minimum_gain` at 1.5 times the observed score spread. Leave `minimum_gain` out to calibrate a noisy baseline with one additional measurement. When you pass it, the controller treats it as an explicit tolerance and stops if the two baseline scores differ by more than that value.
 
-For noisy candidate measurements, the controller screens with one before-and-after pair. It runs two more pairs only when the screen exceeds `minimum_gain`. Every pair needs valid before and after scores. Promotion requires the median paired gain to exceed `minimum_gain`, and every after score must be valid. The controller checks at most two candidates per noisy cycle.
+For noisy candidate measurements, the controller screens with one before-and-after pair. It runs two more pairs only when the screen exceeds `minimum_gain`. Every pair needs valid before and after scores. Promotion requires the median paired gain to exceed `minimum_gain`, and every after score must be valid. The controller checks at most two candidates per noisy cycle. Omitted `minimum_gain` calibrates baseline noise; a supplied value remains the explicit repeat tolerance.
 
 Pass project correctness commands in `gates`, such as the project's test command. Declare each gate's fixed scripts and data in `verifier_inputs`. The controller runs gates on the unchanged target before the probe and on a fresh patched copy after the metric passes. Every gate must exit with code 0. A gate failure rejects that candidate and records the reasons in campaign history.
 
 Keep candidate changes inside the declared `scope`. Exclude evaluator files, fixtures, secrets, and campaign state from candidate edits. Identify additions, updates, and deletions in the candidate patch. If a candidate escapes scope or the target changes during evaluation, stop without applying it.
+
+Every candidate application is gated by its metric and correctness gates, then by an adversarial review of the patch and evidence. The review must start a fresh reviewer and count that start against the saved agent budget. Review each candidate separately; resolve the active session model for each agent call and use the saved campaign configuration only when no active session model is available. Do not hard-code a model name. Any failed gate or rejecting review blocks application and records its rejection details in campaign history. The signals tool reports fixed rejection categories only; do not expose the stored free-form reasons.
 
 ## Start the campaign
 

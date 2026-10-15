@@ -11,6 +11,7 @@ import { campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus,
 import { resolveWithinRoot } from "./engine/apply.ts";
 import { phaseIsActive } from "./engine/ownership.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
+import { collectSignals } from "./engine/signals.ts";
 import { defaultTask, normalizeTask, validateTask, type TaskConfig } from "./engine/task.ts";
 import { SKILLS_DIR } from "./layout.ts";
 
@@ -62,11 +63,20 @@ const improveParams = {
     max_cycles: { type: "integer", minimum: 1, maximum: 5, description: "Optional lower cycle cap (campaign default 5). Use this to honor a request such as 'run 2 cycles'." },
     max_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Optional lower spawned-agent cap (campaign default 36)." },
     max_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Optional lower evaluator-run cap (campaign default 100)." },
-    minimum_gain: { type: "number", minimum: 0, description: "Optional finite normalized-score delta; the baseline must repeat within this tolerance, and a candidate must beat it to qualify." },
+    minimum_gain: { type: "number", minimum: 0, description: "Optional explicit normalized-score tolerance. Omit it to calibrate the baseline from observed noise." },
     runs: { type: "integer", minimum: 1, maximum: 5, description: "Evaluator check repetitions (default 3, maximum 5)." },
     gates: { type: "array", items: { type: "string" }, description: "Optional correctness commands, such as the project's test command. Their inputs belong in verifier_inputs." },
   },
   required: ["action"],
+  additionalProperties: false,
+};
+
+const signalsParams = {
+  type: "object",
+  properties: {
+    focus: { type: "string", description: "Optional plain-language intent used to rank matching evidence." },
+    include_logs: { type: "boolean", description: "Read bounded local session aggregates. Defaults to true; false skips all session-file access." },
+  },
   additionalProperties: false,
 };
 
@@ -120,7 +130,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_improve",
     label: "Dream-RSI Improve",
     description:
-      "Start, inspect, stop or resume an isolated, budgeted Dream-RSI improvement campaign. A start supplies its own goal, project directory and task/evaluator config, so it never reconfigures the legacy .dream-rsi task.",
+      "Check an evaluator before starting a bounded Dream-RSI campaign, then inspect, stop or resume it. The controller applies only verified, gated, adversarially reviewed changes and counts review calls against the agent budget.",
     promptSnippet: "Control the active isolated Dream-RSI campaign. Start only for an explicit improvement request; assess requests are read-only.",
     promptGuidelines: [
       "For dream_rsi_improve, use action=start only after the user explicitly asks to improve or optimize a target and intake has defined a measurable goal, correctness gate, task workspace, candidate program and fixed evaluator outside the candidate workspace, declared in verifier_inputs. Absolute external verifier paths are allowed.",
@@ -130,6 +140,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "For dream_rsi_improve, use status, stop and resume against the active campaign. Resume uses its frozen goal, task, scope and verifier inputs.",
       "For dream_rsi_improve, run action=check before start and resolve its evaluator and gate diagnoses. Check uses fresh copies and writes no campaign record or seed history.",
       "For dream_rsi_improve, omit minimum_gain to calibrate observed baseline noise. Set it only for a defensible explicit tolerance. Every gate input must be declared in verifier_inputs.",
+      "For dream_rsi_improve, every candidate must pass its metric and gates, then receive an accepting adversarial review before apply. Review agent starts count against the saved agent budget.",
+      "For dream_rsi_improve, resolve the active session model and thinking level at each agent call; use the campaign record only when no session value is available.",
       "For dream_rsi_improve, the campaign applies at most one in-scope candidate per cycle, only after its verifier measures a strict improvement. Report the final stop reason and call budget.",
     ],
     parameters: improveParams,
@@ -252,6 +264,33 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       });
       const runtime = campaignRuntimeDiagnostics();
       return { content: [{ type: "text", text: renderCampaignStatus(result, runtime) }], details: { campaign: result, runtime } };
+    },
+  });
+
+  pi.registerTool({
+    name: "dream_rsi_signals",
+    label: "Dream-RSI Signals",
+    description: "Read bounded, privacy-filtered project signals for lever assessment. The tool is free and read-only.",
+    promptSnippet: "Read project signals and rank evidence for an improvement intent. This tool does not run project commands or change files.",
+    promptGuidelines: [
+      "For dream_rsi_signals, pass the user's plain-language improvement intent as focus when available.",
+      "For dream_rsi_signals, report only returned aggregates and diagnostics. Do not repeat raw commands, paths, errors, commit subjects or campaign text.",
+      "For dream_rsi_signals, use include_logs=false when the user disables session-log analysis.",
+    ],
+    parameters: signalsParams,
+    async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
+      const includeLogs = params.include_logs !== false;
+      const result = await collectSignals({
+        projectDir: ctx.cwd,
+        ...(typeof params.focus === "string" && params.focus.trim() ? { focus: params.focus.trim() } : {}),
+        includeLogs,
+        ...(includeLogs ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
+        now: new Date(),
+      });
+      const lines = result.weaknesses.map((weakness) => `- ${weakness.summary}`);
+      for (const diagnostic of result.diagnostics) lines.push(`- ${diagnostic}`);
+      const text = lines.length > 0 ? lines.join("\n") : "No relevant project signals found.";
+      return { content: [{ type: "text", text }], details: { signals: result } };
     },
   });
 
@@ -383,7 +422,7 @@ function normalizePathArg(value: string): string {
 function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
-    "  /dream-rsi assess [what you want]  rank project levers (read-only)",
+    "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
     "  /dream-rsi improve <what you want>  run a verified improvement campaign",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
@@ -393,7 +432,7 @@ function renderCommandHelp(): string {
 function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
-    { value: "assess", label: "assess [what you want]", description: "Rank project levers without changing files" },
+    { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
     { value: "improve", label: "improve <what you want>", description: "Run a bounded improvement campaign" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },

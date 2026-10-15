@@ -22,7 +22,7 @@ test("registers only the campaign controller and lifecycle hooks", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve", "dream_rsi_signals"]);
     assert.deepEqual([...harness.commands.keys()], ["dream-rsi"]);
     for (const event of ["session_start", "session_tree", "session_shutdown", "resources_discover", "input"]) {
       assert.equal(typeof harness.handlers.get(event), "function", `${event} hook registered`);
@@ -114,7 +114,7 @@ test("assess is read-only and works without a configured Dream-RSI task", async 
     await harness.commands.get("dream-rsi").handler("assess src/cache.ts", context);
     assert.equal(harness.sentMessages.length, 1);
     assert.equal(harness.sentMessages[0].content, "/skill:dream-rsi-assess src/cache.ts");
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve", "dream_rsi_signals"]);
     assert.equal(fs.existsSync(project.dreamRoot), false);
   } finally { project.cleanup(); }
 });
@@ -167,6 +167,7 @@ test("headless help and retired manual verbs report without activating model wor
       assert.deepEqual(harness.injectedMessages.at(-1).options, { triggerTurn: false }, "idle hosts receive the report immediately, without waiting for another turn");
       assert.match(help, /arXiv 2609\.14858/);
       assert.match(help, /assess/);
+      assert.match(help, /--no-logs/);
       assert.match(help, /Ctrl\+Shift\+D/);
       assert.doesNotMatch(help, /^\s*\/dream-rsi (?:create|suggest|best|live|dream|run|off)\b/im);
       await command.handler("watch", context);
@@ -186,7 +187,7 @@ test("headless help and retired manual verbs report without activating model wor
     await command.handler("status", context);
     assert.match(harness.notifications.at(-1), /Manual-loop data from an earlier version is in \.dream-rsi\/ \(task\.json, history\/\)\. 1\.0 does not use it\./);
     assert.equal(fs.readFileSync(path.join(project.dreamRoot, "task.json"), "utf8"), "preserve this old file");
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_improve", "dream_rsi_signals"]);
     assert.equal(fs.existsSync(project.dreamRoot), true, "status reports legacy data without removing it");
     context.mode = "tui";
     const before = harness.injectedMessages.length;
@@ -196,11 +197,27 @@ test("headless help and retired manual verbs report without activating model wor
   } finally { project.cleanup(); }
 });
 
+test("signals tool is read-only and receives the active session directory", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    const signals = harness.tools.get("dream_rsi_signals");
+    assert.ok(signals);
+    assert.match(signals.description, /read-only/i);
+    assert.equal(signals.parameters.additionalProperties, false);
+    assert.deepEqual(Object.keys(signals.parameters.properties), ["focus", "include_logs"]);
+    const result = await signals.execute("signals", { include_logs: false }, undefined, undefined, context);
+    assert.equal(result.details.signals.diagnostics.some((item) => /session/i.test(item)), false);
+    assert.ok(result.details.signals.weaknesses.length <= 10);
+    assert.equal(fs.existsSync(project.dreamRoot), false, "signals do not create campaign state");
+  } finally { project.cleanup(); }
+});
+
 test("tool parameter schemas stay validatable and strict", async () => {
   const project = makeProject();
   try {
     const { harness } = await boot(project);
-    assert.equal(harness.tools.size, 1);
+    assert.equal(harness.tools.size, 2);
     for (const [name, tool] of harness.tools) {
       const schema = tool.parameters;
       assert.equal(schema.type, "object", `${name}: parameters must be an object schema`);
@@ -224,6 +241,12 @@ test("tool parameter schemas stay validatable and strict", async () => {
         assert.ok(guideline.includes(name), `guideline for ${name} must name the tool: ${guideline}`);
       }
     }
+    const improve = harness.tools.get("dream_rsi_improve");
+    assert.match(improve.parameters.properties.minimum_gain.description, /omit.*calibrat/i);
+    assert.match(improve.promptGuidelines.join(" "), /review.*agent budget/i);
+    assert.match(improve.promptGuidelines.join(" "), /active session model.*each agent call/i);
+    assert.match(improve.description, /check.*before start/i);
+    assert.match(improve.description, /reviewed/i);
   } finally {
     project.cleanup();
   }

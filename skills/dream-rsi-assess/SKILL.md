@@ -1,64 +1,24 @@
 ---
 name: dream-rsi-assess
-description: Assess the active project and suggest the best targets for Dream-RSI. Use for `/dream-rsi assess`, "what should I improve?", or requests to inspect a project for measurable opportunities.
+description: Analyze a project for measurable improvement levers and rank the strongest evidence-backed options. Use for `/dream-rsi assess`, "what should I improve?", or requests to inspect a project for opportunities.
 ---
 
-# Assess improvement targets
+# Assess improvement levers
 
-Inspect the target and return up to three evidence-backed goals. Assessment is read-only. It does not configure a task, run project commands, start candidate agents, or change files.
+Assessment is read-only. It does not run project commands, start agents, configure a task, or change files.
 
-## Resolve the target
+Use the explicit project or scope named by the user; otherwise use the active project. Always call `dream_rsi_signals`. If the user states a goal, pass it as `focus`. With no goal text, derive a provisional intent from the project's README, roadmap, or `PROBLEM.md` plus the strongest returned signals, then pass that intent as `focus`. For `/dream-rsi assess ... --no-logs`, pass `include_logs: false`. Do not inspect session logs yourself. The signal collector reads only bounded files from the supplied active session directory, verifies each session header's project path, and skips logs when that directory is unavailable. Never call an unbounded session listing API.
 
-Use the explicit target from `/dream-rsi assess <target>`. If the user gives no target, inspect the active project at the current working directory. Resolve the project root and state the path, branch, and whether the working tree has local changes.
+Read relevant project goals, problem statements, source, tests, evaluator scripts, and safe signal evidence paths. Do not run tests, benchmarks, builds, install commands, or candidate agents during assessment. Treat declared commands as unevaluated. Use signal counts and sanitized command heads as observed aggregates; do not repeat raw command arguments, error text, chat content, commit subjects, or free-form campaign reasons. If a path or error was omitted, do not reconstruct it.
 
-If the target is a file or subtree, keep findings and proposed scope inside it unless the goal needs a related path. Name each related path and why it is needed. If the user asks to assess Dream-RSI itself, inspect this repository's code and its documented workflow as separate target areas.
+Restate one or two outcome metrics from the user's goal or, when absent, the provisional intent. Return up to five distinct levers, ordered by relevance to that intent and evidence strength. For each lever, describe:
 
-## Gather evidence
+- **Mechanism and files:** how a bounded change could move the outcome and the concrete files or project area involved.
+- **Evidence:** observed facts with file references or returned aggregate counts; label causal claims as inference.
+- **Metric and evaluator:** a repeatable measure, its baseline source, and required correctness gates. Name existing commands without running them.
+- **Expected effect and confidence:** high, medium, or low, with a short evidence-based reason. Do not invent numerical gains.
+- **Readiness:** ready, needs a baseline, needs a clearer goal, already satisfied, or no defensible measure.
 
-Read the files that can show a concrete problem or a usable measurement:
+For evaluator-backed opportunities, inspect the evaluator definition and baseline evidence to determine whether the metric has room to improve. Passing the current acceptance cases alone is not evidence of headroom. If all cases pass, identify a separate measurable outcome or mark the lever already satisfied. A proposed known-better fixture or control should be outside candidate scope, declared in `verifier_inputs`, and demonstrate that the metric recognizes better behavior while rejecting invalid behavior. Keep the intake small and cite the baseline's actual headroom without inventing an effect size.
 
-- source code and nearby tests;
-- package scripts, build and lint configuration, CI workflows, and benchmark definitions;
-- project goals and constraints in README, problem, or design files;
-- recorded benchmark results, failures, and Dream-RSI campaign history, when present.
-
-Use `rg` and file reads. Do not run tests, benchmarks, build scripts, install commands, or candidate agents during assessment. Report existing commands as unevaluated until a campaign runs them.
-
-Look for a specific gap: a stated requirement without coverage, an observed failure, a measured performance cost, repeated work, or an existing evaluator that can compare an improvement. A TODO, large file, or personal style preference alone does not establish impact.
-
-Separate observed facts from hypotheses. Link every finding to a path and line or a named recorded result. Do not invent issue history, user pain, performance numbers, or a quality score.
-
-## Rank targets
-
-Return at most three distinct target cards. Prefer, in order:
-
-1. A documented user goal, defect, or measured gap with direct evidence.
-2. A goal with an existing repeatable evaluator and a baseline.
-3. A bounded change that can be isolated and checked within the stated scope.
-
-Use confidence labels `high`, `medium`, or `low`. Explain the evidence behind each label. Do not sum impact, feasibility, or confidence into a numeric ranking.
-
-For each target, report:
-
-- **Target and scope:** the exact project area and likely files.
-- **Goal:** one concrete outcome that a user can choose.
-- **Evidence:** observed facts with paths and lines, followed by any inference.
-- **Evaluation:** a repeatable metric, baseline, and correctness gates. Name existing commands without running them.
-- **Readiness:** `ready`, `needs a baseline`, `needs a clearer goal`, `already satisfied`, or `no defensible measure`.
-- **Confidence:** `high`, `medium`, or `low`, with a reason.
-
-Passing tests show that a candidate meets those tests. They do not prove improvement by themselves. If all proposed acceptance cases pass on the baseline and no separate metric has room to improve, mark the target `already satisfied` and ask the user to choose a different measurable goal.
-
-## Hand off the selected target
-
-End with a ready-to-use command such as:
-
-```text
-/dream-rsi improve <selected goal>
-```
-
-Include the target path or scope when the command needs it. If no target has a defensible evaluator, ask the user to choose a measurable outcome before starting a campaign. Do not start the campaign from an assessment request alone.
-
-## Report format
-
-Open with the resolved target and working-tree state. Then list the ranked target cards. If the evidence supports fewer than three targets, return fewer. If it supports none, say what evidence is missing and ask one focused question that would make the next assessment useful.
+When at least one lever is ready, recommend the top ready lever and end with a usable `/dream-rsi improve "<goal>"` command, including its scope when needed. Derive that command goal from the user's request or your stated provisional intent. If no lever is ready, ask one focused question about the missing goal or measurement. An assessment request never starts a campaign.
