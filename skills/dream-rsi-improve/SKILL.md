@@ -34,6 +34,14 @@ Keep candidate changes inside the declared `scope`. Exclude evaluator files, fix
 
 ## Start the campaign
 
+Before spending evaluator calls, call `dream_rsi_improve` with `action: "status"`. Confirm its loaded
+extension path is the intended package and its evaluator timeout cap supports the fixed evaluator.
+The current ceiling is 300,000 ms; set `task.evaluator_timeout_ms` explicitly for a slow evaluator.
+After local source changes, reload the active pi session and recheck status. Confirm the effective
+timeout in campaign progress and `campaign.json`. Count two baseline evaluator starts in the
+authorized campaign budget before allocating candidate calls. A failed campaign is terminal;
+resolve its evaluator failure and start a new campaign rather than resuming it.
+
 Prepare a direct task specification for the selected target. Do not reconfigure an unrelated legacy `.dream-rsi/task.json`. The task names the workspace, candidate program, evaluator command and output fields, score direction, problem statement, and budgets. Call `dream_rsi_improve` with `action: "start"`, the goal, the resolved `project_dir`, the task, the scope, verifier input paths, and `minimum_gain` when the evaluator has a justified nonzero tolerance. Leave it omitted for exact deterministic scores.
 
 The runtime owns all paid candidate work and promotion after intake. It runs the online exploration, replays the recorded worlds, revises the exploration policy, verifies up to three ranked candidates per cycle against the current promoted target, and applies at most one verified win per cycle. It then starts the next cycle from the promoted target.

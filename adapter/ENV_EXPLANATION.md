@@ -1,3 +1,11 @@
+# Historical report: baseline untrusted
+
+The observations below describe the retired preparation-only adapter. Its reported `0.4` baseline
+could come from an unrelated artifact because `--prepare-cases` performs no model evaluation.
+Do not use that score or the old verification claims as evidence of a working evaluator.
+Use `dream-rsi-mind2web-score.mjs` with an explicit pinned model and case manifest, then measure a
+fresh baseline. See the Mind2Web scorer configuration in `../README.md`.
+
 # .env / Adapter / Harness Status — Full Explanation for Dev Team
 
 ## 1. .env File (Verified Working)

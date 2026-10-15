@@ -73,7 +73,7 @@ process.stdin.on("end", () => {
       beta_grid: [0, 0.6],
       default_beta: 0.6,
       agent_timeout_ms: 20_000,
-      evaluator_timeout_ms: 20_000,
+      evaluator_timeout_ms: 300_000,
       agent_command: "node",
       agent_args: [agent, observed],
     };
@@ -90,6 +90,8 @@ process.stdin.on("end", () => {
 
     assert.equal(result.details.campaign.state.kind, "complete", result.content[0].text);
     assert.deepEqual(result.details.campaign.completedCycles, [1, 2], "the second campaign cycle starts after the first promotion");
+    const campaignRecord = JSON.parse(fs.readFileSync(path.join(result.details.campaign.campaignRoot, "campaign.json"), "utf8"));
+    assert.equal(campaignRecord.task.evaluator_timeout_ms, 300_000, "campaign preserves the requested evaluator timeout up to its safe ceiling");
     assert.ok((fs.readFileSync(path.join(project.projectDir, "solution.py"), "utf8").match(/x/g) ?? []).length > 2,
       "verified improvements from both cycles were promoted into the full-repo workspace");
     const applied = fs.readFileSync(path.join(result.details.campaign.campaignRoot, "history", "applied.jsonl"), "utf8")

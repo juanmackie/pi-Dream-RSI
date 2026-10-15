@@ -30,7 +30,7 @@ import { allocator, dreamIsActive, phaseIsActive, pidIsAlive } from "./engine/ow
 import { writeCurrentManifest, readJson, currentManifestPath, type LiveCycleManifest } from "./engine/world.ts";
 import { runLiveEpisode } from "./engine/live.ts";
 import { planNextGrid, runDreamPhase } from "./engine/dream.ts";
-import { readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignStatus } from "./engine/campaign.ts";
+import { campaignRuntimeDiagnostics, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { loadPrompt } from "./engine/prompt.ts";
 import {
   activeRuns,
@@ -1167,15 +1167,17 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const action = typeof params.action === "string" ? params.action : "";
       if (action === "status") {
         const campaign = readCampaignStatus(baseRoot);
+        const runtime = campaignRuntimeDiagnostics();
         return campaign
-          ? { content: [{ type: "text", text: renderCampaignStatus(campaign) }], details: { campaign } }
-          : { content: [{ type: "text", text: `No improvement campaign is recorded under ${baseRoot}.` }], details: { campaign: null } };
+          ? { content: [{ type: "text", text: renderCampaignStatus(campaign, runtime) }], details: { campaign, runtime } }
+          : { content: [{ type: "text", text: `No improvement campaign is recorded under ${baseRoot}.\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
       }
       if (action === "stop") {
         const campaign = stopCampaign(baseRoot);
+        const runtime = campaignRuntimeDiagnostics();
         return campaign
-          ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign)}` }], details: { campaign } }
-          : { content: [{ type: "text", text: `No active improvement campaign under ${baseRoot}.` }], details: { campaign: null } };
+          ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign, runtime)}` }], details: { campaign, runtime } }
+          : { content: [{ type: "text", text: `No active improvement campaign under ${baseRoot}.\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
       }
       if (action !== "start" && action !== "resume") {
         return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
@@ -1228,7 +1230,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
           onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
         });
-        return { content: [{ type: "text", text: renderCampaignStatus(result) }], details: { campaign: result } };
+        const runtime = campaignRuntimeDiagnostics();
+        return { content: [{ type: "text", text: renderCampaignStatus(result, runtime) }], details: { campaign: result, runtime } };
       }
       setMode(ctx, true);
       const result = await resumeCampaign({
@@ -1239,7 +1242,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
         onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
       });
-      return { content: [{ type: "text", text: renderCampaignStatus(result) }], details: { campaign: result } };
+      const runtime = campaignRuntimeDiagnostics();
+      return { content: [{ type: "text", text: renderCampaignStatus(result, runtime) }], details: { campaign: result, runtime } };
     },
   });
 
@@ -1864,7 +1868,11 @@ function campaignPhaseProgress(
   };
 }
 
-function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<typeof runCampaign>>): string {
+function renderCampaignRuntime(runtime: CampaignRuntimeDiagnostics): string {
+  return `  loaded runtime: ${runtime.extensionDir} (package ${runtime.packageVersion ?? "unknown"})\n  campaign module: ${runtime.campaignModule}\n  evaluator timeout cap: ${runtime.evaluatorTimeoutCapMs}ms`;
+}
+
+function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<typeof runCampaign>>, runtime = campaignRuntimeDiagnostics()): string {
   const state = campaign.state;
   const cycle = campaign.completedCycles.length;
   const activeIteration = state.kind === "running" || state.kind === "paused" ? state.iteration : null;
@@ -1875,7 +1883,9 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
     `  cycles: ${cycle}/${campaign.limits.maxCycles}${activeIteration === null ? "" : `; working on ${activeIteration}`}; no-gain cycles: ${campaign.noGainCycles}`,
     `  verified best: ${campaign.bestScore}`,
     `  calls: ${campaign.agentStarts}/${campaign.limits.maxAgentStarts} agent starts, ${campaign.evaluatorRuns}/${campaign.limits.maxEvaluatorRuns} evaluator runs`,
+    `  effective evaluator timeout: ${campaign.effectiveEvaluatorTimeoutMs}ms`,
     `  deadline: ${campaign.deadlineAt}`,
+    renderCampaignRuntime(runtime),
   ];
   if (state.kind === "paused" || state.kind === "complete" || state.kind === "failed") lines.push(`  stopped because: ${state.reason}`);
   if ("stopReason" in campaign && campaign.stopReason) lines.push(`  stop reason: ${campaign.stopReason}`);
@@ -1898,7 +1908,7 @@ function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void)
       const phase = campaign.state.kind === "running" ? campaign.state.phase : campaign.state.kind;
       ctx.ui.setStatus("dream-rsi", `dream-rsi: ${phase} (${campaign.completedCycles.length}/${campaign.limits.maxCycles})`);
     }
-    onUpdate?.({ content: [{ type: "text", text: renderCampaignStatus(campaign) }], details: { campaign } });
+    onUpdate?.({ content: [{ type: "text", text: renderCampaignStatus(campaign) }], details: { campaign, runtime: campaignRuntimeDiagnostics() } });
   };
 }
 

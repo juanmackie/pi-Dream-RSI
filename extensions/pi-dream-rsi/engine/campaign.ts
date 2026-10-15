@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runAgent } from "../agent/runner.ts";
-import { BUNDLED_POLICY_DIR } from "../layout.ts";
+import { BUNDLED_POLICY_DIR, EXTENSION_DIR, PACKAGE_DIR } from "../layout.ts";
 import { runLiveEpisode } from "./live.ts";
 import { runDreamPhase } from "./dream.ts";
 import { CampaignBudget, CampaignLimitError } from "./campaign-budget.ts";
@@ -23,6 +23,36 @@ export interface CampaignLimits {
   deadlineMs: number;
   plateauCycles: number;
   maxCandidatesPerCycle: number;
+}
+
+export const CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS = 5 * 60 * 1000;
+
+export interface CampaignRuntimeDiagnostics {
+  extensionDir: string;
+  packageDir: string;
+  packageVersion: string | null;
+  campaignModule: string;
+  evaluatorTimeoutCapMs: number;
+}
+
+/** Identify the loaded package copy and the timeout ceiling enforced by this runtime. */
+export function campaignRuntimeDiagnostics(): CampaignRuntimeDiagnostics {
+  let packageVersion: string | null = null;
+  try {
+    const packageJson: unknown = JSON.parse(fs.readFileSync(path.join(PACKAGE_DIR, "package.json"), "utf8"));
+    if (typeof packageJson === "object" && packageJson !== null && "version" in packageJson && typeof packageJson.version === "string") {
+      packageVersion = packageJson.version;
+    }
+  } catch {
+    // Keep status available when the loaded extension directory has no readable package metadata.
+  }
+  return {
+    extensionDir: EXTENSION_DIR,
+    packageDir: PACKAGE_DIR,
+    packageVersion,
+    campaignModule: import.meta.url,
+    evaluatorTimeoutCapMs: CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS,
+  };
 }
 
 export const DEFAULT_CAMPAIGN_LIMITS: CampaignLimits = {
@@ -87,6 +117,7 @@ export interface CampaignStatus {
   noGainCycles: number;
   startedAt: string;
   deadlineAt: string;
+  effectiveEvaluatorTimeoutMs: number;
 }
 
 export interface CampaignResult extends CampaignStatus {
@@ -158,6 +189,7 @@ function statusOf(record: CampaignRecord): CampaignStatus {
     state: record.state, limits: record.limits, agentStarts: budget.agent_starts, evaluatorRuns: budget.evaluator_runs,
     completedCycles: record.completedCycles, currentScore: record.currentScore, bestScore: record.bestScore,
     noGainCycles: record.noGainCycles, startedAt: record.startedAt, deadlineAt: record.deadlineAt,
+    effectiveEvaluatorTimeoutMs: record.task.evaluator_timeout_ms,
   };
 }
 function emit(record: CampaignRecord, options: Pick<CampaignOptions, "onProgress" | "onUpdate">): void {
@@ -590,7 +622,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   const campaignRoot = path.join(baseRoot, "campaigns", id);
   fs.mkdirSync(campaignRoot, { recursive: true });
   const started = Date.now();
-  const scopedTask: TaskConfig = { ...task, workers: 2, max_loops: 1, k1: 3, k2: 4, revisions: 2, agent_timeout_ms: Math.min(task.agent_timeout_ms, 8 * 60 * 1000), evaluator_timeout_ms: Math.min(task.evaluator_timeout_ms, 2 * 60 * 1000), ...(task.workspace ? { workspace: task.workspace } : {}) };
+  const scopedTask: TaskConfig = { ...task, workers: 2, max_loops: 1, k1: 3, k2: 4, revisions: 2, agent_timeout_ms: Math.min(task.agent_timeout_ms, 8 * 60 * 1000), evaluator_timeout_ms: Math.min(task.evaluator_timeout_ms, CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS), ...(task.workspace ? { workspace: task.workspace } : {}) };
   const verifierIdentity = hashInputs(projectDir, scopedTask, verifierInputs);
   const record: CampaignRecord = {
     version: 1, id, baseRoot, campaignRoot, projectDir, targetRoot, goal: options.goal.trim(), task: scopedTask,
