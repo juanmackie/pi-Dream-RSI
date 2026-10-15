@@ -35,7 +35,7 @@ test("the session thinking level is passed to attempts", () => {
   assert.deepEqual(
     buildAgentArgs({ ...base, args: ["-p", "--thinking", "max"], thinking: "low" }),
     ["-p", "--thinking", "max"],
-    "an explicit --thinking wins",
+    "saved explicit arguments keep their existing behavior without a resolver",
   );
   assert.deepEqual(buildAgentArgs({ ...base, model: "x/y", thinking: "high" }), [
     "-p",
@@ -45,6 +45,51 @@ test("the session thinking level is passed to attempts", () => {
     "--thinking",
     "high",
   ], "model and thinking travel together");
+});
+
+test("resolved session values replace stale explicit flags without changing custom arguments", () => {
+  const agent = {
+    command: "custom-agent",
+    args: ["run", "--model", "old/model", "--thinking=low", "--workspace", "source"],
+    model: "new/model",
+    thinking: "high",
+  };
+  assert.deepEqual(buildAgentArgs(agent, { overrideExplicit: true }), ["run", "--model", "new/model", "--thinking=high", "--workspace", "source"]);
+});
+
+test("a null session resolver preserves the saved custom CLI flags", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-resolver-null-"));
+  try {
+    const script = path.join(dir, "capture.mjs");
+    const output = path.join(dir, "args.json");
+    fs.writeFileSync(script, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)));\n`);
+    const saved = { command: "node", args: [script, "--model", "literal/model", "--thinking", "max"], model: "saved/model", thinking: "low", prompt_via: "stdin" };
+    const result = await runAgent({ agent: saved, resolveAgent: () => null, cwd: dir, prompt: "capture", timeoutMs: 10_000 });
+    assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+    assert.deepEqual(JSON.parse(fs.readFileSync(output, "utf8")), ["--model", "literal/model", "--thinking", "max", "--model", "saved/model"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("runAgent resolves session configuration separately at each call", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-resolver-"));
+  try {
+    const script = path.join(dir, "capture.mjs");
+    const output = path.join(dir, "args.jsonl");
+    fs.writeFileSync(script, `import { appendFileSync } from "node:fs";\nappendFileSync(${JSON.stringify(output)}, JSON.stringify(process.argv.slice(2)) + "\\n");\n`);
+    const saved = { command: "node", args: [script, "--model", "old/model", "--thinking", "low", "--custom", "kept"], model: "old/model", thinking: "low", prompt_via: "stdin" };
+    let session = { model: "session/first", thinking: "medium" };
+    const resolveAgent = (configured) => ({ ...configured, model: session.model, thinking: session.thinking });
+    for (let i = 0; i < 2; i += 1) {
+      const result = await runAgent({ agent: saved, resolveAgent, cwd: dir, prompt: "capture", timeoutMs: 10_000 });
+      assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+      session = { model: "session/second", thinking: "high" };
+    }
+    const calls = fs.readFileSync(output, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    assert.deepEqual(calls, [
+      ["--model", "session/first", "--thinking", "medium", "--custom", "kept"],
+      ["--model", "session/second", "--thinking", "high", "--custom", "kept"],
+    ]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("the default pi agent re-spawns the running pi instead of trusting PATH", () => {

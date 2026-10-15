@@ -36,6 +36,7 @@ process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   const secretPresent = existsSync(".dream-rsi/legacy-secret.txt");
   appendFileSync(process.argv[2], JSON.stringify({ secretPresent, promptPrefix: prompt.slice(0, 35) }) + "\\n");
+  if (/adversarial review/i.test(prompt)) { writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] })); return; }
   if (prompt.includes("Do not change files.")) { process.stdout.write("I can inspect the target.\\n"); return; }
   if (prompt.includes("prefix-only exploration policy")) { process.stdout.write("Policy remains unchanged.\\n"); return; }
   const source = readFileSync("solution.py", "utf8");

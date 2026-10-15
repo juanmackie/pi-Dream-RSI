@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { Dashboard } from "./dashboard.ts";
 import { campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignCheckReport, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { resolveWithinRoot } from "./engine/apply.ts";
+import { phaseIsActive } from "./engine/ownership.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { defaultTask, normalizeTask, validateTask, type TaskConfig } from "./engine/task.ts";
 import { SKILLS_DIR } from "./layout.ts";
@@ -44,7 +45,6 @@ const campaignTaskParams = {
     guidance: { type: "string", enum: ["off", "summary"], description: "Whether to include bounded prior-work guidance in agent prompts." },
     agent_command: { type: "string", description: "Agent CLI executable." },
     agent_args: { type: "array", items: { type: "string" }, description: "Arguments passed to the agent CLI." },
-    model: { type: "string", description: "Optional model name passed to the agent CLI." },
   },
   required: ["name", "workspace", "eval_program", "score_program"],
   additionalProperties: false,
@@ -81,11 +81,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     return dashboard;
   };
   const dreamRoot = (ctx: ExtensionContext): string => path.join(ctx.cwd, ".dream-rsi");
-  const runAgentConfig = (ctx: ExtensionContext, agent: TaskConfig["agent"]): TaskConfig["agent"] => ({
-    ...agent,
-    model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : agent.model,
-    thinking: ctx.thinkingLevel ?? agent.thinking,
-  });
+  const resolveAgent = (ctx: ExtensionContext) => (savedAgent: TaskConfig["agent"]): TaskConfig["agent"] | null => {
+    const model = ctx.model;
+    if (!model) return null;
+    return {
+      ...savedAgent,
+      model: `${model.provider}/${model.id}`,
+      thinking: ctx.thinkingLevel ?? savedAgent.thinking,
+    };
+  };
   const stateFor = (ctx: ExtensionContext): { mode: boolean } => {
     const id = ctx.sessionManager.getSessionId();
     if (!modes.has(id)) modes.set(id, false);
@@ -160,7 +164,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
         const parsed = parseCampaignTask(params.task, ctx);
         if (parsed.errors.length > 0 || !parsed.task) return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
-        const task = { ...parsed.task, agent: runAgentConfig(ctx, parsed.task.agent) };
+        const task = parsed.task;
         const errors = validateCampaignPaths(projectDir, task);
         const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
         const gates = readStringArray(params.gates, "gates");
@@ -198,7 +202,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (parsed.errors.length > 0 || !parsed.task) {
           return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
         }
-        const task = { ...parsed.task, agent: runAgentConfig(ctx, parsed.task.agent) };
+        const task = parsed.task;
         const errors = validateCampaignPaths(projectDir, task);
         if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
         const scope = readStringArray(params.scope, "scope");
@@ -226,6 +230,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           ...(gates.values ? { gates: gates.values } : {}),
           ...(limitResult.limits ? { limits: limitResult.limits } : {}),
           ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
+          resolveAgent: resolveAgent(ctx),
           signal,
           onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
           onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
@@ -239,6 +244,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         baseRoot,
         projectDir,
         sessionId: ctx.sessionManager.getSessionId(),
+        resolveAgent: resolveAgent(ctx),
         signal,
         onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
         onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
@@ -307,14 +313,18 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           return;
         }
         const campaign = readCampaignStatus(root);
-        if (campaign?.state.kind === "paused") {
+        const interrupted = campaign?.state.kind === "running";
+        const canResume = campaign?.state.kind === "paused" || interrupted;
+        if (interrupted && campaign && phaseIsActive(campaign.campaignRoot, "campaign")) {
+          report("The improvement campaign is already running. Use /dream-rsi status, watch or stop.", "info");
+        } else if (canResume) {
           setMode(ctx, true);
           sendWhenReady("/skill:dream-rsi-improve resume");
-          report("Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.");
+          report(interrupted
+            ? "Recovering the interrupted Dream-RSI campaign through its guarded resume path."
+            : "Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.");
         } else {
-          report(campaign?.state.kind === "running"
-            ? "The improvement campaign is already running. Use /dream-rsi status, watch or stop."
-            : "No paused improvement campaign is available to resume.", campaign?.state.kind === "running" ? "info" : "error");
+          report("No paused improvement campaign is available to resume.", "error");
         }
         return;
       }

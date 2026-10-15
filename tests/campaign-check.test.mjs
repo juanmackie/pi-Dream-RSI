@@ -28,6 +28,25 @@ test("check measures fresh copies and persists only a check report", async () =>
   } finally { project.cleanup(); }
 });
 
+test("check keeps unrepresentable score spreads out of its JSON report", async () => {
+  const project = makeProject();
+  try {
+    const campaign = await jump("engine/campaign.ts");
+    const scorer = path.join(project.projectDir, "extreme-score.mjs");
+    const marker = path.join(project.dir, "extreme-score-count.txt");
+    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst marker=${JSON.stringify(marker)}; const n=existsSync(marker)?Number(readFileSync(marker,"utf8")):0; writeFileSync(marker,String(n+1)); mkdirSync("eval",{recursive:true}); writeFileSync("eval/score.json",JSON.stringify({score:n===0?Number.MAX_VALUE:-Number.MAX_VALUE,valid:true,fail_class:"ok",error:null}));\n`);
+    const report = await campaign.checkCampaignEvaluator({
+      baseRoot: project.dreamRoot, projectDir: project.projectDir,
+      task: { ...project.task, score_program: `node "${scorer}"` },
+      verifierInputs: [scorer], runs: 2,
+    });
+    assert.equal(report.spread, null);
+    assert.ok(Number.isFinite(report.recommendedMinimumGain));
+    assert.ok(report.diagnoses.some((message) => /finite numeric range/i.test(message)));
+    assert.equal(JSON.parse(fs.readFileSync(report.reportPath, "utf8")).spread, null);
+  } finally { project.cleanup(); }
+});
+
 test("check diagnoses relative evaluator paths that only resolve from the target", async () => {
   const project = makeProject();
   try {

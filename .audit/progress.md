@@ -18,3 +18,5 @@
 - Scope excludes push, merge, PR, publish, and running benchmarks in other projects.
 
 - Slice 3 parent review corrected premature confirmation screening and raw lower-is-better median scores, added trustworthy baseline/cancellation checks, shared patched-copy preparation, post-gate identity checks, unique check reports, and deterministic noise/timeout/failing-gate controls. Agent targeted 36/36 passed. Parent final typecheck and full suite passed 178/178 in slice3-parent-final-test.log. Old no-gate verifier identities remain byte-compatible. No external benchmarks run.
+
+- Slice 4 adds fail-closed review before pending apply, exact measured patch hash checks after review, post-review verifier/target checks, a counted review start and full paired evidence. Current session configuration resolves at each actual probe/live/dream/review start; no-session fallback preserves custom CLI behavior. Parent review corrected live-owner command routing, stale explicit argument handling, and nonfinite calibration persistence. Agent focused runner13/runtime19/entry2/check6 passed. Parent typecheck and all185 tests passed in slice4-parent-test.log.

@@ -25,7 +25,7 @@ import { replayEpisode } from "./replay.ts";
 import { sweepSummary, type BetaSweepPoint } from "./reward.ts";
 import type { BetaSweepSummary } from "../policy/api.ts";
 import type { DiscoveryTree } from "./tree.ts";
-import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
+import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
 import { BUNDLED_POLICY_DIR } from "../layout.ts";
 import {
   archivePolicyVersion,
@@ -63,6 +63,7 @@ export interface DreamOptions {
   signal?: AbortSignal;
   /** Durable campaign reservation immediately before each policy revision child starts. */
   beforeAgentSpawn?: (key: string) => void;
+  resolveAgent?: (savedAgent: AgentConfig) => AgentConfig | null;
   /** Durable evaluator reservation for the campaign's seed/apply scorer runs. */
   beforeEvaluatorSpawn?: (key: string) => void;
 }
@@ -489,6 +490,7 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
       progress.stage(cell, "root", revision + 1, "agent");
       const agentRun = await runAgent({
         agent: task.agent,
+        resolveAgent: options.resolveAgent,
         cwd: dreamRoot,
         prompt,
         timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,

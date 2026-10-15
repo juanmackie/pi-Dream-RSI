@@ -12,13 +12,16 @@ import { CampaignBudget, CampaignLimitError } from "./campaign-budget.ts";
 import { buildCandidatePatch, patchConflicts, verifyCandidatePatch, applyCandidatePatch, reconcileCandidatePatch, runCampaignGate, type CandidatePatch } from "./campaign-patch.ts";
 import { scoreSeedCopy } from "./apply.ts";
 import { measureSeed, readSeedMeasurement, findCandidate, type Candidate } from "./improvements.ts";
-import { normalizeTask, scoringFingerprint, type TaskConfig } from "./task.ts";
+import { normalizeTask, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
 import { ensureDreamIgnore, ensurePolicyRuntime, liveMethodPath, nodeWorkspace, readManifest, readJson, writeFileAtomic, writeJson } from "./world.ts";
 import { readTree } from "./world.ts";
 import { acquirePhase, phaseIsActive, pidIsAlive } from "./ownership.ts";
 import { checkpointPath } from "./checkpoint.ts";
 import { tracePoolDir, writeCurrentManifest, type LiveCycleManifest } from "./world.ts";
 import type { ProgressObserver } from "./progress.ts";
+import { loadPrompt, renderPrompt } from "./prompt.ts";
+
+export type CampaignAgentResolver = (savedAgent: AgentConfig) => AgentConfig | null;
 
 export interface CampaignLimits {
   maxCycles: number;
@@ -158,6 +161,7 @@ export interface CampaignOptions {
   maxAgentStarts?: number;
   maxEvaluatorRuns?: number;
   signal?: AbortSignal;
+  resolveAgent?: CampaignAgentResolver;
   onProgress?: (message: string) => void;
   /** Inner live/dream progress from the isolated engine root, including its cycle and worker attempts. */
   onPhaseProgress?: ProgressObserver;
@@ -200,6 +204,7 @@ export interface CampaignResumeOptions {
   projectDir: string;
   sessionId?: string;
   signal?: AbortSignal;
+  resolveAgent?: CampaignAgentResolver;
   onProgress?: (message: string) => void;
   onPhaseProgress?: ProgressObserver;
   onUpdate?: (status: CampaignStatus) => void;
@@ -297,6 +302,10 @@ function hashInputs(projectDir: string, task: TaskConfig, inputs: string[], gate
 function contains(parent: string, child: string): boolean {
   const relative = path.relative(path.resolve(parent), path.resolve(child));
   return relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+function digest(bytes: Buffer): string {
+  return crypto.createHash("sha256").update(bytes).digest("hex");
 }
 
 function assertTrustedVerifier(projectDir: string, targetRoot: string, baseRoot: string, task: TaskConfig, inputs: string[]): void {
@@ -413,10 +422,14 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
     });
   }
   const validScores = runResults.flatMap((run) => run.valid && run.score !== null ? [run.score] : []);
-  const spread = validScores.length === runResults.length ? Math.max(...validScores) - Math.min(...validScores) : null;
+  const rawSpread = validScores.length === runResults.length ? Math.max(...validScores) - Math.min(...validScores) : null;
+  const spread = rawSpread !== null && Number.isFinite(rawSpread) ? rawSpread : null;
+  if (rawSpread !== null && spread === null) diagnoses.push("score spread exceeds the finite numeric range; no reliable minimum_gain recommendation is available");
   const maxDuration = Math.max(...runResults.map((run) => run.durationMs));
   const recommendedEvaluatorTimeoutMs = Math.max(30_000, Math.min(CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS, Math.ceil(maxDuration * 3)));
-  const recommendedMinimumGain = spread === null || spread === 0 ? 0 : spread * 1.5;
+  const rawRecommendedMinimumGain = spread === null || spread === 0 ? 0 : spread * 1.5;
+  const recommendedMinimumGain = Number.isFinite(rawRecommendedMinimumGain) ? rawRecommendedMinimumGain : Number.MAX_VALUE;
+  if (!Number.isFinite(rawRecommendedMinimumGain)) diagnoses.push("recommended minimum_gain exceeds the finite numeric range; the displayed recommendation is capped");
   if (runResults.some((run) => run.code === 127 || run.code === 9009 || (run.code === 1 && /not found|not recognized|cannot find|is not recognized/i.test(run.error ?? "")))) {
     diagnoses.push("interpreter not found on PATH; on Windows prefer node …");
   }
@@ -486,7 +499,7 @@ function makeBudget(record: CampaignRecord, createIfMissing = false): CampaignBu
 
 function withinDeadline(record: CampaignRecord): boolean { return Date.now() < Date.parse(record.deadlineAt); }
 
-async function runProbe(record: CampaignRecord, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void): Promise<void> {
+async function runProbe(record: CampaignRecord, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver): Promise<void> {
   const task = record.task;
   const scratch = path.join(record.campaignRoot, "probe-workspace");
   try {
@@ -495,6 +508,7 @@ async function runProbe(record: CampaignRecord, reserve: (kind: "agent" | "evalu
     await copyWorkspace(record.targetRoot, scratch, { exclude });
     const result = await runAgent({
       agent: task.agent,
+      resolveAgent,
       cwd: scratch,
       prompt: `Inspect this project for the improvement goal below. Do not change files. Reply with one short sentence confirming you can inspect the target and identify the relevant code.\n\nGoal: ${record.goal}`,
       timeoutMs: Math.min(task.agent_timeout_ms, 8 * 60 * 1000),
@@ -541,7 +555,93 @@ function scoresAreNoisy(record: CampaignRecord): boolean {
   return scores.length > 1 && Math.max(...scores) > Math.min(...scores);
 }
 
-async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void): Promise<boolean> {
+type CampaignReview = { verdict: "accept" | "reject"; reasons: string[] };
+
+async function reviewCandidate(options: {
+  record: CampaignRecord;
+  iteration: number;
+  candidate: Candidate;
+  patch: CandidatePatch[];
+  verification: Awaited<ReturnType<typeof verifyCandidatePatch>>;
+  reviewDir: string;
+  signal: AbortSignal;
+  reserve: (kind: "agent" | "evaluator", key: string) => void;
+  resolveAgent?: CampaignAgentResolver;
+}): Promise<CampaignReview> {
+  const { record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent } = options;
+  assertNotAborted(signal);
+  fs.rmSync(reviewDir, { recursive: true, force: true });
+  const beforeDir = path.join(reviewDir, "before");
+  const afterDir = path.join(reviewDir, "after");
+  fs.mkdirSync(beforeDir, { recursive: true });
+  fs.mkdirSync(afterDir, { recursive: true });
+  const files: string[] = [];
+  for (const operation of patch) {
+    const relativeParts = operation.relative.split("/");
+    const before = path.join(record.targetRoot, ...relativeParts);
+    const reviewBefore = path.join(beforeDir, ...relativeParts);
+    const reviewAfter = path.join(afterDir, ...relativeParts);
+    const beforeExists = fs.existsSync(before);
+    if (beforeExists) {
+      fs.mkdirSync(path.dirname(reviewBefore), { recursive: true });
+      fs.copyFileSync(before, reviewBefore);
+    }
+    if (operation.kind === "write") {
+      if (digest(fs.readFileSync(operation.from)) !== operation.afterHash) throw new Error(`candidate patch input changed before review: ${operation.relative}`);
+      fs.mkdirSync(path.dirname(reviewAfter), { recursive: true });
+      fs.copyFileSync(operation.from, reviewAfter);
+    }
+    files.push(`- ${operation.kind.toUpperCase()} ${operation.relative} (before: ${beforeExists ? `before/${operation.relative}` : "absent"}; after: ${operation.kind === "delete" ? "deleted" : `after/${operation.relative}`})`);
+  }
+  fs.writeFileSync(path.join(reviewDir, "REVIEW.md"), [
+    `Goal: ${record.goal}`,
+    `Lever: ${candidate.cell}`,
+    `Scope: ${record.scope.join(", ")}`,
+    `Evaluator command: ${record.task.score_program}`,
+    `Verifier inputs: ${record.verifierInputs.join(", ")}`,
+    `Correctness gates: ${(record.gates ?? []).join(" | ") || "none"}`,
+    `Verified before score: ${verification.before.score}`,
+    `Verified after score: ${verification.after.score}`,
+    `Candidate score: ${candidate.score} (raw: ${candidate.raw_score ?? "n/a"})`,
+    `Paired measurements: ${JSON.stringify(verification.pairs)}`,
+    "Changed files:",
+    ...files,
+  ].join("\n") + "\n", "utf8");
+  const reviewPath = path.join(reviewDir, "review.json");
+  fs.rmSync(reviewPath, { force: true });
+  const prompt = renderPrompt(loadPrompt("adversarial-review.md"), { review_file: "REVIEW.md", output_file: "review.json" });
+  const run = await runAgent({
+    agent: record.task.agent,
+    resolveAgent,
+    cwd: reviewDir,
+    prompt,
+    timeoutMs: Math.min(record.task.agent_timeout_ms, 8 * 60 * 1000),
+    logPath: path.join(reviewDir, "agent.log"),
+    signal,
+    beforeSpawn: () => reserve("agent", `${iteration}:${candidate.cell}:review`),
+  });
+  assertNotAborted(signal);
+  if (!run.ok || run.timedOut || run.aborted) throw new Error(`adversarial review agent failed${run.spawnError ? `: ${run.spawnError}` : run.stderrTail ? `: ${run.stderrTail.trim().slice(-300)}` : ` (exit ${run.code})`}`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(reviewPath, "utf8")); }
+  catch { throw new Error("adversarial review did not produce valid review.json"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("adversarial review output must be an object");
+  const value = parsed as Record<string, unknown>;
+  if (Object.keys(value).length !== 2 || !Object.hasOwn(value, "verdict") || !Object.hasOwn(value, "reasons") || (value.verdict !== "accept" && value.verdict !== "reject") || !Array.isArray(value.reasons) || !value.reasons.every((reason) => typeof reason === "string")) {
+    throw new Error('adversarial review output must match {"verdict":"accept"|"reject","reasons":[string,...]}');
+  }
+  return { verdict: value.verdict, reasons: value.reasons as string[] };
+}
+
+function assertPatchBytesUnchanged(patch: CandidatePatch[]): void {
+  for (const operation of patch) {
+    if (operation.kind === "write" && digest(fs.readFileSync(operation.from)) !== operation.afterHash) {
+      throw new Error(`candidate patch changed during review: ${operation.relative}`);
+    }
+  }
+}
+
+async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver): Promise<boolean> {
   const noisy = scoresAreNoisy(record);
   const maxCandidates = noisy ? Math.min(2, record.limits.maxCandidatesPerCycle) : record.limits.maxCandidatesPerCycle;
   const candidates = candidatesFor(record.campaignRoot, iteration, record.task, record.projectDir).slice(0, maxCandidates);
@@ -624,6 +724,30 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
     if (hashInputs(record.projectDir, record.task, record.verifierInputs, record.gates ?? []) !== record.verifierIdentity) {
       throw new Error("verifier files changed during candidate gates; scores are no longer comparable");
     }
+    let review: CampaignReview;
+    const reviewDir = path.join(evidenceDir, "review");
+    try {
+      review = await reviewCandidate({ record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent });
+    } catch (error) {
+      if (signal.aborted || error instanceof CampaignLimitError) throw error;
+      rejectCandidate(record, iteration, candidate.cell, "review", [error instanceof Error ? error.message : String(error)]);
+      continue;
+    }
+    assertVerifierIdentity(record);
+    try { assertPatchBytesUnchanged(patch); }
+    catch (error) {
+      rejectCandidate(record, iteration, candidate.cell, "review", [error instanceof Error ? error.message : String(error)]);
+      continue;
+    }
+    const reviewConflicts = patchConflicts({ cycleSeedRoot: seedRoot, patch });
+    if (reviewConflicts.length > 0) {
+      rejectCandidate(record, iteration, candidate.cell, "review", [`target changed during review at: ${reviewConflicts.join(", ")}`]);
+      continue;
+    }
+    if (review.verdict !== "accept") {
+      rejectCandidate(record, iteration, candidate.cell, "review", review.reasons.length > 0 ? review.reasons : ["review rejected without a reason"]);
+      continue;
+    }
     const transactionId = `r${String(iteration).padStart(4, "0")}-${candidate.cell}-${crypto.randomUUID()}`;
     record.pendingApply = { iteration, candidate, patch, before: verification.before.score, after: verification.after.score, transactionId };
     persist(record);
@@ -656,7 +780,7 @@ async function reconcilePending(record: CampaignRecord): Promise<void> {
   }
 }
 
-async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log">): Promise<CampaignResult> {
+async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "resolveAgent" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log">): Promise<CampaignResult> {
   const controller = new AbortController();
   const abort = (): void => controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -720,7 +844,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
     }
     if (!fs.existsSync(path.join(record.campaignRoot, "probe.complete"))) {
       setPhase(record, "probe", null, callbacks);
-      try { await runProbe(record, reserve, signal, log); }
+      try { await runProbe(record, reserve, signal, log, options.resolveAgent); }
       catch (error) {
         if (limitReason) { record.state = { kind: "complete", reason: limitReason }; persist(record); return { ...statusOf(record), stopped: true, stopReason: limitReason }; }
         throw error;
@@ -771,6 +895,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       persist(record);
     }
     const baselineRange = Math.max(...record.baselineScores) - Math.min(...record.baselineScores);
+    if (!Number.isFinite(baselineRange)) throw new Error("target verifier score spread exceeds the finite numeric range; minimum_gain cannot be calibrated safely");
     if (baselineRange > 0 && (record.minimumGainSource ?? "explicit") === "explicit" && baselineRange > record.minimumGain) {
       throw new Error(`target verifier repeated baseline changed by ${baselineRange}, above the configured minimum_gain tolerance ${record.minimumGain}`);
     }
@@ -790,7 +915,9 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         throw new Error(`target verifier calibration did not produce a trustworthy score${third.error ? `: ${third.error}` : ""}`);
       }
       record.baselineScores.push(third.score);
-      record.minimumGain = 1.5 * (Math.max(...record.baselineScores) - Math.min(...record.baselineScores));
+      const calibratedGain = 1.5 * (Math.max(...record.baselineScores) - Math.min(...record.baselineScores));
+      if (!Number.isFinite(calibratedGain)) throw new Error("target verifier calibrated minimum_gain exceeds the finite numeric range");
+      record.minimumGain = calibratedGain;
       log(`[baseline] calibrated minimum_gain=${record.minimumGain} from ${record.baselineScores.length} measurements`);
       persist(record);
     }
@@ -811,6 +938,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         resume: manifest?.status === "interrupted" || fs.existsSync(path.join(record.campaignRoot, "trace_pool", `iter${String(iteration).padStart(4, "0")}_current`, "checkpoint.json")),
         signal, workspaceExcludes: contains(record.targetRoot, record.baseRoot) ? [record.baseRoot] : [],
         beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key),
+        resolveAgent: options.resolveAgent,
         log,
       });
       assertVerifierIdentity(record);
@@ -821,7 +949,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       const dream = fs.existsSync(selectionPath) ? { ok: true, error: null } : await runDreamPhase({
         dreamRoot: record.campaignRoot, projectDir: record.projectDir, task: record.task, iteration,
         signal, log, onProgress: options.onPhaseProgress,
-        beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key),
+        beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key), resolveAgent: options.resolveAgent,
       });
       if (limitReason) { record.state = { kind: "complete", reason: limitReason }; persist(record); break; }
       if (!dream.ok) throw new Error(dream.error ?? `dream cycle ${iteration} did not complete soundly`);
@@ -829,7 +957,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       setPhase(record, "promote", iteration, callbacks);
       const before = record.currentScore;
       let applied: boolean;
-      try { applied = await promoteCandidates(record, iteration, reserve, signal, log); }
+      try { applied = await promoteCandidates(record, iteration, reserve, signal, log, options.resolveAgent); }
       catch (error) {
         if (error instanceof CampaignLimitError && limitReason) { record.state = { kind: "complete", reason: limitReason }; break; }
         throw error;
@@ -901,7 +1029,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   makeBudget(record, true);
   persist(record);
   writeActive(baseRoot, id);
-  const result = execute(record, { signal: options.signal, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log });
+  const result = execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log });
   releaseStart();
   return await result;
   } catch (error) {
@@ -922,7 +1050,7 @@ export async function resumeCampaign(options: CampaignResumeOptions): Promise<Ca
   recoverInterruptedLiveClaims(record.campaignRoot, { sessionId: options.sessionId });
   if (record.state.kind === "running") record.state = { kind: "paused", phase: record.state.phase, iteration: record.state.iteration, reason: "resuming after interrupted host process" };
   fs.rmSync(path.join(record.campaignRoot, "stop.request"), { force: true });
-  return execute(record, { signal: options.signal, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log });
+  return execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log });
 }
 
 /** Recover only stale live claims inside this campaign's isolated engine state before resuming it. */

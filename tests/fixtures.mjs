@@ -22,6 +22,10 @@ const SCRIPTS = {
 import { readFileSync, writeFileSync, appendFileSync } from "node:fs";
 let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
+  if (/adversarial review/i.test(prompt)) {
+    writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
+    return;
+  }
   const depth = (readFileSync("solution.py", "utf8").match(/x/g) ?? []).length;
   appendFileSync("solution.py", "x".repeat(1 + (depth % 3)) + "\\n");
   writeFileSync("proposal.md", "# mechanism\\ndepth=" + depth + "\\nprompt_bytes=" + prompt.length + "\\n");

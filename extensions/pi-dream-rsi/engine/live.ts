@@ -19,7 +19,7 @@ import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { runPolicy } from "../policy/runner.ts";
 import type { EpisodeResult } from "../policy/api.ts";
 import type { ProbeFn, RevealedNode } from "../policy/host.ts";
-import type { TaskConfig } from "./task.ts";
+import type { AgentConfig, TaskConfig } from "./task.ts";
 import { runningIterations } from "../state.ts";
 import { checkpointPath } from "./checkpoint.ts";
 import { allocator, acquirePhase, dreamIsActive } from "./ownership.ts";
@@ -72,6 +72,7 @@ export interface LiveEpisodeOptions {
   signal?: AbortSignal;
   /** Durable budget reservations called immediately before actual child starts. */
   beforeAgentSpawn?: (key: string) => void;
+  resolveAgent?: (savedAgent: AgentConfig) => AgentConfig | null;
   beforeEvaluatorSpawn?: (key: string) => void;
   /** Additional protected directories to keep out of full-workspace campaign snapshots. */
   workspaceExcludes?: string[];
@@ -453,6 +454,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     }
     const agentRun = pending.agentRun ?? await runAgent({
       agent: task.agent,
+      resolveAgent: options.resolveAgent,
       cwd: prepared.workspace,
       prompt: prepared.prompt,
       timeoutMs: task.agent_timeout_ms,
