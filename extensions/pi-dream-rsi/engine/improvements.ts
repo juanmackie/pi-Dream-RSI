@@ -19,10 +19,7 @@ import * as path from "node:path";
 import { scoreSeedCopy } from "./apply.ts";
 import { DiscoveryTree, type TreeNode } from "./tree.ts";
 import { historyDir, iterationDir, readJson, readManifest, workRoot, writeJson } from "./world.ts";
-import { programFingerprint, readTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
-
-/** A candidate has to beat the recorded baseline by this much (relative) before it is worth reporting. */
-export const MIN_IMPROVEMENT_RATIO = 0.01;
+import { programFingerprint, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 
 export interface SeedMeasurement {
   /** Normalised score (higher is better), matching the engine's convention. */
@@ -40,35 +37,11 @@ export interface SeedMeasurement {
    * Scoring-contract fingerprint of the task at measure time (`scoringFingerprint`), plus a hash of
    * the measured program's contents. Absent in files written before they were recorded. A mismatch
    * against the current task means this baseline describes a different objective — it cannot serve
-   * as the reference point and `dream_rsi_init` re-measures instead of keeping it.
+   * as the reference point and campaign intake re-measures instead of keeping it.
    */
   fingerprint?: string;
   program_fingerprint?: string;
   seconds: number;
-}
-
-export interface AppliedRecord {
-  iteration: number;
-  cell: string;
-  /**
-   * Normalized score (higher is better under the then-current contract) that the user's code measured
-   * with the files applied. For an unverified apply, and in records written before verification
-   * existed, it is the score the candidate got in its own attempt workspace.
-   */
-  score: number | null;
-  /** What the candidate scored in its own attempt workspace. */
-  candidate_score?: number | null;
-  /** What the user's code measured immediately before the apply; absent when not verified. */
-  before_score?: number | null;
-  /** False when verification was skipped; absent in records written before verification existed. */
-  verified?: boolean;
-  /** Scoring-contract fingerprint at apply time; absent in records written before it existed. */
-  fingerprint?: string;
-  applied_at: string;
-  paths: string[];
-  target: string;
-  /** Where the replaced files were kept, relative to the project; absent when nothing was replaced. */
-  backup?: string;
 }
 
 export interface Candidate {
@@ -84,26 +57,8 @@ export interface Candidate {
   program: string | null;
 }
 
-export interface ImprovementReport {
-  seed: SeedMeasurement | null;
-  applied: { score: number | null; count: number } | null;
-  /** The best candidate on record that has not been applied. */
-  best: Candidate | null;
-  /**
-   * Set when there is something worth applying right now. `gain_pct` is null when the reference score is
-   * zero (a percentage of nothing means nothing); `delta` always carries the raw improvement.
-   */
-  pending: (Candidate & { gain_pct: number | null; delta: number; relative_to: "seed" | "applied" }) | null;
-  /** Human-readable reason when nothing is pending. */
-  reason: string;
-}
-
 export function seedScorePath(dreamRoot: string): string {
   return path.join(historyDir(dreamRoot), "seed", "score.json");
-}
-
-export function appliedLogPath(dreamRoot: string): string {
-  return path.join(historyDir(dreamRoot), "applied.jsonl");
 }
 
 /** The candidate program a candidate workspace holds, if the file is there. */
@@ -187,67 +142,6 @@ export function readSeedMeasurement(dreamRoot: string): SeedMeasurement | null {
  * otherwise the measured seed score, otherwise null. Without the seed fallback an idle replay
  * scores 0 while a cost-task policy scores negative, so doing nothing always wins.
  */
-export function resolveBaselineScore(dreamRoot: string, task: TaskConfig): number | null {
-  try {
-    const parsed = readJson<{ score?: number; task_fingerprint?: string }>(
-      path.join(historyDir(dreamRoot), "baseline", "score.json"),
-    );
-    if (parsed && (parsed.task_fingerprint === undefined || parsed.task_fingerprint === scoringFingerprint(task))) {
-      if (typeof parsed.score === "number") return parsed.score;
-    }
-  } catch {
-    // Fall through to the seed measurement below.
-  }
-  const seed = readSeedMeasurement(dreamRoot);
-  if (seed && seedMatchesTask(seed, task) && typeof seed.score === "number") return seed.score;
-  return null;
-}
-
-export function readApplied(dreamRoot: string): AppliedRecord[] {
-  const file = appliedLogPath(dreamRoot);
-  if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => {
-      try {
-        return JSON.parse(line) as AppliedRecord;
-      } catch {
-        return null;
-      }
-    })
-    .filter((record): record is AppliedRecord => record !== null);
-}
-
-export function recordApplied(dreamRoot: string, record: AppliedRecord): void {
-  fs.mkdirSync(historyDir(dreamRoot), { recursive: true });
-  fs.appendFileSync(appliedLogPath(dreamRoot), `${JSON.stringify(record)}\n`, "utf8");
-}
-
-/**
- * Does this recorded baseline describe the task as it is configured *now*? A missing fingerprint
- * falls back to the pre-fingerprint rule (workspace path + scorer) so older projects keep behaving
- * as they did; a present-but-different one means the objective changed and the number is not a
- * reference point for it.
- */
-export function seedMatchesTask(seed: SeedMeasurement, task: TaskConfig): boolean {
-  if (seed.fingerprint !== undefined) {
-    return seed.fingerprint === scoringFingerprint(task);
-  }
-  // Pre-fingerprint files: the recorded score must still be consistent with the current direction
-  // (a `higher_is_better` flip silently inverts every stored reference), then fall back to the
-  // workspace/scorer rule.
-  if (seed.score !== null && seed.raw_score !== null && !scoreMatchesDirection(task, seed.score, seed.raw_score)) {
-    return false;
-  }
-  return seed.workspace === task.workspace && (seed.score_program ?? task.score_program) === task.score_program;
-}
-
-/**
- * The best valid candidate of one recorded iteration, ignoring scores from another contract.
- * `skip` holds cell ids to leave out (candidates that were already applied).
- */
 function bestOfIteration(
   dreamRoot: string,
   iteration: number,
@@ -300,87 +194,6 @@ function recordedIterations(dreamRoot: string): number[] {
  * What is worth applying, and why not when nothing is. `projectDir` defaults to the parent of the dream
  * root, which is what the tools use.
  */
-export function improvements(dreamRoot: string, task?: TaskConfig, projectDir?: string): ImprovementReport {
-  const resolvedTask = task ?? readTask(dreamRoot);
-  const project = projectDir ?? path.dirname(dreamRoot);
-  const rawSeed = readSeedMeasurement(dreamRoot);
-  // A baseline measured under another contract is reported as absent: comparing candidates of this
-  // objective against it would invent improvements that do not exist (the C(25,15,5) bug report).
-  const seed = rawSeed && seedMatchesTask(rawSeed, resolvedTask) ? rawSeed : null;
-  const staleBaseline = rawSeed !== null && seed === null;
-  const fingerprint = scoringFingerprint(resolvedTask);
-  const appliedRecords = readApplied(dreamRoot).filter(
-    (record) => record.fingerprint === undefined || record.fingerprint === fingerprint,
-  );
-  const appliedScores = appliedRecords.map((record) => record.score).filter((score): score is number => typeof score === "number");
-  const appliedBest = appliedScores.length > 0 ? Math.max(...appliedScores) : null;
-
-  // An applied candidate is never offered again. Its recorded score can be higher than the score the
-  // user's code measured with it, so the reference alone does not exclude it.
-  let best: Candidate | null = null;
-  for (const iteration of recordedIterations(dreamRoot)) {
-    const appliedCells = new Set(appliedRecords.filter((record) => record.iteration === iteration).map((record) => record.cell));
-    const candidate = bestOfIteration(dreamRoot, iteration, resolvedTask, project, appliedCells);
-    if (candidate && (!best || candidate.score > best.score)) best = candidate;
-  }
-
-  const unreachable =
-    "no candidate workspace on disk for the best score (workspaces are per iteration: check .dream-rsi/work/)";
-  if (!best) {
-    const reason =
-      appliedRecords.length > 0 ? "no successful candidate on record that is not already applied" : "no successful candidate recorded yet";
-    return { seed, applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length }, best: null, pending: null, reason };
-  }
-  if (!best.program) {
-    return {
-      seed,
-      applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length },
-      best,
-      pending: null,
-      reason: unreachable,
-    };
-  }
-  if (seed?.score === undefined || seed?.score === null) {
-    return {
-      seed,
-      applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length },
-      best,
-      pending: null,
-      reason: staleBaseline
-        ? "the recorded baseline was measured under a different scoring configuration — run dream_rsi_init to re-measure your code"
-        : "your own code has not been measured yet, so there is no reference point (run dream_rsi_init)",
-    };
-  }
-
-  // The reference point is whichever is better: your measured code, or the last thing you applied.
-  const reference = appliedBest !== null && appliedBest > seed.score ? appliedBest : seed.score;
-  const relative_to: "seed" | "applied" = appliedBest !== null && appliedBest > seed.score ? "applied" : "seed";
-  const threshold = reference + Math.abs(reference) * MIN_IMPROVEMENT_RATIO;
-  if (best.score <= threshold) {
-    return {
-      seed,
-      applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length },
-      best,
-      pending: null,
-      reason:
-        `nothing beats ${relative_to === "applied" ? "the last applied candidate" : "your code"} ` +
-        `(${reference}${relative_to === "applied" ? "" : ` → best ${best.score}`}) by ${MIN_IMPROVEMENT_RATIO * 100}%`,
-    };
-  }
-
-  const delta = best.score - reference;
-  // A percentage of a zero (or unknown-magnitude) reference is noise, so say the raw delta instead.
-  const gain_pct = reference === 0 ? null : Math.round(((delta / Math.abs(reference)) * 100) * 10) / 10;
-  return {
-    seed,
-    applied: appliedBest === null ? null : { score: appliedBest, count: appliedRecords.length },
-    best,
-    pending: { ...best, gain_pct, delta: Math.round(delta * 1e6) / 1e6, relative_to },
-    reason: "improvement pending",
-  };
-}
-
-/** A specific recorded cell of one iteration, when it is a valid comparable candidate. */
 function candidateByCell(
   dreamRoot: string,
   iteration: number,
@@ -438,7 +251,7 @@ export function findCandidate(
   return null;
 }
 
-/** Absolute path of a candidate workspace, for messaging and for `dream_rsi_apply`. */
+/** Absolute path of a candidate workspace, for messaging and patch validation. */
 export function candidatePath(dreamRoot: string, iteration: number, cell: string): string {
   return path.join(workRoot(dreamRoot), `r${String(iteration).padStart(4, "0")}`, cell);
 }

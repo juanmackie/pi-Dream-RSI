@@ -23,8 +23,7 @@ import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { readManifest, readTree } from "./world.ts";
 import { replayEpisode } from "./replay.ts";
 import { sweepSummary, type BetaSweepPoint } from "./reward.ts";
-import { planGrid } from "../policy/runner.ts";
-import type { BetaSweepSummary, GridPlan, GridPlanningContext } from "../policy/api.ts";
+import type { BetaSweepSummary } from "../policy/api.ts";
 import type { DiscoveryTree } from "./tree.ts";
 import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type TaskConfig } from "./task.ts";
 import { BUNDLED_POLICY_DIR } from "../layout.ts";
@@ -37,7 +36,6 @@ import {
   historyDir,
   liveMethodPath,
   proposalResultsDir,
-  readJson,
   recentManifests,
   roundDir,
   stagingPolicyPath,
@@ -45,7 +43,6 @@ import {
   writeFileAtomic,
   writeJson,
   writeJsonl,
-  type LiveCycleManifest,
 } from "./world.ts";
 
 
@@ -202,7 +199,7 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
   if (worlds.length === 0) {
     throw new Error(
       skippedStale > 0
-        ? `every recorded world (${skippedStale}) belongs to a different scoring configuration — run dream_rsi_live to record a world for this task`
+        ? `every recorded world (${skippedStale}) belongs to a different scoring configuration — record a world for this task`
         : "no recorded worlds to replay; run a live cycle first",
     );
   }
@@ -537,7 +534,7 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
     const scaleNote = efficiencyOverturnNote(evaluations, selected);
     if (monotone) {
       deployPolicy(dreamRoot, fs.readFileSync(best.policy_path, "utf8"));
-      // Record the beta the next live episode will actually run at; `planNextGrid` forces it, so the
+      // Record the beta the next live episode will actually run at; the planner forces it, so the
       // reported deployed_beta matches behavior instead of describing an adjustment that was never used.
       writeJson(deployedBetaPath(dreamRoot), { beta: deployedBeta, iteration, policy: best.policy_path });
     }
@@ -617,65 +614,6 @@ export function efficiencyOverturnNote(
     `(${bestAttainment.toFixed(4)}) than ${overturned.map((e) => `pi_${e.revision} (${(meanAttainment(e) ?? 0).toFixed(4)})`).join(", ")} — ` +
     `if peak score matters more than probe cost, lower beta1/beta2 (defaults 0.01 assume scores of order 1-10 per probe)`
   );
-}
-
-/** Ask the deployed policy for the next live grid (used by `dream_rsi_live`). */
-export async function planNextGrid(
-  dreamRoot: string,
-  task: TaskConfig,
-  _iteration: number,
-  baselineScore: number | null,
-  policyPath?: string,
-  signal?: AbortSignal,
-): Promise<{ plan: GridPlan; beta: number | null; error: string | null }> {
-  const history = recentManifests(dreamRoot, 3)
-    .filter((manifest) => manifest.task_fingerprint === undefined || manifest.task_fingerprint === scoringFingerprint(task))
-    .map((manifest: LiveCycleManifest) => {
-    const sweep = readSweep(dreamRoot, manifest.iteration);
-    return {
-      iteration: manifest.iteration,
-      best_score: manifest.best_score,
-      baked_beta: manifest.baked_beta,
-      sweep,
-    };
-  });
-  const context: GridPlanningContext = {
-    history,
-    baseline_score: baselineScore,
-    max_parallelism: task.workers,
-    budget: { workers: task.workers, attempts: task.workers * Math.max(1, task.k1) },
-  };
-  // The beta the previous dream selected and recorded. Force it into the policy config so the reported
-  // `deployed_beta` is the beta the live episode actually runs at, not a number nothing applies.
-  const deployed = readJson<{ beta?: number }>(deployedBetaPath(dreamRoot));
-  const forcedBeta = typeof deployed?.beta === "number" && Number.isFinite(deployed.beta) ? deployed.beta : null;
-  const result = await planGrid({
-    policyPath: policyPath ?? liveMethodPath(dreamRoot),
-    maxParallelism: task.workers,
-    config: forcedBeta === null ? {} : { beta: forcedBeta },
-    gridPlanContext: context,
-    timeoutMs: 60_000,
-    signal,
-  });
-  if (!result.ok || !result.plan) return { plan: fallbackGrid(task), beta: null, error: result.error ?? "plan_grid failed" };
-  return {
-    plan: {
-      branch_count: Math.min(result.plan.branch_count, Math.max(1, task.workers)),
-      refine_count: result.plan.refine_count,
-      reason: result.plan.reason,
-    },
-    beta: result.beta ?? null,
-    error: null,
-  };
-}
-
-/** Safe default grid when a policy cannot plan one (paper: one branch per worker, refine to budget). */
-export function fallbackGrid(task: TaskConfig): GridPlan {
-  return {
-    branch_count: Math.max(1, task.workers),
-    refine_count: Math.max(1, task.k1),
-    reason: "fallback: one branch per worker refined to the round budget",
-  };
 }
 
 function readSweep(dreamRoot: string, iteration: number): BetaSweepSummary | null {

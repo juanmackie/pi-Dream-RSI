@@ -1,0 +1,273 @@
+/** Agent runner behavior, scoring identity, and session isolation. */
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { EXT, jump } from "./fixtures.mjs";
+
+const { DiscoveryTree } = await jump("engine/tree.ts");
+const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
+const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
+
+test("the configured model is actually passed to attempts", () => {
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin", output_format: "text" };
+  assert.deepEqual(buildAgentArgs(base), ["-p", "--no-session"], "no model, no flag");
+  assert.deepEqual(buildAgentArgs({ ...base, model: "opencode-go/deepseek-v4.1-flash" }), [
+    "-p",
+    "--no-session",
+    "--model",
+    "opencode-go/deepseek-v4.1-flash",
+  ], "a configured model is appended when the args carry no placeholder");
+  assert.deepEqual(buildAgentArgs({ ...base, args: ["-p", "--model", "{model}"], model: "x/y" }), ["-p", "--model", "x/y"], "placeholder wins");
+  assert.deepEqual(buildAgentArgs({ ...base, args: ["-p"], model: null }), ["-p"]);
+});
+
+test("the session thinking level is passed to attempts", () => {
+  const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin", output_format: "text" };
+  assert.deepEqual(buildAgentArgs({ ...base, thinking: "high" }), ["-p", "--no-session", "--thinking", "high"]);
+  assert.deepEqual(
+    buildAgentArgs({ ...base, args: ["-p", "--thinking={thinking}"], thinking: "low" }),
+    ["-p", "--thinking=low"],
+    "placeholder wins",
+  );
+  assert.deepEqual(
+    buildAgentArgs({ ...base, args: ["-p", "--thinking", "max"], thinking: "low" }),
+    ["-p", "--thinking", "max"],
+    "an explicit --thinking wins",
+  );
+  assert.deepEqual(buildAgentArgs({ ...base, model: "x/y", thinking: "high" }), [
+    "-p",
+    "--no-session",
+    "--model",
+    "x/y",
+    "--thinking",
+    "high",
+  ], "model and thinking travel together");
+});
+
+test("the default pi agent re-spawns the running pi instead of trusting PATH", () => {
+  const argv1 = "/opt/pi/dist/bundle/cli.js";
+  const exists = (candidate) => candidate === argv1;
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1, execPath: "/usr/bin/node", exists }),
+    { command: "/usr/bin/node", args: [argv1] },
+    "node + the running cli.js is PATH-independent",
+  );
+  assert.equal(
+    piSelfInvocation({ insidePi: false, argv1, execPath: "/usr/bin/node", exists }),
+    null,
+    "outside pi (SDK host, tests) the caller falls back to `pi`",
+  );
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1: "/$bunfs/root/cli.js", execPath: "/usr/local/bin/pi", exists: () => true }),
+    { command: "/usr/local/bin/pi", args: [] },
+    "a bun virtual script is not a real path; the compiled binary is re-run directly",
+  );
+  assert.equal(
+    piSelfInvocation({ insidePi: true, argv1: "/no/such/cli.js", execPath: "/usr/bin/node", exists: () => false }),
+    null,
+    "generic runtime with no real script falls back to `pi`",
+  );
+});
+
+test("only a real pi entry point is re-spawned, never the host process that inherited pi's markers", () => {
+  // pi sets PI_CODING_AGENT/AI_AGENT on its CLI and RPC entries and every child inherits them, so a host
+  // app that embeds pi (or anything launched from inside pi) is `insidePi` while argv1 is its own entry.
+  // Re-running that argv1 spawns the host as the "agent": it writes nothing, and the attempt dies 30
+  // minutes later as a silent `timeout` with an empty agent.log.
+  const exists = () => true;
+  for (const host of ["/srv/pi-web/server.js", "/opt/web/sessiond.mjs", "/app/index.cjs", "/app/worker.ts"]) {
+    assert.equal(
+      piSelfInvocation({ insidePi: true, argv1: host, execPath: "/usr/bin/node", exists }),
+      null,
+      `${host} is not pi, so it must not be spawned as the discovery agent`,
+    );
+  }
+  for (const entry of [
+    "/opt/pi/dist/cli.js",
+    "/opt/pi/dist/bundle/cli.js",
+    "/opt/pi/dist/bundle/cli-runtime.js",
+    "/src/cli.ts",
+  ]) {
+    assert.deepEqual(
+      piSelfInvocation({ insidePi: true, argv1: entry, execPath: "/usr/bin/node", exists }),
+      { command: "/usr/bin/node", args: [entry] },
+      `${entry} is pi's own entry point`,
+    );
+  }
+});
+
+test("rpc-entry re-spawns as its sibling CLI, never as an RPC server that ignores -p", () => {
+  // rpc-entry.js hardcodes `--mode rpc`, which wins over our `-p`: spawned as the agent it waits
+  // for JSON-RPC frames, writes nothing, and burns the attempt as a silent timeout with an empty log.
+  // Paths go through path.join, so build expectations with the platform's separators.
+  const distDir = path.dirname("/opt/pi/dist/rpc-entry.js");
+  const siblingCli = path.join(distDir, "cli.js");
+  const rpcEntry = path.join(distDir, "rpc-entry.js");
+  const realDist = (candidate) => candidate === siblingCli || candidate === rpcEntry;
+  assert.deepEqual(
+    piSelfInvocation({ insidePi: true, argv1: rpcEntry, execPath: "/usr/bin/node", exists: realDist }),
+    { command: "/usr/bin/node", args: [siblingCli] },
+    "the CLI entry beside rpc-entry runs print mode",
+  );
+  // No sibling CLI on disk: fall back to PATH resolution instead of spawning an RPC server.
+  assert.equal(
+    piSelfInvocation({ insidePi: true, argv1: rpcEntry, execPath: "/usr/bin/node", exists: (c) => c === rpcEntry }),
+    null,
+    "without a sibling CLI the caller falls back to `pi` rather than spawning rpc mode",
+  );
+});
+
+test("a missing agent CLI reports the command and the fix instead of a bare ENOENT", async () => {
+  const enoent = Object.assign(new Error("spawn pi ENOENT"), { code: "ENOENT" });
+  assert.match(describeSpawnError(enoent, true), /spawn pi ENOENT/);
+  assert.doesNotMatch(describeSpawnError(enoent, true), /agent\.command/, "a shell already named the command");
+  assert.match(describeSpawnError(enoent, false), /spawn pi ENOENT/);
+  assert.match(describeSpawnError(enoent, false), /agent\.command/, "a shell-free miss says how to pin the CLI");
+  const other = Object.assign(new Error("spawn pi EPERM"), { code: "EPERM" });
+  assert.equal(describeSpawnError(other, false), "spawn pi EPERM", "only a miss gets the hint");
+
+  // POSIX-only wiring check: a custom command spawns without a shell there, so a missing CLI raises ENOENT.
+  if (process.platform === "win32") return;
+  const result = await runAgent({
+    agent: { command: "/nonexistent/dream-rsi-agent", args: [], prompt_via: "stdin" },
+    cwd: os.tmpdir(),
+    prompt: "propose something",
+    timeoutMs: 10_000,
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.timedOut, false, "a missing CLI fails immediately, it must not look like a hang");
+  assert.match(result.spawnError, /agent\.command/);
+});
+
+test("an npm-installed package runs its worker from the project, not from node_modules", async () => {
+  // Node refuses to strip TypeScript types under node_modules, and that is exactly where npm puts the
+  // package. The worker entry must therefore be mirrored into the project before it is spawned.
+  const { runPolicyChecked } = await jump("policy/runner.ts");
+  const { ensurePolicyRuntime, deployPolicy, ensureWorkerRuntime } = await jump("engine/world.ts");
+  const { EXT } = await import("./fixtures.mjs");
+  const path = await import("node:path");
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-npmlayout-"));
+  try {
+    // A faithful npm layout: the extension inside node_modules/pi-dream-rsi/extensions/pi-dream-rsi.
+    const installRoot = path.join(dir, "consumer", "node_modules", "pi-dream-rsi");
+    fs.mkdirSync(installRoot, { recursive: true });
+    for (const entry of ["extensions", "prompts", "skills", "package.json"]) {
+      fs.cpSync(path.join(EXT, "..", "..", entry), path.join(installRoot, entry), { recursive: true });
+    }
+    const installedExt = path.join(installRoot, "extensions", "pi-dream-rsi");
+
+    // Deploy that copy's policy into a fresh project fixture.
+    const dreamRoot = path.join(dir, "consumer", ".dream-rsi");
+    fs.mkdirSync(path.join(dir, "consumer", "seed"), { recursive: true });
+    ensurePolicyRuntime(dreamRoot, path.join(installedExt, "policy"));
+    deployPolicy(dreamRoot, fs.readFileSync(path.join(installedExt, "policy", "method.ts"), "utf8"));
+
+    // Spawning the package copy directly is what used to happen, and it throws.
+    const { Worker } = await import("node:worker_threads");
+    const spawnPackageWorker = () =>
+      new Promise((_resolve, reject) => {
+        const worker = new Worker(path.join(installedExt, "worker", "policy-worker.ts"), {
+          execArgv: process.features?.typescript ? [] : ["--experimental-strip-types"],
+          workerData: { policyPath: path.join(dreamRoot, "policy", "method.ts"), mode: "grid", maxParallelism: 1, config: {} },
+        });
+        worker.on("error", reject);
+        worker.on("exit", () => _resolve(undefined));
+      });
+    await assert.rejects(spawnPackageWorker(), /node_modules/);
+
+    // Mirrored into the project, the same policy runs.
+    const mirrored = ensureWorkerRuntime(dreamRoot, installedExt);
+    assert.ok(mirrored && fs.existsSync(mirrored), "the worker is mirrored into the project");
+    assert.ok(mirrored.includes(`${path.sep}.dream-rsi${path.sep}runtime${path.sep}`));
+    for (const relative of ["worker/policy-worker.ts", "engine/tree.ts", "engine/replay.ts", "policy/host.ts", "policy/api.ts"]) {
+      assert.ok(fs.existsSync(path.join(dreamRoot, "runtime", relative)), `${relative} came along`);
+    }
+
+    const tree = new DiscoveryTree({ baselineScore: 0, branchCount: 1, refineCount: 1 });
+    tree.addBranchSlot(0);
+    const run = await runPolicyChecked({
+      policyPath: path.join(dreamRoot, "policy", "method.ts"),
+      mode: "replay",
+      maxParallelism: 1,
+      world: tree,
+      maxRounds: 2,
+      verifyDeterminism: true,
+    });
+    assert.equal(run.ok, true, run.error ?? "");
+    assert.equal(run.deterministic, true, "and the mirrored worker is deterministic");
+    assert.ok(!mirrored.includes("node_modules"), "never spawns from node_modules");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the scoring fingerprint follows the contract, not the budgets", () => {
+  const base = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const budgetOnly = normalizeTask({ ...base, workers: 8, k1: 2, revisions: 5, default_beta: 0.2, max_loops: 4 });
+  assert.equal(scoringFingerprint(base), scoringFingerprint(budgetOnly), "budgets never invalidate recorded scores");
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, higher_is_better: false })));
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, score_program: "node other.mjs" })));
+  assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, workspace: "seed2" })));
+});
+
+test("a stored score that contradicts the current direction is recognized", () => {
+  const higher = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const lower = normalizeTask({ ...higher, higher_is_better: false });
+  assert.equal(scoreMatchesDirection(higher, 79, 79), true);
+  assert.equal(scoreMatchesDirection(higher, -79, 79), false);
+  assert.equal(scoreMatchesDirection(lower, -79, 79), true);
+  // The bug report's mix: an old +79 candidate and new -54 candidates cannot both be "best".
+  assert.equal(scoreMatchesDirection(lower, 79, 79), false);
+  assert.equal(scoreMatchesDirection(lower, -54, 54), true);
+  assert.equal(scoreMatchesDirection(lower, -79, null), true, "an unknown raw score cannot be judged");
+});
+
+test("a spawned agent does not inherit the host session identity", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-env-"));
+  const script = path.join(dir, "env-probe.mjs");
+  fs.writeFileSync(
+    script,
+    `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync("env.json", JSON.stringify({\n` +
+      `  sid: process.env.PI_SESSION_ID ?? null,\n` +
+      `  file: process.env.PI_SESSION_FILE ?? null,\n` +
+      `  web: process.env.PI_WEB_SESSION ?? null,\n` +
+      `  keep: process.env.DREAM_TEST_KEEP ?? null,\n` +
+      `}));\n`,
+    "utf8",
+  );
+  const sessionVars = ["PI_SESSION_ID", "PI_SESSION_FILE", "PI_WEB_SESSION"];
+  const saved = new Map(sessionVars.map((key) => [key, process.env[key]]));
+  process.env.PI_SESSION_ID = "parent-session";
+  process.env.PI_SESSION_FILE = "/tmp/parent-session.jsonl";
+  process.env.PI_WEB_SESSION = "1";
+  const agent = { command: "node", args: [script], model: null, thinking: null, prompt_via: "stdin" };
+  try {
+    const first = await runAgent({ agent, cwd: dir, prompt: "hello", timeoutMs: 10_000 });
+    assert.equal(first.ok, true, first.spawnError ?? first.stderrTail);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, "env.json"), "utf8")), {
+      sid: null,
+      file: null,
+      web: null,
+      keep: null,
+    });
+
+    // A task that genuinely needs one can put it back via `agent.env` (task.json's documented escape hatch).
+    const withEnv = { ...agent, env: { PI_SESSION_FILE: "explicit" } };
+    const second = await runAgent({ agent: withEnv, cwd: dir, prompt: "hello", timeoutMs: 10_000 });
+    assert.equal(second.ok, true, second.spawnError ?? second.stderrTail);
+    const seen = JSON.parse(fs.readFileSync(path.join(dir, "env.json"), "utf8"));
+    assert.equal(seen.file, "explicit");
+    assert.equal(seen.sid, null, "stripping is per variable");
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

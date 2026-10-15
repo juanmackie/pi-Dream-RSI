@@ -59,28 +59,24 @@ async function inspectWatch(harness, pending, expectedActivity) {
   await pending;
 }
 
-test("watch selectors and Ctrl+Shift+D retain access to active campaign and legacy trees", async () => {
+test("watch and Ctrl+Shift+D only open the active campaign", async () => {
   const project = makeProject();
   try {
-    seedProgress(project.dreamRoot, "legacy-tree-marker");
     const { pi, context, harness } = mockPi();
     context.cwd = project.projectDir;
     context.mode = "tui";
     dreamRsi(pi);
     await harness.handlers.get("session_start")({}, context);
 
-    let pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
+    await harness.commands.get("dream-rsi").handler("watch", context);
+    assert.match(harness.notifications.at(-1), /No campaign yet\. Run \/dream-rsi assess\./);
+    assert.equal(harness.customViews.length, 0, "watch without a campaign does not open legacy state");
+    await harness.shortcuts.get("ctrl+shift+d").handler(context);
+    assert.equal(harness.customViews.length, 0, "the shortcut also requires a campaign");
 
     const campaign = recordCampaign(project);
     seedProgress(campaign.campaignRoot, "campaign-tree-marker");
-    pending = harness.commands.get("dream-rsi").handler("watch", context);
-    await inspectWatch(harness, pending, "campaign-tree-marker");
-
-    pending = harness.commands.get("dream-rsi").handler("watch legacy", context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
-
-    pending = harness.commands.get("dream-rsi").handler("watch campaign", context);
+    let pending = harness.commands.get("dream-rsi").handler("watch", context);
     await inspectWatch(harness, pending, "campaign-tree-marker");
 
     pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
@@ -90,12 +86,12 @@ test("watch selectors and Ctrl+Shift+D retain access to active campaign and lega
     current.state = { kind: "complete", reason: "fixture complete" };
     fs.writeFileSync(campaign.campaignFile, JSON.stringify(current));
     pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
-    await inspectWatch(harness, pending, "legacy-tree-marker");
-
-    const shortcutCount = harness.customViews.length;
-    pending = harness.commands.get("dream-rsi").handler("watch campaign", context);
     await inspectWatch(harness, pending, "campaign-tree-marker");
-    assert.equal(harness.customViews.length, shortcutCount + 1, "explicit campaign selection remains available after completion");
+
+    const completedWatchCount = harness.customViews.length;
+    pending = harness.shortcuts.get("ctrl+shift+d").handler(context);
+    await inspectWatch(harness, pending, "campaign-tree-marker");
+    assert.equal(harness.customViews.length, completedWatchCount + 1, "completed campaigns remain watchable");
   } finally {
     project.cleanup();
   }

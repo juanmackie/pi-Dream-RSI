@@ -7,7 +7,6 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { renderDirectionGuidance, diagnoseTimeout, GUIDANCE_MAX_CHARS } from "../extensions/pi-dream-rsi/engine/guidance.ts";
-import { renderHandoffSummary, HANDOFF_MAX_CHARS, HANDOFF_MAX_RUN_ENTRIES } from "../extensions/pi-dream-rsi/engine/handoff.ts";
 import {
   defaultTask,
   normalizeTask,
@@ -184,35 +183,6 @@ test("output is bounded and never leaks workspaces or proposals", () => {
   assert.match(out, /omitted for length/);
   assert.ok(!out.includes("work/r0001"), "workspace paths must not leak");
   assert.ok(!out.includes("attempt_b"), "per-attempt paths must not leak");
-});
-
-test("automatic handoff stays bounded and keeps live recovery details ahead of old history", () => {
-  const history = Array.from({ length: 400 }, (_, i) => `    t=${i + 1}: status=complete best=${i} beta=0.6 attempts=6 rounds=3`);
-  const summary = [
-    "Dream-RSI — fixture", "  root: /tmp/project", "  budgets: W=4 K1=3 K2=4 loops<=20", "  scoring: score.mjs -> score.value", "  policy: policy/method.ts (versions: r1, r2)",
-    "  recoverable: 402, 401, 400 — /dream-rsi resume [iteration]", "  live 403: running | round 2/3 | workers 3/4 | completed 5 | best 9", "  in flight: live cycle 403 (in flight)", "  worlds: 400 recorded (t=1,2,3)", ...history,
-  ].join("\n");
-  const handoff = renderHandoffSummary(summary, { iteration: 403, kind: "active", owner: "live owner session test, pid 12", checkpoint: "/tmp/project/trace_pool/iter0403_current/checkpoint.json" });
-  assert.ok(handoff.length <= HANDOFF_MAX_CHARS);
-  assert.match(handoff, /budgets: W=4 K1=3 K2=4 loops<=20/);
-  assert.match(handoff, /live 403: running/);
-  assert.match(handoff, /selected iteration: 403 \(active\)/);
-  assert.match(handoff, /owner: iteration 403, live owner session test, pid 12/);
-  assert.match(handoff, /checkpoint: iteration 403, \/tmp\/project\/trace_pool\/iter0403_current\/checkpoint.json/);
-  assert.match(handoff, /next safe action: inspect or wait for the active owner/);
-  assert.match(handoff, /t=400: status=complete/);
-  assert.doesNotMatch(handoff, /t=1: status=complete/);
-  assert.match(handoff, new RegExp(`recoverable: 402, 401, 400`));
-  assert.ok(HANDOFF_MAX_RUN_ENTRIES >= 1);
-});
-
-test("interrupted-only handoff invites explicit resume and keeps its action under pathological metadata", () => {
-  const huge = "x".repeat(20_000);
-  const summary = ["Dream-RSI — fixture", `  root: ${huge}`, "  budgets: W=2 K1=3 K2=4 loops<=5", "  scoring: score.mjs -> score.value", "  policy: policy/method.ts", "  recoverable: 7 — /dream-rsi resume [iteration]", `  in flight: ${huge}`].join("\n");
-  const handoff = renderHandoffSummary(summary, { iteration: 7, kind: "recoverable", owner: huge, checkpoint: huge });
-  assert.ok(handoff.length <= HANDOFF_MAX_CHARS);
-  assert.match(handoff, /selected iteration: 7 \(recoverable\)/);
-  assert.match(handoff, /next safe action: review the interrupted checkpoint and resume only when the user requests continuation/);
 });
 
 test("unevaluated cells are excluded", () => {

@@ -193,9 +193,8 @@ export function makeProject(options = {}) {
 }
 
 export async function writeTaskJson(project) {
-  const { writeTask } = await jump("engine/task.ts");
   fs.mkdirSync(project.dreamRoot, { recursive: true });
-  writeTask(project.dreamRoot, project.task);
+  fs.writeFileSync(path.join(project.dreamRoot, "task.json"), `${JSON.stringify(project.task, null, 2)}\n`, "utf8");
 }
 
 /** Deploy the shipped policy into the project, with its relative imports. */

@@ -1,165 +1,19 @@
 /**
- * pi-dream-rsi — Dream-RSI for pi (arXiv 2609.14858).
- *
- * Created by Juan Mackie — https://juanmackie.com
- *
- * The extension owns the deterministic machinery of the method and nothing else:
- *
- *   dream_rsi_init    write task.json, seed the policy, validate the evaluator contract
- *   dream_rsi_live    one online rollout (policy pi_t, W workers, <= K1 rounds) -> discovery tree T_t
- *   dream_rsi_resume  continue an interrupted live tree with its saved settings and remaining budget
- *   dream_rsi_dream   the offline phase: replay every candidate on every world, revise, select, deploy
- *   dream_rsi_apply   apply a recorded candidate after explicit confirmation
- *   dream_rsi_status  iterations, worlds, versions, sweep, progress and recoverable checkpoints
- *   /dream-rsi watch  read-only tree and log dashboard (also Ctrl+Shift+D)
- *
- * No LLM runs in the driver: the only agents are the discovery attempts (one per selected node) and
- * the policy-development agent (one per revision), both spawned through the configured agent command.
+ * pi-dream-rsi — campaign based project improvement for pi (arXiv 2609.14858).
  */
 
-import type { CustomEntry, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { readTask, validateTask, writeTask, defaultTask, normalizeTask, programFingerprint, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
 import { Dashboard } from "./dashboard.ts";
-import { buildAgentArgs } from "./agent/runner.ts";
-import { readCheckpoint, recoverableIterations } from "./engine/checkpoint.ts";
-import { progressIterations, readProgress, progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
-import { allocator, dreamIsActive, phaseIsActive, pidIsAlive } from "./engine/ownership.ts";
-import { writeCurrentManifest, readJson, currentManifestPath, type LiveCycleManifest } from "./engine/world.ts";
-import { runLiveEpisode } from "./engine/live.ts";
-import { planNextGrid, runDreamPhase } from "./engine/dream.ts";
 import { campaignRuntimeDiagnostics, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
-import { loadPrompt } from "./engine/prompt.ts";
-import {
-  activeRuns,
-  dreamRootFor,
-  iterationReport,
-  recoverInterruptedRuns,
-  reserveIterations,
-  runningIterations,
-  LIVE_MANIFEST_ENTRY,
-  saveTaskEntry,
-  handoffSummary,
-  statusSummary,
-  type DreamState,
-  type RunningPhase,
-} from "./state.ts";
-import { ensureDreamIgnore, ensurePolicyRuntime, type PhaseOwner } from "./engine/world.ts";
-import {
-  findCandidate,
-  improvements,
-  measureSeed,
-  readSeedMeasurement,
-  recordApplied,
-  resolveBaselineScore,
-  seedMatchesTask,
-} from "./engine/improvements.ts";
-import { rankCandidates, renderSuggestion, type Ranking } from "./engine/candidates.ts";
-import {
-  locallyChanged,
-  replaceFiles,
-  resolveWithinRoot,
-  targetState,
-  verifyApply,
-  type ApplyFile,
-  type ApplyVerification,
-} from "./engine/apply.ts";
-import { BUNDLED_POLICY_DIR, SKILLS_DIR } from "./layout.ts";
-
+import { resolveWithinRoot } from "./engine/apply.ts";
+import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
+import { defaultTask, normalizeTask, validateTask, type TaskConfig } from "./engine/task.ts";
+import { SKILLS_DIR } from "./layout.ts";
 
 const MODE_ENTRY = "pi-dream-rsi/mode";
-
-// Plain JSON-Schema parameter objects (what pi validates against), so the package needs no runtime deps.
-const taskParams = {
-  type: "object",
-  properties: {
-    name: { type: "string", description: "Task name (used in reports)." },
-    workspace: { type: "string", description: "Seed workspace directory for the discovery root (relative to the project)." },
-    eval_program: { type: "string", description: "Path of the candidate program attempts must implement ($eval_program in the discovery prompt)." },
-    score_program: { type: "string", description: "Fixed scoring command run in an attempt workspace; must write eval/score.json." },
-    problem_file: { type: "string", description: "Optional problem statement file shown to attempts." },
-    workers: { type: "number", description: "W — parallel attempts (default 4)." },
-    max_loops: {
-      type: "number",
-      description: "Cap on parallel online episodes per dream_rsi_live call (default 2, max 8); real fan-out is max_loops x workers agents.",
-    },
-    k1: { type: "number", description: "K1 — online decision rounds per live episode (default 6)." },
-    k2: { type: "number", description: "K2 — replay decision rounds per evaluation (default 8)." },
-    revisions: { type: "number", description: "M — policy revisions per offline phase (default 3)." },
-    default_beta: { type: "number", description: "Beta baked into a freshly seeded policy (default 0.6)." },
-    beta_grid: { type: "array", items: { type: "number" }, description: "Beta grid swept during offline evaluation." },
-    higher_is_better: { type: "boolean", description: "False when score_program reports a cost (smaller is better)." },
-    beta1: { type: "number", description: "Eq. 1 execution-cost coefficient (default 0.01)." },
-    beta2: { type: "number", description: "Eq. 1 parallelism-bonus coefficient (default 0.01)." },
-    agent_command: { type: "string", description: "Executable spawned for one attempt (default 'pi')." },
-    agent_args: {
-      type: "array",
-      items: { type: "string" },
-      description:
-        "Arguments for the attempt agent; '{model}' is substituted. Defaults suppress inherited context (--no-context-files --no-prompt-templates); keep them unless attempts should read your repo's instructions.",
-    },
-    model: { type: "string", description: "Model id passed to the attempt agent." },
-    reset: { type: "boolean", description: "Also reset the seeded policy to the shipped default (does not delete history)." },
-    measure_seed: {
-      type: "boolean",
-      description: "Run the scorer once on your own code to record the baseline candidates must beat (default true; set false for a slow scorer).",
-    },
-    remeasure_seed: {
-      type: "boolean",
-      description:
-        "Re-run the scorer on the seed even though a reference measurement already exists (default false; a changed workspace or scorer re-measures automatically, and the old measurement is kept).",
-    },
-    copy_exclude: {
-      type: "array",
-      items: { type: "string" },
-      description: "Workspace-relative paths never copied into attempt workspaces (e.g. node_modules, dist).",
-    },
-    work_retention: {
-      type: "number",
-      description: "How many recent iteration workspaces to keep under .dream-rsi/work (default 20; older ones are pruned).",
-    },
-    guidance: {
-      type: "string",
-      description: 'Attempt-prompt direction guidance: "off" (default, historical empty $direction_guidance) or "summary" (deterministic bounded evaluated-history summary; experimental, paper §4 ablation).',
-    },
-  },
-  required: ["name", "workspace", "eval_program", "score_program"],
-  additionalProperties: false,
-};
-
-const liveParams = {
-  type: "object",
-  properties: {
-    grid: { type: "string", description: "Optional explicit grid as 'branches x refinements' (e.g. '4x6'); default: plan_grid from the policy." },
-    loops: {
-      type: "number",
-      description:
-        "How many online episodes to run at once, each on its own iteration (parallel worlds). Clamped to max_loops in task.json (default 2); default 1.",
-    },
-    note: { type: "string", description: "Free-form note recorded in the live-cycle manifest." },
-  },
-  additionalProperties: false,
-};
-
-const dreamParams = {
-  type: "object",
-  properties: {
-    revision: { type: "number", description: "Override M (policy revisions) for this offline phase." },
-    evaluate_only: { type: "boolean", description: "Score the current policy on the frozen history without revising it." },
-  },
-  additionalProperties: false,
-};
-
-const statusParams = {
-  type: "object",
-  properties: {
-    detail: { type: "string", description: "'summary' (default) or 'full' for the per-version score table." },
-  },
-  additionalProperties: false,
-};
-
 const campaignTaskParams = {
   type: "object",
   properties: {
@@ -214,937 +68,47 @@ const improveParams = {
   additionalProperties: false,
 };
 
-const applyParams = {
-  type: "object",
-  properties: {
-    cell: { type: "string", description: "Candidate cell id to apply (default: the pending best candidate)." },
-    iteration: { type: "number", description: "Iteration that produced the candidate (default: the pending best)." },
-    paths: {
-      type: "array",
-      items: { type: "string" },
-      description: "Extra workspace-relative files to copy alongside eval_program (default: eval_program only).",
-    },
-    confirm: {
-      type: "boolean",
-      description: "Must be true, and only after the user explicitly asked for the change to be applied.",
-    },
-    verify: {
-      type: "boolean",
-      description:
-        "Default true: run the scorer on scratch copies of the user's code without and with the files, and write only when the result measures better. Set false only when the scorer cannot run now; the apply is then recorded as unverified.",
-    },
-    overwrite_changed: {
-      type: "boolean",
-      description:
-        "Replace a target file that changed after the candidate's cycle started (the previous version is kept). Only after the user accepted losing that change.",
-    },
-  },
-  additionalProperties: false,
-};
-
 export default function dreamRsi(pi: ExtensionAPI): void {
-  // The factory only registers things: no processes, sockets, watchers or timers start here, because
-  // factories also run in invocations that never start a session. All work happens in tools/commands,
-  // and the only session-scoped handles (per-session state) are dropped in `session_shutdown`.
-  const runtimes = new Map<string, DreamState>();
-  const gatedNames = new Set<string>();
+  const modes = new Map<string, boolean>();
   const dashboards = new Map<string, Dashboard>();
   const closingSessions = new Set<string>();
-  const jobs = new Map<string, Set<{ controller: AbortController; finished: Promise<void> }>>();
   const dashboardFor = (ctx: ExtensionContext): Dashboard => {
     const id = ctx.sessionManager.getSessionId();
-    let dashboard = dashboards.get(id); if (!dashboard) { dashboard = new Dashboard(ctx); dashboards.set(id, dashboard); }
+    let dashboard = dashboards.get(id);
+    if (!dashboard) { dashboard = new Dashboard(ctx); dashboards.set(id, dashboard); }
     return dashboard;
   };
-  const observe = (ctx: ExtensionContext, onUpdate: any) => (progress: ProgressSnapshot): void => {
-    if (!closingSessions.has(ctx.sessionManager.getSessionId())) dashboardFor(ctx).observe(progress);
-    onUpdate?.({ content: [{ type: "text", text: progressSummary(progress) }], details: { progress } });
-  };
-  const beginJob = (ctx: ExtensionContext, signal?: AbortSignal): { signal: AbortSignal; end: () => void } => {
-    const id = ctx.sessionManager.getSessionId(); const controller = new AbortController();
-    const abort = (): void => controller.abort(); signal?.addEventListener("abort", abort, { once: true });
-    if (signal?.aborted) abort();
-    let resolve!: () => void; const finished = new Promise<void>((done) => { resolve = done; });
-    const job = { controller, finished }; let set = jobs.get(id); if (!set) { set = new Set(); jobs.set(id, set); } set.add(job);
-    return { signal: controller.signal, end: () => { signal?.removeEventListener("abort", abort); set!.delete(job); if (!set!.size) jobs.delete(id); resolve(); } };
-  };
-
-  const projectDir = (ctx: ExtensionContext): string => ctx.cwd;
-  const dreamRoot = (ctx: ExtensionContext): string => dreamRootFor(ctx.cwd);
-
-  /** Iterations owned by phases still in flight — the claims an interruption cleanup must not touch. */
-  const claimedBy = (phases: RunningPhase[]): number[] => phases.flatMap((phase) => phase.iterations);
-
-  /**
-   * Session-scoped agent settings. The active session wins at run time; task.json's agent is only the
-   * fallback for a host with no model (SDK/CI). This is why a model switch takes effect on the next cycle.
-   */
-  const sessionModelId = (ctx: ExtensionContext): string | null =>
-    ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
-  const sessionThinking = (ctx: ExtensionContext): TaskConfig["agent"]["thinking"] =>
-    (ctx.thinkingLevel as TaskConfig["agent"]["thinking"] | undefined) ?? null;
+  const dreamRoot = (ctx: ExtensionContext): string => path.join(ctx.cwd, ".dream-rsi");
   const runAgentConfig = (ctx: ExtensionContext, agent: TaskConfig["agent"]): TaskConfig["agent"] => ({
     ...agent,
-    model: sessionModelId(ctx) ?? agent.model,
-    thinking: sessionThinking(ctx) ?? agent.thinking,
+    model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : agent.model,
+    thinking: ctx.thinkingLevel ?? agent.thinking,
   });
-
-  const stateFor = (ctx: ExtensionContext): DreamState => {
-    const key = ctx.sessionManager.getSessionId();
-    let state = runtimes.get(key);
-    if (!state) {
-      state = { mode: false, iteration: 0, running: [] };
-      runtimes.set(key, state);
-    }
-    return state;
+  const stateFor = (ctx: ExtensionContext): { mode: boolean } => {
+    const id = ctx.sessionManager.getSessionId();
+    if (!modes.has(id)) modes.set(id, false);
+    return { get mode() { return modes.get(id) === true; } };
   };
-
-  const refreshTools = (ctx: ExtensionContext): void => {
-    const state = stateFor(ctx);
-    const active = new Set(pi.getActiveTools());
-    for (const name of gatedNames) {
-      if (state.mode) active.add(name);
-      else active.delete(name);
-    }
-    pi.setActiveTools([...active]);
-  };
-
   const setMode = (ctx: ExtensionContext, enabled: boolean): void => {
-    stateFor(ctx).mode = enabled;
+    modes.set(ctx.sessionManager.getSessionId(), enabled);
     pi.appendEntry(MODE_ENTRY, { version: 1, project: dreamRoot(ctx), active: enabled });
-    refreshTools(ctx);
     ctx.ui.setStatus("dream-rsi", enabled ? "dream-rsi: active" : undefined);
   };
-
   const reconstruct = (ctx: ExtensionContext): void => {
     const id = ctx.sessionManager.getSessionId();
     closingSessions.delete(id);
-    dashboards.get(id)?.dispose(); dashboards.delete(id);
-    const state = { mode: false, iteration: 0, running: [] } as DreamState;
-    // `getBranch()` (not `getEntries()`): a mode or iteration recorded on another branch must not
-    // leak back in when the session tree is rewired.
-    for (const entry of ctx.sessionManager.getBranch() as CustomEntry[]) {
-      if (entry.type !== "custom") continue;
-      if (entry.customType === MODE_ENTRY) {
-        const data = entry.data as { project?: string; active?: boolean };
-        if (data?.project === dreamRoot(ctx)) state.mode = data.active === true;
-      }
-      if (entry.customType === LIVE_MANIFEST_ENTRY) {
-        const data = entry.data as { root?: string; iteration?: number; reset?: boolean };
-        // Entries name the root they belong to: a session resumed in another project must not inherit its
-        // iteration count. `reset` (a fresh task in this session) zeroes the count, and later entries — the
-        // live cycles of the new task — raise it again from there.
-        if (data?.root === dreamRoot(ctx)) {
-          if (data.reset === true) state.iteration = 0;
-          if (typeof data.iteration === "number") state.iteration = Math.max(state.iteration, data.iteration);
-        }
-      }
+    dashboards.get(id)?.dispose();
+    dashboards.delete(id);
+    let active = false;
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "custom" || entry.customType !== MODE_ENTRY) continue;
+      const data = entry.data as { project?: string; active?: boolean };
+      if (data.project === dreamRoot(ctx)) active = data.active === true;
     }
-    runtimes.set(ctx.sessionManager.getSessionId(), state);
-    refreshTools(ctx);
-    ctx.ui.setStatus("dream-rsi", state.mode ? "dream-rsi: active" : undefined);
+    modes.set(id, active);
+    ctx.ui.setStatus("dream-rsi", active ? "dream-rsi: active" : undefined);
   };
-
-  const setStatus = (ctx: ExtensionContext, ranking: Ranking | null): void => {
-    const state = stateFor(ctx);
-    if (!state.mode) return;
-    ctx.ui.setStatus("dream-rsi", ranking?.pending ? "dream-rsi: improvement ready" : "dream-rsi: active");
-  };
-
-  /**
-   * The proactive half: rank what is on disk and say what is worth taking, with the evidence that makes
-   * the pick auditable (score delta, secondary metrics, changed files, admitted trades). Applying is
-   * never implied by this text — `dream_rsi_apply` stays a separate, confirmed step.
-   */
-  const suggestionFor = (ctx: ExtensionContext, goal?: string | null): Ranking =>
-    rankCandidates({ dreamRoot: dreamRoot(ctx), projectDir: projectDir(ctx), goal: goal ?? null });
-
-  const reportImprovements = (ctx: ExtensionContext, goal?: string | null): Ranking => {
-    const ranking = suggestionFor(ctx, goal);
-    setStatus(ctx, ranking);
-    if (ranking.pending) {
-      ctx.ui.notify(
-        `Dream-RSI: improvement ready — ${ranking.pending.cell} at ${ranking.pending.raw_score ?? ranking.pending.score}` +
-          `${ranking.pending.gain_pct === null ? "" : ` (${ranking.pending.gain_pct}% better)`}. Not applied to your code yet.`,
-        "info",
-      );
-    }
-    return ranking;
-  };
-
-  /** Tools that spend real agent time or write to the user's tree are gated: only callable in Dream-RSI mode. */
-  const registerGatedTool = (tool: Parameters<typeof pi.registerTool>[0]): void => {
-    gatedNames.add(tool.name);
-    pi.registerTool(tool);
-  };
-
   // -- tools ---------------------------------------------------------------
-
-  pi.registerTool({
-    name: "dream_rsi_init",
-    label: "Dream-RSI Init",
-    description:
-      "Configure a Dream-RSI task: seed workspace, candidate program, fixed scoring command, budgets (W, loops, K1, K2, M), beta grid and the agent command used for discovery attempts. Writes <project>/.dream-rsi/task.json and seeds .dream-rsi/policy/method.ts from the shipped parallel-refine policy.",
-    promptSnippet: "Configure the Dream-RSI task (workspace, eval_program, score_program, budgets, agent).",
-    promptGuidelines: [
-      "Call dream_rsi_init before dream_rsi_live: it writes .dream-rsi/task.json and seeds the exploration policy.",
-      "dream_rsi_init validates configuration and measures the seed with the scorer by default; measure_seed=false skips that measurement. It starts no discovery or revision agents.",
-      "dream_rsi_init keeps the recorded baseline only while the scoring configuration still matches it — a changed workspace, scorer or score direction re-measures automatically (the old measurement is kept, not deleted); pass remeasure_seed=true to measure unchanged code on demand.",
-    ],
-    parameters: taskParams,
-    async execute(_id, params: any, _signal, onUpdate: any, ctx): Promise<any> {
-      const root = dreamRoot(ctx);
-      fs.mkdirSync(root, { recursive: true });
-      const existing = fs.existsSync(path.join(root, "task.json")) ? readTask(root) : null;
-      const task: TaskConfig = {
-        ...(existing ?? defaultTask(String(params.name))),
-        ...(params.name ? { name: String(params.name) } : {}),
-        ...(params.workspace ? { workspace: normalizePathArg(String(params.workspace)) } : {}),
-        ...(params.eval_program ? { eval_program: normalizePathArg(String(params.eval_program)) } : {}),
-        ...(params.score_program ? { score_program: String(params.score_program) } : {}),
-        ...(params.problem_file !== undefined
-          ? { problem_file: params.problem_file ? normalizePathArg(String(params.problem_file)) : null }
-          : {}),
-        ...(typeof params.workers === "number" ? { workers: params.workers } : {}),
-        ...(typeof params.max_loops === "number" ? { max_loops: params.max_loops } : {}),
-        ...(typeof params.k1 === "number" ? { k1: params.k1 } : {}),
-        ...(typeof params.k2 === "number" ? { k2: params.k2 } : {}),
-        ...(typeof params.revisions === "number" ? { revisions: params.revisions } : {}),
-        ...(typeof params.default_beta === "number" ? { default_beta: params.default_beta } : {}),
-        ...(Array.isArray(params.beta_grid) ? { beta_grid: params.beta_grid as number[] } : {}),
-        ...(typeof params.higher_is_better === "boolean" ? { higher_is_better: params.higher_is_better } : {}),
-        ...(typeof params.beta1 === "number" ? { beta1: params.beta1 } : {}),
-        ...(typeof params.beta2 === "number" ? { beta2: params.beta2 } : {}),
-        ...(Array.isArray(params.copy_exclude) ? { copy_exclude: params.copy_exclude as string[] } : {}),
-        ...(typeof params.work_retention === "number" ? { work_retention: params.work_retention } : {}),
-        ...(params.guidance === "off" || params.guidance === "summary" ? { guidance: params.guidance } : {}),
-      };
-      task.agent = {
-        ...task.agent,
-        ...(params.agent_command ? { command: String(params.agent_command) } : {}),
-        ...(Array.isArray(params.agent_args) ? { args: params.agent_args as string[] } : {}),
-        ...(params.model !== undefined ? { model: params.model ? String(params.model) : null } : {}),
-      };
-
-      const errors = validateTask(task);
-      const workspacePath = path.resolve(projectDir(ctx), task.workspace);
-      if (!fs.existsSync(workspacePath)) errors.push(`workspace does not exist: ${workspacePath}`);
-      if (task.problem_file && !fs.existsSync(path.resolve(projectDir(ctx), task.problem_file))) {
-        errors.push(`problem_file does not exist: ${path.resolve(projectDir(ctx), task.problem_file)}`);
-      }
-      if (errors.length > 0) {
-        return { content: [{ type: "text", text: `❌ task.json not written:\n- ${errors.join("\n- ")}` }], details: { errors } };
-      }
-
-      writeTask(root, task);
-      const seeded = fs.existsSync(path.join(root, "policy", "method.ts"));
-      const policyPath = seedPolicy(root, task, !seeded || params.reset === true);
-      // Measure your own code once. Without it "the loop found something better" has no reference point —
-      // but re-running init must not silently move that reference point: a re-interview after a candidate
-      // was applied would adopt the improved code as the baseline and retire every past win. Re-measure only
-      // when the thing being measured changed, or when explicitly asked.
-      const recorded = readSeedMeasurement(root);
-      // Re-measure when the recorded reference no longer describes *this* configuration: a different
-      // workspace/scorer/score direction (or a stored score inconsistent with the current direction)
-      // makes the old number incomparable — keeping it was how a C(16,5,3) baseline kept ranking
-      // C(25,15,5) candidates. Budgets/agents are not part of the contract and never force a re-run.
-      const remeasure =
-        params.remeasure_seed === true ||
-        recorded === null ||
-        !seedMatchesTask(recorded, task) ||
-        recorded.workspace !== task.workspace ||
-        recorded.score_program !== task.score_program;
-      const measurement =
-        params.measure_seed === false || !remeasure
-          ? null
-          : await measureSeed({ dreamRoot: root, projectDir: projectDir(ctx), task, log: (m) => onUpdate?.({ content: [{ type: "text", text: m }] }) });
-      const programNow = programFingerprint(projectDir(ctx), task);
-      const programChanged =
-        !remeasure &&
-        recorded !== null &&
-        recorded.program_fingerprint !== undefined &&
-        programNow !== null &&
-        recorded.program_fingerprint !== programNow;
-      const baselineNote =
-        measurement !== null
-          ? `  baseline:   your code measures ${measurement.raw_score ?? "n/a"} (${measurement.fail_class}) — every candidate is compared against it`
-          : recorded === null
-            ? "  baseline:   not measured (scorer not run on your code yet)"
-            : `  baseline:   kept ${recorded.raw_score ?? "n/a"} (${recorded.fail_class}), measured ${recorded.measured_at} — pass remeasure_seed=true to measure the current code instead`;
-      // Show — and record — the settings a run will actually use (the session model wins over the fallback).
-      const configuredAgent = runAgentConfig(ctx, task.agent);
-      saveTaskEntry(pi, root, { task: task.name, policy: policyPath, iteration: 0, model: configuredAgent.model });
-      setMode(ctx, true);
-      const programNote = programChanged
-        ? [`  note:      ${task.eval_program} changed since the baseline was measured — pass remeasure_seed=true to measure the new code (the old measurement is kept until then).`]
-        : [];
-      // measure_seed=false with a changed contract: the kept number is not a reference point for this
-      // objective, and every comparison against it is suppressed until the code is re-measured.
-      const staleNote =
-        remeasure && measurement === null && recorded !== null
-          ? [
-              "  note:      the recorded baseline belongs to the previous scoring configuration — it will not be used (candidates are not compared against it) until your code is re-measured; drop measure_seed=false or pass remeasure_seed=true.",
-            ]
-          : [];
-      // Scoring runs inside the attempt workspace, which the candidate can edit. A scorer referenced
-      // by a workspace-relative command (./score.sh) runs from the candidate's copy and can be
-      // rewritten by it: verification still stops a bad apply from landing, but the attempts are
-      // wasted. Keep the scorer outside the workspace and reference it by absolute path.
-      const scorerNote = /^\s*\./.test(task.score_program)
-        ? [
-            `  note:      scorer "${task.score_program}" looks workspace-relative — a candidate can edit that copy. Move the scorer outside "${task.workspace}" and reference it by absolute path.`,
-          ]
-        : [];
-      return {
-        content: [
-          {
-            type: "text",
-            text: [
-              `Dream-RSI configured: ${task.name}`,
-              `  root:       ${root}`,
-              `  workspace:  ${workspacePath}`,
-              `  candidate:  ${task.eval_program}`,
-              `  scorer:     ${task.score_program}`,
-              `  budgets:    W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} loops<=${task.max_loops} beta_grid=[${task.beta_grid.join(", ")}]`,
-              `  agent:      ${configuredAgent.command} ${buildAgentArgs(configuredAgent).join(" ")}`,
-              `  (new cycles follow the active session model/thinking level; resumed cycles keep their saved settings; model= sets the fallback)`,
-              `  policy:     ${policyPath}${seeded && params.reset !== true ? " (existing policy kept)" : " (seeded from the shipped parallel-refine baseline)"}`,
-              baselineNote,
-              ...programNote,
-              ...staleNote,
-              ...scorerNote,
-              `Next: dream_rsi_live to run one online rollout.`,
-              `Nothing is ever written to your code: candidates land in .dream-rsi/work/, and applying one is a separate, explicit step (dream_rsi_apply).`,
-            ].join("\n"),
-          },
-        ],
-        details: { task, agent: configuredAgent, policy: policyPath, baseline: measurement ?? recorded, remeasured: measurement !== null },
-      };
-    },
-  });
-
-  registerGatedTool({
-    name: "dream_rsi_live",
-    label: "Dream-RSI Live Cycle",
-    description:
-      "Run one or more online exploration episodes with the current policy: plan_grid decides the branch x refinement grid, the policy batches up to W nodes per decision round (<= K1 rounds), each selected node runs one discovery attempt, and the task's scorer evaluates it. Each episode records its discovery tree as a replay world; pass loops>1 to run several episodes at once (parallel worlds).",
-    promptSnippet: "Run Dream-RSI online exploration cycle(s) (policy pi_t, W workers, <= K1 rounds); loops>1 for parallel worlds.",
-    promptGuidelines: [
-      "Use dream_rsi_live to collect discovery trees; it spends real agent time (loops x W attempts per round), so report the plan and budgets before running it.",
-      "dream_rsi_live loops=N records N worlds of the same policy in parallel — one dream then replays all of them. Real fan-out is loops x W agent processes (clamped to task.json's max_loops, default 2), so raise it only when the attempt model and the disk can take it.",
-      "Start several dream_rsi_live calls in one turn to run independent cycles side by side: they share the max_loops budget, and dream_rsi_dream replays whatever worlds they recorded once they have finished.",
-      "After dream_rsi_live, run dream_rsi_dream to improve the exploration policy from the newly recorded world(s).",
-      "dream_rsi_live exposes progress through its updates and /dream-rsi watch (Ctrl+Shift+D in terminal mode). Interrupted checkpointed cycles remain available to dream_rsi_resume; a new live call starts a new tree.",
-    ],
-    parameters: liveParams,
-    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
-      const root = dreamRoot(ctx);
-      const state = stateFor(ctx);
-      // Live cycles may overlap each other (parallel worlds), but never a dream phase: that one rewrites the
-      // deployed policy and must replay a frozen history.
-      const exclusive = state.running.filter((phase) => !phase.label.startsWith("live"));
-      if (exclusive.length > 0) {
-        return {
-          content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${exclusive.map((p) => p.label).join(", ")}` }],
-          details: {},
-        };
-      }
-      let mine: RunningPhase | null = null;
-      let job: ReturnType<typeof beginJob> | undefined;
-      try {
-        let task: TaskConfig;
-        try {
-          task = readTask(root);
-        } catch (error) {
-          return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
-        }
-        // Release stale claims so new cycles can start. Checkpointed trees remain available for explicit
-        // resume; another live session and sibling calls keep their claims.
-        const sessionId = ctx.sessionManager.getSessionId();
-        const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId });
-        if (recovered.length > 0) {
-          onUpdate?.({
-            content: [{ type: "text", text: recoveryNotice(recovered) }],
-          });
-        }
-        // The world cap is shared by every live call in flight, not per call.
-        const claimed = runningIterations(root).length;
-        const remaining = task.max_loops - claimed;
-        if (remaining <= 0) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `❌ ${claimed} live cycle(s) already in flight and max_loops=${task.max_loops} — let one finish (dream_rsi_dream waits for all of them) or raise max_loops in task.json.`,
-              },
-            ],
-            details: { in_flight: claimed, max_loops: task.max_loops },
-          };
-        }
-        const requested = typeof params.loops === "number" ? Math.floor(params.loops) : 1;
-        const want = Math.max(1, Number.isFinite(requested) ? requested : 1);
-        let loops = Math.min(want, remaining);
-        const clampNote =
-          want > loops
-            ? ` (asked for ${want} loop(s), running ${loops}: max_loops=${task.max_loops}${claimed > 0 ? ` with ${claimed} already in flight` : ""})`
-            : "";
-        // Claim the numbers before planning: allocation must not interleave with another call's. The
-        // owner is recorded so another session cannot reclaim this claim while it is genuinely running.
-        const owner: PhaseOwner = { session_id: sessionId, pid: process.pid, claimed_at: new Date().toISOString() };
-        const iterations = reserveIterations(root, loops, Math.max(state.iteration, latestIteration(root)) + 1, owner, task.max_loops);
-        loops = iterations.length;
-        const iteration = iterations[0];
-        mine = { label: loops === 1 ? `live cycle ${iteration}` : `live cycles ${iterations.join(", ")}`, iterations };
-        state.running.push(mine);
-        job = beginJob(ctx, signal);
-        const baseline = readBaselineScore(root, task);
-        const previous = latestBest(root, task);
-        // The active session model/thinking level is what the attempts run on; task.json is only a fallback.
-        const runTask: TaskConfig = { ...task, agent: runAgentConfig(ctx, task.agent) };
-
-        const planned = await planNextGrid(root, runTask, iteration, baseline, undefined, job.signal);
-        const grid = params.grid ? parseGrid(String(params.grid), planned.plan) : planned.plan;
-        const bakedBeta = typeof planned.beta === "number" ? planned.beta : task.default_beta;
-
-        ctx.ui.setStatus(
-          "dream-rsi",
-          iterations.length === 1
-            ? `dream-rsi: live ${iteration} (${grid.branch_count}x${grid.refine_count})`
-            : `dream-rsi: live x${iterations.length} (${grid.branch_count}x${grid.refine_count} each)`,
-        );
-        const header =
-          iterations.length === 1
-            ? `Live cycle ${iteration}: grid ${grid.branch_count} branches x ${grid.refine_count} refinements, W=${task.workers}, K1=${task.k1}, beta=${bakedBeta}`
-            : `${iterations.length} online cycles in parallel (worlds ${iterations.join(", ")}): grid ${grid.branch_count} branches x ${grid.refine_count} refinements each, W=${task.workers} each (${iterations.length * task.workers} attempts at once), K1=${task.k1}, beta=${bakedBeta}${clampNote}`;
-        onUpdate?.({ content: [{ type: "text", text: `${header}\n${grid.reason}` }] });
-
-        // One episode failing must not discard its siblings: collect per-world outcomes instead of rejecting.
-        const outcomes = await Promise.all(
-          iterations.map(async (world) => {
-            try {
-              const episode = await runLiveEpisode({
-                dreamRoot: root,
-                projectDir: projectDir(ctx),
-                task: runTask,
-                iteration: world,
-                policyPath: path.join(root, "policy", "method.ts"),
-                bakedBeta,
-                grid: { branch_count: grid.branch_count, refine_count: grid.refine_count },
-                baselineScore: baseline,
-                previousBestScore: previous,
-                signal: job!.signal,
-                owner,
-                onProgress: observe(ctx, onUpdate),
-                log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
-              });
-              return { iteration: world, episode, error: episode.error };
-            } catch (error) {
-              return { iteration: world, episode: null, error: (error as Error).message };
-            }
-          }),
-        );
-        for (const outcome of outcomes) {
-          if (!outcome.episode) onUpdate?.({ content: [{ type: "text", text: `⚠️ live cycle ${outcome.iteration} failed: ${outcome.error}` }] });
-        }
-
-        const last = iterations[iterations.length - 1];
-        const policyVersion = outcomes.find((o) => o.episode)?.episode?.manifest.policy_version ?? null;
-        state.iteration = Math.max(state.iteration, last);
-        saveTaskEntry(pi, root, { task: task.name, policy: policyVersion ?? undefined, iteration: last, model: runTask.agent.model });
-        const reports = outcomes.map((outcome) =>
-          outcome.episode
-            ? iterationReport(root, outcome.iteration, outcome.episode.manifest)
-            : `⚠️ Live cycle ${outcome.iteration} FAILED: ${outcome.error}`,
-        );
-        const ranking = reportImprovements(ctx);
-        return {
-          content: [{ type: "text", text: `${header}\n${grid.reason}\n\n${reports.join("\n\n")}\n\n${renderSuggestion(ranking)}` }],
-          details: {
-            ok: outcomes.every((o) => o.episode?.ok === true),
-            iteration: last,
-            iterations,
-            loops: iterations.length,
-            grid,
-            beta: bakedBeta,
-            worlds: outcomes
-              .filter((o) => o.episode)
-              .map((o) => ({
-                iteration: o.iteration,
-                ok: o.episode?.ok === true,
-                attempts: o.episode?.manifest.attempts ?? 0,
-                rounds: o.episode?.manifest.decision_rounds ?? 0,
-                best: o.episode?.manifest.best_score ?? null,
-              })),
-            attempts: outcomes.reduce((sum, o) => sum + (o.episode?.manifest.attempts ?? 0), 0),
-            rounds: outcomes.reduce((most, o) => Math.max(most, o.episode?.manifest.decision_rounds ?? 0), 0),
-            best: outcomes.reduce<number | null>((best, o) => {
-              const score = o.episode?.manifest.best_score;
-              return typeof score === "number" && (best === null || score > best) ? score : best;
-            }, null),
-            pending_improvement: ranking.pending,
-            ranking: ranking.candidates.slice(0, 5),
-            error: outcomes.find((o) => o.episode?.error)?.error ?? outcomes.find((o) => !o.episode)?.error ?? null,
-          },
-        };
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ live cycle failed: ${(error as Error).message}` }], details: {} };
-      } finally {
-        // Release this call's stale claims while preserving checkpointed trees and their iteration numbers.
-        // Siblings keep theirs, so a finishing live call never kills a concurrent one.
-        const others = state.running.filter((phase) => phase !== mine);
-        const leftover = recoverInterruptedRuns(root, claimedBy(others), { sessionId: ctx.sessionManager.getSessionId() });
-        if (leftover.length > 0) {
-          onUpdate?.({ content: [{ type: "text", text: recoveryNotice(leftover) }] });
-        }
-        state.running = others;
-        job?.end();
-        ctx.ui.setStatus(
-          "dream-rsi",
-          others.length > 0 ? `dream-rsi: ${others.map((p) => p.label).join(", ")}` : state.mode ? "dream-rsi: active" : undefined,
-        );
-      }
-    },
-  });
-
-  registerGatedTool({
-    name: "dream_rsi_resume", label: "Dream-RSI Resume",
-    description: "Resume an interrupted live cycle from its checkpoint, original effective settings and remaining original budget. Completed attempts are reused; unfinished generators restart from their committed parent, while saved completed generators need only evaluation. Omit iteration for the latest recoverable cycle.",
-    promptSnippet: "Resume an interrupted Dream-RSI live tree with its original settings.",
-    promptGuidelines: [
-      "Before dream_rsi_resume, report kept attempts, unfinished work, original model/thinking and remaining budgets. Retries can add calls beyond the original logical attempt budget; completed trees and interrupted dream revisions cannot be extended/resumed.",
-      "dream_rsi_resume requires the original scoring contract and intact saved workspaces; do not delete checkpoints or snapshots to bypass a recovery error. After completion, use dream_rsi_status or /dream-rsi suggest to rank candidates, then dream_rsi_dream to improve the policy.",
-    ],
-    parameters: { type: "object", properties: { iteration: { type: "integer", minimum: 1, description: "Interrupted live iteration to resume; omit for the latest recoverable cycle." } }, additionalProperties: false } as any,
-    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
-      const root = dreamRoot(ctx); const state = stateFor(ctx);
-      let phase: RunningPhase | undefined; let job: ReturnType<typeof beginJob> | undefined;
-      try {
-        if (state.running.some((p) => !p.label.startsWith("live"))) throw new Error("a dream phase is already running");
-        recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
-        const task = readTask(root);
-        const iteration = params.iteration ?? recoverableIterations(root)[0];
-        if (!iteration) throw new Error("no recoverable interrupted live cycle");
-        const cp = readCheckpoint(root, iteration);
-        if (!recoverableIterations(root).includes(iteration)) throw new Error("cycle is already complete; resume only accepts interrupted live trees");
-        const kept = cp.batches.flatMap((b) => b.attempts).filter((a) => a.record).length;
-        const unfinished = cp.batches.flatMap((b) => b.attempts).filter((a) => !a.record);
-        const owner: PhaseOwner = { session_id: ctx.sessionManager.getSessionId(), pid: process.pid, claimed_at: new Date().toISOString() };
-        allocator(root, () => {
-          if (dreamIsActive(root)) throw new Error("a dream phase owns this project");
-          const current = readJson<LiveCycleManifest>(currentManifestPath(root, iteration));
-          if (phaseIsActive(root, `live-${iteration}`) || (current?.status === "running" && current.owner && pidIsAlive(current.owner.pid))) throw new Error("cycle already has an active owner");
-          if (runningIterations(root).length >= task.max_loops) throw new Error("project max_loops budget is already in use");
-          writeCurrentManifest(root, { ...cp.manifest, status: "running", owner });
-        });
-        phase = { label: `live resume ${iteration}`, iterations: [iteration] }; state.running.push(phase);
-        job = beginJob(ctx, signal);
-        const header = `Resume live ${iteration}: keeping ${kept} attempts; ${unfinished.length} unfinished (${unfinished.filter((a) => a.stage === "evaluation").length} evaluation-only). ` +
-          `Original model=${cp.task.agent.model ?? "default"}, thinking=${cp.task.agent.thinking ?? "default"}, W=${cp.task.workers}, ` +
-          `rounds remaining=${cp.task.k1 - cp.batches.filter((b) => b.attempts.every((a) => a.record)).length}, logical attempts remaining=${cp.manifest.grid.branch_count * cp.manifest.grid.refine_count - kept}.`;
-        onUpdate?.({ content: [{ type: "text", text: header }], details: { kept, unfinished: unfinished.length, original_agent: cp.task.agent } });
-        const result = await runLiveEpisode({ dreamRoot: root, projectDir: ctx.cwd, task, iteration, resume: true,
-          policyPath: cp.policy, bakedBeta: cp.manifest.baked_beta, baselineScore: cp.manifest.baseline_score,
-          grid: cp.manifest.grid, owner, signal: job.signal, onProgress: observe(ctx, onUpdate) });
-        state.iteration = Math.max(state.iteration, iteration);
-        saveTaskEntry(pi, root, { iteration });
-        const saved = readCheckpoint(root, iteration);
-        return { content: [{ type: "text", text: `${header}\n${iterationReport(root, iteration, result.manifest)}\nExtra calls across recovery: agents=${saved.extra_agent_calls}, evaluators=${saved.extra_eval_calls}.` }],
-          details: { ok: result.ok, iteration, kept, attempts: result.manifest.attempts, best: result.manifest.best_score,
-            extra_agent_calls: saved.extra_agent_calls, extra_eval_calls: saved.extra_eval_calls, progress: readProgress(root, iteration) } };
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ resume failed: ${(error as Error).message}` }], details: { ok: false } };
-      } finally {
-        if (phase) state.running = state.running.filter((p) => p !== phase);
-        recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
-        job?.end();
-      }
-    },
-  });
-
-  registerGatedTool({
-    name: "dream_rsi_dream",
-    label: "Dream-RSI Offline Phase",
-    description:
-      "Run the offline phase: freeze completed worlds recorded under the current scoring contract, evaluate the current policy and M-1 revisions on every world (deterministic replay, Eq. 1), sweep beta, select argmax V and deploy the winner. The policy-development agent edits staged candidates; the selected version replaces .dream-rsi/policy/method.ts.",
-    promptSnippet: "Improve the exploration policy offline: replay M versions over the frozen history, select argmax V, deploy.",
-    promptGuidelines: [
-      "Use dream_rsi_dream after dream_rsi_live; it spends agent time only on policy revisions, and replay itself is deterministic and cheap.",
-      "dream_rsi_dream asserts V* >= V_0: a reported failure means the policy was non-deterministic or non-prefix-only, so its result must not be trusted.",
-      "dream_rsi_dream releases interrupted claims, preserving live checkpoints for explicit resume, then refuses while a phase is genuinely in flight or its manifest is unreadable. It replays completed worlds under the current scoring contract; resume any interrupted trees you want included before dreaming.",
-    ],
-    parameters: dreamParams,
-    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
-      const root = dreamRoot(ctx);
-      const state = stateFor(ctx);
-      if (state.running.length > 0) {
-        return {
-          content: [{ type: "text", text: `❌ a Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}` }],
-          details: {},
-        };
-      }
-      let task: TaskConfig;
-      try {
-        task = readTask(root);
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
-      }
-      // Replay needs *finished* worlds: an in-flight episode has no tree yet, so dreaming now would silently
-      // replay fewer worlds than the report claims. A run left `running` on disk while no phase in this
-      // session owns it was interrupted (crashed session, killed host) — recover it the same way
-      // dream_rsi_live does, or one dead cycle blocks dreaming forever.
-      const recovered = recoverInterruptedRuns(root, claimedBy(state.running), { sessionId: ctx.sessionManager.getSessionId() });
-      if (recovered.length > 0) {
-        onUpdate?.({
-          content: [{ type: "text", text: recoveryNotice(recovered) }],
-        });
-      }
-      const inFlight = activeRuns(root);
-      if (inFlight.length > 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `❌ a live cycle is still in flight — let it finish before dreaming: ${inFlight.join("; ")}`,
-            },
-          ],
-          details: { in_flight: inFlight },
-        };
-      }
-      const iteration = Math.max(state.iteration, latestIteration(root));
-      if (!fs.existsSync(path.join(root, "trace_pool", `iter${String(iteration).padStart(4, "0")}`))) {
-        return {
-          content: [{ type: "text", text: "❌ no recorded world yet — run dream_rsi_live first (replay needs a live cycle)." }],
-          details: {},
-        };
-      }
-
-      const phase: RunningPhase = { label: `dream phase ${iteration}`, iterations: [] };
-      state.running = [phase];
-      const job = beginJob(ctx, signal);
-      ctx.ui.setStatus("dream-rsi", `dream-rsi: dreaming ${iteration}`);
-      try {
-        const runTask: TaskConfig = {
-          ...task,
-          revisions: typeof params.revision === "number" ? params.revision : task.revisions,
-          agent: runAgentConfig(ctx, task.agent),
-        };
-        const result = await runDreamPhase({
-          dreamRoot: root,
-          projectDir: projectDir(ctx),
-          task: runTask,
-          iteration,
-          evaluateOnly: params.evaluate_only === true,
-          signal: job.signal,
-          onProgress: observe(ctx, onUpdate),
-          log: (message) => onUpdate?.({ content: [{ type: "text", text: message }] }),
-        });
-        const pending = reportImprovements(ctx);
-        return {
-          content: [
-            {
-              type: "text",
-              text: [
-                result.ok ? `Dreaming phase ${iteration} complete` : `⚠️ Dreaming phase ${iteration} FAILED: ${result.error}`,
-                result.report,
-                `  artifacts: ${path.join(root, "history", `r${String(iteration).padStart(4, "0")}_dream`, "proposal_results")}`,
-                result.ok
-                  ? `Next: dream_rsi_live runs cycle ${iteration + 1} with the deployed policy (beta=${result.deployed_beta}).`
-                  : "Do not deploy this result: re-check the policy for hidden state or unrevealed-data access.",
-                "",
-                renderSuggestion(pending),
-              ].join("\n"),
-            },
-          ],
-          details: {
-            ok: result.ok,
-            iteration,
-            worlds: result.worlds,
-            revisions: result.revisions,
-            selected: result.selected,
-            v_mean: result.evaluations.map((e) => e.v_mean),
-            deployed_beta: result.deployed_beta,
-            improved: result.improved,
-            pending_improvement: pending.pending,
-          },
-        };
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ dream phase failed: ${(error as Error).message}` }], details: {} };
-      } finally {
-        state.running = state.running.filter((running) => running !== phase);
-        job.end();
-        ctx.ui.setStatus("dream-rsi", state.mode ? "dream-rsi: active" : undefined);
-      }
-    },
-  });
-
-  registerGatedTool({
-    name: "dream_rsi_apply",
-    label: "Dream-RSI Apply Candidate",
-    description:
-      "Copy a recorded candidate's implementation back over your own code. Requires confirm=true and copies only the declared eval_program plus any paths you name. Before it writes, it scores scratch copies of your code without and with those files (two scorer runs) and refuses when the result does not measure better. It writes all files or none, keeps the replaced versions, and never commits. Applying is always a deliberate act by the user.",
-    promptSnippet: "Apply a Dream-RSI candidate's code to the user's own files (needs explicit confirmation; verified with the scorer before it writes).",
-    promptGuidelines: [
-      "Use dream_rsi_apply only after the user explicitly asks for a candidate to be applied — never on your own initiative, and never as a follow-up to dream_rsi_live or dream_rsi_dream.",
-      "Before calling dream_rsi_apply, show the user which file changes and by how much, and say that it is not committed.",
-      "When dream_rsi_apply refuses, report the measured numbers and the other files the candidate changed. Add those files with paths=[...] only when the user agrees. Pass verify=false or overwrite_changed=true only when the user asks for it.",
-    ],
-    parameters: applyParams,
-    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
-      const root = dreamRoot(ctx);
-      let task: TaskConfig;
-      try {
-        task = readTask(root);
-      } catch (error) {
-        return { content: [{ type: "text", text: `❌ ${(error as Error).message}` }], details: {} };
-      }
-      const report = improvements(root, task, projectDir(ctx));
-      const wanted =
-        typeof params.cell === "string" || typeof params.iteration === "number"
-          ? findCandidate(root, task, projectDir(ctx), params.iteration, params.cell)
-          : report.pending ?? report.best;
-      if (!wanted) {
-        return {
-          content: [{ type: "text", text: `❌ no candidate to apply: ${report.reason}` }],
-          details: { improvements: report },
-        };
-      }
-      if (!wanted.program) {
-        return {
-          content: [{ type: "text", text: `❌ candidate ${wanted.cell} has no workspace on disk any more (${report.reason}).` }],
-          details: { candidate: wanted },
-        };
-      }
-
-      const candidateRoot = wanted.workspace as string;
-      const seedRoot = path.resolve(projectDir(ctx), task.workspace);
-      const files: ApplyFile[] = [];
-      const problems: string[] = [];
-      for (const named of [task.eval_program, ...((params.paths ?? []) as string[])]) {
-        if (path.isAbsolute(named) || named.split(/[\\/]/).includes("..")) {
-          problems.push(`${named}: paths must be relative and stay inside the workspace`);
-          continue;
-        }
-        const relative = named.split(/[\\/]+/).filter((part) => part !== "" && part !== ".").join("/");
-        // Resolve real ancestry on both sides: a symlink or Windows junction component can point
-        // outside either workspace while the textual path still looks contained.
-        const from = resolveWithinRoot(candidateRoot, relative);
-        const to = resolveWithinRoot(seedRoot, relative);
-        if (!from || !to) {
-          problems.push(`${named}: escapes the workspace (symlink/junction)`);
-          continue;
-        }
-        if (!fs.existsSync(from)) {
-          problems.push(`${named}: not present in the candidate workspace`);
-          continue;
-        }
-        if (!fs.statSync(from).isFile() || (fs.existsSync(to) && !fs.statSync(to).isFile())) {
-          problems.push(`${named}: only files can be applied; name each file`);
-          continue;
-        }
-        if (files.some((file) => file.to === to)) continue; // named twice: one copy, one kept version
-        const before = fs.existsSync(to) ? fs.readFileSync(to, "utf8").split("\n").length : 0;
-        files.push({ relative, from, to, before, after: fs.readFileSync(from, "utf8").split("\n").length });
-      }
-      if (problems.length > 0) {
-        return { content: [{ type: "text", text: `❌ nothing applied:\n- ${problems.join("\n- ")}` }], details: { problems } };
-      }
-
-      const candidateScore = wanted.raw_score ?? wanted.score;
-      const listing = files
-        .map((file) => `  ${file.relative}\n    from: ${file.from}\n    to:   ${file.to}  (${file.before} → ${file.after} lines)`)
-        .join("\n");
-      // The candidate was scored with every file of its workspace in place. Code files that differ from
-      // the user's code and are not part of this apply are named: the score can depend on them.
-      const ranked = suggestionFor(ctx).candidates.find((c) => c.iteration === wanted.iteration && c.cell === wanted.cell);
-      const applying = new Set(files.map((file) => file.relative));
-      const notCopied = (ranked?.out_of_scope_files ?? []).filter((relative) => !applying.has(relative));
-      const notCopiedNote =
-        notCopied.length === 0
-          ? null
-          : `The candidate workspace also differs from your code in: ${notCopied.slice(0, 8).join(", ")}` +
-            `${notCopied.length > 8 ? ` (+${notCopied.length - 8} more)` : ""}. ` +
-            "These are not copied unless you name them in paths, and the candidate's score can depend on them.";
-      // The candidate was built from the cycle's seed snapshot. A target that changed since then holds
-      // work the candidate does not contain.
-      const changed = locallyChanged(root, wanted.iteration, files);
-      const lines = (...entries: (string | null)[]): string => entries.filter((entry): entry is string => entry !== null).join("\n");
-
-      if (params.confirm !== true) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: lines(
-                `Not applied — confirm first. ${wanted.cell} (iteration ${wanted.iteration}) scored ${candidateScore}` +
-                  `${report.seed ? ` vs your code's ${report.seed.raw_score ?? report.seed.score}` : ""}.`,
-                listing,
-                notCopiedNote,
-                changed.length > 0
-                  ? `⚠️ Changed after cycle ${wanted.iteration} started: ${changed.join(", ")}. Applying replaces that change (needs overwrite_changed: true).`
-                  : null,
-                `Review it with: diff -u \"${files[0]?.to}\" \"${files[0]?.from}\"`,
-                `To apply it, call dream_rsi_apply again with confirm: true, iteration: ${wanted.iteration}${typeof params.cell === "string" ? `, cell: \"${params.cell}\"` : ""}. ` +
-                  "It first scores your code without and with these files (two scorer runs on scratch copies) and writes only when the result measures better.",
-              ),
-            },
-          ],
-          details: { needs_confirmation: true, candidate: wanted, files, not_copied: notCopied, locally_changed: changed },
-        };
-      }
-
-      const applyHistory = path.join(root, "history", "apply");
-      if (changed.length > 0 && params.overwrite_changed !== true) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: lines(
-                `❌ nothing applied: ${changed.join(", ")} changed after cycle ${wanted.iteration} took its seed snapshot, and ${wanted.cell} was built from the earlier version. Applying it replaces that change.`,
-                `Merge by hand (diff -u \"${files[0]?.to}\" \"${files[0]?.from}\"), run a new cycle from your current code, or call dream_rsi_apply again with overwrite_changed: true (the replaced version is kept under ${applyHistory}).`,
-              ),
-            },
-          ],
-          details: { candidate: wanted, files, locally_changed: changed },
-        };
-      }
-
-      // Scorer logs and the replaced files of this apply.
-      const evidence = path.join(applyHistory, new Date().toISOString().replace(/[:.]/g, "-"));
-      let verification: ApplyVerification | null = null;
-      if (params.verify !== false) {
-        onUpdate?.({
-          content: [{ type: "text", text: "Verifying: scoring your code without and with these files on scratch copies. Your code is not changed yet." }],
-        });
-        const targets = targetState(files);
-        try {
-          verification = await verifyApply({ dreamRoot: root, projectDir: projectDir(ctx), task, files, evidenceDir: evidence, signal });
-        } catch (error) {
-          return {
-            content: [{ type: "text", text: `❌ Not applied — verification could not run: ${(error as Error).message}. Your code is unchanged.` }],
-            details: { candidate: wanted, files },
-          };
-        }
-        if (!verification.improved) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: lines(
-                  `❌ Not applied — not a measured improvement: ${verification.reason}.`,
-                  `${wanted.cell} (iteration ${wanted.iteration}) scored ${candidateScore} in its own attempt workspace.`,
-                  notCopiedNote,
-                  `Scorer output: ${evidence}`,
-                  "Your code is unchanged.",
-                ),
-              },
-            ],
-            details: { verification, candidate: wanted, files, not_copied: notCopied },
-          };
-        }
-        if (targetState(files) !== targets) {
-          return {
-            content: [{ type: "text", text: "❌ Not applied — a target file changed while the verification ran. This tool wrote nothing; call dream_rsi_apply again." }],
-            details: { verification, candidate: wanted, files },
-          };
-        }
-      }
-
-      const replaced = path.join(evidence, "replaced");
-      let kept: string[];
-      try {
-        kept = replaceFiles(files, replaced);
-      } catch (error) {
-        return {
-          content: [{ type: "text", text: `❌ Not applied — writing failed: ${(error as Error).message}. Files already written were restored; your code is unchanged.` }],
-          details: { candidate: wanted, files },
-        };
-      }
-      const copied = files.map((file) => path.relative(projectDir(ctx), file.to) || file.to);
-      try {
-        recordApplied(root, {
-          iteration: wanted.iteration,
-          cell: wanted.cell,
-          score: verification ? verification.after.score : wanted.score,
-          candidate_score: wanted.score,
-          ...(verification ? { before_score: verification.before.score } : {}),
-          verified: verification !== null,
-          fingerprint: scoringFingerprint(task),
-          applied_at: new Date().toISOString(),
-          paths: files.map((file) => file.relative),
-          target: path.relative(projectDir(ctx), seedRoot) || seedRoot,
-          ...(kept.length > 0 ? { backup: path.relative(projectDir(ctx), replaced) } : {}),
-        });
-      } catch (error) {
-        // The files are written; say so instead of reporting an apply that left no record.
-        return {
-          content: [
-            {
-              type: "text",
-              text: `⚠️ Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code, but the apply record could not be written: ${(error as Error).message}. Files written: ${copied.join(", ")}. This candidate stays listed as pending until history/applied.jsonl can be written.`,
-            },
-          ],
-          details: { applied: wanted, files: copied, verification, recorded: false },
-        };
-      }
-      setStatus(ctx, suggestionFor(ctx));
-      const measured = (outcome: ApplyVerification["before"]): string =>
-        String(outcome.raw_score ?? outcome.score ?? `no score (${outcome.fail_class})`);
-      return {
-        content: [
-          {
-            type: "text",
-            text: lines(
-              verification
-                ? `Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code — VERIFIED: your code measured ${measured(verification.before)} before and ${measured(verification.after)} with these files (the candidate scored ${candidateScore} in its attempt workspace).`
-                : `Applied ${wanted.cell} (iteration ${wanted.iteration}) over your code — UNVERIFIED (verify=false): the scorer was not run on your code. ${candidateScore} is the candidate's score in its own attempt workspace.`,
-              listing,
-              `Files written: ${copied.join(", ")}`,
-              kept.length > 0 ? `Replaced versions kept at: ${replaced}` : null,
-              verification ? null : notCopiedNote,
-              `Nothing was committed. Review with git diff and run your own checks before committing — a score from one benchmark is not a correctness review.`,
-              "The next dream_rsi_live starts from this code.",
-            ),
-          },
-        ],
-        details: { applied: wanted, files: copied, verification, backup: kept.length > 0 ? replaced : null },
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "dream_rsi_status",
-    label: "Dream-RSI Status",
-    description:
-      "Report Dream-RSI iterations, best scores, baked-in beta, completed worlds, policy versions, the last beta sweep (pareto.reward, AUC, parallel penalty), persisted live progress and recoverable checkpoints.",
-    promptSnippet: "Report Dream-RSI state, live progress and recoverable iterations without spending agent time.",
-    promptGuidelines: [
-      "Use dream_rsi_status before deciding the next cycle: it shows the live trend (best score per iteration) and the beta sweep that the cross-cycle beta rule reads.",
-      "dream_rsi_status lists saved live checkpoints; use dream_rsi_resume only for an interrupted tree the user wants continued. An active owner prevents duplicate recovery. /dream-rsi watch and Ctrl+Shift+D inspect logs without starting model work.",
-    ],
-    parameters: statusParams,
-    async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
-      const root = dreamRoot(ctx);
-      const state = stateFor(ctx);
-      const campaign = readCampaignStatus(root);
-      if (!fs.existsSync(path.join(root, "task.json"))) {
-        return campaign
-          ? {
-              content: [{ type: "text", text: renderCampaignStatus(campaign) }],
-              details: { campaign, campaignProgress: progressSnapshots(campaign.campaignRoot) },
-            }
-          : { content: [{ type: "text", text: `No Dream-RSI task at ${root}. Use dream_rsi_init to configure one.` }], details: {} };
-      }
-      const ranking = suggestionFor(ctx);
-      const summary = statusSummary(root, { full: params.detail === "full", sessionIteration: state.iteration });
-      const lines = [summary, renderSuggestion(ranking, { compact: true })];
-      if (campaign) lines.push("", renderCampaignStatus(campaign));
-      if (ranking.seed) lines.push(`  baseline: your code measures ${ranking.seed.raw_score ?? "n/a"} (${ranking.seed.fail_class}${ranking.seed.fail_class === "ok" ? "" : `: ${ranking.seed.error}`})`);
-      setStatus(ctx, ranking);
-      return { content: [{ type: "text", text: lines.join("\n") }], details: { root, improvements: ranking, recoverable: recoverableIterations(root),
-        progress: progressIterations(root).map((i) => readProgress(root, i)).filter(Boolean),
-        ...(campaign ? { campaignProgress: progressSnapshots(campaign.campaignRoot) } : {}) } };
-    },
-  });
 
   pi.registerTool({
     name: "dream_rsi_improve",
@@ -1165,12 +129,18 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
       const baseRoot = dreamRoot(ctx);
       const action = typeof params.action === "string" ? params.action : "";
+      if ((action === "start" || action === "resume" || action === "check") && !stateFor(ctx).mode) {
+        return { content: [{ type: "text", text: "Start, resume or check requires an explicit improvement request. Use /dream-rsi improve <what you want> first." }], details: { ok: false } };
+      }
       if (action === "status") {
         const campaign = readCampaignStatus(baseRoot);
         const runtime = campaignRuntimeDiagnostics();
+        const manualDataNotice = fs.existsSync(path.join(baseRoot, "task.json")) || fs.existsSync(path.join(baseRoot, "history"))
+          ? "\nManual-loop data from an earlier version is in .dream-rsi/ (task.json, history/). 1.0 does not use it."
+          : "";
         return campaign
-          ? { content: [{ type: "text", text: renderCampaignStatus(campaign, runtime) }], details: { campaign, runtime } }
-          : { content: [{ type: "text", text: `No improvement campaign is recorded under ${baseRoot}.\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
+          ? { content: [{ type: "text", text: `${renderCampaignStatus(campaign, runtime)}${manualDataNotice}` }], details: { campaign, runtime } }
+          : { content: [{ type: "text", text: `No campaign yet. Run /dream-rsi assess.${manualDataNotice}\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
       }
       if (action === "stop") {
         const campaign = stopCampaign(baseRoot);
@@ -1181,9 +151,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       }
       if (action !== "start" && action !== "resume") {
         return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
-      }
-      if (!stateFor(ctx).mode) {
-        return { content: [{ type: "text", text: "Start/resume requires an explicit improvement request. Use /dream-rsi improve <target/goal> or ask directly to improve a target; assessment and generic questions do not enable campaign execution." }], details: { ok: false } };
       }
 
       const projectDir = action === "start"
@@ -1237,6 +204,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const result = await resumeCampaign({
         baseRoot,
         projectDir,
+        sessionId: ctx.sessionManager.getSessionId(),
         signal,
         onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
         onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
@@ -1250,74 +218,26 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: assess [target] | improve [target/goal] | create [--reconfigure|--fresh] [goal] | suggest/best [goal] | status | watch [campaign|legacy] [iteration] | resume [iteration] | stop | live [n] | dream | run [n] | off | help",
+    description: "Dream-RSI: assess | improve | watch | status | stop | resume",
     getArgumentCompletions: commandCompletions,
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
       const parts = String(args ?? "").trim().split(/\s+/).filter(Boolean);
       const verb = parts[0] ?? "help";
       const rest = parts.slice(1).join(" ");
-      const configured = fs.existsSync(path.join(root, "task.json"));
       const report = (text: string, type: "info" | "error" = "info"): void => {
         ctx.ui.notify(text, type);
         if (ctx.mode !== "tui") pi.sendMessage({ customType: "dream-rsi/command", content: text, display: true }, { triggerTurn: false });
       };
-      const missingTask = (): void => {
-        report(
-          [
-            `No Dream-RSI task in this project: ${path.join(root, "task.json")} is missing.`,
-            `Run /dream-rsi create <goal> to set one up here (the agent calls dream_rsi_init),`,
-            `or copy a task.json you configured elsewhere into ${root}.`,
-            `Current directory: ${ctx.cwd}`,
-          ].join("\n"),
-          "error",
-        );
-      };
-      const showSuggestion = (goal: string): void => {
-        const ranking = suggestionFor(ctx, goal || null);
-        setStatus(ctx, ranking);
-        const lines = [renderSuggestion(ranking)];
-        if (ranking.relevance && ranking.relevance.aligned === false) {
-          lines.unshift(
-            `⚠️ this task may not be about your goal — it says: "${ranking.relevance.taskSummary}".`,
-            `   These candidates come from that task, so "best for <goal>" may not apply here.`,
-          );
-        }
-        const text = lines.join("\n");
-        // Two channels on purpose: `notify` is the immediate TUI signal (a no-op in print mode), and the
-        // session message makes the same text durable and visible to the agent without spending a turn.
-        ctx.ui.notify(text, "info");
-        pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { triggerTurn: false });
-      };
-      /**
-       * Hand a message to the agent. `/skill:<name>` only expands with `expandPromptTemplates`, and the
-       * message must *start* with `/skill:` — never prepend anything to it.
-       */
+      const manualDataNotice = (): string | null =>
+        fs.existsSync(path.join(root, "task.json")) || fs.existsSync(path.join(root, "history"))
+          ? "Manual-loop data from an earlier version is in .dream-rsi/ (task.json, history/). 1.0 does not use it."
+          : null;
       const sendWhenReady = (message: string): void => {
-        if (ctx.isIdle()) {
-          pi.sendUserMessage(message, { expandPromptTemplates: true });
-          return;
-        }
-        pi.sendUserMessage(message, { expandPromptTemplates: true, deliverAs: "followUp" });
+        pi.sendUserMessage(message, { expandPromptTemplates: true, ...(ctx.isIdle() ? {} : { deliverAs: "followUp" }) });
       };
-
-      if (verb === "watch") {
-        const campaign = readCampaignStatus(root);
-        const [first, second, ...extra] = rest.split(/\s+/).filter(Boolean);
-        const target = first === "campaign" || first === "legacy" ? first : null;
-        const iterationText = target ? second : first;
-        const hasExtraArguments = target ? extra.length > 0 : second !== undefined || extra.length > 0;
-        if (hasExtraArguments || (iterationText && !validIteration(iterationText))) {
-          report("watch expects [campaign|legacy] and a positive, safely representable integer iteration number", "error");
-          return;
-        }
-        if (target === "campaign" && !campaign) {
-          report("No improvement campaign is recorded here.", "error");
-          return;
-        }
-        const watchRoot = resolveWatchRoot(root, campaign, target);
-        const summary = await dashboardFor(ctx).watch(watchRoot, iterationText ? Number(iterationText) : undefined);
-        if (summary) pi.sendMessage({ customType: "dream-rsi/watch", content: summary, display: true }, { triggerTurn: false });
+      if (verb === "help" || verb === "?") {
+        report(renderCommandHelp());
         return;
       }
       if (verb === "assess") {
@@ -1327,7 +247,19 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       if (verb === "improve") {
         setMode(ctx, true);
         sendWhenReady(`/skill:dream-rsi-improve ${rest}`.trim());
-        report("Dream-RSI improvement intake started. A target without a measurable goal is assessed first.", "info");
+        report("Dream-RSI improvement intake started. A target without a measurable goal is assessed first.");
+        return;
+      }
+      if (verb === "watch" && rest === "legacy") {
+        report("watch legacy was removed in 1.0. Use /dream-rsi improve <what you want>.");
+        return;
+      }
+      if (verb === "status") {
+        const campaign = readCampaignStatus(root);
+        const lines = [campaign ? renderCampaignStatus(campaign) : "No campaign yet. Run /dream-rsi assess."];
+        const notice = manualDataNotice();
+        if (notice) lines.push(notice);
+        report(lines.join("\n"));
         return;
       }
       if (verb === "stop") {
@@ -1336,180 +268,51 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return;
       }
       if (verb === "resume") {
-        if (rest && !validIteration(rest)) { report("resume expects a positive, safely representable integer iteration number", "error"); return; }
+        if (rest) {
+          report(`resume ${rest} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
+          return;
+        }
         const campaign = readCampaignStatus(root);
         if (campaign?.state.kind === "paused") {
           setMode(ctx, true);
           sendWhenReady("/skill:dream-rsi-improve resume");
-          report("Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.", "info");
-          return;
+          report("Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.");
+        } else {
+          report(campaign?.state.kind === "running"
+            ? "The improvement campaign is already running. Use /dream-rsi status, watch or stop."
+            : "No paused improvement campaign is available to resume.", campaign?.state.kind === "running" ? "info" : "error");
         }
-        if (campaign?.state.kind === "running") {
-          report("The Dream-RSI improvement campaign is already running. Use /dream-rsi status or watch to inspect it, or /dream-rsi stop to pause it.", "info");
-          return;
-        }
-        if (!configured) { missingTask(); return; }
-        setMode(ctx, true);
-        sendWhenReady(`Resume the interrupted Dream-RSI live cycle${rest ? ` ${rest}` : " with the latest recoverable checkpoint"} using dream_rsi_resume${rest ? ` iteration=${rest}` : ""}. Report the saved settings, kept attempts and remaining budgets before running.`);
         return;
       }
-      if (verb === "off") {
-        setMode(ctx, false);
-        report("Dream-RSI mode off (state on disk is untouched; running work continues).", "info");
-        return;
-      }
-      if (verb === "status") {
+      if (verb === "watch") {
+        if (rest) {
+          report(`watch ${rest} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
+          return;
+        }
         const campaign = readCampaignStatus(root);
-        const legacy = configured ? statusSummary(root, { sessionIteration: stateFor(ctx).iteration }) : `No Dream-RSI task at ${root}.`;
-        report(campaign ? `${legacy}\n\n${renderCampaignStatus(campaign)}` : legacy, "info");
-        return;
-      }
-      if (verb === "create") {
-        if (configured) {
-          const task = readTask(root);
-          // "Set up" and "what is best" are different jobs, and guessing between them is what stranded
-          // returning users: `create` used to skip the interview forever. `--reconfigure` / `--fresh` are
-          // the non-interactive path — hosts without a TUI answer `undefined` to `select`.
-          const flag = /^--(reconfigure|fresh)\b/.exec(rest);
-          const goal = flag ? rest.slice(flag[0].length).trim() : rest;
-          const choice = flag
-            ? flag[1] === "reconfigure"
-              ? CREATE_RECONFIGURE
-              : CREATE_FRESH
-            : await ctx.ui.select(`/dream-rsi create — this project already has a task (${task.name})`, [
-                goal ? `Show the best candidate for "${goal}"` : "Show the best candidate",
-                CREATE_RECONFIGURE,
-                CREATE_FRESH,
-                CREATE_CANCEL,
-              ]);
-          if (choice === CREATE_FRESH) {
-            const running = activeRuns(root);
-            if (running.length > 0) {
-              report(`Refusing to start a fresh task while a phase is in flight: ${running.join("; ")}.`, "error");
-              return;
-            }
-            if (
-              await ctx.ui.confirm(
-                "Start a fresh Dream-RSI task?",
-                `The current task's state is archived under ${path.join(root, "archive")}/<timestamp>/ — nothing is deleted.`,
-              )
-            ) {
-              const archived = archiveDreamRoot(root);
-              setMode(ctx, true);
-              // The new task must not continue the old one's iteration count: without this, the first live
-              // cycle of a fresh task in this session would be numbered after the archived cycles. The entry
-              // carries the reset for a later reload; the in-memory state needs it now.
-              saveTaskEntry(pi, root, { iteration: 0, reset: true });
-              stateFor(ctx).iteration = 0;
-              report(`Archived the previous task to ${archived} — loading the dream-rsi-create skill for a fresh one`, "info");
-              sendWhenReady(`/skill:dream-rsi-create fresh ${goal}`.replace(/\s+/g, " ").trim());
-              return;
-            }
-            // Declined: fall through to the report rather than leaving the command silent.
-          }
-          if (choice === CREATE_RECONFIGURE) {
-            setMode(ctx, true);
-            report("Dream-RSI mode ON — loading the dream-rsi-create skill to reconfigure this task", "info");
-            sendWhenReady(`/skill:dream-rsi-create reconfigure ${goal}`.replace(/\s+/g, " ").trim());
-            return;
-          }
-          // Show (the default, an unavailable dialog, or Cancel): report the config and rank the field.
-          // Mode is turned on here too — it used to stay off, so "apply the improvement" reached a tool
-          // that was not registered.
-          setMode(ctx, true);
-          const ranking = suggestionFor(ctx, goal || null);
-          setStatus(ctx, ranking);
-          const text = [
-            renderExistingConfig(root, ctx.cwd, stateFor(ctx).iteration),
-            "",
-            renderSuggestion(ranking),
-            "",
-            "Next: /dream-rsi watch to inspect progress, /dream-rsi resume to continue an interrupted tree, /dream-rsi run 2 to start new cycles, or /dream-rsi create --reconfigure | --fresh to change tasks.",
-          ].join("\n");
-          ctx.ui.notify(text, "info");
-          pi.sendMessage({ customType: "dream-rsi/suggestion", content: text, display: true }, { triggerTurn: false });
+        if (!campaign) {
+          const notice = manualDataNotice();
+          report(notice ? `No campaign yet. Run /dream-rsi assess.\n${notice}` : "No campaign yet. Run /dream-rsi assess.", "info");
           return;
         }
-        setMode(ctx, true);
-        report("Dream-RSI mode ON — no task here yet, loading the dream-rsi-create skill", "info");
-        sendWhenReady(`/skill:dream-rsi-create ${rest}`.replace(/\s+/g, " ").trim());
+        const summary = await dashboardFor(ctx).watch(resolveWatchRoot(campaign));
+        if (summary) pi.sendMessage({ customType: "dream-rsi/watch", content: summary, display: true }, { triggerTurn: false });
         return;
       }
-      if (verb === "suggest" || verb === "best") {
-        if (!configured) {
-          missingTask();
-          return;
-        }
-        showSuggestion(rest);
+      const removed = new Set(["create", "suggest", "best", "live", "dream", "run", "off"]);
+      if (removed.has(verb)) {
+        report(`${verb} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
         return;
       }
-      if (verb === "run" || verb === "live" || verb === "dream") {
-        if (!configured) {
-          missingTask();
-          return;
-        }
-        const state = stateFor(ctx);
-        if (state.running.length > 0) {
-          report(`A Dream-RSI phase is already running: ${state.running.map((p) => p.label).join(", ")}.`, "error");
-          return;
-        }
-        setMode(ctx, true);
-        const requested = parts[1];
-        if ((verb === "run" || verb === "live") && requested !== undefined) {
-          const parsed = Number(requested);
-          const limit = verb === "run" ? 100 : 8;
-          if (!Number.isInteger(parsed) || parsed < 1 || parsed > limit) {
-            report(
-              verb === "run"
-                ? `/dream-rsi run takes a cycle count between 1 and 100; got "${requested}".`
-                : `/dream-rsi live takes a loop count between 1 and 8; got "${requested}".`,
-              "error",
-            );
-            return;
-          }
-        }
-        const cycles = verb === "run" ? (requested === undefined ? 1 : Number(requested)) : 1;
-        const instruction =
-          verb === "live"
-            ? requested === undefined
-              ? "Run one Dream-RSI online cycle (dream_rsi_live): report the planned grid and beta first, then the attempts, best score and where the records landed."
-              : `Run ${requested} Dream-RSI online cycle${Number(requested) === 1 ? "" : "s"} in parallel (dream_rsi_live loops=${requested}): one world each from the same policy, then report the shared grid and beta, every world's best score, and where the records landed. Then dream_rsi_dream replays all of them at once.`
-            : verb === "dream"
-              ? "Run the Dream-RSI offline phase (dream_rsi_dream): report the V table, the beta sweep and which policy version was deployed."
-              : `Run ${cycles} full Dream-RSI cycle${cycles === 1 ? "" : "s"} in ${root}: for each one call dream_rsi_live, then dream_rsi_dream. Pass dream_rsi_live loops=<n> (up to task.json's max_loops) when the goal is throughput: n worlds of the same policy in parallel, one dream replaying all of them. Report the planned grid and beta before the first cycle, and after each pair the live score trend with the sweep's pareto.reward and the current best candidate. Stop early and tell me why if the live best plateaus while the beta sweep stays flat.`;
-        // The command drives the agent rather than dead-ending in a notification: a human at the prompt
-        // cannot call tools, and "ask the agent to run the loop" is not an instruction that does anything.
-        sendWhenReady(instruction);
-        report(`Dream-RSI mode active — asked the agent to run ${verb === "run" ? `${cycles} cycle${cycles === 1 ? "" : "s"}` : verb}.`, "info");
-        return;
-      }
-      if (verb === "help" || verb === "?") {
-        report(renderCommandHelp(root, configured), "info");
-        return;
-      }
-      // Keep bare text from starting an improvement campaign. A configured task treats it as a
-      // read-only candidate-ranking preference; an explicit optimization request may start intake.
-      if (!configured) {
-        const freeText = `${verb} ${rest}`.trim();
-        if (!/\b(improve|optimi[sz]e|speed\s+up|accelerate|reduce|lower|increase|raise|tune)\b/i.test(freeText)) {
-          report(`Nothing is configured here. Use /dream-rsi assess to inspect targets or /dream-rsi improve <goal> to start an explicit improvement request.`, "info");
-          return;
-        }
-        setMode(ctx, true);
-        report("Dream-RSI improvement intake started", "info");
-        sendWhenReady(`/skill:dream-rsi-improve ${freeText}`.replace(/\s+/g, " ").trim());
-        return;
-      }
-      showSuggestion(`${verb} ${rest}`.trim());
+      report(`Unknown Dream-RSI command. Use /dream-rsi help.`);
     },
   });
-
   // -- lifecycle -----------------------------------------------------------
 
-  pi.registerShortcut("ctrl+shift+d", { description: "Watch Dream-RSI tree and worker output", handler: async (ctx) => {
-    const baseRoot = dreamRoot(ctx);
-    const campaign = readCampaignStatus(baseRoot);
-    await dashboardFor(ctx).watch(resolveWatchRoot(baseRoot, campaign));
+  pi.registerShortcut("ctrl+shift+d", { description: "Watch the Dream-RSI campaign", handler: async (ctx) => {
+    const campaign = readCampaignStatus(dreamRoot(ctx));
+    if (!campaign) { ctx.ui.notify("No campaign yet. Run /dream-rsi assess.", "info"); return; }
+    await dashboardFor(ctx).watch(resolveWatchRoot(campaign));
   } });
   pi.on("input", async (event, ctx) => {
     if (event.source !== "extension" && explicitlyRequestsImprovement(event.text)) setMode(ctx, true);
@@ -1517,173 +320,49 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   });
   pi.on("session_start", async (_event, ctx) => reconstruct(ctx));
   pi.on("session_tree", async (_event, ctx) => reconstruct(ctx));
-  // Contribute the skill from this package, so the loop is documented to the agent even when the
-  // extension is loaded by path (`pi -e …`) rather than as a package with `pi.skills`.
   pi.on("resources_discover", async () => ({ skillPaths: [SKILLS_DIR] }));
   pi.on("session_shutdown", async (_event, ctx) => {
     const id = ctx.sessionManager.getSessionId();
     closingSessions.add(id);
-    dashboards.get(id)?.dispose(); dashboards.delete(id);
-    const running = [...(jobs.get(id) ?? [])];
-    for (const job of running) job.controller.abort();
-    await Promise.allSettled(running.map((job) => job.finished));
-    runtimes.delete(id);
-  });
-  pi.on("before_agent_start", async (event, ctx) => {
-    const state = stateFor(ctx);
-    if (!state.mode) return;
-    const root = dreamRoot(ctx);
-    let note =
-      "\n\n## Dream-RSI Mode (ACTIVE)" +
-      `\nRoot: ${root} (task.json, policy/method.ts, history/, trace_pool/).` +
-      "\nThe loop is: dream_rsi_live (one online exploration cycle -> discovery tree T_t) then dream_rsi_dream (replay every candidate policy version over the frozen history, revise, select argmax V, deploy)." +
-      "\ndream_rsi_live takes loops=<n> (clamped to task.json's max_loops) to record n worlds of the same policy in parallel, and you may start several dream_rsi_live calls in one turn when cycles are independent — they share that cap. One dream then replays all of them, so prefer wider batches over many narrow cycles when the attempt model and the disk can take the fan-out (loops x W agents at once)." +
-      "\nRead the task problem statement and .dream-rsi/history/baseline before proposing a first cycle, and report grid/budget before spending agent time." +
-      "\n/dream-rsi watch and Ctrl+Shift+D inspect trees and logs without spending agent time. dream_rsi_status reports progress and recoverable checkpoints. Continue an interrupted live tree explicitly with dream_rsi_resume: report kept attempts, original settings and remaining budget first; completed attempts are reused and retries are counted separately. New live calls start new trees. Only completed worlds under the current scoring contract enter dream replay." +
-      "\nPolicy code is prefix-only and deterministic; replay is deterministic, so a V* >= V_0 violation means the policy is unsound — do not deploy it.";
-    const status = handoffSummary(root, state.iteration);
-    if (status) note += `\n\n${status}`;
-    return { systemPrompt: event.systemPrompt + note };
-  });
-
-  // Keep the status line honest about in-flight phases.
-  pi.on("agent_start", async (_event, ctx) => {
-    const runs = activeRuns(dreamRoot(ctx));
-    if (runs.length === 0) return;
-    const state = stateFor(ctx);
-    const labels = state.running.map((phase) => phase.label).join(", ");
-    ctx.ui.setStatus("dream-rsi", `dream-rsi: ${labels || runs[runs.length - 1]}`);
+    dashboards.get(id)?.dispose();
+    dashboards.delete(id);
+    modes.delete(id);
   });
 }
-
-/** Seed `.dream-rsi/policy/method.ts` (+ its relative imports) from the shipped baseline. */
-function seedPolicy(root: string, task: TaskConfig, overwrite: boolean): string {
-  // One implementation of the runtime copy lives in the engine; seeding must not duplicate it.
-  ensurePolicyRuntime(root, BUNDLED_POLICY_DIR);
-  const target = path.join(root, "policy", "method.ts");
-  if (overwrite || !fs.existsSync(target)) {
-    const template = fs.readFileSync(path.join(BUNDLED_POLICY_DIR, "method.ts"), "utf8");
-    fs.writeFileSync(target, template.replace(/default_beta = 0\.6;/, `default_beta = ${task.default_beta};`), "utf8");
-  }
-  // Fail early if the package was installed without its prompt templates.
-  for (const name of ["discovery-agent.md", "policy-improvement.md"]) loadPrompt(name);
-  return target;
-}
-
 /**
- * Models sometimes prefix path arguments with `@` (pi's built-in tools accept that too). Normalize it
- * before resolving, or a perfectly good path looks like a missing directory.
+ * Models sometimes prefix path arguments with `@`; strip it before resolving the path.
  */
 function normalizePathArg(value: string): string {
   return value.startsWith("@") ? value.slice(1) : value;
 }
 
-/**
- * The answers `/dream-rsi create` offers on a configured project. Labels are matched by the handler and
- * the tests, so they live in one place.
- */
-const CREATE_RECONFIGURE = "Reconfigure this task (re-interview)";
-const CREATE_FRESH = "Start a fresh task (archives current .dream-rsi)";
-const CREATE_CANCEL = "Cancel";
-
-/** The state a fresh task replaces. Archived by rename, never deleted. */
-const ARCHIVE_ENTRIES = ["task.json", "policy", "policy_versions", "history", "trace_pool", "work", "runtime"];
-
-/**
- * Move the current task's state aside so a fresh one can be configured without losing the old one.
- * Renames only, into `.dream-rsi/archive/<timestamp>/`, which inherits the gitignore that keeps the bulk
- * run state (`work/`, `trace_pool/`, `runtime/`) out of version control.
- */
-function archiveDreamRoot(root: string): string {
-  const dir = path.join(root, "archive", new Date().toISOString().replace(/[:.]/g, "-"));
-  fs.mkdirSync(dir, { recursive: true });
-  for (const name of ARCHIVE_ENTRIES) {
-    const from = path.join(root, name);
-    if (fs.existsSync(from)) fs.renameSync(from, path.join(dir, name));
-  }
-  ensureDreamIgnore(dir);
-  return dir;
-}
-
-/** The existing configuration, so `/dream-rsi create` on a configured project answers instead of interrogating. */
-function renderExistingConfig(root: string, cwd: string, sessionIteration: number): string {
-  let summary: string;
-  try {
-    summary = statusSummary(root, { sessionIteration });
-  } catch (error) {
-    return `Dream-RSI is configured at ${root}, but its state is unreadable: ${(error as Error).message}`;
-  }
-  return `Already configured here (${path.relative(cwd, root) || root}) — no interview:
-\n${summary}`;
-}
-
-function renderCommandHelp(root: string, configured: boolean): string {
+function renderCommandHelp(): string {
   return [
-    "Dream-RSI (arXiv 2609.14858)",
-    "  /dream-rsi assess [target] inspect the project and rank measurable improvement targets (read-only)",
-    "  /dream-rsi improve [target/goal] start a bounded improvement campaign",
-    "  /dream-rsi create [goal]    set up a task here (loads the dream-rsi-create skill); on a configured",
-    "                              project, ask whether to report, reconfigure or start fresh",
-    "  /dream-rsi create --reconfigure|--fresh [goal]",
-    "                              the same choice without the dialog (print/scripted use)",
-    "  /dream-rsi suggest [goal]   best candidate for a goal: fastest | safest | simplest (alias: best)",
-    "  /dream-rsi status           iterations, worlds, policies, sweep, progress and recoverable checkpoints",
-    "  /dream-rsi watch [campaign|legacy] [iteration] browse trees/logs; active campaign is default, otherwise legacy",
-    "                              Ctrl+Shift+D opens the same view; arrows select cycles/nodes,",
-    "                              d switches live/dream, Tab changes panes, PgUp/PgDn page logs, Esc closes",
-    "                              RPC/JSON/print hosts receive text; watching spends no agent time",
-    "  /dream-rsi resume [iteration] ask the agent to continue an interrupted tree; default: latest recoverable",
-    "                              keeps completed attempts, original settings and remaining budget; retries add calls",
-    "  /dream-rsi stop             stop the active improvement campaign",
-    "  /dream-rsi live [n]         ask the agent for new online cycles; default: 1, range: 1–8, shared task cap",
-    "  /dream-rsi dream            ask the agent for one offline policy-improvement phase",
-    "  /dream-rsi run [n]          ask the agent for n full cycles (live then dream); default: 1, range: 1–100",
-    "  /dream-rsi off              disable gated tools; saved state and running work are kept",
-    "  /dream-rsi help | ?         show this help (also /dream-rsi alone; leaves mode unchanged)",
-    "",
-    configured
-      ? `Configured here (task file: ${path.join(root, "task.json")}). \`suggest\` ranks recorded candidates; \`assess\` finds new targets.`
-      : `Nothing configured here yet. Use \`assess\` to inspect, or \`improve\` / \`create\` for an explicit improvement request.`,
-    `  root: ${root}`,
+    "Dream-RSI · arXiv 2609.14858",
+    "  /dream-rsi assess [what you want]  rank project levers (read-only)",
+    "  /dream-rsi improve <what you want>  run a verified improvement campaign",
+    "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
+    "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
 }
 
-/** Completion values replace the full argument prefix, including the subcommand. */
 function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
-  let choices = [
-    { value: "create", label: "create [goal]", description: "Set up, reconfigure or archive a task" },
-    { value: "assess", label: "assess [target]", description: "Read-only scan for measurable improvement targets" },
-    { value: "improve", label: "improve [target/goal]", description: "Start a bounded improvement campaign" },
-    { value: "suggest", label: "suggest [goal]", description: "Rank recorded candidates" },
-    { value: "best", label: "best [goal]", description: "Alias for suggest" },
-    { value: "status", label: "status", description: "State, progress and recoverable checkpoints" },
-    { value: "watch", label: "watch [campaign|legacy] [iteration]", description: "Inspect campaign or legacy trees and logs without agent calls" },
-    { value: "resume", label: "resume [iteration]", description: "Continue an interrupted live tree with saved settings" },
-    { value: "stop", label: "stop", description: "Stop the active improvement campaign" },
-    { value: "live", label: "live [n]", description: "Start new online cycles; default 1, up to 8 (shared task cap)" },
-    { value: "dream", label: "dream", description: "Improve the policy using completed worlds" },
-    { value: "run", label: "run [n]", description: "Start full live/dream cycles; default 1, up to 100" },
-    { value: "off", label: "off", description: "Disable gated tools; running work continues" },
-    { value: "help", label: "help", description: "Command syntax, defaults and dashboard controls" },
+  const choices = [
+    { value: "assess", label: "assess [what you want]", description: "Rank project levers without changing files" },
+    { value: "improve", label: "improve <what you want>", description: "Run a bounded improvement campaign" },
+    { value: "watch", label: "watch", description: "Open the campaign dashboard" },
+    { value: "status", label: "status", description: "Inspect campaign state" },
+    { value: "stop", label: "stop", description: "Stop the active campaign" },
+    { value: "resume", label: "resume", description: "Resume a paused campaign" },
   ];
-  if (/^create\s/.test(query)) {
-    choices = ["--reconfigure", "--fresh"].map((flag) => ({ value: `create ${flag}`, label: `create ${flag}`, description: flag === "--fresh" ? "Archive the current task and start a new one" : "Re-interview for this task" }));
-  } else {
-    const verb = /^(suggest|best)\s/.exec(query)?.[1];
-    if (verb) choices = ["fastest", "safest", "simplest"].map((goal) => ({ value: `${verb} ${goal}`, label: `${verb} ${goal}`, description: "Candidate ranking preference" }));
-  }
   const matches = choices.filter((choice) => choice.value.startsWith(query));
   return matches.length ? matches : null;
 }
 
-function validIteration(value: string): boolean {
-  return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value));
-}
-
 function explicitlyRequestsImprovement(text: string): boolean {
   const input = text.trim();
-  if (/^\/dream-rsi\s+(assess|status|watch|suggest|best|help|\?)\b/i.test(input)) return false;
+  if (/^\/dream-rsi\s+(assess|status|watch|stop|resume|help|\?)\b/i.test(input)) return false;
   if (/\b(assess|evaluate|what should|how does|why does|suggest|recommend)\b.{0,100}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
   if (/\b(what|how|why|should|could|can)\b.{0,80}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
   return (
@@ -1691,6 +370,10 @@ function explicitlyRequestsImprovement(text: string): boolean {
     /\bdream[- ]rsi\b.{0,50}\b(improve|optimi[sz]e)\b/i.test(input) ||
     /\b(improve|optimi[sz]e)\b.{0,100}\b(with|using|via)\s+dream[- ]rsi\b/i.test(input)
   );
+}
+
+function resolveWatchRoot(campaign: CampaignStatus): string {
+  return campaign.campaignRoot;
 }
 
 function resolveCampaignProjectDir(value: unknown, cwd: string): string | null {
@@ -1702,7 +385,6 @@ function resolveCampaignProjectDir(value: unknown, cwd: string): string | null {
     return null;
   }
 }
-
 function parseCampaignTask(value: unknown, ctx: ExtensionContext): { task: TaskConfig | null; errors: string[] } {
   if (!isRecord(value)) return { task: null, errors: ["task must be an object with name, workspace, eval_program and score_program"] };
   const raw = value;
@@ -1837,22 +519,6 @@ function stringArray(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string") ? value : null;
 }
 
-function progressSnapshots(root: string): ProgressSnapshot[] {
-  return progressIterations(root).flatMap((iteration) =>
-    (["live", "dream"] as const)
-      .map((phase) => readProgress(root, iteration, phase))
-      .filter((snapshot): snapshot is ProgressSnapshot => snapshot !== null),
-  );
-}
-
-function resolveWatchRoot(baseRoot: string, campaign: CampaignStatus | null, target?: "campaign" | "legacy" | null): string {
-  if (target === "legacy") return baseRoot;
-  if (target === "campaign") return campaign?.campaignRoot ?? baseRoot;
-  return campaign && (campaign.state.kind === "running" || campaign.state.kind === "paused")
-    ? campaign.campaignRoot
-    : baseRoot;
-}
-
 function campaignPhaseProgress(
   dashboard: Dashboard,
   baseRoot: string,
@@ -1936,59 +602,4 @@ function parseCampaignMinimumGain(value: unknown): { minimumGain?: number; error
     return { error: "minimum_gain must be a finite, non-negative normalized-score delta" };
   }
   return { minimumGain: value };
-}
-
-function recoveryNotice(iterations: number[]): string {
-  return `Recovered interrupted cycle(s): ${iterations.join(", ")} (released stale claims). Checkpointed live trees remain resumable; use /dream-rsi status to inspect them and /dream-rsi resume [iteration] to continue one.`;
-}
-
-function parseGrid(value: string, fallback: { branch_count: number; refine_count: number; reason: string }): { branch_count: number; refine_count: number; reason: string } {
-  const match = /^(\d+)\s*[x×]\s*(\d+)$/.exec(value.trim());
-  if (!match) return { ...fallback, reason: `${fallback.reason} (grid argument "${value}" not understood; expected e.g. 4x6)` };
-  return {
-    branch_count: Math.max(1, Number(match[1])),
-    refine_count: Math.max(1, Number(match[2])),
-    reason: `explicit grid from the operator: ${match[1]} branches x ${match[2]} refinements`,
-  };
-}
-
-function readBaselineScore(root: string, task: TaskConfig): number | null {
-  return resolveBaselineScore(root, task);
-}
-
-function latestBest(root: string, task: TaskConfig): number | null {
-  const dir = path.join(root, "trace_pool");
-  if (!fs.existsSync(dir)) return null;
-  const iterations = fs
-    .readdirSync(dir)
-    .map((name) => /^iter(\d+)$/.exec(name))
-    .filter((m): m is RegExpExecArray => m !== null)
-    .map((m) => Number(m[1]))
-    .sort((a, b) => a - b);
-  const last = iterations[iterations.length - 1];
-  if (last === undefined) return null;
-  try {
-    const manifest = JSON.parse(fs.readFileSync(path.join(dir, `iter${String(last).padStart(4, "0")}`, "live_cycle_manifest.json"), "utf8")) as {
-      best_score?: number | null;
-      task_fingerprint?: string;
-    };
-    if (manifest.task_fingerprint !== undefined && manifest.task_fingerprint !== scoringFingerprint(task)) return null;
-    return typeof manifest.best_score === "number" ? manifest.best_score : null;
-  } catch {
-    return null;
-  }
-}
-
-function latestIteration(root: string): number {
-  // The audit trail on disk decides the next iteration, never session state: a fresh session in a
-  // project that already has recorded cycles must continue the history, not restart at t=1 and
-  // overwrite the attempt records and workspaces of the cycles before it.
-  const dir = path.join(root, "trace_pool");
-  if (!fs.existsSync(dir)) return 0;
-  return fs
-    .readdirSync(dir)
-    .map((name) => /^iter(\d+)$/.exec(name))
-    .filter((m): m is RegExpExecArray => m !== null)
-    .map((m) => Number(m[1]))
-    .reduce((best, value) => Math.max(best, value), 0);
 }

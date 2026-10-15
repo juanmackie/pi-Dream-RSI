@@ -1,258 +1,51 @@
-/**
- * Session state and human-readable reporting.
- *
- * Session state is intentionally thin: the *durable* state is the on-disk layout under `.dream-rsi/`
- * (task, policy, history, trace pool). Session entries only record which iteration the session reached and
- * whether Dream-RSI mode is active, so a resumed session can pick the loop back up. They are read back by
- * `reconstruct` in the extension, which is why the entry type written here has to match the one read there.
- */
-
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { allocator, dreamIsActive, phaseIsActive } from "./engine/ownership.ts";
-import { checkpointPath, recoverableIterations } from "./engine/checkpoint.ts";
-import { progressIterations, readProgress, progressSummary } from "./engine/progress.ts";
-import { renderHandoffSummary } from "./engine/handoff.ts";
-
-import { DREAM_DIR, readTask, scoringFingerprint, type TaskConfig } from "./engine/task.ts";
-import {
-  claimCurrentManifest,
-  listIterations,
-  readJson,
-  readManifest,
-  historyDir,
-  liveMethodPath,
-  policyDir,
-  tracePoolDir,
-  type LiveCycleManifest,
-  type PhaseOwner,
-} from "./engine/world.ts";
-
-export const LIVE_MANIFEST_ENTRY = "pi-dream-rsi/live";
+import { DREAM_DIR } from "./engine/task.ts";
+import { historyDir, readJson, tracePoolDir, type LiveCycleManifest } from "./engine/world.ts";
+import { checkpointPath } from "./engine/checkpoint.ts";
 
 export interface RunningPhase {
-  /** Human label, also shown on the status line. */
   label: string;
-  /** Iterations this phase has claimed (live cycles only; empty for a dream phase). */
   iterations: number[];
-}
-
-export interface DreamState {
-  mode: boolean;
-  /** Highest iteration this session reached (never decreases). */
-  iteration: number;
-  /**
-   * Phases in flight for this session, oldest first. Live cycles may overlap (parallel worlds); a dream
-   * phase runs alone, because it replays a frozen history and rewrites the deployed policy.
-   */
-  running: RunningPhase[];
 }
 
 export function dreamRootFor(cwd: string): string {
   return path.join(cwd, DREAM_DIR);
 }
 
-export function saveTaskEntry(
-  pi: { appendEntry: (type: string, data: unknown) => void },
-  root: string,
-  data: { task?: string; policy?: string; iteration?: number; model?: string | null; reset?: boolean },
-): void {
-  pi.appendEntry(LIVE_MANIFEST_ENTRY, { version: 1, root, ...data });
-}
-
-/** Phases left marked `running` in the in-flight mirrors — also catches crashed cycles. */
+/** Live cycles still marked as running, including claims left by an interrupted process. */
 export function activeRuns(root: string): string[] {
   const dir = tracePoolDir(root);
   if (!fs.existsSync(dir)) return [];
-  const out: string[] = [];
+  const runs: string[] = [];
   for (const entry of fs.readdirSync(dir)) {
     const match = /^iter(\d+)_current$/.exec(entry);
     if (!match) continue;
     try {
-      const manifest = JSON.parse(
-        fs.readFileSync(path.join(dir, entry, "live_cycle_manifest.json"), "utf8"),
-      ) as LiveCycleManifest;
-      if (manifest.status === "running") out.push(`live cycle ${match[1]} (in flight)`);
+      const manifest = JSON.parse(fs.readFileSync(path.join(dir, entry, "live_cycle_manifest.json"), "utf8")) as LiveCycleManifest;
+      if (manifest.status === "running") runs.push(`live cycle ${match[1]} (in flight)`);
     } catch {
-      out.push(`live cycle ${match[1]} (unreadable manifest)`);
+      runs.push(`live cycle ${match[1]} (unreadable manifest)`);
     }
   }
-  return out.sort((a, b) => a.localeCompare(b));
+  return runs.sort((a, b) => a.localeCompare(b));
 }
 
-/** Iterations whose in-flight mirror still says `running` — worlds claimed but not finished. */
+/** Iterations whose in-flight mirrors still carry a running claim. */
 export function runningIterations(root: string): number[] {
   const dir = tracePoolDir(root);
   if (!fs.existsSync(dir)) return [];
-  const out: number[] = [];
+  const iterations: number[] = [];
   for (const entry of fs.readdirSync(dir)) {
     const match = /^iter(\d+)_current$/.exec(entry);
     if (!match) continue;
     const manifest = readJson<LiveCycleManifest>(path.join(dir, entry, "live_cycle_manifest.json"));
-    if (manifest?.status === "running") out.push(Number(match[1]));
+    if (manifest?.status === "running") iterations.push(Number(match[1]));
   }
-  return out.sort((a, b) => a - b);
+  return iterations.sort((a, b) => a - b);
 }
 
-/**
- * Allocation starting point after recorded worlds and in-flight claims. reserveIterations additionally
- * skips existing claim files, preserving interrupted trees and their numbers for explicit resume.
- */
-export function nextIteration(root: string): number {
-  const recorded = listIterations(root);
-  const claimed = runningIterations(root);
-  return [...recorded, ...claimed].reduce((best, value) => Math.max(best, value), 0) + 1;
-}
-
-/**
- * Claim `count` new iteration numbers for episodes that are about to start, and return them.
- *
- * The claim is an exclusive file create, so two sessions (or two processes) sharing a project cannot be
- * handed the same number: the loser sees EEXIST and moves to the next one. Synchronous on purpose — the
- * caller reserves before its first `await`, so a second tool call in the same session cannot interleave.
- */
-export function reserveIterations(root: string, count: number, minBase = 1, owner?: PhaseOwner, maxLoops?: number): number[] {
-  return allocator(root, () => {
-  if (dreamIsActive(root)) throw new Error("a dream phase owns this project");
-  if (maxLoops !== undefined) count = Math.min(count, Math.max(0, maxLoops - runningIterations(root).length));
-  if (count === 0) throw new Error("project max_loops budget is already in use");
-  let iteration = Math.max(nextIteration(root), minBase);
-  const reserved: number[] = [];
-  for (let offset = 0; offset < count; offset += 1) {
-    for (let attempt = 0; attempt < 10_000; attempt += 1) {
-      const manifest: LiveCycleManifest = {
-        iteration,
-        status: "running",
-        created_at: new Date().toISOString(),
-        completed_at: null,
-        owner,
-        baked_beta: 0,
-        policy_version: "",
-        policy_name: null,
-        grid: { branch_count: 0, refine_count: 0 },
-        decision_rounds: 0,
-        attempts: 0,
-        baseline_score: null,
-        best_score: null,
-        previous_best_score: null,
-        stopped: null,
-        error: null,
-        note: "reserved: this episode is allocated but has not started yet",
-      };
-      if (claimCurrentManifest(root, manifest)) {
-        reserved.push(iteration);
-        iteration += 1;
-        break;
-      }
-      iteration += 1; // another session/process owns this number
-    }
-  }
-  return reserved;
-  });
-}
-
-/** True when `pid` is a live process on this host (EPERM still means it exists). */
-function pidIsAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-export interface RecoveryOptions {
-  /** The recovering session: its own non-running claims are stale by definition. */
-  sessionId?: string;
-  /** Liveness probe for another owner's pid (injectable for tests). */
-  isAlive?: (pid: number) => boolean;
-}
-
-/**
- * Release stale `running` claims after interruption. A tree with a checkpoint becomes `interrupted`
- * and remains available for explicit resume; a legacy claim without one becomes `failed`.
- *
- * `except` names the iterations this session is still running. Crucially, a claim owned by *another*
- * session whose process is still alive is left alone: two sessions sharing a project must not mark each
- * other's genuinely running cycles as interrupted. Phase locks also protect work in this process.
- *
- * Only the in-flight manifest is touched. Checkpoints, snapshots, completed siblings and iteration
- * numbers are retained; a new live cycle starts a new tree rather than replacing interrupted work.
- */
-export function recoverInterruptedRuns(root: string, except: number[] = [], options: RecoveryOptions = {}): number[] {
-  const dir = tracePoolDir(root);
-  if (!fs.existsSync(dir)) return [];
-  const isAlive = options.isAlive ?? pidIsAlive;
-  const recovered: number[] = [];
-  for (const entry of fs.readdirSync(dir)) {
-    const match = /^iter(\d+)_current$/.exec(entry);
-    if (!match) continue;
-    const iteration = Number(match[1]);
-    if (except.includes(iteration)) continue;
-    const file = path.join(dir, entry, "live_cycle_manifest.json");
-    const manifest = readJson<LiveCycleManifest>(file);
-    if (!manifest || manifest.status !== "running") continue;
-    if (phaseIsActive(root, `live-${iteration}`)) continue;
-    const owner = manifest.owner;
-    if (owner) {
-      const ours = options.sessionId !== undefined && owner.session_id === options.sessionId;
-      // Another session's claim with a live process is genuinely running: leave it and its number alone.
-      if (!ours && isAlive(owner.pid)) continue;
-    }
-    const updated: LiveCycleManifest = {
-      ...manifest,
-      status: fs.existsSync(checkpointPath(root, iteration)) ? "interrupted" : "failed",
-      completed_at: new Date().toISOString(),
-      error: manifest.error ?? "interrupted — the previous run did not finish",
-    };
-    fs.writeFileSync(file, `${JSON.stringify(updated, null, 2)}\n`, "utf8");
-    recovered.push(iteration);
-  }
-  return recovered.sort((a, b) => a - b);
-}
-
-export interface LoadedState {
-  task: TaskConfig;
-  iterations: { iteration: number; manifest: LiveCycleManifest | null }[];
-  policy: string;
-  policyVersions: string[];
-  sweeps: { iteration: number; auc: number; pareto_reward: number; parallel_penalty: number }[];
-}
-
-export function loadState(root: string): LoadedState {
-  const task = readTask(root);
-  const iterations = listIterations(root).map((iteration) => ({ iteration, manifest: readManifest(root, iteration) }));
-  const policyVersions = fs.existsSync(policyDir(root))
-    ? fs
-        .readdirSync(policyDir(root))
-        .filter((name) => /^r\d+_v\d+\.ts$/.test(name))
-        .sort((a, b) => a.localeCompare(b))
-    : [];
-  const sweeps: LoadedState["sweeps"] = [];
-  for (const { iteration } of iterations) {
-    const file = path.join(historyDir(root), `r${String(iteration).padStart(4, "0")}_dream`, "proposal_results", "beta_sweep.json");
-    if (!fs.existsSync(file)) continue;
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
-        auc?: number;
-        pareto_reward?: number;
-        parallel_penalty?: number;
-      };
-      sweeps.push({
-        iteration,
-        auc: Number(parsed.auc ?? 0),
-        pareto_reward: Number(parsed.pareto_reward ?? 0),
-        parallel_penalty: Number(parsed.parallel_penalty ?? 0),
-      });
-    } catch {
-      // ignore unreadable sweeps; status must never throw
-    }
-  }
-  return { task, iterations, policy: liveMethodPath(root), policyVersions, sweeps };
-}
-
-/** Compact report of one completed live cycle. */
+/** Compact live-cycle report, including diagnostic timeout values without promoting them to scores. */
 export function iterationReport(root: string, iteration: number, manifest: LiveCycleManifest): string {
   const scored = manifest.best_score;
   const baseline = manifest.baseline_score;
@@ -266,148 +59,30 @@ export function iterationReport(root: string, iteration: number, manifest: LiveC
     `  stopped:    ${manifest.stopped ?? "n/a"}${manifest.error ? ` | error: ${manifest.error}` : ""}`,
     manifest.status === "complete" ? `  world:      ${path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json")}` :
       `  recovery:   ${fs.existsSync(checkpointPath(root, iteration)) ? checkpointPath(root, iteration) : "no checkpoint (cycle did not start)"}`,
-
     `  records:    ${path.join(historyDir(root), `${tag}_live`)}`,
   ];
-  // Timeout-assessment section: only when diagnostic assessment records exist.
-  // Main best-score lines above stay unchanged; every value here is labeled partial.
   try {
-    const pooled = readJson<{ cells?: { meta?: { cell_id?: string; seq?: number }; partial?: boolean; fail_class?: string; timeout_assessment?: { raw_score?: unknown; fail_class?: string; error?: string | null; valid?: boolean } }[] }>(
+    const tree = readJson<{ cells?: { meta?: { cell_id?: string; seq?: number }; partial?: boolean; fail_class?: string; timeout_assessment?: { raw_score?: unknown; fail_class?: string; error?: string | null; valid?: boolean } }[] }>(
       path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}`, "tree.json"),
     ) ?? readJson<{ cells?: { meta?: { cell_id?: string; seq?: number }; partial?: boolean; fail_class?: string; timeout_assessment?: { raw_score?: unknown; fail_class?: string; error?: string | null; valid?: boolean } }[] }>(
       path.join(historyDir(root), `${tag}_live`, "tree.json"),
     );
-    const assessed = (pooled?.cells ?? [])
-      .filter((n) => n?.partial === true || n?.timeout_assessment !== undefined || n?.fail_class === "timeout_scored")
-      .sort((a, b) => (a.meta?.seq ?? 0) - (b.meta?.seq ?? 0));
-    if (assessed.length > 0) {
+    const assessed = (tree?.cells ?? []).filter((n) => n?.partial || n?.timeout_assessment || n?.fail_class === "timeout_scored").sort((a, b) => (a.meta?.seq ?? 0) - (b.meta?.seq ?? 0));
+    if (assessed.length) {
       lines.push("  partial assessments (diagnostic only, excluded from attainment and promotion):");
       const recent = assessed.slice(-10);
-      const fmtRaw = (raw: unknown): string =>
-        typeof raw === "number" && Number.isFinite(raw) ? String(Math.round(raw * 10000) / 10000) : "n/a";
       for (const n of recent) {
         const cell = n.meta?.cell_id ?? "unknown";
         const cls = n.fail_class ?? "timeout";
-        const raw = fmtRaw(n.timeout_assessment?.raw_score);
-        if (cls === "timeout_scored" && raw !== "n/a") {
-          lines.push(`    ${cell} timeout_scored partial raw ${raw}${n.timeout_assessment?.valid === false ? " valid:false" : ""}`);
-        } else {
-          const fail = n.timeout_assessment
-            ? `${n.timeout_assessment.fail_class ?? "unresolved"}${n.timeout_assessment.error ? `: ${n.timeout_assessment.error}` : ""}`
-            : "unresolved";
+        const raw = typeof n.timeout_assessment?.raw_score === "number" && Number.isFinite(n.timeout_assessment.raw_score) ? String(Math.round(n.timeout_assessment.raw_score * 10000) / 10000) : "n/a";
+        if (cls === "timeout_scored" && raw !== "n/a") lines.push(`    ${cell} timeout_scored partial raw ${raw}${n.timeout_assessment?.valid === false ? " valid:false" : ""}`);
+        else {
+          const fail = n.timeout_assessment ? `${n.timeout_assessment.fail_class ?? "unresolved"}${n.timeout_assessment.error ? `: ${n.timeout_assessment.error}` : ""}` : "unresolved";
           lines.push(`    ${cell} ${cls} partial raw ${raw} assessment ${fail}`);
         }
       }
-      if (assessed.length > recent.length) {
-        lines.push(`    ... ${assessed.length - recent.length} more partial assessment(s) omitted; see ${path.join(historyDir(root), `${tag}_live`)}`);
-      }
+      if (assessed.length > recent.length) lines.push(`    ... ${assessed.length - recent.length} more partial assessment(s) omitted; see ${path.join(historyDir(root), `${tag}_live`)}`);
     }
-  } catch {
-    // Unreadable tree: keep the existing report text unchanged.
-  }
+  } catch { /* An unreadable tree must not break the cycle report. */ }
   return lines.join("\n");
-}
-
-export interface StatusOptions {
-  full?: boolean;
-  sessionIteration?: number;
-}
-
-/** Everything an operator needs to decide the next cycle, and nothing more. */
-export function statusSummary(root: string, options: StatusOptions = {}): string {
-  if (!fs.existsSync(path.join(root, "task.json"))) return `No Dream-RSI task at ${root}.`;
-  let state: LoadedState;
-  try {
-    state = loadState(root);
-  } catch (error) {
-    return `Dream-RSI state unreadable: ${(error as Error).message}`;
-  }
-  const { task } = state;
-  const fingerprint = scoringFingerprint(task);
-  const lines = [
-    `Dream-RSI — ${task.name}`,
-    `  root:     ${root}`,
-    `  budgets:  W=${task.workers} K1=${task.k1} K2=${task.k2} M=${task.revisions} loops<=${task.max_loops} beta_grid=[${task.beta_grid.join(", ")}]`,
-    `  scoring:  ${task.score_program} -> ${task.score_path}.${task.score_field} (${task.higher_is_better ? "higher" : "lower"} is better)`,
-    `  policy:   ${path.relative(root, state.policy)} (versions: ${state.policyVersions.length === 0 ? "none archived" : state.policyVersions.join(", ")})`,
-  ];
-  const recoverable = recoverableIterations(root);
-  if (recoverable.length) lines.push(`  recoverable: ${recoverable.join(", ")} — /dream-rsi resume [iteration]`);
-  for (const iteration of progressIterations(root)) {
-    const progress = readProgress(root, iteration);
-    if (progress?.status === "running" || progress?.status === "interrupted") lines.push(`  ${progressSummary(progress)}`);
-  }
-  const active = activeRuns(root);
-  if (active.length > 0) lines.push(`  in flight: ${active.join("; ")}`);
-  const worlds = state.iterations.length;
-  lines.push(
-    worlds === 0
-      ? "  worlds:   none recorded yet — run dream_rsi_live first (dream_rsi_dream replays recorded worlds, it does not create them)"
-      : `  worlds:   ${worlds} recorded (t=${state.iterations.map((i) => i.iteration).join(",")}) — dream_rsi_dream can replay them now`,
-  );
-  if (typeof options.sessionIteration === "number" && options.sessionIteration > 0) {
-    lines.push(`  session iteration: ${options.sessionIteration}`);
-  }
-  if (state.iterations.length === 0) {
-    lines.push("  no live cycles recorded yet — run dream_rsi_live to record the first world.");
-    return lines.join("\n");
-  }  lines.push("  iterations (world t, best, beta, attempts, rounds):");
-  for (const { iteration, manifest } of state.iterations) {
-    if (!manifest) {
-      lines.push(`    t=${iteration}: manifest missing`);
-      continue;
-    }
-    const sweep = state.sweeps.find((s) => s.iteration === iteration);
-    const foreignContract = manifest.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint;
-    lines.push(
-      `    t=${iteration}: status=${manifest.status} best=${manifest.best_score ?? "n/a"} beta=${manifest.baked_beta}` +
-        ` attempts=${manifest.attempts} rounds=${manifest.decision_rounds}` +
-        (foreignContract ? " [different scoring config — not comparable]" : "") +
-        (sweep ? ` | sweep pareto.reward=${sweep.pareto_reward.toFixed(3)} auc=${sweep.auc.toFixed(3)} penalty=${sweep.parallel_penalty.toFixed(3)}` : ""),
-    );
-  }
-  const trend = state.iterations
-    .map(({ manifest }) => (typeof manifest?.best_score === "number" ? manifest.best_score : null))
-    .filter((value): value is number => value !== null);
-  if (trend.length >= 2) {
-    const improving = trend[trend.length - 1] > trend[trend.length - 2];
-    lines.push(`  live trend: ${trend.join(" -> ")} (${improving ? "still improving" : "plateaued"})`);
-  }
-  if (options.full && state.sweeps.length > 0) {
-    const last = state.sweeps[state.sweeps.length - 1];
-    const file = path.join(historyDir(root), `r${String(last.iteration).padStart(4, "0")}_dream`, "proposal_results", "beta_sweep.json");
-    lines.push(`  last sweep (t=${last.iteration}, ${file}):`);
-    try {
-      const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as {
-        versions?: { revision: number; v_mean: number; default_beta: number; deterministic: boolean | null }[];
-      };
-      for (const version of parsed.versions ?? []) {
-        lines.push(
-          `    pi_${version.revision}: V=${version.v_mean.toFixed(4)} beta=${version.default_beta} deterministic=${version.deterministic ?? "n/a"}`,
-        );
-      }
-    } catch {
-      lines.push("    (sweep unreadable)");
-    }
-  }
-  return lines.join("\n");
-}
-
-/** Bounded prompt handoff; statusSummary remains the complete operator report. */
-export function handoffSummary(root: string, sessionIteration?: number): string {
-  const summary = statusSummary(root, { sessionIteration });
-  const activeIteration = runningIterations(root).at(-1);
-  const recoverable = recoverableIterations(root);
-  const iteration = activeIteration ?? recoverable[0];
-  const kind = activeIteration ? "active" : iteration ? "recoverable" : undefined;
-  const manifestPath = iteration
-    ? path.join(tracePoolDir(root), `iter${String(iteration).padStart(4, "0")}_current`, "live_cycle_manifest.json")
-    : undefined;
-  const manifest = manifestPath ? readJson<LiveCycleManifest>(manifestPath) : undefined;
-  const ownerText = manifest?.owner
-    ? `${kind === "active" ? "live owner" : "recorded owner"} session ${manifest.owner.session_id}, pid ${manifest.owner.pid}`
-    : undefined;
-  const checkpointFile = iteration ? checkpointPath(root, iteration) : undefined;
-  const checkpoint = checkpointFile && fs.existsSync(checkpointFile) ? checkpointFile : undefined;
-  return renderHandoffSummary(summary, { iteration, kind, owner: ownerText, checkpoint });
 }

@@ -15,7 +15,7 @@ import { EXT, deployShippedPolicy, exists, jump, makeProject, readJson, writeTas
 const { copyWorkspace } = await jump("agent/runner.ts");
 
 const { runLiveEpisode } = await jump("engine/live.ts");
-const { runDreamPhase, planNextGrid, fallbackGrid } = await jump("engine/dream.ts");
+const { runDreamPhase } = await jump("engine/dream.ts");
 const { readTree, listIterations, readManifest, liveMethodPath, iterationDir, writeJson } = await jump("engine/world.ts");
 const { interpretEvaluation } = await jump("engine/live.ts");
 const { normalizeTask, scoringFingerprint } = await jump("engine/task.ts");
@@ -446,24 +446,6 @@ test("evaluator interpretation is a pure function of the command result and the 
   assert.equal(interpretEvaluation(task, ok, { fail_class: "wrong_answer", error: "bad result" }).fail_class, "wrong_answer");
   assert.equal(interpretEvaluation(task, ok, { score: "not a number" }).fail_class, "invalid_score");
   assert.equal(interpretEvaluation(task, ok, { score: 3, valid: false, fail_class: "ok" }).valid, false, "the evaluator's validity flag is preserved");
-});
-
-test("grid planning: bootstrap without history, then widen while improving and narrow on a plateau", async () => {
-  const project = makeProject();
-  try {
-    await writeTaskJson(project);
-    await deployShippedPolicy(project);
-    const first = await planNextGrid(project.dreamRoot, project.task, 1, null);
-    assert.equal(first.plan.branch_count, project.task.workers, "no history: one direction per worker");
-    assert.ok(first.plan.reason.length > 0, "a plan must carry a factual reason");
-    assert.equal(first.beta, project.task.default_beta);
-
-    const fallback = fallbackGrid(project.task);
-    assert.equal(fallback.branch_count, project.task.workers);
-    assert.ok(fallback.reason.length > 0);
-  } finally {
-    project.cleanup();
-  }
 });
 
 test("per-batch guidance delivers timeout diagnostics with identical sibling prompts", async () => {

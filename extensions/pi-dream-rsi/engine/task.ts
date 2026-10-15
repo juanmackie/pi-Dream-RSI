@@ -57,7 +57,7 @@ export interface TaskConfig {
   /** W — attempts that may run in parallel. */
   workers: number;
   /**
-   * Cap on how many online episodes `dream_rsi_live` may run at once (parallel worlds).
+   * Cap on how many online episodes may run at once (parallel worlds).
    * Real fan-out is `loops x workers` agent processes, so keep it near what the provider allows.
    */
   max_loops: number;
@@ -215,10 +215,6 @@ export function validateTask(raw: unknown): string[] {
   return errors;
 }
 
-export function taskPath(dreamRoot: string): string {
-  return path.join(dreamRoot, "task.json");
-}
-
 /**
  * Fingerprint of the *scoring contract*: everything that decides what a score means. Candidates,
  * baselines, applied records and replay worlds recorded under a different fingerprint are not
@@ -276,24 +272,4 @@ export function normalizeTask(raw: Partial<TaskConfig>): TaskConfig {
   const errors = validateTask(merged);
   if (errors.length > 0) throw new Error(`invalid task:\n- ${errors.join("\n- ")}`);
   return merged;
-}
-
-export function writeTask(dreamRoot: string, task: TaskConfig): void {
-  fs.mkdirSync(dreamRoot, { recursive: true });
-  fs.writeFileSync(taskPath(dreamRoot), `${JSON.stringify(task, null, 2)}\n`, "utf8");
-}
-
-/** Read + validate + fill defaults. Throws with every problem listed, not just the first. */
-export function readTask(dreamRoot: string): TaskConfig {
-  const file = taskPath(dreamRoot);
-  if (!fs.existsSync(file)) throw new Error(`no task.json at ${file}; run dream_rsi_init first`);
-  let raw: unknown;
-  try {
-    raw = JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch (error) {
-    // Still throws — but names the file and the parse error instead of a bare SyntaxError from a
-    // line the operator never sees.
-    throw new Error(`invalid JSON in ${file}: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  return normalizeTask(raw as Partial<TaskConfig>);
 }

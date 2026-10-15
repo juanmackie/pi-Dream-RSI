@@ -126,18 +126,17 @@ process.stdin.on("end", () => {
     const command = harness.commands.get("dream-rsi");
     context.mode = "print";
     await command.handler("watch", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /LEGACY_MANUAL_HISTORY/,
-      "default watch returns to legacy manual history after the campaign stops");
+    assert.match(harness.notifications.at(-1), /live 2:/,
+      "default watch opens the completed campaign dashboard");
     await command.handler("watch legacy 97", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /LEGACY_MANUAL_HISTORY/,
-      "legacy manual history remains browseable with the explicit selector");
-    await command.handler("watch campaign 1", context);
-    assert.match(harness.injectedMessages.at(-1).message.content, /live 1:/,
-      "a completed campaign remains browseable by its explicit selector");
+    assert.equal(harness.notifications.at(-1), "watch legacy 97 was removed in 1.0. Use /dream-rsi improve <what you want>.",
+      "the legacy watch selector is retired without touching saved history");
 
-    const status = await harness.tools.get("dream_rsi_status").execute("status-with-campaign", {}, undefined, undefined, context);
-    assert.ok(status.details.campaignProgress.some((snapshot) => snapshot.project === result.details.campaign.campaignRoot),
-      "status exposes persisted campaign progress separately from legacy progress");
+    const status = await harness.tools.get("dream_rsi_improve").execute("status-with-campaign", { action: "status" }, undefined, undefined, context);
+    assert.equal(status.details.campaign.campaignRoot, result.details.campaign.campaignRoot,
+      "the campaign controller status reports the saved campaign");
+    assert.doesNotMatch(status.content[0].text, /LEGACY_MANUAL_HISTORY/,
+      "campaign status does not display the separate legacy progress snapshot");
   } finally {
     project.cleanup();
   }

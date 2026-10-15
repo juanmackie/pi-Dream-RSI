@@ -55,7 +55,7 @@ export interface LiveCycleManifest {
   task_fingerprint?: string;
 }
 
-export function pad(index: number, width = 4): string {
+function pad(index: number, width = 4): string {
   return String(index).padStart(width, "0");
 }
 
@@ -66,7 +66,7 @@ export interface PhaseOwner {
   claimed_at: string;
 }
 
-export function policyDir(dreamRoot: string): string {
+function policyDir(dreamRoot: string): string {
   return path.join(dreamRoot, "policy");
 }
 
@@ -82,11 +82,6 @@ export function liveMethodPath(dreamRoot: string): string {
  */
 export function versionedPolicyPath(dreamRoot: string, iteration: number, revision: number): string {
   return path.join(policyDir(dreamRoot), `r${pad(iteration)}_v${pad(revision)}.ts`);
-}
-
-/** The archived policy-version file name, for status listings. */
-export function policyVersionName(iteration: number, revision: number): string {
-  return `r${pad(iteration)}_v${pad(revision)}.ts`;
 }
 
 /** Staging file the policy-development agent edits; the deployed policy is replaced only on success. */
@@ -164,12 +159,6 @@ export function readJson<T>(file: string): T | null {
   } catch {
     return null;
   }
-}
-
-export function appendJsonl(file: string, records: unknown[]): void {
-  if (records.length === 0) return;
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join("\n") + "\n", "utf8");
 }
 
 /** Overwrite a JSONL file with the full record set (idempotent partial writes for a live reader). */

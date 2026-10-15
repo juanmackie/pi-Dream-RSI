@@ -71,7 +71,7 @@ resume continues the saved budget and deadline without renewal.
 
 ## Let the runtime finish the loop
 
-After `start`, the controller owns live exploration, policy replay and revision, candidate verification, patch application, and stop decisions. Do not call the legacy `dream_rsi_live`, `dream_rsi_dream`, or `dream_rsi_apply` tools to continue this campaign.
+After `start`, the controller owns live exploration, policy replay and revision, candidate verification, patch application, and stop decisions.
 
 Use `dream_rsi_improve` actions as follows:
 
@@ -82,7 +82,3 @@ Use `dream_rsi_improve` actions as follows:
 The controller stops at the first of these conditions: two completed cycles have no verified gain against the latest promoted target, five cycles finish, the agent or evaluator cap runs out, or the deadline expires. A failed or unavailable evaluator is not a plateau. Report it as `unverifiable`, explain the failure, and ask for the measurement decision needed before starting a new campaign. Do not describe a failed campaign as paused or resume it without resolving the evaluator issue.
 
 If the baseline cannot be scored, the evaluator is noisy without a declared tolerance, generated acceptance cases have no headroom, or the project cannot support a defensible improvement measure, do not call `start`. Explain the evidence and ask the user to choose a measurable goal or review a proposal without automatic promotion.
-
-## Preserve the manual workflow
-
-`/dream-rsi create`, `live`, `dream`, `run`, and `resume` keep their existing task-based behavior. `create` configures a task and stops before spending a cycle. `/dream-rsi improve` is the explicit route for a full bounded campaign that applies verified wins automatically.

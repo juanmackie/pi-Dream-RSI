@@ -1,4 +1,4 @@
-/** Durable, bounded improve-target controller. The legacy manual run/apply engine remains independent. */
+/** Durable, bounded improve-target controller. */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -13,7 +13,9 @@ import { measureSeed, readSeedMeasurement, findCandidate, type Candidate } from 
 import { normalizeTask, scoringFingerprint, type TaskConfig } from "./task.ts";
 import { ensureDreamIgnore, ensurePolicyRuntime, liveMethodPath, nodeWorkspace, readManifest, readJson, writeFileAtomic, writeJson } from "./world.ts";
 import { readTree } from "./world.ts";
-import { acquirePhase, phaseIsActive } from "./ownership.ts";
+import { acquirePhase, phaseIsActive, pidIsAlive } from "./ownership.ts";
+import { checkpointPath } from "./checkpoint.ts";
+import { tracePoolDir, writeCurrentManifest, type LiveCycleManifest } from "./world.ts";
 import type { ProgressObserver } from "./progress.ts";
 
 export interface CampaignLimits {
@@ -152,6 +154,7 @@ export interface CampaignOptions {
 export interface CampaignResumeOptions {
   baseRoot: string;
   projectDir: string;
+  sessionId?: string;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
   onPhaseProgress?: ProgressObserver;
@@ -652,9 +655,39 @@ export async function resumeCampaign(options: CampaignResumeOptions): Promise<Ca
   if (record.state.kind === "complete" || record.state.kind === "failed") return { ...statusOf(record), stopped: true, stopReason: record.state.reason };
   if (!withinDeadline(record)) throw new Error("campaign deadline expired; its budget cannot be renewed");
   if (record.state.kind === "running" && phaseIsActive(record.campaignRoot, "campaign")) throw new Error("campaign is already running");
+  recoverInterruptedLiveClaims(record.campaignRoot, { sessionId: options.sessionId });
   if (record.state.kind === "running") record.state = { kind: "paused", phase: record.state.phase, iteration: record.state.iteration, reason: "resuming after interrupted host process" };
   fs.rmSync(path.join(record.campaignRoot, "stop.request"), { force: true });
   return execute(record, { signal: options.signal, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, minimumGain: record.minimumGain });
+}
+
+/** Recover only stale live claims inside this campaign's isolated engine state before resuming it. */
+export function recoverInterruptedLiveClaims(root: string, options: { sessionId?: string; isAlive?: (pid: number) => boolean } = {}): number[] {
+  const dir = tracePoolDir(root);
+  if (!fs.existsSync(dir)) return [];
+  const isAlive = options.isAlive ?? pidIsAlive;
+  const recovered: number[] = [];
+  for (const entry of fs.readdirSync(dir)) {
+    const match = /^iter(\d+)_current$/.exec(entry);
+    if (!match) continue;
+    const iteration = Number(match[1]);
+    if (phaseIsActive(root, `live-${iteration}`)) continue;
+    const file = path.join(dir, entry, "live_cycle_manifest.json");
+    const manifest = readJson<LiveCycleManifest>(file);
+    if (!manifest || manifest.status !== "running") continue;
+    if (manifest.owner) {
+      const ownedByThisSession = options.sessionId !== undefined && manifest.owner.session_id === options.sessionId;
+      if (!ownedByThisSession && isAlive(manifest.owner.pid)) continue;
+    }
+    writeCurrentManifest(root, {
+      ...manifest,
+      status: fs.existsSync(checkpointPath(root, iteration)) ? "interrupted" : "failed",
+      completed_at: new Date().toISOString(),
+      error: manifest.error ?? "interrupted — the previous run did not finish",
+    });
+    recovered.push(iteration);
+  }
+  return recovered.sort((a, b) => a - b);
 }
 
 export function readCampaignStatus(baseRoot: string): CampaignStatus | null {

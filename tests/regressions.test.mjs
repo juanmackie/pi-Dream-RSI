@@ -23,11 +23,13 @@ const {
   claimCurrentManifest,
   liveMethodPath,
   pruneWorkspaces,
+  readJson,
   versionedPolicyPath,
+  writeCurrentManifest,
   writeJson,
 } = await jump("engine/world.ts");
 const { readPolicyViolations, scanPolicySource } = await jump("policy/runner.ts");
-const { recoverInterruptedRuns, reserveIterations } = await jump("state.ts");
+const { recoverInterruptedLiveClaims } = await jump("engine/campaign.ts");
 const { makeReplayProbe } = await jump("engine/replay.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { findCandidate } = await jump("engine/improvements.ts");
@@ -180,43 +182,37 @@ test("each policy revision can read the replay feedback that guides it", async (
   }
 });
 
-test("recovery leaves another session's live claim alone and reclaims a dead one", () => {
+test("campaign resume recovery preserves live claims and marks stale or session-owned claims", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-own-"));
   try {
-    const root = path.join(dir, ".dream-rsi");
-    const owner = { session_id: "other-session", pid: process.pid, claimed_at: new Date().toISOString() };
-    assert.deepEqual(reserveIterations(root, 1, 1, owner), [1]);
+    const root = path.join(dir, ".dream-rsi", "campaigns", "campaign-a");
+    const manifest = (iteration, owner) => ({
+      iteration, status: "running", created_at: new Date().toISOString(), completed_at: null, owner,
+      baked_beta: 0, policy_version: "", policy_name: null, grid: { branch_count: 1, refine_count: 1 },
+      decision_rounds: 0, attempts: 0, baseline_score: null, best_score: null, previous_best_score: null,
+      stopped: null, error: null, note: null,
+    });
+    writeCurrentManifest(root, manifest(1, { session_id: "other-session", pid: process.pid, claimed_at: new Date().toISOString() }));
     assert.deepEqual(
-      recoverInterruptedRuns(root, [], { sessionId: "me", isAlive: () => true }),
+      recoverInterruptedLiveClaims(root, { sessionId: "me", isAlive: () => true }),
       [],
       "a claim owned by a live process is not interrupted",
     );
     assert.deepEqual(
-      recoverInterruptedRuns(root, [], { sessionId: "me", isAlive: () => false }),
+      recoverInterruptedLiveClaims(root, { sessionId: "me", isAlive: () => false }),
       [1],
       "a claim whose owner is confirmed dead is reclaimed",
     );
+    assert.equal(readJson(path.join(root, "trace_pool", "iter0001_current", "live_cycle_manifest.json")).status, "failed");
+    writeCurrentManifest(root, manifest(2, { session_id: "me", pid: process.pid, claimed_at: new Date().toISOString() }));
+    assert.deepEqual(recoverInterruptedLiveClaims(root, { sessionId: "me", isAlive: () => true }), [2], "the same session can recover its abandoned claim");
+    const broken = path.join(root, "trace_pool", "iter0003_current", "live_cycle_manifest.json");
+    fs.mkdirSync(path.dirname(broken), { recursive: true });
+    fs.writeFileSync(broken, "{ not json", "utf8");
+    assert.deepEqual(recoverInterruptedLiveClaims(root, { isAlive: () => false }), [], "unreadable claims stay untouched");
     // Atomic claim: the same iteration number cannot be claimed twice.
-    const manifest = {
-      iteration: 9,
-      status: "running",
-      created_at: new Date().toISOString(),
-      completed_at: null,
-      baked_beta: 0,
-      policy_version: "",
-      policy_name: null,
-      grid: { branch_count: 0, refine_count: 0 },
-      decision_rounds: 0,
-      attempts: 0,
-      baseline_score: null,
-      best_score: null,
-      previous_best_score: null,
-      stopped: null,
-      error: null,
-      note: null,
-    };
-    assert.equal(claimCurrentManifest(root, manifest), true);
-    assert.equal(claimCurrentManifest(root, manifest), false, "an existing claim cannot be overwritten");
+    assert.equal(claimCurrentManifest(root, manifest(9)), true);
+    assert.equal(claimCurrentManifest(root, manifest(9)), false, "an existing claim cannot be overwritten");
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

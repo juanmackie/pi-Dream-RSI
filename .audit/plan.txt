@@ -1,0 +1,341 @@
+Plan: pi-dream-rsi 1.0: say what you want, find the levers, apply verified wins, framed /watch
+
+ Context
+
+ Evidence from real deployments (~/Documents/GitHub/{mnemosyne-hermes,Chromeext_PromptPaul}/.dream-rsi/campaigns/*/campaign.json):
+ 8 campaigns, 0 applied a gain.
+
+ ┌───────┬────────────────────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │ Count │              Outcome               │                                             Root cause                                             │
+ ├───────┼────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 3     │ failed: "evaluator timed out"      │ LLM scorer (3×10 cases) above the 120 s cap; nothing measured its duration first                   │
+ ├───────┼────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1     │ failed: dirname: command not found │ bash scorer on Windows (exit 127)                                                                  │
+ ├───────┼────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1     │ failed: python ../task/score.py    │ relative path. assertTrustedVerifier resolves it against the target (campaign.ts:271), but the     │
+ │       │ not found                          │ evaluator runs from a scratch copy (campaign-patch.ts:252). Validation passes, then the run fails. │
+ ├───────┼────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 1     │ failed: "repeated baseline changed │ noisy perf benchmark; minimum_gain defaulted to 0 (campaign.ts:616)                                │
+ │       │  by 44.24 > tolerance 0"           │                                                                                                    │
+ ├───────┼────────────────────────────────────┼────────────────────────────────────────────────────────────────────────────────────────────────────┤
+ │ 2     │ complete: "2 cycles without a      │ not confirmed. Likely: noisy latency, explicit thresholds, a single paired verification            │
+ │       │ verified gain"                     │                                                                                                    │
+ └───────┴────────────────────────────────────┴────────────────────────────────────────────────────────────────────────────────────────────────────┘
+
+ The main loss is evaluator setup (5/8), then noise, not search quality. Other problems:
+ - The UX is two products in one: a manual policy loop (7 tools, 14 verbs, about 38 concepts) and the campaign.
+ - Users must already know a measurable goal. Nothing turns "what I want" into concrete levers.
+ - No module reads real usage data.
+ - Nothing guards against benchmark gaming before auto-apply.
+ - /watch is an unpadded overlay with no background (dashboard
+ - MASS (Sakana): a homogeneous self-judging loop has shared blind spots, and search is noisy. Use
+   independent checks and repeated validation.
+ - Anthropic self-replication post: inherited notes improved success from 45% to 61–84%. Deferred.
+ - User pipeline: usage logs → weaknesses → self-generated eval data → multi-round validation → promote,
+   with little human input. Here that becomes: signals + intent → levers → targeted evaluator + check →
+   paired repeats + gates + adversarial review → auto-apply.
+
+ Decisions
+
+ 1. Remove the manual loop entirely. Breaking release 0.8.1 → 1.0.0. Old .dream-rsi/task.json and
+    history stay on disk, never read or changed.
+ 2. Session-log mining is on by default, with --no-logs to turn it off. It reads aggregates only:
+    command heads, counts, and redacted one-line errors. No chat text.
+ 3. Model-agnostic product. No model names, model-specific prompts, or per-model knobs in code, prompts or
+    docs. Every role (attempts, policy revision, adversarial review) uses the model the user has active in the
+    session, resolved when the call starts. If no session is available, it falls back to the model saved in the
+    campaign record. The review_model idea is dropped.
+ 4. Intent-driven assess. With no text, assess suggests the best levers to move the project forward. With
+    plain-language text ("make first load faster", "fewer flaky tests"), it maps that intent to the best levers
+    to pull. improve <plain words> runs the same lever analysi
+    writer at a time, verified by the parent. This is how we build it; nothing in the shipped package depends
+    on it.
+
+ Target UX
+
+ /dream-rsi                          5-line help
+ /dream-rsi assess [what you want]   rank levers (no text = what moves the project forward)  [--no-logs]
+ /dream-rsi improve <what you want>  levers → pick top ready lever → check evaluator → campaign → verified, reviewed wins applied
+ /dream-rsi watch                    framed dashboard (Ctrl+Shift+D)
+ /dream-rsi status | stop | resume   campaign only
+
+ - Lever: a concrete change site (files, config, algorithm, prompt or data path), plus the outcome metric it
+   moves, the evidence that it matters (signals or code refs), how to measure it (an existing or buildable
+   evaluator), and its readiness.
+ - Tools: dream_rsi_improve (start/check/status/stop/resume) and dream_rsi_signals (read-only).
+ - Skills: dream-rsi (router + overview), dream-rsi-assess, dream-rsi-improve.
+
+ Execution model
+
+ - Setup: create local branch v1-campaign-ux. Commit the pre-existing uncommitted WIP as found as a
+   checkpoint. Record baseline npm run typecheck and npm test results.
+ - Implementers: each slice goes to one Haiku 5.5 implementer (Agent, model: "haiku"), run
+   sequentially because most slices touch index.ts or campaign.ts. The contract for each: objective, allowed
+   paths, facts below, tests first for new behavior, run typecheck plus the named tests, and a receipt of about
+   300 words.
+ - After each slice: the parent reviews the diff, reruns the checks, and makes a local commit.
+ - At the end: a fresh read-only Haiku reviewer reviews the branch against this plan.
+ - Out of scope: no push, PR or publish. A version bump merged to main auto-publishes to npm
+   (RELEASING.md), so merging is a separate, explicit request.
+ - Preserve the user's WIP hunks: campaignRuntimeDiagnostics, effectiveEvaluatorTimeoutMs and
+   CAMPAIGN_MAX_EVALUATOR_TIMEOUT_MS in campaign.ts; renderCampaignRuntime in index.ts.
+
+ Slices
+
+ 1a. Remove the manual surface (index.ts)
+
+ - Delete:
+   - Tools: dream_rsi_init (383–525), _live (526–708), _resume (709–763), _dream (764–879),
+     _apply (880–1113) and _status (1114–1148), which duplicates improve status.
+   - Schemas: taskParams, liveParams, dreamParams, statusParams, applyParams (75–162, 217).
+   - Gating: gatedNames/refreshTools/registerGatedTool (250, 302–318, 376–379) and the
+     before_agent_start handoff and mode note (1532–1549).
+   - Verbs: create, suggest/best, live, dream, run, off, legacy resume, watch legacy.
+   - Helpers: seedPolicy, CREATE_*, ARCHIVE_ENTRIES, archiveDreamRoot, renderExistingConfig,
+     recoveryNotice, parseGrid, readBaselineScore, latestBest, latestIteration.
+ - Keep the improve-intent guard (index.ts:1185), which stops an agent from starting a paid campaign on
+   its own:
+   - Keep the persisted mode entry, the input hook and explicitlyRequestsImprovement (1684). Remove the
+     patterns for removed verbs.
+   - /dream-rsi improve sets it. It now guards start, resume and the new check.
+ - Rewrite renderCommandHelp (1620) and commandCompletions (1652) for the 5 verbs. Keep "arXiv 2609.14858"
+   in the help header (asserted at extension.test.mjs:995). A removed verb replies with one line:
+   "create was removed in 1.0. Use /dream-rsi improve <what you want>."
+ - resolveWatchRoot (1848) is campaign-only. With no campaign, it reports "No campaign yet. Run
+   /dream-rsi assess." Old manual data gets one status line, "Manual-loop data from an earlier version is in
+   .dream-rsi/ (task.json, history/). 1.0 does not use it."
+ - dream_rsi_improve campaign records keep version: 1, so paused 0.8.x campaigns still load
+   (campaign.ts:169).
+
+ 1b. Shrink the engine and split the tests
+
+ - Delete: engine/candidates.ts and engine/handoff.ts.
+ - Shrink:
+   - improvements.ts: keep measureSeed, readSeedMeasurement, findCandidate, candidatePath,
+     seedScorePath and their types.
+   - state.ts: keep dreamRootFor, activeRuns, runningIterations, RunningPhase. Move
+     recoverInterruptedRuns into the campaign resume path; it is the only repair for a manifest left
+     running after a crash.
+   - checkpoint.ts: drop recoverableIterations.
+   - dream.ts: drop planNextGrid, fallbackGrid and the planGrid import.
+   - task.ts: drop readTask, writeTask, taskPath.
+   - world.ts: grep and remove dead exports.
+ - Tests:
+   - Move the agent-runner, fingerprint and identity tests from candidates.test.mjs (245–459, 517–562) to a new
+     tests/agent-runner.test.mjs, then delete the rest.
+   - Trim extension.test.mjs to the campaign surface and rewrite its help and completion assertions.
+   - In visibility-resume.test.mjs: delete 190–205 and 243–253; rewrite 225–242 and 254–277 on campaign or
+     allocator.
+   - Drop the handoff tests in guidance.test.mjs (189–217) and in regressions.test.mjs 265–288; trim 411–436.
+   - Keep live-dream, tree-replay, reward-policy, scorer, layout, campaign-* and adapter-scorer.
+ - Skills: delete skills/dream-rsi-create/. Rewrite skills/dream-rsi/SKILL.md as a short router;
+   layout.test.mjs:21 requires the file. Remove the manual-workflow lines in dream-rsi-improve/SKILL.md
+   (74, 86–88).
+ - Acceptance:
+   - typecheck is clean.
+   - npm test is green, compared against the baseline.
+   - grep -rE "dream_rsi_(init|live|dream|apply|status)\b" finds hits only in CHANGELOG and docs.
+
+ 2. Framed /watch panel (dashboard.ts, tests/fixtures.mjs)
+ - Painters: DashboardView builds typed rows (title|section|row|selected|ok|warn|error|muted).
+   plain(width) keeps the headless text unchanged; campaign-dashboard.test.mjs:57 regex-matches it.
+   framed(width, theme, maxRows) is the TUI path.
+ - Frame:
+   - A rounded ╭─╮│╰─╯ border in theme.fg("border"). Inside the top border, a title in accent+bold:
+     Dream-RSI · <campaign id8> · cycle n/N · <phase>. A dim key-hint footer.
+   - Every row, blank padding rows included, is padded to the full width with visibleWidth and painted with
+     theme.bg("customMessageBg"). theme.getBgAnsi("customMessageBg") is re-inserted after each \x1b[0m
+     that truncateToWidth emits (pi-tui/dist/utils.js:130-139).
+   - Styling is applied after clean().
+ - Highlights:
+   - The selected tree row uses selectedBg.
+   - Status words: ok/applied in success; agent/evaluation/running in warning; error/timeout/fail/rejected
+     in error; unopened and n/a in muted.
+   - Section headers use accent.
+   - Slice 3/4 rejection reasons are shown for the selected cell.
+ - Height: stable at min(floor((tui.terminal?.rows ?? 40) * 0.9), max(content, 20)). The log section is
+   trimmed first, so the bottom border is never clipped.
+ - Factory: use the theme argument (dashboard.ts:144). Guard with typeof theme?.fg === "function".
+ - Widget: drop the legacy source label in observe (dashboard.ts:133).
+ - Test: extend campaign-dashboard.test.mjs, adding to the mockPi custom stub a theme whose
+   fg/bg/bold/getBgAnsi emit real SGR codes, plus terminal: { rows: 30 }. Assert:
+   - every row has visibleWidth === 80;
+   - the first row starts with ╭ and the last with ╰;
+ 3. Evaluator check, calibration, paired verification, gates (campaign.ts, campaign-patch.ts, apply.ts, index.ts schema, improve skill)
+
+ - dream_rsi_improve action:"check". Guarded by intent. It makes no agent calls and creates no campaign
+   record.
+   - Runs the evaluator runs times (default 3, max 5) on fresh scratch copies using scoreSeedCopy
+     (apply.ts:82), not measureSeed, which writes seed history.
+   - Reports per-run duration, exit code, valid/fail_class, score, and spread.
+   - Diagnoses:
+     - exit 127 → "interpreter not found on PATH; on Windows prefer node …";
+     - relative or .. path tokens in score_program that resolve from the target but not from the scratch
+       copy → "use an absolute path";
+     - a run near or over the timeout → "evaluator takes X s; the cap is 300 s; reduce cases or raise
+       evaluator_timeout_ms";
+     - gates failing on the unchanged target.
+   - Recommends evaluator_timeout_ms = clamp(ceil(3×max), 30 s, cap) and
+     minimum_gain = spread ? 1.5×spread : 0.
+   - Writes only .dream-rsi/checks/<ts>.json.
+ - Validation fix: start rejects ..-escaping relative path tokens in score_program with the same
+   message. Today assertTrustedVerifier accepts them (campaign.ts:271).
+ - Calibrated baseline:
+   - Add an optional record field minimumGainSource: "explicit" | "calibrated". index.ts:1216-1227 already
+     knows whether the user passed minimum_gain; keep that bit instead of defaulting to 0 at
+     campaign.ts:616. Old records lack the field and are treated as explicit.
+   - When the 2 baseline runs differ and the source is not explicit, run 1 more, set
+     minimumGain = 1.5 × range and baselineScores = [...], log it, and continue. Explicit tolerances keep
+     today's failure.
+   - promoteCandidates reads record.minimumGain, not options.minimumGain.
+ - Paired verification: verifyCandidatePatch(repeats).
+   - Deterministic baseline (spread 0): 1 pair, the same as today.
+   - Noisy baseline: one screening pair first, then 2 confirming pairs only if the screen shows a gain above
+     minimumGain. Promote only when the median paired gain is above minimumGain and every "after" run is
+     valid; currentScore becomes the median of the "after" runs.
+   - In noisy mode, verify at most the top 2 candidates per cycle, to stay within the 100-evaluator cap
+     (campaign.ts:61). Each run reserves an evaluator start, with key suffix :pair<i>.
+ - Gates: optional gates: string[] (for example the project's test command).
+   - They run on a fresh patched copy from a shared preparePatchedCopy helper. scoreCopy deletes its
+     scratch in finally (campaign-patch.ts:260), so gates cannot reuse it.
+   - Gates run only after the metric passes, and each must exit 0. They must already pass on the unchanged
+     target at check and at start.
+   - They count as evaluator starts and are included in hashInputs.
+ - Rejection records: every rejection is appended as {cell, stage, reasons} to history/rejections.jsonl.
+   Status shows the last 3.
+ - Skill: dream-rsi-improve lines 27, 31, 37–43 and 84 change to describe the calibration rule, the
+   required check before start, and gates.
+ - Tests first (campaign-runtime.test.mjs, makeProject, fixture scorers):
+   a. A ±noise scorer with no minimum_gain reaches the calibrated baseline. With explicit 0 it still fails
+      with today's message.
+   b. A candidate below the calibrated threshold is not applied.
+   c. A failing gate blocks apply and records a rejection.
+   d. check diagnoses node ../score.mjs on a subdirectory workspace, and exit 127.
+   e. start rejects the .. path.
+
+ 4. Adversarial review before apply (campaign.ts, index.ts, new prompts/adversarial-review.md)
+
+ - Insertion point: after the metric and gates pass, and before record.pendingApply is persisted
+   (campaign.ts:406-408). A rejected candidate therefore never becomes a pending apply.
+ - Run: one runAgent call, following the probe pattern (campaign.ts:329-348).
+   - Scratch dir: history/r####_campaign/<cell>/review/, containing REVIEW.md (goal, lever and scope,
+     evaluator command and inputs, gate commands, paired scores) plus before/ and after/ copies of the
+     changed files only.
+   - Budget: reserves an agent start with key ${iteration}:${cell}:review.
+ - Model: the active session model. runCampaign/resumeCampaign accept
+   resolveAgent?: () => AgentConfig | null. index.ts supplies it from ctx.model and the thinking level at
+   call time (today these are frozen at start, index.ts:1750). Live attempts and policy revisions use the same
+   resolver, falling back to the record's agent config. No model names anywhere.
+ - Adversarial prompt (model-neutral wording): assume the patch games the evaluator. Check for special-cased
+   inputs or fixture ids, weakened or skipped checks, disabled features, edits that only change the measured
+   path, and behavior outside the goal. Output review.json: { "verdict": "accept"|"reject", "reasons": string[] }.
+ - Fail closed: a missing, invalid or reject verdict blocks apply, records a rejection, and moves to the
+   next candidate.
+   review prompts. Assert:
+   - reject blocks apply;
+   - a missing file blocks apply;
+   - accept applies;
+   - the review start is counted;
+   - a resolver-supplied model reaches the agent args.
+
+ 5. Signals and levers (new engine/signals.ts, tool dream_rsi_signals, assess and improve skills, index.ts)
+
+ - collectSignals({ projectDir, focus?, includeLogs = true, sessionDir?, now }). Deterministic, read-only,
+   bounded.
+   a. Session logs (unless --no-logs):
+      - Read with SessionManager.list(projectDir, sessionDir) and parseSessionEntries, both exported by
+        @earendil-works/pi-coding-agent. Do not hand-encode the cwd→dir rule (session-manager.js:290-294).
+      - Bounds: the 30 most recent sessions, from the last 30 days, ≤20 MB each.
+      - Pair assistant toolCall blocks with toolResult. Duration is durationMs when present (seen in real
+        logs), else the timestamp delta.
+      - Output:
+        - failing bash command heads (npm test, pytest, …) with count and last seen;
+        - the slowest commands;
+        - files edited within 3 calls after a failure;
+        - the first error line, truncated to 160 chars and redac
+      - Never user text.
+   b. git: execFile("git", ["log","--since=90.days","--name-only","--pretty=format:%x1e%s"]). Report fix,
+      revert, regress, flaky, slow, perf and timeout hotspots, plus churn. Skip when git is unavailable.
+   c. Existing evaluators: package.json scripts (test, bench*, perf*), pyproject, Makefile.
+   d. Past campaigns: failure reasons and rejections.jsonl.
+   - focus: plain-language intent. Evidence whose command, path or commit text shares terms with the
+     intent ranks first. This is a deterministic term match; the semantic mapping is left to the skill.
+   - Returns ≤10 weaknesses[], each {kind, summary, evidence[{source, ref, count}], suggestedMetric}.
+ - Tool dream_rsi_signals (focus, include_logs). Free and read-only.
+ - dream-rsi-assess skill becomes lever analysis:
+   - No text: derive the intent from the project's stated goals (README, roadmap, PROBLEM) and the strongest
+     signals ("what moves this project forward").
+   - With text: restate the intent as 1–2 outcome metrics, call dream_rsi_signals focus=<intent>, read
+     the code paths the evidence points to, and list ≤5 levers. Each lever has: mechanism, scope (files),
+     evidence (cited as counts and command heads for session data), metric and evaluator (existing or
+     buildable), expected effect (high/med/low with reasoning, no invented numbers), readiness and confidence.
+   - End with the recommended lever and a ready /dream-rsi improve "<lever goal>".
+ - dream-rsi-improve skill:
+   - If the request is plain intent rather than a measurable goal, run the lever analysis, pick the top lever
+     whose readiness is ready, state why in one line, and continue. If no lever is ready, show the levers and
+     ask.
+   - Self-generated eval data: for a weakness-derived lever, intake writes a small targeted case set from
+     the evidence. It lives outside scope and is listed in verifier_inputs, and it must show headroom on the
+     unchanged target (a known-positive control).
+   - Put the project's own tests in gates. Run check and fix every diagnosis before start.
+   - At the end, report the remaining levers with ready commands.
+ - Tests first (new tests/signals.test.mjs, with a fixture session dir and a temp git repo):
+   - failing npm test aggregates with a count;
+   - a secret in an error line is redacted;
+   - user text never appears;
+   - include_logs:false reads no session files;
+   - focus ranks matching evidence first;
+   - a missing git binary is tolerated.
+
+ 6. Docs and release prep (README, docs/, CHANGELOG, PROBLEM.md, version)
+
+ - README sections, in order:
+   a. Pitch.
+   b. Quick start: assess, improve in plain words, watch.
+   c. Levers.
+   d. What it changes in your project: verified, gated, reviewed wins; never committed; a rollback journal.
+   e. Signals and privacy, including --no-logs.
+   f. Evaluator contract and check.
+   g. Limits.
+   h. Watching.
+   i. Install.
+   j. Method background with a link to the paper.
+   k. Tests.
+ - Moves:
+   - The Mind2Web scorer section moves verbatim to docs/mind2web-scorer.md.
+   - The method internals move to docs/method.md.
+   - Delete plans/parallel-loops.md (historical, describes the manual loop).
+   - Fix the dead "First run" link and the dream_rsi_assess mention.
+ - PROBLEM.md: the repo's own optimization task becomes a campaign. Snapshot .auto/score.mjs and its
+   engine imports into .dream-rsi/verifier/, which assertTrustedVerifier accepts (campaign.ts:249), list
+   them all in verifier_inputs, set scope to extensions/pi-dream-rsi/policy/method.ts, and use an absolute
+   score_program. Remove dream_rsi_init remeasure_seed (line 66).
+ - CHANGELOG.md 1.0.0: removals, the migration note, check, calibration, paired verification, gates,
+   review, signals and levers, the framed watch, and the live session model.
+ - Version: package.json and package-lock.json move to 1.0.0.
+
+ Deferred
+
+ - Inherited pitfall notes across cycles. The paper's §4 says prompt guidance can hurt, so this needs an
+   A/B. Slice 3 records the rejection data it would use.
+ - Auto-chaining to the next lever after a plateau. Budget implications; for now improve reports the next
+   levers.
+ - Honoring the campaign workers/k1/k2/revisions settings (campaign.ts:625 hard-codes them). This would
+   change spend.
+ - Landing wins on a git branch instead of the working tree.
+
+ Verification
+
+ 1. After each slice: npm run typecheck and npm test, compared against the recorded baseline.
+ 2. End to end through the real entry point, with evidence in the scratchpad:
+    - pi -e "<repo>" in a temp project with Node fixture scorers.
+    - /dream-rsi assess "make the parser faster": levers cite a seeded session-log failure.
+    - check on the relative-path scorer shows the diagnosis.
+    - /dream-rsi improve "<plain words>" with stub agents: lever → calibrated baseline → paired verify → gate →
+      review → apply.
+    - /dream-rsi watch: the framed panel, screenshotted in the dark and light themes.
+ 3. Known-positive controls: fixture scorers reproduce each real failure shape (relative ../ path, exit 127,
+    a sleep past the timeout, ±noise), and check or the calibrated start catches each one. The other projects'
+    benchmarks are never run.
+ 4. The final Haiku review of git diff main...v1-campaign-ux. The final report covers changed files, checks,
+    gaps, and the pending release actions (merging to main means an npm publish), which need your explicit OK.
