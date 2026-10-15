@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+Release version only: the campaign-first 1.0.0 merge did not publish to npm. This version makes the 1.0 release available; product behavior is unchanged from 1.0.0.
+
 ## 1.0.0
 
 Dream-RSI now guides project improvement through bounded campaigns.
