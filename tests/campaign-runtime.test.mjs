@@ -63,7 +63,21 @@ test("campaign resolves the active agent model again at each spawned call", asyn
     assert.equal(result.state.kind, "complete");
     assert.ok(resolverCalls >= 2, "each actual spawned phase call resolves the current session config");
     const calls = fs.readFileSync(output, "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
-    assert.deepEqual(calls.slice(0, 2).map((args) => args[args.indexOf("--model") + 1]), ["session/first", "session/second"]);
+    // The diagnostic keeps a platform-only failure actionable: it reports why the
+    // second spawn did not happen instead of only that it did not.
+    const observed = {
+      stopReason: result.stopReason,
+      state: result.state,
+      agentStarts: result.agentStarts,
+      evaluatorRuns: result.evaluatorRuns,
+      resolverCalls,
+      recordedCalls: calls.length,
+    };
+    assert.deepEqual(
+      calls.slice(0, 2).map((args) => args[args.indexOf("--model") + 1]),
+      ["session/first", "session/second"],
+      `per-spawn model resolution; observed ${JSON.stringify(observed)}`,
+    );
     assert.deepEqual(calls.slice(0, 2).map((args) => args.slice(args.indexOf("--thinking") + 1, args.indexOf("--thinking") + 2)), [["medium"], ["high"]]);
   } finally { project.cleanup(); }
 });
