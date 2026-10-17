@@ -36,10 +36,15 @@ const COMSHELL = process.env.ComSpec ?? "cmd.exe";
 // Process helpers
 // ---------------------------------------------------------------------------
 
-/** Run a command; shellShim routes via the Windows interpreter so npm-style shims resolve. */
+/**
+ * Run a command. `shellShim` routes through the platform shell so npm-style shims
+ * resolve: the Windows command interpreter on Windows, /bin/sh elsewhere. Using
+ * cmd.exe unconditionally makes every shimmed command fail with ENOENT on POSIX.
+ */
 function runCommand(command, args, cwd, shellShim = false) {
-  const file = shellShim ? COMSHELL : command;
-  const argv = shellShim ? ["/d", "/s", "/c", [command, ...args].join(" ")] : args;
+  const posix = process.platform !== "win32";
+  const file = !shellShim ? command : posix ? "/bin/sh" : COMSHELL;
+  const argv = !shellShim ? args : posix ? ["-c", [command, ...args].join(" ")] : ["/d", "/s", "/c", [command, ...args].join(" ")];
   const result = spawnSync(file, argv, { cwd, encoding: "utf8", timeout: 120_000, windowsHide: true });
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "", error: result.error ?? null };
 }

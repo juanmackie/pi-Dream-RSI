@@ -49,8 +49,11 @@ test("measurement timeout must fit spawnSync's supported integer range", () => {
   assert.equal(parseArgs(["--timeout=2147483647", "--", process.execPath, "-e", ""]).options.timeout, 2147483647);
 });
 
-test("Tier 2 repositories have a known baseline and a control patch that improves the metric and passes held-out gates", (t) => {
-  for (const fixture of loadFixtures()) t.test(fixture.name, () => {
+test("Tier 2 repositories have a known baseline and a control patch that improves the metric and passes held-out gates", async (t) => {
+  // Awaiting each subtest keeps the parent alive until they finish. A synchronous
+  // parent that merely registers them can complete first, and the runner then
+  // cancels the stragglers as `cancelledByParent` on slower machines.
+  for (const fixture of loadFixtures()) await t.test(fixture.name, () => {
     const project = fs.mkdtempSync(path.join(os.tmpdir(), `dream-rsi-${fixture.name}-`));
     try {
       fs.cpSync(fixture.root, project, { recursive: true });
