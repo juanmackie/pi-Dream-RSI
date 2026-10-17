@@ -113,11 +113,22 @@ test("the approval fingerprint is stable for unchanged content and ignores depen
   assert.notEqual(projectFingerprint(projectDir), first.fingerprint, "a source edit does change the baseline");
 });
 
-test("a probe environment carries only the allowlisted variables", () => {
-  const contract = normalizeRunContract(validContract({ execution: { envAllowlist: ["PATH", "CI"] } }));
-  const env = restrictedEnvironment(contract, { PATH: "/bin", CI: "1", OPENAI_API_KEY: "sk-secret", AWS_SECRET_ACCESS_KEY: "x", PI_SESSION_ID: "s" });
-  assert.deepEqual(env, { PATH: "/bin", CI: "1" });
-  assert.deepEqual(restrictedEnvironment(normalizeRunContract(validContract()), { PATH: "/bin" }), {});
+test("a probe environment carries the runtime baseline plus the allowlist, and never a secret", () => {
+  const contract = normalizeRunContract(validContract({ execution: { envAllowlist: ["CI"] } }));
+  const source = {
+    PATH: "/bin", CI: "1", HOME: "/home/u",
+    OPENAI_API_KEY: "sk-secret", AWS_SECRET_ACCESS_KEY: "x", GITHUB_TOKEN: "ghp_secret", PI_SESSION_ID: "s",
+  };
+  const env = restrictedEnvironment(contract, source);
+  assert.equal(env.PATH, "/bin", "process execution needs PATH or nothing can start");
+  assert.equal(env.CI, "1", "the allowlist is added on top");
+  for (const secret of ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "PI_SESSION_ID"]) {
+    assert.equal(Object.hasOwn(env, secret), false, `${secret} must never reach a probe`);
+  }
+  // An empty allowlist still yields a runnable environment, and still no secrets.
+  const bare = restrictedEnvironment(normalizeRunContract(validContract()), source);
+  assert.equal(bare.PATH, "/bin");
+  assert.equal(Object.hasOwn(bare, "GITHUB_TOKEN"), false);
 });
 
 test("scope and protected-asset checks are exact about paths", () => {

@@ -49,10 +49,13 @@ objective, permissions and spend are decided, and no autonomous step can widen i
   outcome's units, or a percentage.
 - `scope.roots` limits what a candidate may edit. `scope.protectedAssets` and
   `preserved.gates` are what must keep working.
-- `envAllowlist` is the entire environment for the processes this page's cold-start
-  path starts: discovery probes, the generated instrument, and the independent
-  post-apply check. Credentials, provider keys and session identity are withheld
-  from those.
+- `envAllowlist` is what these processes may see *in addition to* a fixed
+  non-secret runtime baseline (`PATH`, and on Windows the command interpreter,
+  `SystemRoot`, `PATHEXT`, temp directories). That baseline is what lets any process
+  start at all; without `PATH` a probe fails with "command not found" on a machine
+  whose runtime is not in the shell's default search path. It applies to discovery
+  probes, the generated instrument and the independent post-apply check.
+  Credentials, provider keys and session identity are withheld from all of them.
 
   It does **not** cover the campaign phase. The campaign engine runs the scoring
   command and the correctness gates with the host environment minus session

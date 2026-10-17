@@ -326,12 +326,28 @@ export function approveRunContract(projectDir: string, contract: RunContract): A
  */
 export function restrictedEnvironment(contract: RunContract, source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
+  // Path resolution and the Windows command interpreter are needed to start any
+  // process at all, and neither carries a secret. Without them an empty allowlist
+  // makes every probe fail with "command not found" on a machine whose runtime is
+  // not in the shell's default search path (for example a CI runner).
+  for (const key of RUNTIME_ENV_BASELINE) {
+    const value = source[key];
+    if (typeof value === "string") env[key] = value;
+  }
   for (const key of contract.execution.envAllowlist) {
     const value = source[key];
     if (typeof value === "string") env[key] = value;
   }
   return env;
 }
+
+/**
+ * Non-secret variables a child process needs to start on each platform. Everything
+ * else — provider keys, tokens, credentials, session identity — is withheld.
+ */
+const RUNTIME_ENV_BASELINE = process.platform === "win32"
+  ? ["PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "ComSpec", "TEMP", "TMP", "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE"]
+  : ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
 
 /** True when `relative` stays inside one of the contract's editable roots. */
 export function withinApprovedScope(contract: RunContract, relative: string): boolean {

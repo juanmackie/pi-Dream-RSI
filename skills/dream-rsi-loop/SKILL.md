@@ -13,7 +13,7 @@ To work on a repository with no recorded evidence, pass a `contract`. It is the 
 
 `execution.consent` must be `true` before any probe runs, and it is a risk acceptance, not a sandbox: discovered repository code runs on this host with host access. Say that plainly when you ask for it. Only point the loop at repositories the operator would run by hand, and never approve a contract for an unfamiliar or hostile repository on their behalf.
 
-`envAllowlist` is the entire environment for discovery probes, the generated instrument and the post-apply check. It does not cover campaign scoring and gates, which run with the host environment minus session identity because project-declared commands normally need `PATH`. Do not tell the user that a contract withholds all credentials from every process; state the per-phase scope.
+`envAllowlist` is added on top of a fixed non-secret runtime baseline (`PATH`, plus the Windows command interpreter, `SystemRoot`, `PATHEXT` and temp directories) for discovery probes, the generated instrument and the post-apply check. That baseline is required to start a process at all. It does not cover campaign scoring and gates, which run with the host environment minus session identity because project-declared commands normally need `PATH`. Do not tell the user that a contract withholds all credentials from every process; state the per-phase scope.
 
 Pass `control_patch` (a known-better change for the metric, relative to `project_dir` or absolute) whenever one exists. Every supplied control is validated during evaluator preflight.
 
