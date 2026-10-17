@@ -34,11 +34,23 @@ if (spins <= 0) process.exit(1);
 console.log(spins);
 `;
 
-// The duration is drawn once per process from two very different extremes, so
-// repeated readings in one evaluator run agree while separate runs disagree
-// sharply. That is exactly the instability the stability check exists to detect.
-const BENCH_NOISY = `import { work } from "./src/work.mjs";
-work(Math.random() < 0.5 ? 40 : 800);
+/**
+ * Each launch flips a marker outside the copied workspace, so consecutive readings
+ * alternate between two very different durations. The instability is deterministic
+ * rather than random, so a slow CI runner cannot accidentally produce a stable
+ * series. The marker lives in the temp directory because every qualification run
+ * starts from a fresh copy of the project.
+ */
+const BENCH_NOISY = (marker) => `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { work } from "./src/work.mjs";
+// One evaluator run launches the workload four times (one warmup plus three
+// samples), so grouping by launch count gives each run a single duration and makes
+// consecutive runs disagree sharply -- exactly the instability the stability check
+// must catch, without relying on chance.
+const count = existsSync(${JSON.stringify(marker)}) ? Number(readFileSync(${JSON.stringify(marker)}, "utf8")) : 0;
+writeFileSync(${JSON.stringify(marker)}, String(count + 1));
+const group = Math.floor(count / 4) % 2;
+work(group === 0 ? 40 : 800);
 console.log("done");
 `;
 
@@ -170,7 +182,8 @@ test("an instrument is qualified without any supplied winning patch", async () =
 });
 
 test("an instrument that cannot resolve the useful gain is refused, not accommodated", async () => {
-  const projectDir = nodeProject({ bench: BENCH_NOISY });
+  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-noise-marker-")), "toggle");
+  const projectDir = nodeProject({ bench: BENCH_NOISY(marker) });
   // This fixture is noisy by construction, so a retry would only repeat the same refusal.
   const { plan, report } = await qualify(projectDir, contract(), { attempts: 1 });
 

@@ -122,7 +122,7 @@ impossible. An instrument is now qualified from independent evidence:
 |---|---|
 | workload | The declared workload completes on the unchanged target and produces a valid reading. |
 | baseline | Repeated readings are recorded, with their median. |
-| stability | Repeated readings spread by less than the smallest worthwhile change. |
+| stability | Repeated readings spread by less than the smallest worthwhile change. A busy host can make one series jittery, so the same measurement is taken again before refusing; the thresholds never change between passes. |
 | direction | More work in the same measured operation moves the score the way the contract declares. |
 | sensitivity | A degraded control moves the score by more than the smallest worthwhile change. |
 | missing-workload | A workload that does not exist produces an invalid score. |

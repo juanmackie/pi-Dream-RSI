@@ -403,7 +403,11 @@ test("a contract run that supplies a control patch still cannot record an unveri
     "src/work.mjs": "export function work() {\n  const until = performance.now() + 120;\n  while (performance.now() < until) { /* measured work */ }\n  return 1;\n}\n",
     "control.patch": "diff --git a/src/work.mjs b/src/work.mjs\n",
   });
-  const contract = normalizeRunContract(validContract({ budgets: { maxCampaigns: 1, maxAgentStarts: 6, maxEvaluatorRuns: 40 } }));
+  // A large required gain, so measurement noise alone can never look like a win.
+  const contract = normalizeRunContract(validContract({
+    outcome: { statement: "reduce benchmark duration", unit: "ms", higherIsBetter: false, minimumUsefulGain: "90%" },
+    budgets: { maxCampaigns: 1, maxAgentStarts: 6, maxEvaluatorRuns: 40 },
+  }));
 
   // A stub campaign claims an apply without improving anything, so only the independent
   // post-apply check can tell the difference between a claim and a verified improvement.

@@ -92,6 +92,13 @@ export interface QualificationOptions {
   signal?: AbortSignal;
   /** Host-side extra work injected into the same measured operation, in milliseconds. */
   injectedDelayMs?: number;
+  /**
+   * Baseline passes to take before refusing on instability. A busy machine can
+   * produce one unusually jittery series; taking a second sample with exactly the
+   * same thresholds distinguishes that from an instrument that is genuinely unable
+   * to resolve the useful gain. A truly noisy instrument fails every pass.
+   */
+  baselinePasses?: number;
   /** Baseline readings to take. */
   baselineRuns?: number;
 }
@@ -518,33 +525,46 @@ export async function qualifyInstrument(
     if (!passed) rejections.push(detail);
   };
 
-  // 1. The declared workload must complete on the unchanged target.
-  const readings: number[] = [];
-  for (let index = 0; index < baselineRuns; index += 1) {
-    const probe = await runInstrument({ ...common, evaluatorFile });
-    if (!probe.valid) {
-      record("workload", false, `the declared workload did not produce a valid reading on the unchanged target: ${probe.error}`);
-      const failed: QualificationReport = { passed: false, checks, contract: null, rejections };
-      plan.qualification = failed;
-      plan.ready = false;
-      plan.rejections.push(...rejections);
-      return failed;
+  // 1. The declared workload must complete on the unchanged target, and repeated
+  //    readings must resolve the smallest worthwhile change. A busy host can make one
+  //    series jittery, so the same measurement is taken again before refusing; the
+  //    thresholds never change between passes.
+  const passes = Math.max(1, Math.min(options.baselinePasses ?? 2, 4));
+  let readings: number[] = [];
+  let baseline = 0;
+  let spread = 0;
+  let threshold = 0;
+  let stabilityDetail = "";
+  let stable = false;
+  let passedPasses = 0;
+  for (let pass = 0; pass < passes; pass += 1) {
+    passedPasses = pass + 1;
+    readings = [];
+    for (let index = 0; index < baselineRuns; index += 1) {
+      const probe = await runInstrument({ ...common, evaluatorFile });
+      if (!probe.valid) {
+        record("workload", false, `the declared workload did not produce a valid reading on the unchanged target: ${probe.error}`);
+        const failed: QualificationReport = { passed: false, checks, contract: null, rejections };
+        plan.qualification = failed;
+        plan.ready = false;
+        plan.rejections.push(...rejections);
+        return failed;
+      }
+      readings.push(probe.score!);
     }
-    readings.push(probe.score!);
+    const sorted = [...readings].sort((a, b) => a - b);
+    baseline = sorted[Math.floor(sorted.length / 2)];
+    spread = Math.max(...readings) - Math.min(...readings);
+    threshold = resolveGainThreshold(options.minimumUsefulGain, baseline);
+    stable = spread <= threshold;
+    stabilityDetail = stable
+      ? `baseline spread ${Math.round(spread * 1000) / 1000} is within the useful gain ${Math.round(threshold * 1000) / 1000}`
+      : `baseline spread ${Math.round(spread * 1000) / 1000} exceeds the useful gain ${Math.round(threshold * 1000) / 1000}, so a real improvement of that size cannot be distinguished from noise`;
+    if (stable) break;
   }
-  record("workload", true, `"${plan.headCommand}" completed ${readings.length} time(s) on the unchanged target`);
-
-  const sorted = [...readings].sort((a, b) => a - b);
-  const baseline = sorted[Math.floor(sorted.length / 2)];
-  const spread = Math.max(...readings) - Math.min(...readings);
-  const threshold = resolveGainThreshold(options.minimumUsefulGain, baseline);
+  record("workload", true, `"${plan.headCommand}" completed ${readings.length} time(s) on the unchanged target${passedPasses > 1 ? ` (pass ${passedPasses} of ${passes})` : ""}`);
   record("baseline", true, `baseline readings ${readings.map((value) => Math.round(value * 1000) / 1000).join(", ")} (median ${Math.round(baseline * 1000) / 1000})`);
-
-  // 2. Repeated readings must resolve the smallest worthwhile change.
-  const stable = spread <= threshold;
-  record("stability", stable, stable
-    ? `baseline spread ${Math.round(spread * 1000) / 1000} is within the useful gain ${Math.round(threshold * 1000) / 1000}`
-    : `baseline spread ${Math.round(spread * 1000) / 1000} exceeds the useful gain ${Math.round(threshold * 1000) / 1000}, so a real improvement of that size cannot be distinguished from noise`);
+  record("stability", stable, stabilityDetail);
 
   const editable = options.editableScope ?? [];
   const metricMode = plan.metricKind === "command-duration" ? "duration" : "failures";
