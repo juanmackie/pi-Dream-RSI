@@ -1,0 +1,22 @@
+{
+  "name": "python-csv-row-parser",
+  "goal": "Improve repeated CSV row parsing without changing CSV quoting, escaping, or header semantics.",
+  "metric": "median parse time (milliseconds; lower is better)",
+  "direction": "minimize",
+  "workspace": "workspace",
+  "copy_exclude": ["__pycache__"],
+  "scope_files": ["row_parser.py"],
+  "candidate_program": "row_parser.py",
+  "evaluator": "evaluate.py",
+  "gate": "gate.py",
+  "control_patch": "control.patch",
+  "verifier_inputs": ["evaluate.py", "gate.py", "control.patch"],
+  "evaluator_kind": "timed Python command",
+  "interpreter": "python",
+  "readiness": "ready",
+  "baseline_gate_passes": true,
+  "levers": [
+    { "goal": "Avoid CSV parser setup for unquoted rows while preserving fallback semantics", "scope_files": ["row_parser.py"], "metric": "median parse time in milliseconds", "evaluator_kind": "command", "readiness": "ready" },
+    { "goal": "Cache parsed header layouts across repeated calls", "scope_files": ["row_parser.py"], "metric": "median parse time in milliseconds", "evaluator_kind": "command", "readiness": "needs_setup" }
+  ]
+}

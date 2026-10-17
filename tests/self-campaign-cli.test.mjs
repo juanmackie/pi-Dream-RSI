@@ -85,14 +85,15 @@ test("installed Pi CLI loads Dream-RSI and runs a provider-free guarded campaign
     assert.equal(report.ok, true, report.error ?? JSON.stringify(report));
     assert.match(report.signal, /npm test/);
     assert.match(report.relativeCheck, /use an absolute path/);
-    assert.equal(report.calibrated, "calibrated");
-    assert.deepEqual(report.baselineScores.length, 3);
+    assert.equal(report.baselineScores.length, 5);
+    assert.equal(report.agentStartsAtBaseline, 0, "the five baseline scores complete before the first agent starts");
     assert.deepEqual(report.cycle, 1);
     assert.equal(report.counters.agentStarts, report.counters.recordedAgentStarts);
     assert.equal(report.counters.evaluatorRuns, report.counters.recordedEvaluatorStarts);
     assert.ok(report.roles.includes("review"));
     assert.equal(report.reviewVerdict, "accept");
-    assert.equal(report.pairedMeasurements.length, 3);
+    assert.equal(report.pairedMeasurements.length, report.confirmationCount,
+      "review measurements agree with the campaign's confirmation ledger");
     assert.match(report.appliedHash, /^[a-f0-9]{64}$/);
     assert.equal(report.finalState.kind, "complete");
     assert.equal(report.applied, true);

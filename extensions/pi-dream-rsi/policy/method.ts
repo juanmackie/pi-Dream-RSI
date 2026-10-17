@@ -22,9 +22,6 @@
  * Default beta: 0.6 — moderately exploratory, the paper's prescribed default when the live/beta
  * evidence is insufficient or conflicting.
  *
- * Grid planning: widen while live directions are still improving; on a plateau, hold or reduce width
- * and spend the budget going deeper on the surviving directions.
- *
  * Safeguards: a single failure never closes a direction; a repairable failure keeps eligibility and
  * gets at most one recovery slot per round; a branch with a successful anchor is never starved; and
  * batches prefer distinct branches so probes always run in parallel.
@@ -38,8 +35,6 @@ import {
   finalize_result,
   type Budget,
   type EpisodeResult,
-  type GridPlan,
-  type GridPlanningContext,
   type QuestionView,
   type Schedule,
 } from "./api.ts";
@@ -62,52 +57,6 @@ export class OptimalPolicy extends LLMDesignedMethod {
 
   _schedule(beta: number): Schedule {
     return LLMDesignedMethod.schedule(beta);
-  }
-
-  plan_grid(context: GridPlanningContext): GridPlan {
-    const maxWidth = Math.max(1, context.max_parallelism);
-    const budgetAttempts = context.budget?.attempts ?? maxWidth * 6;
-    const depthFor = (width: number): number => Math.max(1, Math.floor(budgetAttempts / width));
-
-    if (context.history.length === 0) {
-      return {
-        branch_count: maxWidth,
-        refine_count: Math.min(8, depthFor(maxWidth)),
-        reason: "no live history: open one direction per worker and refine each to the round budget",
-      };
-    }
-
-    const scored = context.history.filter((h) => typeof h.best_score === "number") as {
-      iteration: number;
-      best_score: number;
-      baked_beta: number | null;
-    }[];
-    const latest = scored[scored.length - 1];
-    const previous = scored[scored.length - 2];
-    // Insufficient history is not a plateau: bootstrap full width rather than pretending to see a trend.
-    if (!latest || !previous) {
-      return {
-        branch_count: maxWidth,
-        refine_count: Math.min(8, depthFor(maxWidth)),
-        reason: "fewer than two scored live cycles: bootstrap full width",
-      };
-    }
-    const improving = latest.best_score > previous.best_score;
-
-    if (improving) {
-      return {
-        branch_count: maxWidth,
-        refine_count: Math.min(10, depthFor(maxWidth)),
-        reason: `live best still improving (${previous.best_score} -> ${latest.best_score}): keep full width`,
-      };
-    }
-
-    const width = Math.max(1, Math.round(maxWidth / 2));
-    return {
-      branch_count: width,
-      refine_count: Math.min(12, depthFor(width)),
-      reason: `live best plateaued at ${latest.best_score}: narrow to ${width} directions and refine the survivors deeper`,
-    };
   }
 
   async solve(question: QuestionView, budget?: Budget | null): Promise<EpisodeResult> {

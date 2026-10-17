@@ -30,9 +30,11 @@ test("campaign reserves the probe before spawn and stops at the actual agent-sta
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
-    const result = await campaign.runCampaign(campaignOptions(project, project.task, { maxCycles: 1, maxAgentStarts: 1 }));
+    const reserved = [];
+    const result = await campaign.runCampaign({ ...campaignOptions(project, project.task, { maxCycles: 1, maxAgentStarts: 1 }), beforeAgentSpawn: (key) => reserved.push(key) });
+    assert.deepEqual(reserved, ["campaign-probe"], "shared reservations occur only after local capacity is available");
     assert.equal(result.agentStarts, 1);
-    assert.equal(result.evaluatorRuns, 2, "both initial and repeat baseline measurements are charged");
+    assert.equal(result.evaluatorRuns, 5, "all preflight baseline measurements are charged before the probe");
     assert.equal(result.completedCycles.length, 0);
     assert.equal(result.state.kind, "complete");
     assert.match(result.stopReason, /agent start limit reached/);
@@ -123,28 +125,30 @@ test("campaign rejects a baseline the evaluator marks invalid even when fail_cla
     const task = { ...project.task, score_program: `node "${scorer}"` };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1 }), verifierInputs: [scorer] });
     assert.equal(result.state.kind, "failed");
-    assert.match(result.stopReason, /trustworthy baseline/);
+    assert.match(result.stopReason, /preflight failed.*valid score/);
+    assert.equal(result.agentStarts, 0);
     assert.equal(result.completedCycles.length, 0);
   } finally { project.cleanup(); }
 });
 
-test("campaign stops before live when repeated baseline scores exceed the declared tolerance", async () => {
+test("campaign stops before any agent when noise makes meaningful effects undetectable", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
     const scorer = path.join(project.projectDir, "varying-score.mjs");
     const counter = path.join(project.dir, "baseline-count.txt");
-    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst counter = ${JSON.stringify(counter)};\nconst n = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;\nwriteFileSync(counter, String(n));\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score: n * 100, valid: true, fail_class: "ok", error: null }));\n`);
+    fs.writeFileSync(scorer, `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";\nconst counter = ${JSON.stringify(counter)};\nconst n = existsSync(counter) ? Number(readFileSync(counter, "utf8")) + 1 : 1;\nwriteFileSync(counter, String(n));\nmkdirSync("eval", { recursive: true });\nwriteFileSync("eval/score.json", JSON.stringify({ score: n % 2 ? 1 : 1000, valid: true, fail_class: "ok", error: null }));\n`);
     const task = { ...project.task, score_program: `node "${scorer}"` };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1 }), verifierInputs: [scorer], minimumGain: 0 });
     assert.equal(result.state.kind, "failed");
-    assert.match(result.stopReason, /repeated baseline changed/);
-    assert.equal(result.evaluatorRuns, 2);
+    assert.match(result.stopReason, /minimum detectable effect exceeds 50%/);
+    assert.equal(result.evaluatorRuns, 5);
+    assert.equal(result.agentStarts, 0);
     assert.equal(result.completedCycles.length, 0);
   } finally { project.cleanup(); }
 });
 
-test("omitted minimum gain calibrates a noisy baseline with one additional measurement", async () => {
+test("omitted minimum gain tests positive improvement using five baseline measurements", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
@@ -154,17 +158,18 @@ test("omitted minimum gain calibrates a noisy baseline with one additional measu
     const task = { ...project.task, score_program: `node "${scorer}"` };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 1 }), verifierInputs: [scorer] });
     assert.equal(result.state.kind, "complete");
-    assert.equal(result.evaluatorRuns, 3);
+    assert.equal(result.evaluatorRuns, 5);
     const recordPath = path.join(result.campaignRoot, "campaign.json");
     const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
     assert.equal(record.minimumGainSource, "calibrated");
-    assert.equal(record.baselineScores.length, 3);
-    assert.deepEqual(record.baselineScores, [10, 12, 11]);
-    assert.equal(record.minimumGain, 3);
+    assert.equal(record.baselineScores.length, 5);
+    assert.deepEqual(record.baselineScores, [10, 12, 11, 11, 11]);
+    assert.equal(record.minimumGain, 0);
+    assert.ok(record.checkReport.mde_rel > 0);
   } finally { project.cleanup(); }
 });
 
-test("a candidate below the calibrated minimum gain is never applied", async () => {
+test("noisy search scores rank candidates while paired confirmation enforces an explicit gain", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
@@ -176,9 +181,10 @@ test("a candidate below the calibrated minimum gain is never applied", async () 
       ...campaignOptions(project, task),
       verifierInputs: [scorer],
       limits: { maxCycles: 1, maxAgentStarts: 36, maxEvaluatorRuns: 100 },
+      minimumGain: 30,
     });
     assert.equal(result.state.kind, "complete", result.stopReason);
-    assert.ok(result.rejections.some((rejection) => rejection.stage === "candidate-score"));
+    assert.ok(result.rejections.some((rejection) => rejection.stage === "verification"));
     const record = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign.json"), "utf8"));
     assert.equal(record.minimumGain, 30);
     assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false);
@@ -227,7 +233,7 @@ test("a gate that changes a declared input aborts before campaign work", async (
     assert.equal(result.state.kind, "failed");
     assert.match(result.stopReason, /identity changed during campaign/);
     assert.equal(result.agentStarts, 0);
-    assert.equal(result.evaluatorRuns, 1);
+    assert.equal(result.evaluatorRuns, 6, "five baselines and the mutating gate are charged");
   } finally { project.cleanup(); }
 });
 
@@ -268,7 +274,7 @@ test("candidate gate failure records a rejection and leaves the target untouched
   } finally { project.cleanup(); }
 });
 
-test("review rejects missing, malformed and negative verdicts without applying any candidate", async () => {
+test("review rejects missing and malformed verdicts within the confirmation budget", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
@@ -278,10 +284,9 @@ test("review rejects missing, malformed and negative verdicts without applying a
     const task = { ...project.task, agent: { ...project.task.agent, args: [agent, counter] } };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task), limits: { maxCycles: 1, maxAgentStarts: 36, maxEvaluatorRuns: 100 } });
     assert.equal(result.state.kind, "complete", result.stopReason);
-    assert.equal(Number(fs.readFileSync(counter, "utf8")), 3, "each candidate receives one counted review");
+    assert.equal(Number(fs.readFileSync(counter, "utf8")), 2, "two distinct candidates receive one counted review each");
     assert.ok(result.rejections.filter((item) => item.stage === "review").some((item) => /missing|review\.json/i.test(item.reasons.join(" "))));
     assert.ok(result.rejections.filter((item) => item.stage === "review").some((item) => /invalid|verdict/i.test(item.reasons.join(" "))));
-    assert.ok(result.rejections.filter((item) => item.stage === "review").some((item) => /bypasses/i.test(item.reasons.join(" "))));
     assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false);
     const ledger = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign-processes.json"), "utf8"));
     assert.equal(ledger.agent_starts, result.agentStarts);
@@ -309,7 +314,7 @@ test("accepted review applies the measured patch, not an edited review copy", as
   } finally { project.cleanup(); }
 });
 
-test("a probe that edits a pinned evaluator aborts before the first evaluation", async () => {
+test("a probe that edits a pinned evaluator aborts after preflight and before search", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
@@ -321,7 +326,7 @@ test("a probe that edits a pinned evaluator aborts before the first evaluation",
     assert.equal(result.state.kind, "failed");
     assert.match(result.stopReason, /identity changed/);
     assert.equal(result.agentStarts, 1);
-    assert.equal(result.evaluatorRuns, 0);
+    assert.equal(result.evaluatorRuns, 5);
   } finally { project.cleanup(); }
 });
 
@@ -331,8 +336,8 @@ test("campaign deadline aborts an in-flight child instead of waiting for its age
     const campaign = await jump("engine/campaign.ts");
     const agent = path.join(project.projectDir, "wait-for-campaign-end.mjs");
     fs.writeFileSync(agent, `import { writeFileSync } from "node:fs";\nwriteFileSync("started.marker", "yes");\nprocess.stdin.on("data", () => {});\nprocess.stdin.on("end", () => setInterval(() => {}, 1000));\n`);
-    const task = { ...project.task, agent: { ...project.task.agent, args: [agent] }, agent_timeout_ms: 30_000 };
-    const options = campaignOptions(project, task, { maxCycles: 1, deadlineMs: 2500 });
+    const task = { ...project.task, agent: { ...project.task.agent, args: [agent] }, agent_timeout_ms: 60_000 };
+    const options = campaignOptions(project, task, { maxCycles: 1, deadlineMs: 15_000 });
     const started = Date.now();
     const resultPromise = campaign.runCampaign(options);
     let probeWorkspace;
@@ -341,9 +346,9 @@ test("campaign deadline aborts an in-flight child instead of waiting for its age
       if (!status) return false;
       probeWorkspace = path.join(status.campaignRoot, "probe-workspace");
       return fs.existsSync(path.join(probeWorkspace, "started.marker"));
-    });
+    }, 20_000);
     const result = await resultPromise;
-    assert.ok(Date.now() - started < 7000, "deadline should terminate the child before its 30s timeout");
+    assert.ok(Date.now() - started < 30_000, "deadline should terminate the child before its 60s timeout");
     assert.equal(result.state.kind, "complete");
     assert.match(result.stopReason, /deadline expired/);
     assert.equal(fs.existsSync(path.join(project.seed, "started.marker")), false);

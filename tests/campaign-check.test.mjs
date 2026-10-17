@@ -82,7 +82,7 @@ test("check diagnoses relative evaluator paths that only resolve from the target
   }
 });
 
-test("check diagnoses missing interpreters and clamps evaluator timeout", async () => {
+test("check diagnoses missing interpreters without imposing the old timeout ceiling", async () => {
   const project = makeProject({ evaluatorTimeoutMs: 900_000 });
   try {
     const campaign = await jump("engine/campaign.ts");
@@ -94,7 +94,7 @@ test("check diagnoses missing interpreters and clamps evaluator timeout", async 
       verifierInputs: [scorer], runs: 1,
     });
     assert.ok(report.diagnoses.some((message) => /interpreter not found on PATH/i.test(message)));
-    assert.ok(report.diagnoses.some((message) => /300 s/i.test(message)));
+    assert.equal(report.diagnoses.some((message) => /capped/i.test(message)), false);
     assert.equal(report.runs[0].code, 127);
   } finally { project.cleanup(); }
 });

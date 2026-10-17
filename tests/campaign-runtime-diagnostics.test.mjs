@@ -7,7 +7,7 @@ import { EXT, jump, makeProject, mockPi } from "./fixtures.mjs";
 
 const { default: dreamRsi } = await jump("index.ts");
 
-test("registered improve status reports its loaded runtime and timeout ceiling before a campaign exists", async () => {
+test("registered improve status reports its loaded runtime and default evaluator timeout before a campaign exists", async () => {
   const project = makeProject();
   try {
     const { pi, context, harness } = mockPi();
@@ -21,15 +21,15 @@ test("registered improve status reports its loaded runtime and timeout ceiling b
     assert.equal(result.details.runtime.packageDir, path.resolve(EXT, "..", ".."));
     assert.equal(result.details.runtime.packageVersion, metadata.version);
     assert.match(result.details.runtime.campaignModule, /engine\/campaign\.ts$/);
-    assert.equal(result.details.runtime.evaluatorTimeoutCapMs, 300_000);
-    assert.match(result.content[0].text, /evaluator timeout cap: 300000ms/);
+    assert.equal(result.details.runtime.defaultEvaluatorTimeoutMs, 300_000);
+    assert.match(result.content[0].text, /default evaluator timeout: 300000ms/);
     assert.match(result.content[0].text, /campaign module:/);
   } finally {
     project.cleanup();
   }
 });
 
-test("registered campaign start persists its effective timeout before the first evaluator runs", async () => {
+test("registered campaign start preserves the configured evaluator timeout and five-score baseline", async () => {
   const project = makeProject();
   try {
     const { pi, context, harness } = mockPi();
@@ -40,7 +40,6 @@ test("registered campaign start persists its effective timeout before the first 
       type: "input", source: "interactive", text: "Use Dream-RSI to improve the fixture score",
     }, context);
 
-    const snapshots = [];
     const resultPromise = harness.tools.get("dream_rsi_improve").execute("timeout-smoke", {
       action: "start",
       project_dir: project.projectDir,
@@ -51,6 +50,7 @@ test("registered campaign start persists its effective timeout before the first 
         eval_program: "solution.py",
         score_program: project.task.score_program,
         problem_file: "PROBLEM.md",
+        higher_is_better: true,
         agent_timeout_ms: 20_000,
         evaluator_timeout_ms: 600_000,
         agent_command: "node",
@@ -59,23 +59,18 @@ test("registered campaign start persists its effective timeout before the first 
       scope: ["solution.py"],
       verifier_inputs: ["score-ok.mjs"],
       max_cycles: 1,
-      max_agent_starts: 1,
-      max_evaluator_runs: 1,
-    }, undefined, (update) => snapshots.push(update), context);
+      max_agent_starts: 24,
+      max_evaluator_runs: 80,
+    }, undefined, undefined, context);
 
     const result = await resultPromise;
     const campaign = JSON.parse(fs.readFileSync(path.join(result.details.campaign.campaignRoot, "campaign.json"), "utf8"));
-    const baselineAnnouncement = snapshots.find((update) => /effective evaluator timeout: 300000ms/.test(update.content?.[0]?.text ?? ""));
-
-    assert.ok(baselineAnnouncement, "tool progress exposes the cap before baseline evaluation");
-    assert.equal(baselineAnnouncement.details.campaign.evaluatorRuns, 0, "the baseline announcement precedes the evaluator spawn");
-    assert.equal(baselineAnnouncement.details.runtime.evaluatorTimeoutCapMs, 300_000);
-    assert.match(baselineAnnouncement.content[0].text, /evaluator timeout cap: 300000ms/);
-    assert.equal(campaign.task.evaluator_timeout_ms, 300_000);
-    assert.equal(result.details.campaign.effectiveEvaluatorTimeoutMs, 300_000);
-    assert.equal(result.details.runtime.evaluatorTimeoutCapMs, 300_000);
-    assert.equal(result.details.campaign.evaluatorRuns, 1, "only the local fixture evaluator ran");
-    assert.equal(result.details.campaign.agentStarts, 1, "only the local fixture probe ran");
+    assert.equal(campaign.baselineScores.length, 5);
+    assert.equal(campaign.task.evaluator_timeout_ms, 600_000);
+    assert.equal(result.details.campaign.effectiveEvaluatorTimeoutMs, 600_000);
+    assert.equal(result.details.runtime.defaultEvaluatorTimeoutMs, 300_000);
+    assert.ok(result.details.campaign.evaluatorRuns >= 5, "five baseline measurements precede candidate evaluation");
+    assert.ok(result.details.campaign.agentStarts >= 1, "the local fixture campaign agent ran");
   } finally {
     project.cleanup();
   }
@@ -102,6 +97,7 @@ test("campaign status keeps lower evaluator timeouts intact", async () => {
         eval_program: "solution.py",
         score_program: project.task.score_program,
         problem_file: "PROBLEM.md",
+        higher_is_better: true,
         agent_timeout_ms: 20_000,
         evaluator_timeout_ms: 40_000,
         agent_command: "node",
@@ -110,8 +106,8 @@ test("campaign status keeps lower evaluator timeouts intact", async () => {
       scope: ["solution.py"],
       verifier_inputs: ["score-ok.mjs"],
       max_cycles: 1,
-      max_agent_starts: 1,
-      max_evaluator_runs: 1,
+      max_agent_starts: 24,
+      max_evaluator_runs: 80,
     }, undefined, undefined, context);
 
     assert.equal(result.details.campaign.effectiveEvaluatorTimeoutMs, 40_000);

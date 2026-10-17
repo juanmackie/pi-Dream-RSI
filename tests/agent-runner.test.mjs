@@ -10,6 +10,58 @@ import { EXT, jump } from "./fixtures.mjs";
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
 const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
+const { OutputDecoder } = await jump("agent/output.ts");
+
+test("pi JSON output decodes bounded usage and content-free tool evidence", () => {
+  const events = [];
+  const decoder = new OutputDecoder(true, (event) => events.push(event));
+  decoder.feed("stdout", `${JSON.stringify({ type: "message_end", message: { model: "provider/model", stopReason: "length", usage: { input: 4, output: 3, cacheRead: 2, cacheWrite: 1, totalTokens: 10 } } })}\n`);
+  decoder.feed("stdout", `${JSON.stringify({ type: "tool_execution_start", toolName: "edit", args: { path: "private/file", content: "SECRET" } })}\n`);
+  decoder.feed("stdout", `${JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: "verifier/private.ts" } })}\n`);
+  decoder.finish();
+  const usage = events.find((event) => event.kind === "usage");
+  assert.deepEqual(usage.usage, { input: 4, output: 3, cacheRead: 2, cacheWrite: 1, total: 10 });
+  assert.equal(usage.stopReason, "length");
+  assert.equal(events.filter((event) => event.edit).length, 1);
+  assert.equal(events.filter((event) => event.read).length, 1);
+  assert.doesNotMatch(JSON.stringify(events), /SECRET|verifier\/private|private\/file/);
+});
+
+test("verifier-read telemetry only matches explicitly protected paths", () => {
+  const input = `${JSON.stringify({ type: "tool_execution_start", toolName: "read", args: { path: "src/measure.ts" } })}\n`;
+  const ordinary = [];
+  new OutputDecoder(true, (event) => ordinary.push(event), { cwd: process.cwd() }).feed("stdout", input);
+  assert.equal(ordinary[0]?.verifierRead, false);
+  const protectedRead = [];
+  new OutputDecoder(true, (event) => protectedRead.push(event), { cwd: process.cwd(), protectedReadPaths: [path.join(process.cwd(), "src/measure.ts")] }).feed("stdout", input);
+  assert.equal(protectedRead[0]?.verifierRead, true);
+  assert.doesNotMatch(JSON.stringify(protectedRead), /src\\measure|measure\.ts/);
+});
+
+test("runAgent writes a bounded decoded log without raw tool arguments", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-compact-log-"));
+  try {
+    const script = path.join(dir, "emit.mjs");
+    const logPath = path.join(dir, "agent.log");
+    fs.writeFileSync(script, `console.log(JSON.stringify({type:"message_update",assistantMessageEvent:{type:"text_delta",delta:"${"x".repeat(60_000)}"}}));\nconsole.log(JSON.stringify({type:"tool_execution_start",toolName:"read",args:{path:"private/verifier-secret.md"}}));\n`);
+    const protectedPath = path.join(dir, "private", "verifier-secret.md");
+    const result = await runAgent({
+      agent: { command: process.execPath, args: [script, "--mode=json"], output_format: "pi-json", prompt_via: "stdin" },
+      cwd: dir, prompt: "emit telemetry", timeoutMs: 10_000, logPath, protectedReadPaths: [protectedPath],
+    });
+    assert.equal(result.ok, true, result.stderrTail);
+    const log = fs.readFileSync(logPath);
+    assert.ok(log.byteLength <= 50 * 1024);
+    assert.ok(log.toString("utf8").includes("x"));
+    assert.doesNotMatch(log.toString("utf8"), /verifier-secret|private/);
+    assert.equal(result.evidence?.verifierRead, true);
+    const ordinary = await runAgent({
+      agent: { command: process.execPath, args: [script, "--mode=json"], output_format: "pi-json", prompt_via: "stdin" },
+      cwd: dir, prompt: "emit telemetry", timeoutMs: 10_000, logPath: path.join(dir, "ordinary.log"),
+    });
+    assert.equal(ordinary.evidence?.verifierRead, false, "ordinary reads are not inferred to be verifier reads");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("the configured model is actually passed to attempts", () => {
   const base = { command: "pi", args: ["-p", "--no-session"], model: null, thinking: null, prompt_via: "stdin", output_format: "text" };
@@ -270,7 +322,7 @@ test("an npm-installed package runs its worker from the project, not from node_m
 });
 
 test("the scoring fingerprint follows the contract, not the budgets", () => {
-  const base = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const base = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs", higher_is_better: true });
   const budgetOnly = normalizeTask({ ...base, workers: 8, k1: 2, revisions: 5, default_beta: 0.2, max_loops: 4 });
   assert.equal(scoringFingerprint(base), scoringFingerprint(budgetOnly), "budgets never invalidate recorded scores");
   assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, higher_is_better: false })));
@@ -279,7 +331,7 @@ test("the scoring fingerprint follows the contract, not the budgets", () => {
 });
 
 test("a stored score that contradicts the current direction is recognized", () => {
-  const higher = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs" });
+  const higher = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs", higher_is_better: true });
   const lower = normalizeTask({ ...higher, higher_is_better: false });
   assert.equal(scoreMatchesDirection(higher, 79, 79), true);
   assert.equal(scoreMatchesDirection(higher, -79, 79), false);

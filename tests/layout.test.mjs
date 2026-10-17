@@ -23,7 +23,7 @@ test("the shipped package resolves its own prompts, skills and policy", async ()
   assert.ok(exists(path.join(layout.BUNDLED_POLICY_DIR, "api.ts")));
 
   const { loadPrompt } = await import(pathToFileURL(path.join(EXT, "engine", "prompt.ts")).href);
-  assert.match(loadPrompt("discovery-agent.md"), /read every historical proposal/);
+  assert.match(loadPrompt("discovery-agent.md"), /at most the three most/);
   assert.match(loadPrompt("policy-improvement.md"), /prefix-only exploration policy/);
   assert.throws(() => loadPrompt("nope.md"), /missing prompt template/);
 });
@@ -46,7 +46,7 @@ test("a relocated copy under .pi/extensions still finds its resources", async ()
     assert.ok(exists(path.join(layout.BUNDLED_POLICY_DIR, "method.ts")));
 
     const { loadPrompt } = await import(pathToFileURL(path.join(target, "extensions", "pi-dream-rsi", "engine", "prompt.ts")).href);
-    assert.match(loadPrompt("discovery-agent.md"), /read every historical proposal/);
+    assert.match(loadPrompt("discovery-agent.md"), /at most the three most/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

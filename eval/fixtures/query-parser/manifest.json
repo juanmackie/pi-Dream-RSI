@@ -1,0 +1,21 @@
+{
+  "name": "node-query-parser-acceptance",
+  "goal": "Increase correctly parsed query cases without changing repeated-key, empty-value, or key-storage semantics.",
+  "metric": "accepted training query cases (higher is better)",
+  "direction": "maximize",
+  "workspace": "workspace",
+  "scope_files": ["query.mjs"],
+  "candidate_program": "query.mjs",
+  "evaluator": "evaluate.mjs",
+  "gate": "gate.mjs",
+  "control_patch": "control.patch",
+  "verifier_inputs": ["evaluate.mjs", "gate.mjs", "control.patch"],
+  "evaluator_kind": "deterministic command",
+  "interpreter": "node",
+  "readiness": "ready",
+  "baseline_gate_passes": true,
+  "levers": [
+    { "goal": "Decode query keys and values while preserving repeated keys", "scope_files": ["query.mjs"], "metric": "accepted training query cases", "evaluator_kind": "command", "readiness": "ready" },
+    { "goal": "Reduce output size while preserving query semantics", "scope_files": ["query.mjs"], "metric": "accepted training query cases and bytes", "evaluator_kind": "command", "readiness": "needs_setup" }
+  ]
+}

@@ -4,3 +4,18 @@ node_modules/
 .DS_Store
 *.evals
 *eval
+!eval/
+eval/*
+!eval/bench.mjs
+!eval/scenarios.json
+!eval/purity.mjs
+!eval/self-score.mjs
+!eval/self-controller.mjs
+!eval/prompt-score.mjs
+!eval/controller.mjs
+!eval/tier2.mjs
+!eval/assess.mjs
+!eval/fixtures/
+
+# Local runtime state (lock files, in-progress markers)
+state/

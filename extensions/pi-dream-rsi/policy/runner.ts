@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 import { DiscoveryTree } from "../engine/tree.ts";
 import { ensureWorkerRuntime } from "../engine/world.ts";
 import type { Decision, ProbeFn } from "./host.ts";
-import type { Budget, CellId, EpisodeResult, GridPlan, GridPlanningContext, PolicyConfig } from "./api.ts";
+import type { Budget, CellId, EpisodeResult, PolicyConfig } from "./api.ts";
 
 const WORKER_PATH = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "worker", "policy-worker.ts");
 
@@ -47,7 +47,7 @@ const FORBIDDEN = [
 
 export interface PolicyRunOptions {
   policyPath: string;
-  mode: "grid" | "live" | "replay";
+  mode: "live" | "replay";
   maxParallelism: number;
   config?: Partial<PolicyConfig>;
   /** Live mode: executes one batch of generation-evaluation attempts. */
@@ -62,7 +62,6 @@ export interface PolicyRunOptions {
   baselineScore?: number | null;
   refineCount?: number;
   budget?: Budget | null;
-  gridPlanContext?: GridPlanningContext | null;
   verifyDeterminism?: boolean;
   timeoutMs?: number;
   workerPath?: string;
@@ -86,7 +85,6 @@ export interface PolicyRunResult {
   revealed?: number;
   trace?: Decision[];
   deterministic?: boolean | null;
-  plan?: GridPlan;
   durationMs?: number;
 }
 
@@ -222,7 +220,6 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
       refineCount: options.refineCount ?? 0,
       budget: options.budget ?? null,
       world: options.world ? options.world.toJSON() : null,
-      gridPlanContext: options.gridPlanContext ?? null,
     },
   });
 
@@ -284,10 +281,6 @@ export async function runPolicy(options: PolicyRunOptions): Promise<PolicyRunRes
         void pending.finally(() => probes.delete(pending));
         return;
       }
-      if (type === "grid-plan") {
-        finish({ ok: true, plan: message.plan as GridPlan, beta: Number(message.beta ?? 0) });
-        return;
-      }
       if (type === "result") {
         finish({
           ok: true,
@@ -326,12 +319,4 @@ export async function runPolicyChecked(options: PolicyRunOptions): Promise<Polic
   const deterministic =
     repeat.ok && JSON.stringify(first.trace ?? []) === JSON.stringify(repeat.trace ?? []);
   return { ...first, deterministic };
-}
-
-/** Convenience wrapper for the grid-planning phase. */
-export async function planGrid(
-  options: Omit<PolicyRunOptions, "mode"> & { gridPlanContext: GridPlanningContext },
-): Promise<{ ok: boolean; plan?: GridPlan; beta?: number; error?: string }> {
-  const run = await runPolicy({ ...options, mode: "grid" });
-  return run.ok && run.plan ? { ok: true, plan: run.plan, beta: run.beta } : { ok: false, error: run.error ?? "plan_grid failed" };
 }

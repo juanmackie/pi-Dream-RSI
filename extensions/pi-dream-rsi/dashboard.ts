@@ -48,20 +48,15 @@ function campaignDisplayMetadata(root: string, fallbackCycle: number, cycleCount
 
 function selectedRejections(root: string, iteration: number, cell: string): { stage: string; reasons: string[] }[] {
   if (!cell) return [];
-  const file = path.join(root, "history", "rejections.jsonl");
+  const file = path.join(root, "history", "ledger.jsonl");
   const { text } = readLogPage(file);
-  const cycles = progressIterations(root);
-  const metadata = campaignDisplayMetadata(root, iteration, cycles.length);
-  const allowUnscoped = cycles.length <= 1 && metadata.maxCycles <= 1 && iteration === 1 && metadata.completedCycles.length <= 1;
   const matches = text.split("\n").flatMap((line) => {
     try {
       const value: unknown = JSON.parse(line);
       if (typeof value !== "object" || value === null) return [];
-      const item = value as { cell?: unknown; stage?: unknown; reasons?: unknown; iteration?: unknown };
-      if (item.cell !== cell || typeof item.stage !== "string" || !Array.isArray(item.reasons)) return [];
-      if (typeof item.iteration === "number" ? item.iteration !== iteration : !allowUnscoped) return [];
-      const reasons = item.reasons.filter((reason): reason is string => typeof reason === "string");
-      return reasons.length > 0 ? [{ stage: item.stage, reasons }] : [];
+      const item = value as { kind?: unknown; outcome?: unknown; facts?: { cell?: unknown; terminalStage?: unknown; reason?: unknown; iteration?: unknown } };
+      if (item.kind !== "skip" || item.outcome !== "rejected" || item.facts?.cell !== cell || item.facts.iteration !== iteration || typeof item.facts.terminalStage !== "string" || typeof item.facts.reason !== "string") return [];
+      return [{ stage: item.facts.terminalStage, reasons: [item.facts.reason] }];
     } catch { return []; }
   });
   return matches.slice(-3);

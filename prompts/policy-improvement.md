@@ -8,17 +8,18 @@ The environment is a frozen, irregular branch x attempt grid. A policy opens a r
 cell of an already-open branch. Each revealed cell costs one probe. The policy sees only the cells it has
 revealed so far; unrevealed scores are unknown.
 
-The evaluator sweeps your single `beta` knob and ranks the resulting curve by:
+The host scores each frozen replay episode with:
 
 ```
-pareto.reward = pareto.auc - lambda * parallel_penalty
+V = max attainment - beta1 * probes + beta2 * probes / decision_rounds
 ```
 
-`pareto.auc` rewards reaching high per-trace attainment with few **total probes**. `parallel_penalty` is
-the mean of `effective_sequential_rounds / total_probes` over the sweep. For a batch of size `k` with
-`W = question.max_parallelism` workers, it costs one decision round and `ceil(k / W)` effective sequential
-rounds. A serial policy has penalty near 1; useful full batches approach `1/W`. Therefore choose only
-promising probes, but batch independent promising probes whenever possible.
+The host selects a policy revision by its mean `V` at that revision's baked-in beta. It also sweeps the
+configured beta grid and reports `pareto.reward = auc - lambda * parallel_penalty` as a diagnostic of the
+whole curve. `auc` rewards high per-trace attainment with fewer probes. `parallel_penalty` is the mean of
+`effective_sequential_rounds / total_probes`; a batch of size `k` with `W = question.max_parallelism`
+workers costs `ceil(k / W)` effective sequential rounds. Choose useful probes and batch independent
+promising probes when possible.
 
 A local implementation failure does not by itself prove that its parent direction is poor. Weigh recovery
 value against new roots and ordinary refinements while keeping batches parallel.
@@ -221,7 +222,7 @@ cell ids into policy logic.
 ## Deliverable
 
 Write a complete adaptive policy in `{method_file}`. Include a short module docstring describing its
-prefix signals, batch rule, beta schedule, default-beta rationale, grid-planning rule (if implemented),
+prefix signals, batch rule, beta schedule, default-beta rationale, grid-planning rule,
 and safeguards against over-pruning, over-stopping, permanent starvation after repairable failures, and
 serial probes. Before finishing, verify trajectory-based ranking, the stated success semantics,
 non-automatic zero-valid closure, deterministic recovery competition, and portfolio-level stop.

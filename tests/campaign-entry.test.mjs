@@ -35,7 +35,12 @@ let prompt = "";
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
   const secretPresent = existsSync(".dream-rsi/legacy-secret.txt");
-  appendFileSync(process.argv[2], JSON.stringify({ secretPresent, promptPrefix: prompt.slice(0, 35) }) + "\\n");
+  const role = /adversarial review/i.test(prompt) ? "review"
+    : prompt.includes("Do not change files.") ? "probe"
+      : prompt.includes("prefix-only exploration policy") ? "dream" : "live";
+  appendFileSync(process.argv[2], JSON.stringify({ secretPresent, promptPrefix: prompt.slice(0, 35), role,
+    candidateBrief: prompt.includes("Direction: maximize"), briefGoal: prompt.includes("Goal: Increase the score by adding valid x markers"),
+    briefMetric: prompt.includes("Metric: score"), briefScope: prompt.includes("Editable scope: solution.py"), briefBudget: prompt.includes("Time budget per attempt: 20 seconds") }) + "\\n");
   if (/adversarial review/i.test(prompt)) { writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] })); return; }
   if (prompt.includes("Do not change files.")) { process.stdout.write("I can inspect the target.\\n"); return; }
   if (prompt.includes("prefix-only exploration policy")) { process.stdout.write("Policy remains unchanged.\\n"); return; }
@@ -67,10 +72,6 @@ process.stdin.on("end", () => {
       fail_class_field: "fail_class",
       error_field: "error",
       higher_is_better: true,
-      workers: 2,
-      k1: 3,
-      k2: 4,
-      revisions: 2,
       beta_grid: [0, 0.6],
       default_beta: 0.6,
       agent_timeout_ms: 20_000,
@@ -107,6 +108,10 @@ process.stdin.on("end", () => {
     assert.ok(observations.length >= 3, "probe and campaign agents actually ran as local subprocesses");
     assert.ok(observations.every((entry) => entry.secretPresent === false),
       "the protected .dream-rsi verifier and legacy state are omitted from agent workspaces");
+    const livePrompts = observations.filter((entry) => entry.role === "live");
+    assert.ok(livePrompts.length > 0, "a candidate discovery attempt ran");
+    assert.ok(livePrompts.every((entry) => entry.candidateBrief && entry.briefGoal && entry.briefMetric && entry.briefScope && entry.briefBudget),
+      "every discovery attempt receives the runtime goal, metric, scope, and remaining time brief");
     assert.ok(fs.existsSync(verifier), "the original protected evaluator remains available to score candidates");
 
     const campaignProgressUpdates = updates.filter((update) => update.details?.progress?.project === result.details.campaign.campaignRoot);
@@ -161,6 +166,7 @@ test("campaign entry rejects an evaluator script that lives in the editable full
       workspace: ".",
       eval_program: "solution.py",
       score_program: `node "${project.script("score-ok.mjs")}"`,
+      higher_is_better: true,
       agent_command: "node",
       agent_args: [project.script("agent-ok.mjs")],
     };

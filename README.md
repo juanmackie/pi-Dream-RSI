@@ -24,6 +24,18 @@ Ask for an improvement in plain language. The improve skill assesses an unmeasur
 /dream-rsi improve "make the parser faster without changing its output"
 ```
 
+For unattended work on a repository the tool has never seen, run the loop with an approved run contract. It finds a measurable bottleneck itself, qualifies its own instrument, chains verified campaigns, checks every applied change independently, re-ranks against a fresh baseline, and stops on budget, deadline, plateau, blocked state, or no verifiable lever:
+
+```text
+/dream-rsi loop "reduce the benchmark duration by 25% without changing its output"
+```
+
+The contract is the one place the objective, permissions and spend are decided, and no autonomous step can widen it. It records the outcome and its units, the smallest change worth applying, the preserved gates, the editable roots and protected assets, trusted-local consent, the allowed command categories, the approved providers, and the durable budgets. See [running the autonomous loop](docs/autonomous-loop.md).
+
+Without a contract the loop keeps the earlier signal-driven path, which needs recorded evidence and a known-better control patch. With one, a metric is qualified from independent evidence instead: it must complete on the unchanged target, reproduce its own baseline, respond to a degraded control in the same measured operation, reject a workload that does not exist, and fail an inert version of the editable code at its declared correctness commands. A lever that cannot pass any of those checks is rejected with its reason.
+
+Trusted-local means trusted, not contained: discovered repository code runs as a host process with host access. Only point it at repositories you would run by hand. Loop budgets are durable and immutable: the caps you set stay in force across runs.
+
 Intake checks the evaluator before a campaign starts. It measures baseline noise, searches within fixed budgets, verifies paired before-and-after scores, runs correctness gates, and asks a separate agent to review each candidate before it applies a change. You can inspect the campaign while it runs:
 
 ```text
@@ -35,6 +47,14 @@ Intake checks the evaluator before a campaign starts. It measures baseline noise
 `/dream-rsi assess [intent]` ranks up to five possible improvements. Each lever names its mechanism, file scope, evidence, metric, evaluator, expected effect, readiness, and confidence. The `dream_rsi_signals` tool supplies bounded project evidence. The assess skill connects that evidence to code paths and measurable goals.
 
 `/dream-rsi improve <intent>` runs this assessment when the request does not already name a measurable goal. It continues only when intake can define a ready evaluator and correctness gate. If the evidence does not support a safe campaign, the skill returns the proposed levers for discussion.
+
+`/dream-rsi loop <intent>` uses the same evidence without stopping after one campaign. It scores levers with a UCB-style allocation from durable loop memory, synthesizes a pinned evaluator for scoped levers that have none, and runs one bounded campaign per step. Outcomes are recorded in `.dream-rsi/loop/memory.json` with their provenance; the durable spend lives in `.dream-rsi/loop/budget.json`. Applied patches stay uncommitted, and a plateau (three campaigns without a verified win) stops the loop with a Memento-style note for the next run.
+
+Tried levers are allocated by measured gain per confirmation run, so a large improvement that was expensive to confirm competes honestly with a small cheap one. Each win records the contract, instrument and baseline it was measured against; an experiment from another objective or instrument stays in history but does not steer the run.
+
+## Independent verification
+
+Every applied change is checked once more from outside the campaign: a fresh copy of the result, the declared correctness commands, and the same workload measured again against the baseline recorded before any candidate ran. A promoted change that does not clear the smallest useful change stops the run with `post-apply check failed` instead of becoming the next baseline.
 
 ## What it changes
 
@@ -52,9 +72,13 @@ Use `--no-logs` to skip all session-directory access. Git and evaluator summarie
 
 A campaign needs a numeric score and a correctness result. Its scorer must be fixed outside candidate-editable files, write the configured score JSON, and be declared with its data in `verifier_inputs`. Put the project's tests in the gate commands. Keep credentials and production systems out of candidate workspaces.
 
-The intake runs `dream_rsi_improve` with `action: "check"` before a campaign starts. Check uses fresh copies and reports evaluator or gate diagnoses without creating campaign history. Fix each diagnosis and check again before starting. When `minimum_gain` is omitted, Dream-RSI estimates measurement noise from repeated baseline scores and requires an improvement above that calibrated threshold.
+Every start checks the evaluator and unchanged-target gates before an agent runs. An optional `action: "check"` measures fresh copies without creating a campaign. Five baseline readings estimate noise and the smallest detectable effect. Checks report direction, resolved gain units, projected confirmation cost, and optional known-better control-patch evidence.
 
-Status also reports the loaded extension directory, campaign module, package version, and the 300,000 ms evaluator cap. If these do not match the checkout you expect, reload the extension before starting a campaign.
+Set `task.higher_is_better` explicitly. Use a number for absolute `minimum_gain`, or `"5%"` for a relative gain. Percentages require positive raw metric values. Omission tests for positive improvement above zero. Deterministic confirmation uses one exact pair; noisy confirmation alternates before/after order in ABBA blocks and can stop for futility. Live scores rank noisy candidates; confirmation decides whether they improve.
+
+The shipped [command evaluator](evaluators/measure.mjs) measures numeric stdout or elapsed time for any language. It discards warmups and writes the median, samples, and validity to `eval/score.json`. Pass `--mode=elapsed` or `--mode=stdout-number`, `--warmup=N`, `--repeats=N`, then `--` and the command with its arguments.
+
+Status reports the loaded extension directory, campaign module, package version, process counts, and ledger health. The default evaluator timeout is 300,000 ms; `task.evaluator_timeout_ms` can change it. Reload the extension if its loaded directory or version differs from the checkout you expect.
 
 ## Limits
 
@@ -65,8 +89,8 @@ Status also reports the loaded extension directory, campaign module, package ver
 | Evaluator starts, including pairs and gates | 100 |
 | Campaign deadline | 60 minutes |
 | Consecutive cycles without a verified gain | 2 |
-| Candidates verified per cycle | 3 deterministic, 2 noisy |
-| Evaluator timeout | 300 seconds |
+| Candidates verified per cycle | 2 |
+| Evaluator timeout | 300 seconds, configurable |
 
 - The score must measure the outcome you care about. A weak proxy rewards its blind spots.
 - Noisy or slow evaluators consume budget and can hide real changes. Stabilize the evaluator before running a campaign.
@@ -74,7 +98,23 @@ Status also reports the loaded extension directory, campaign module, package ver
 - Agent-generated code is untrusted. Gate it, review the diff, and keep the candidate away from secrets and production.
 - The campaign applies only in-scope files. It does not commit, open a pull request, or chain automatically to another lever.
 - The historical live and dream policy loop is not a 1.0 user command. Earlier `.dream-rsi/task.json` and `history/` data remain on disk and are not used by campaigns.
-- Paused campaigns from 0.8.x remain loadable. Resume uses their saved goal, scope, verifier identity, remaining budgets, and deadline.
+- New campaigns use the 2.0 intake contract. Start a new campaign when upgrading an older installation.
+
+## Experiment memory and self-improvement
+
+Campaigns append facts to `history/ledger.jsonl`: attempts, confirmation pairs, gates, reviews, applies, skips, and integrity events. A bounded digest of this project's history reaches later attempts. Status distinguishes timeouts, known no-edit attempts, duplicate patches, and applied wins.
+
+DreamBench evaluates the measurement engine with seeded synthetic instruments and exercises the controller with scripted agents. Scenarios cover noise, drift, boundary effects, wrong direction, no-ops, cheats, duplicate patches, and timed-out agents with valid edits. Results apply to the tested distributions and budgets, rather than every possible evaluator.
+
+See [running and evaluating self-improvement](docs/self-improvement.md) for the measurement self-target, held-out validation, size penalty, structural usage mining, and opt-in real-model fixtures.
+
+An unattended start accepts the same JSON payload as the tool:
+
+```text
+/dream-rsi start /absolute/path/to/intake.json
+```
+
+An OS scheduler can invoke `pi -p "/dream-rsi start /absolute/path/to/intake.json"`. This package does not install a scheduler.
 
 ## Watching
 
@@ -103,6 +143,12 @@ The extension contributes the `dream-rsi`, `dream-rsi-assess`, and `dream-rsi-im
 The paper's method improves an exploration policy by evaluating candidate policies against recorded search worlds. The repository still uses that policy runtime in its protected self-evaluator, but the 1.0 extension workflow exposes bounded project campaigns. See [the method and replay objective](docs/method.md) for the paper's online and replay phases, reward, and limits.
 
 The repository's fixed Mind2Web scorer remains documented in [the Mind2Web scorer guide](docs/mind2web-scorer.md). It is not run by the campaign setup script or by the test suite as a benchmark.
+
+## Documentation
+
+- [Running the autonomous loop](docs/autonomous-loop.md): the run contract, cold-start discovery, instrument qualification, whole-run budgets, independent verification, and optimizer generations.
+- [Measuring and evaluating self-improvement](docs/self-improvement.md): measurement targets, held-out validation, and real-model fixtures.
+- [The method and replay objective](docs/method.md): the paper's online and replay phases.
 
 ## Tests
 

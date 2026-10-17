@@ -43,6 +43,28 @@ process.exit(3);
 process.stdin.on("data", () => {});
 process.stdin.on("end", () => { setInterval(() => {}, 1000); });
 `,
+  "agent-scenario.mjs": `
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+let prompt = ""; process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  const scenario = process.env.DREAM_SCENARIO ?? "truewin";
+  if (/Perform an adversarial review/i.test(prompt)) {
+    const reject = scenario === "reviewReject";
+    writeFileSync("review.json", JSON.stringify({ verdict: reject ? "reject" : "accept", reasons: reject ? ["scripted review rejection"] : [] }));
+    return;
+  }
+  if (prompt.includes("Do not change files.")) { process.stdout.write("Ready to inspect the target.\\n"); return; }
+  if (prompt.includes("prefix-only exploration policy")) { process.stdout.write("Policy revision left unchanged.\\n"); return; }
+  const source = readFileSync("solution.py", "utf8");
+  if (scenario === "noop") { writeFileSync("proposal.md", "# No change\\n"); return; }
+  if (scenario === "regression") { writeFileSync("solution.py", "print('seed')\\n"); writeFileSync("proposal.md", "# Regression\\n"); return; }
+  if (scenario === "cheat") { writeFileSync("solution.py", source + "x # CHEAT\\n"); writeFileSync("proposal.md", "# Hidden-path change\\n"); return; }
+  if (scenario === "duplicate") { writeFileSync("solution.py", "x\\n"); writeFileSync("proposal.md", "# Same candidate\\n"); return; }
+  appendFileSync("solution.py", "x\\n");
+  writeFileSync("proposal.md", "# Add a valid marker\\n");
+  if (scenario === "timeout") setInterval(() => {}, 1000);
+});
+`,
   "score-ok.mjs": `
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 const src = readFileSync("solution.py", "utf8");
@@ -169,6 +191,7 @@ export function makeProject(options = {}) {
     eval_program: "solution.py",
     score_program: `node "${path.join(projectDir, options.scorer ?? "score-ok.mjs")}"`,
     problem_file: "PROBLEM.md",
+    higher_is_better: true,
     workers: 2,
     k1: 3,
     k2: 4,

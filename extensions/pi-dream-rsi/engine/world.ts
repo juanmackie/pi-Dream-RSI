@@ -94,6 +94,28 @@ export function deployedBetaPath(dreamRoot: string): string {
   return path.join(policyDir(dreamRoot), "deployed_beta.json");
 }
 
+/** Synchronous sleep; Atomics.wait with a timeout is allowed on the main thread. */
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * Rename with bounded retries for transient Windows refusals: another process (a reader, a
+ * scanner) can briefly hold the destination handle and fail the rename with EPERM, EACCES, or
+ * EBUSY. Anything else, and the last attempt, still throws.
+ */
+function renameAtomic(from: string, to: string): void {
+  for (let attempt = 0; ; attempt += 1) {
+    try { fs.renameSync(from, to); return; }
+    catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      const transient = code === "EPERM" || code === "EACCES" || code === "EBUSY";
+      if (!transient || attempt >= 3) throw error;
+      sleepSync(5 * (attempt + 1));
+    }
+  }
+}
+
 /** Write a file atomically (same directory, then rename), so a crash cannot leave a half-written policy. */
 export function writeFileAtomic(file: string, contents: string, durable = false): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -101,7 +123,7 @@ export function writeFileAtomic(file: string, contents: string, durable = false)
   try {
     fs.writeFileSync(tmp, contents, "utf8");
     if (durable) { const fd = fs.openSync(tmp, "r+"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
-    fs.renameSync(tmp, file);
+    renameAtomic(tmp, file);
     if (durable && process.platform !== "win32") { const fd = fs.openSync(path.dirname(file), "r"); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
   } finally { fs.rmSync(tmp, { force: true }); }
 }
@@ -297,7 +319,7 @@ export function listIterations(root: string): number[] {
   return [...found].sort((a, b) => a - b);
 }
 
-/** The most recent `count` manifests, oldest first — input for `plan_grid` and the beta rule. */
+/** The most recent `count` manifests, oldest first, for the beta rule. */
 export function recentManifests(root: string, count = 3): LiveCycleManifest[] {
   const iterations = listIterations(root).slice(-count);
   return iterations.map((i) => readManifest(root, i)).filter((m): m is LiveCycleManifest => m !== null);

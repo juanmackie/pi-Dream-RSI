@@ -8,7 +8,7 @@ import { promisify } from "node:util";
 import { execFile } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 
-import { collectSignals } from "../extensions/pi-dream-rsi/engine/signals.ts";
+import { collectSignals, discoverSessionProjects } from "../extensions/pi-dream-rsi/engine/signals.ts";
 
 const execFileAsync = promisify(execFile);
 const NOW = new Date("2026-10-15T00:00:00.000Z");
@@ -42,6 +42,21 @@ function toolResult(id, name, text, time, { isError = false, details } = {}) {
     message: { role: "toolResult", toolCallId: id, toolName: name, content: [{ type: "text", text }], isError, timestamp: time, details },
   };
 }
+
+test("session project discovery returns cwd roots in process without serializing them", () => {
+  const project = tempDir();
+  const other = tempDir();
+  const sessions = tempDir();
+  try {
+    writeSession(sessions, project, [], "one.jsonl");
+    writeSession(sessions, other, [], "two.jsonl");
+    assert.deepEqual(discoverSessionProjects(sessions, NOW).sort(), [fs.realpathSync(other), fs.realpathSync(project)].sort());
+  } finally {
+    fs.rmSync(project, { recursive: true, force: true });
+    fs.rmSync(other, { recursive: true, force: true });
+    fs.rmSync(sessions, { recursive: true, force: true });
+  }
+});
 
 test("session signals aggregate safe command heads, correlate edits, and redact private text", async () => {
   const projectDir = tempDir();
@@ -88,6 +103,32 @@ test("session signals aggregate safe command heads, correlate edits, and redact 
   }
 });
 
+test("session mining reports structural tool, retry, stop, compaction, model and Dream-RSI facts only", async () => {
+  const projectDir = tempDir();
+  const sessionDir = path.join(projectDir, "sessions");
+  const secret = "PRIVATE-ARGS-should-never-escape";
+  const calls = [];
+  for (let index = 0; index < 3; index += 1) {
+    const id = `retry-${index}`;
+    calls.push(toolEntry(id, "custom_tool", { payload: secret }, NOW.getTime() + index * 20));
+    calls.push(toolResult(id, "custom_tool", secret, NOW.getTime() + index * 20 + 10, { isError: true }));
+  }
+  const dream = toolEntry("dream", "dream_rsi_improve", { focus: secret }, NOW.getTime() + 100);
+  calls.push(dream, toolResult("dream", "dream_rsi_improve", secret, NOW.getTime() + 110));
+  calls.push({ type: "compaction", summary: secret });
+  calls.push({ type: "message", message: { role: "assistant", model: "provider/a", stopReason: "aborted", content: [] } });
+  calls.push({ type: "message", message: { role: "assistant", model: "provider/b", stopReason: "length", content: [] } });
+  writeSession(sessionDir, projectDir, calls);
+  try {
+    const result = await collectSignals({ projectDir, sessionDir, now: NOW });
+    const serialized = JSON.stringify(result);
+    for (const kind of ["session-tool-error", "repeated-tool-retry", "aborted-session", "session-compaction", "session-model-change", "dream-improve"])
+      assert.ok(result.weaknesses.some((item) => item.kind === kind), `${kind} signal is present`);
+    assert.doesNotMatch(serialized, /PRIVATE-ARGS-should-never-escape/);
+    assert.match(serialized, /at least three times/);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("PowerShell script text supplies the duration command head when command is absent", async () => {
   const projectDir = tempDir();
   const sessionDir = path.join(projectDir, "sessions");
@@ -100,6 +141,35 @@ test("PowerShell script text supplies the duration command head when command is 
     const duration = result.weaknesses.find((item) => item.kind === "slow-command");
     assert.equal(duration?.evidence[0]?.ref, "npm test");
     assert.match(duration?.summary ?? "", /4200 ms/);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("command weaknesses carry the files edited right after their failures as scope hints", async () => {
+  const projectDir = tempDir();
+  const sessionDir = path.join(projectDir, "sessions");
+  const t0 = NOW.getTime() - 30_000;
+  writeSession(sessionDir, projectDir, [
+    toolEntry("fail-1", "bash", { command: "npm test" }, t0),
+    toolResult("fail-1", "bash", "Error: command failed", t0 + 80, { isError: true }),
+    toolEntry("edit-1", "edit", { path: "src/parser.ts", edits: [{ oldText: "a", newText: "b" }] }, t0 + 120),
+    toolResult("edit-1", "edit", "edited", t0 + 160),
+    toolEntry("fail-2", "bash", { command: "git status" }, t0 + 200),
+    toolResult("fail-2", "bash", "Error: not a repository", t0 + 240, { isError: true }),
+    toolEntry("slow", "bash", { command: "npm test" }, t0 + 300),
+    toolResult("slow", "bash", "ok", t0 + 20_300, { details: { durationMs: 20_000 } }),
+  ]);
+  try {
+    const result = await collectSignals({ projectDir, sessionDir, now: NOW });
+    const failure = result.weaknesses.find((item) => item.kind === "session-failure" && item.evidence.some((evidence) => evidence.ref === "npm test"));
+    assert.deepEqual(failure?.scopeHints, ["src/parser.ts"], "the file edited after the failure becomes the command scope hint");
+    const slow = result.weaknesses.find((item) => item.kind === "slow-command");
+    assert.deepEqual(slow?.scopeHints, ["src/parser.ts"], "slow-command hints come from edits after the same head's failure");
+    const hinted = result.weaknesses.filter((item) => item.scopeHints !== undefined);
+    assert.equal(hinted.length, 2, "only the head with a recorded follow-up edit carries hints");
+    const item = result.weaknesses.find((w) => w.kind === "session-failure" && w.scopeHints);
+    assert.ok(item, "hints stay attached to the weakness for the inventory");
   } finally {
     fs.rmSync(projectDir, { recursive: true, force: true });
   }
@@ -338,5 +408,39 @@ test("crowded signal collections retain recurring session failures ahead of read
     assert.ok(result.weaknesses.length <= 10);
   } finally {
     fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("signals stay language-agnostic across build manifests and test runners", async () => {
+  const projectDir = tempDir();
+  const sessionDir = path.join(projectDir, "sessions");
+  try {
+    const commands = ["cargo test --locked", "cargo bench", "go test ./...", "mvn -q test", "gradle test", "dotnet test", "yarn test"];
+    const entries = commands.flatMap((command, index) => [
+      toolEntry(`head-${index}`, "bash", { command }, NOW.getTime() + index * 20),
+      toolResult(`head-${index}`, "bash", "failure", NOW.getTime() + index * 20 + 10, { isError: true }),
+    ]);
+    writeSession(sessionDir, projectDir, entries);
+    const result = await collectSignals({ projectDir, sessionDir, now: NOW });
+    const serialized = JSON.stringify(result);
+    for (const head of ["cargo test", "cargo benchmark", "go test", "maven test", "gradle test", "dotnet test", "npm test"]) {
+      assert.ok(result.weaknesses.some((item) => item.kind === "session-failure" && item.evidence.some((evidence) => evidence.ref === head)),
+        `${head} command head is preserved`);
+    }
+    assert.doesNotMatch(serialized, /cargo test --locked|go test \.\.\/\.\.\.|mvn -q/);
+  } finally {
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+  const manifestDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(manifestDir, "Cargo.toml"), '[package]\nname = "fixture"\n\n[[bench]]\nname = "parse"\nharness = false\n');
+    fs.writeFileSync(path.join(manifestDir, "go.mod"), "module example.invalid/fixture\n\ngo 1.22\n");
+    const result = await collectSignals({ projectDir: manifestDir, includeLogs: false, now: NOW });
+    assert.ok(result.weaknesses.some((item) => item.kind === "evaluator" && /test evaluator/.test(item.summary)),
+      "manifest-based test evaluators are reported without Node/Python specifics");
+    assert.ok(result.weaknesses.some((item) => item.kind === "evaluator" && /benchmark evaluator/.test(item.summary)),
+      "the Cargo bench manifest is reported as a benchmark target");
+  } finally {
+    fs.rmSync(manifestDir, { recursive: true, force: true });
   }
 });

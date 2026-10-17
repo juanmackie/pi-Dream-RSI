@@ -2,7 +2,10 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { pathToFileURL } from "node:url";
+import { countCodeTokens } from "../eval/purity.mjs";
 
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = path.resolve(SCRIPT_DIR, "..");
@@ -34,6 +37,7 @@ function moduleFiles(root, entries) {
       ? GENERATED.get(relative)
       : fs.readFileSync(absolute, "utf8");
     found.add(relative);
+    if (!/\.[cm]?[jt]sx?$/.test(relative)) continue;
     for (const match of source.matchAll(STATIC_SPECIFIER)) {
       const specifier = match[1] ?? match[2];
       if (!specifier.startsWith(".")) continue;
@@ -136,37 +140,145 @@ function quoted(value) {
   return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
-export function setupSelfCampaign(projectDir = PACKAGE_ROOT, sourceRoot = PACKAGE_ROOT) {
+export function setupSelfCampaign(projectDir = PACKAGE_ROOT, sourceRoot = PACKAGE_ROOT, options = {}) {
+  if (typeof options === "string") options = { target: options };
+  const target = options.target ?? "measure";
+  if (!["measure", "policy", "controller", "prompts"].includes(target)) throw new Error(`unsupported self-campaign target: ${target}`);
+  if (target === "prompts" && (!Number.isSafeInteger(options.tier2Budget) || options.tier2Budget < 1 || typeof options.tier2Model !== "string" || !options.tier2Model.trim() || typeof options.tier2Baseline !== "string")) {
+    throw new Error("prompts target requires --tier2-budget, --tier2-model and --tier2-baseline from an explicit real-model evaluation");
+  }
   const canonicalProject = fs.realpathSync(projectDir);
   const canonicalSource = fs.realpathSync(sourceRoot);
+  for (const key of [".auto/controller-config.json", ".auto/prompts-config.json"]) GENERATED.delete(key);
+  if (target === "controller") {
+    const relative = "extensions/pi-dream-rsi/engine/campaign.ts";
+    GENERATED.set(".auto/controller-config.json", `${JSON.stringify({ candidate_path: relative, baseline_sha256: sha256(fs.readFileSync(path.join(canonicalSource, relative))) })}\n`);
+  }
+  if (target === "prompts") {
+    const report = JSON.parse(fs.readFileSync(path.resolve(options.tier2Baseline), "utf8"));
+    if (report.model !== options.tier2Model || !report.promptHashes || !report.rates) throw new Error("Tier2 baseline must contain its model, promptHashes, and measured rates");
+    for (const name of ["discovery-agent.md", "policy-improvement.md", "adversarial-review.md"]) {
+      if (report.promptHashes[name] !== sha256(fs.readFileSync(path.join(canonicalProject, "prompts", name)))) throw new Error(`Tier2 baseline does not describe the current prompt: ${name}`);
+    }
+    for (const key of ["meanWinRate", "proposalRate", "editRate", "timeoutRate"]) if (!Number.isFinite(report.rates[key]) || report.rates[key] < 0 || report.rates[key] > 1) throw new Error(`Tier2 baseline has an invalid ${key}`);
+    const availableFixtures = fs.readdirSync(path.join(canonicalSource, "eval", "fixtures"), { withFileTypes: true }).filter((entry) => entry.isDirectory()).map((entry) => entry.name).sort();
+    const selectedFixtures = report.selectedFixtures ?? availableFixtures;
+    if (!Array.isArray(selectedFixtures) || selectedFixtures.length === 0 || selectedFixtures.some((name) => typeof name !== "string" || !name.trim()) || new Set(selectedFixtures).size !== selectedFixtures.length) {
+      throw new Error("Tier2 baseline selectedFixtures must be a non-empty list of unique fixture names");
+    }
+    const unknownFixtures = selectedFixtures.filter((name) => !availableFixtures.includes(name));
+    if (unknownFixtures.length) throw new Error(`Tier2 baseline names unknown fixture(s): ${unknownFixtures.join(", ")}`);
+    GENERATED.set(".auto/prompts-config.json", `${JSON.stringify({ model: options.tier2Model, total_agent_budget: options.tier2Budget,
+      budget_file: path.join(canonicalProject, ".dream-rsi", "self-improvement", "prompt-budget.json"), baseline: report.rates,
+      baselinePromptHashes: report.promptHashes, fixtureRoot: "eval/fixtures", fixtures: selectedFixtures })}\n`);
+  }
+  if (target === "measure") {
+    const baselinePath = path.join(canonicalSource, "extensions", "pi-dream-rsi", "engine", "measure.ts");
+    const baseline = fs.readFileSync(baselinePath);
+    const typeScriptPath = createRequire(path.join(canonicalSource, "package.json")).resolve("typescript");
+    const puritySource = fs.readFileSync(path.join(canonicalSource, "eval", "purity.mjs"), "utf8");
+    const rewrittenPurity = puritySource.replace('import ts from "typescript";', `import ts from ${JSON.stringify(pathToFileURL(typeScriptPath).href)};`);
+    if (rewrittenPurity === puritySource) throw new Error("purity verifier no longer has its expected TypeScript parser import");
+    GENERATED.set("eval/purity.mjs", rewrittenPurity);
+    GENERATED.set(".auto/measure-config.json", `${JSON.stringify({ version: 1,
+      baseline_sha256: sha256(baseline), baseline_tokens: countCodeTokens(baseline.toString("utf8")),
+      candidate_path: "extensions/pi-dream-rsi/engine/measure.ts", alpha: 0.01,
+      heldout_tolerance: 0.005, bloat_penalty: 0.01, bloat_token_unit: 50,
+    }, null, 2)}\n`);
+  } else {
+    GENERATED.delete(".auto/measure-config.json");
+    GENERATED.delete("eval/purity.mjs");
+  }
   const files = verifierInputs(canonicalSource);
+  let testGate;
+  if (fs.existsSync(path.join(canonicalSource, "tests"))) {
+    const kit = [];
+    const capture = (relative) => {
+      const absolute = path.join(canonicalSource, relative);
+      if (!fs.existsSync(absolute)) return;
+      const stat = fs.lstatSync(absolute);
+      if (stat.isDirectory()) for (const entry of fs.readdirSync(absolute)) capture(`${relative}/${entry}`);
+      else if (stat.isFile() && /\.(?:[cm]?[jt]sx?|json|md|py|sh|patch)$/.test(relative)) {
+        const bytes = fs.readFileSync(absolute);
+        kit.push(relative);
+        files.push({ relative: `test-kit/${relative}`, bytes, sha256: sha256(bytes) });
+      }
+    };
+    for (const relative of ["tests", "scripts", "eval", "adapter", ".auto", "package.json", "package-lock.json", "tsconfig.json"]) capture(relative);
+    const script = `import fs from "node:fs"; import path from "node:path"; import {fileURLToPath} from "node:url"; import {spawnSync} from "node:child_process";
+const root=path.resolve(path.dirname(fileURLToPath(import.meta.url)),"..");
+const workspace=fs.realpathSync(process.cwd());
+for(const relative of ${JSON.stringify(kit)}) { const destination=path.resolve(workspace,relative); if(!destination.startsWith(workspace+path.sep))throw new Error("test kit path escapes gate workspace"); fs.mkdirSync(path.dirname(destination),{recursive:true}); fs.copyFileSync(path.join(root,"test-kit",relative),destination); }
+const result=spawnSync("npm",["test"],{cwd:workspace,stdio:"inherit",shell:process.platform==="win32",windowsHide:true});
+if(result.error)throw result.error;process.exitCode=result.status??1;
+`;
+    const bytes = Buffer.from(script);
+    files.push({ relative: ".auto/test-gate.mjs", bytes, sha256: sha256(bytes) });
+    testGate = ".auto/test-gate.mjs";
+  }
+  if (target === "controller" || target === "prompts") {
+    const entries = target === "controller" ? ["eval/self-controller.mjs", "eval/controller.mjs", "docs/controller-problem.md", "extensions/pi-dream-rsi/engine/campaign.ts"]
+      : ["eval/prompt-score.mjs", "eval/tier2.mjs", "eval/controller.mjs", "prompts/discovery-agent.md", "prompts/policy-improvement.md", "prompts/adversarial-review.md"];
+    const extras = moduleFiles(canonicalSource, entries);
+    const fixtureFiles = (dir) => fs.readdirSync(path.join(canonicalSource, dir), { withFileTypes: true }).flatMap((entry) => entry.isDirectory() ? fixtureFiles(`${dir}/${entry.name}`) : entry.isFile() ? [`${dir}/${entry.name}`] : []);
+    if (target === "prompts") for (const file of fixtureFiles("eval/fixtures")) extras.add(file);
+    for (const relative of extras) if (!files.some((file) => file.relative === relative)) {
+      const bytes = fs.readFileSync(path.join(canonicalSource, relative));
+      files.push({ relative, bytes, sha256: sha256(bytes) });
+    }
+    files.sort((a, b) => a.relative.localeCompare(b.relative));
+  }
+  if (target === "measure") {
+    for (const relative of ["eval/self-score.mjs", "eval/purity.mjs", "eval/bench.mjs", "eval/scenarios.json", "docs/measure-problem.md", "extensions/pi-dream-rsi/engine/measure.ts", ".auto/measure-config.json"]) {
+      if (!fs.existsSync(path.join(canonicalSource, ...relative.split("/"))) && !GENERATED.has(relative)) throw new Error(`required measure verifier input is missing: ${relative}`);
+      files.push({ relative, bytes: GENERATED.has(relative) ? Buffer.from(GENERATED.get(relative), "utf8") : fs.readFileSync(path.join(canonicalSource, ...relative.split("/"))),
+        sha256: sha256(GENERATED.has(relative) ? Buffer.from(GENERATED.get(relative), "utf8") : fs.readFileSync(path.join(canonicalSource, ...relative.split("/")))) });
+    }
+    const unique = new Map(files.map((file) => [file.relative, file]));
+    files.splice(0, files.length, ...[...unique.values()].sort((a, b) => a.relative.localeCompare(b.relative)));
+    if (options.scenarioConfig !== undefined) {
+      const scenarios = Buffer.from(`${JSON.stringify(options.scenarioConfig, null, 2)}\n`, "utf8");
+      const scenarioFile = files.find((file) => file.relative === "eval/scenarios.json");
+      if (!scenarioFile) throw new Error("measure scenario verifier input is missing");
+      scenarioFile.bytes = scenarios;
+      scenarioFile.sha256 = sha256(scenarios);
+    }
+  }
+  files.sort((a, b) => a.relative.localeCompare(b.relative));
   const hash = snapshotHash(files);
   const verifierRoot = path.join(canonicalProject, ".dream-rsi", "verifier", hash);
   if (fs.existsSync(verifierRoot)) verifyExisting(verifierRoot, files, hash);
   else writeSnapshot(verifierRoot, files, hash);
 
   const baseRoot = path.join(canonicalProject, ".dream-rsi");
-  const scorer = path.join(verifierRoot, ".auto", "score.mjs");
+  const scorer = path.join(verifierRoot, target === "measure" ? "eval/self-score.mjs" : target === "controller" ? "eval/self-controller.mjs" : target === "prompts" ? "eval/prompt-score.mjs" : ".auto/score.mjs");
   const gate = path.join(verifierRoot, ".auto", "policy-gate.mjs");
   const snapshotFiles = files.map(({ relative }) => path.join(verifierRoot, ...relative.split("/")));
-  const candidatePath = "extensions/pi-dream-rsi/policy/method.ts";
+  const correctnessGate = testGate ? `node ${quoted(path.join(verifierRoot, testGate))}` : "npm test";
+  const candidatePath = target === "measure" ? "extensions/pi-dream-rsi/engine/measure.ts"
+    : target === "controller" ? "extensions/pi-dream-rsi/engine/campaign.ts" : target === "prompts" ? "prompts/discovery-agent.md" : "extensions/pi-dream-rsi/policy/method.ts";
   const intake = {
     action: "start",
-    goal: "Improve exploration-policy replay score while preserving determinism and the policy contract.",
+    goal: target === "measure" ? "Improve statistical measurement and confirmation decisions while preserving validity and false-accept controls."
+      : target === "controller" ? "Improve campaign selection and budget control against the candidate-backed campaign scenarios."
+        : target === "prompts" ? "Improve agent proposal, edit, timeout and verified-win rates across protected real-model fixture repositories."
+        : "Improve exploration-policy replay score while preserving determinism and the policy contract.",
     project_dir: canonicalProject,
     task: {
-      name: "Dream-RSI exploration policy",
+      name: target === "measure" ? "Dream-RSI measurement decisions" : target === "controller" ? "Dream-RSI campaign controller" : "Dream-RSI exploration policy",
       workspace: ".",
       eval_program: candidatePath,
-      score_program: `node ${quoted(scorer)} --benchmark-version=2`,
-      problem_file: path.relative(canonicalProject, path.join(verifierRoot, PROBLEM)),
-      evaluator_timeout_ms: 300_000,
+      score_program: target === "policy" ? `node ${quoted(scorer)} --benchmark-version=2` : `node ${quoted(scorer)}`,
+      higher_is_better: true,
+      problem_file: target === "measure" ? path.relative(canonicalProject, path.join(verifierRoot, "docs/measure-problem.md")) : target === "controller" ? path.relative(canonicalProject, path.join(verifierRoot, "docs/controller-problem.md")) : path.relative(canonicalProject, path.join(verifierRoot, PROBLEM)),
+      evaluator_timeout_ms: target === "policy" ? 300_000 : 600_000,
       agent_timeout_ms: 300_000,
       copy_exclude: ["node_modules"],
     },
-    scope: [candidatePath],
+    scope: target === "prompts" ? ["prompts/discovery-agent.md", "prompts/policy-improvement.md", "prompts/adversarial-review.md"] : [candidatePath],
     verifier_inputs: [...snapshotFiles, path.join(verifierRoot, "snapshot.json")],
-    gates: [`node ${quoted(gate)} ${candidatePath}`, "npm test"],
+    gates: target === "measure" ? [`node ${quoted(path.join(verifierRoot, "eval/purity.mjs"))} ${candidatePath}`, correctnessGate]
+      : target === "policy" ? [`node ${quoted(gate)} ${candidatePath}`, correctnessGate] : ["npm run typecheck", correctnessGate],
     minimum_gain: undefined,
   };
   const intakePath = path.join(baseRoot, `self-campaign-${hash}.json`);
@@ -181,7 +293,14 @@ export function setupSelfCampaign(projectDir = PACKAGE_ROOT, sourceRoot = PACKAG
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const result = setupSelfCampaign(process.argv[2] ? path.resolve(process.argv[2]) : PACKAGE_ROOT);
+    const args = process.argv.slice(2);
+    const project = args.find((arg) => !arg.startsWith("--"));
+    const options = Object.fromEntries(args.filter((arg) => arg.startsWith("--")).map((arg) => {
+      const [key, ...rest] = arg.slice(2).split("=");
+      return [key.replaceAll(/-([a-z])/g, (_, letter) => letter.toUpperCase()), rest.join("=") || true];
+    }));
+    if (options.tier2Budget) options.tier2Budget = Number(options.tier2Budget);
+    const result = setupSelfCampaign(project ? path.resolve(project) : PACKAGE_ROOT, PACKAGE_ROOT, options);
     console.log(JSON.stringify({ snapshot: result.verifierRoot, hash: result.hash, intake: result.intakePath }, null, 2));
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));

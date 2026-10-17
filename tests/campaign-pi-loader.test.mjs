@@ -12,7 +12,7 @@ import { EXT, REPO } from "./fixtures.mjs";
 const smokeScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "campaign-pi-loader-smoke.mjs");
 const execFileAsync = promisify(execFile);
 
-test("Pi's extension loader reports the loaded source and applies the campaign timeout cap", async () => {
+test("Pi's extension loader reports the loaded source and preserves the requested evaluator timeout", async () => {
   const isolatedAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-pi-loader-"));
   try {
     let child;
@@ -38,14 +38,16 @@ test("Pi's extension loader reports the loaded source and applies the campaign t
     assert.equal(smoke.status.campaign, null);
     assert.equal(smoke.status.runtime.extensionDir, EXT);
     assert.equal(smoke.status.runtime.packageDir, expectedPackageDir);
-    assert.equal(smoke.status.runtime.evaluatorTimeoutCapMs, 300_000);
+    assert.equal(smoke.status.runtime.defaultEvaluatorTimeoutMs, 300_000);
     assert.match(smoke.status.runtime.campaignModule.replaceAll("\\", "/"), /extensions\/pi-dream-rsi\/engine\/campaign\.ts$/);
-    assert.equal(smoke.persistedTimeoutMs, 300_000);
-    assert.equal(smoke.start.campaign.effectiveEvaluatorTimeoutMs, 300_000);
-    assert.equal(smoke.baselineEvaluatorRuns, 0, "the reported timeout precedes the local baseline scorer");
-    assert.equal(smoke.baselineRuntime.evaluatorTimeoutCapMs, 300_000);
-    assert.equal(smoke.start.campaign.evaluatorRuns, 1, "the smoke runs only the local fixture scorer");
-    assert.equal(smoke.start.campaign.agentStarts, 1, "the smoke runs only the local fixture probe");
+    assert.equal(smoke.persistedTimeoutMs, 600_000);
+    assert.equal(smoke.start.campaign.effectiveEvaluatorTimeoutMs, 600_000);
+    assert.ok(smoke.baselineEvaluatorRuns >= 5, "the startup snapshot includes the completed five-score baseline");
+    assert.equal(smoke.baselineScoreCount, 5);
+    assert.equal(smoke.baselineRuntime.defaultEvaluatorTimeoutMs, 300_000);
+    assert.ok(smoke.start.campaign.evaluatorRuns >= 5, "baseline and subsequent verification scores are recorded");
+    assert.ok(smoke.start.campaign.agentStarts >= 1, "the smoke runs local campaign agents after the baseline");
+    assert.equal(smoke.agentStartsAtBaseline, 0, "baseline scoring begins before any agent runs");
   } finally {
     fs.rmSync(isolatedAgentDir, { recursive: true, force: true });
   }

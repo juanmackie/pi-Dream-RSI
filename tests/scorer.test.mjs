@@ -101,11 +101,10 @@ test("forged policy result numbers never contribute to the score", async () => {
   } finally { fixture.cleanup(); }
 });
 
-test("syntax, guardrail, grid and illegal-batch failures invalidate the entire evaluation", async () => {
+test("syntax, guardrail and illegal-batch failures invalidate the entire evaluation", async () => {
   const sources = [
     "export class OptimalPolicy extends {",
     IDLE + '\nimport * as fs from "node:fs";\n',
-    IDLE.replace("default_beta = 0.6;", "default_beta = 0.6; plan_grid() { return { branch_count: NaN, refine_count: 2 }; }"),
     IDLE.replace("return finalize_result(question);", 'await question.probe_batch(["b0a0", "b0a0"]); return finalize_result(question);'),
     // The first world passes; failure on the breadth world must discard the earlier quality.
     IDLE.replace("return finalize_result(question);",

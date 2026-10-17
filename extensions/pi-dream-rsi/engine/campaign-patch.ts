@@ -1,6 +1,7 @@
 /** Complete, scope-limited candidate verification and recoverable target promotion. */
 
 import * as crypto from "node:crypto";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -8,6 +9,7 @@ import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/run
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import type { ApplyVerification } from "./apply.ts";
 import type { TaskConfig } from "./task.ts";
+import { runPaired, type MeasurementPlan } from "./measure.ts";
 
 export interface CandidateWrite {
   kind: "write";
@@ -52,6 +54,19 @@ export interface GateRun {
 
 const RESERVED = new Set([".git", ".dream-rsi"]);
 
+/**
+ * Ephemeral artifacts that test runners and build tools create in a workspace after an
+ * evaluation: bytecode caches, test-runner state, dependency trees, virtual environments
+ * and build output. They are never candidate changes, so the difference walk ignores them
+ * at any depth. Without this skip, a runner that writes its cache (pytest, coverage, a
+ * compiler) turns every candidate into an out-of-scope change.
+ */
+const EPHEMERAL = new Set([
+  "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".pytype", ".tox", ".nox",
+  "node_modules", ".venv", "venv", ".cache", ".gradle", "target", ".turbo", ".parcel-cache",
+  ".vite", ".next", ".nuxt", ".svelte-kit", ".angular", ".output", ".coverage", "htmlcov", ".nyc_output",
+]);
+
 function digest(data: Buffer | string): string {
   return crypto.createHash("sha256").update(data).digest("hex");
 }
@@ -94,14 +109,52 @@ function ensureDirectoryRoot(root: string): string {
 
 interface FileEntry { hash: string; lines: number; mode: number; absolute: string }
 
-function treeFiles(rootInput: string, excluded: string[] = []): Map<string, FileEntry> {
+/**
+ * Cache-like paths that must stay candidate-visible, compared as repository-relative paths,
+ * directories and files alike. A path the repository tracks is repository content: `treeFiles`
+ * keeps it visible, and this walk descends into a visible cache directory so nested cache
+ * paths are registered too — an agent edit or a review-window change inside tracked content
+ * cannot escape the patch and the scope check. A cache-shaped path without tracked files was
+ * created by runner activity and stays skipped. Without git evidence a present path counts as
+ * repository content, which is the safe direction for the scope check.
+ */
+function visibleCachePaths(rootInput: string, repoRoot?: string): Set<string> {
+  const root = ensureDirectoryRoot(rootInput);
+  const visible = new Set<string>();
+  const walk = (directory: string, prefix: string): void => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const lower = entry.name.toLowerCase();
+      if (RESERVED.has(lower)) continue;
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (EPHEMERAL.has(lower)) {
+        if (repoRoot && gitTracksPath(repoRoot, relative) === false) continue;
+        visible.add(process.platform === "win32" ? relative.toLowerCase() : relative);
+      }
+      if (entry.isDirectory()) walk(path.join(directory, entry.name), relative);
+    }
+  };
+  walk(root, "");
+  return visible;
+}
+
+/** null when git evidence is unavailable; false when the path holds no tracked files. */
+function gitTracksPath(repoRoot: string, relative: string): boolean | null {
+  const result = spawnSync("git", ["-C", repoRoot, "--literal-pathspecs", "ls-files", "-z", "--", relative],
+    { encoding: "buffer", windowsHide: true, maxBuffer: 4 * 1024 * 1024 });
+  if (result.error || result.status !== 0) return null;
+  return result.stdout.length > 0;
+}
+
+function treeFiles(rootInput: string, excluded: string[] = [], visibleEphemeral: Set<string> = new Set()): Map<string, FileEntry> {
   const root = ensureDirectoryRoot(rootInput);
   const files = new Map<string, FileEntry>();
   const walk = (directory: string, prefix: string): void => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-      if (RESERVED.has(entry.name.toLowerCase())) continue;
+      const lower = entry.name.toLowerCase();
+      if (RESERVED.has(lower)) continue;
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
       const comparedRelative = process.platform === "win32" ? relative.toLowerCase() : relative;
+      if (EPHEMERAL.has(lower) && !visibleEphemeral.has(comparedRelative)) continue;
       if (excluded.some((item) => {
         const comparedItem = process.platform === "win32" ? item.toLowerCase() : item;
         return comparedRelative === comparedItem || comparedRelative.startsWith(`${comparedItem}/`);
@@ -141,9 +194,10 @@ export function buildCandidatePatch(options: {
   const candidateRoot = ensureDirectoryRoot(options.candidateRoot);
   const scopes = normalizeScopes(options.scope);
   const excluded = normalizeScopes(options.exclude) ?? [];
-  const seed = treeFiles(seedRoot, excluded);
-  treeFiles(targetRoot); // fail closed on symlinks and unsupported filesystem entries in the target
-  const candidate = treeFiles(candidateRoot, excluded);
+  const visibleEphemeral = visibleCachePaths(seedRoot, targetRoot);
+  const seed = treeFiles(seedRoot, excluded, visibleEphemeral);
+  treeFiles(targetRoot, excluded, visibleEphemeral);
+  const candidate = treeFiles(candidateRoot, excluded, visibleEphemeral);
   const relatives = [...new Set([...seed.keys(), ...candidate.keys()])].sort((a, b) => a.localeCompare(b));
   const patch: CandidatePatch[] = [];
   for (const relative of relatives) {
@@ -165,6 +219,31 @@ export function buildCandidatePatch(options: {
 
 function desiredHash(operation: CandidatePatch): string | null {
   return operation.kind === "write" ? operation.afterHash : null;
+}
+
+/**
+ * Fingerprint of every candidate-visible file under a root: relative path,
+ * content hash, and mode. The campaign takes it around candidate review so
+ * drift outside the re-verified paths is detected before a patch is applied.
+ * Cache visibility is anchored to the cycle seed, exactly as in
+ * `buildCandidatePatch`, and excluded generated artifacts do not participate.
+ */
+export function workspaceDigest(options: { root: string; cycleSeedRoot?: string; repoRoot?: string; exclude?: string[] }): string {
+  const root = ensureDirectoryRoot(options.root);
+  const excluded = normalizeScopes(options.exclude) ?? [];
+  const anchor = ensureDirectoryRoot(options.cycleSeedRoot ?? root);
+  const files = treeFiles(root, excluded, visibleCachePaths(anchor, options.repoRoot));
+  const entries = [...files.entries()]
+    .map(([relative, entry]) => `${process.platform === "win32" ? relative.toLowerCase() : relative}\u0000${entry.hash}\u0000${entry.mode}`)
+    .sort((a, b) => a.localeCompare(b));
+  return digest(JSON.stringify(entries));
+}
+
+export class WorkspaceDriftDuringApplyError extends Error {
+  constructor() {
+    super("target workspace changed immediately before or during promotion outside the re-verified patch paths");
+    this.name = "WorkspaceDriftDuringApplyError";
+  }
 }
 
 function fileHashOrNull(file: string, root: string): string | null {
@@ -335,6 +414,7 @@ export async function verifyCandidatePatch(options: {
   repeats?: 1 | 3;
   minimumGain?: number;
   requireValidBeforeAfter?: boolean;
+  measurementPlan?: MeasurementPlan;
 }): Promise<CandidatePatchVerification> {
   const { dreamRoot, projectDir, task, patch, evidenceDir, signal, beforeSpawn } = options;
   const targetRoot = path.resolve(projectDir, task.workspace);
@@ -343,6 +423,60 @@ export async function verifyCandidatePatch(options: {
   const scratchBase = path.join(evidenceDir, `candidate-${process.pid}-${Date.now()}`);
   const stop = (): void => { if (signal?.aborted) throw new Error("candidate verification was cancelled"); };
   stop();
+  if (options.measurementPlan) {
+    const outcomes = new Map<string, ScoreOutcome>();
+    const measured = await runPaired({
+      plan: options.measurementPlan,
+      higherIsBetter: task.higher_is_better,
+      instrument: async ({ condition, pair, order, baseline }) => {
+        stop();
+        const outcome = await scoreCopy({
+          sourceRoot: targetRoot,
+          scratch: `${scratchBase}-${baseline ? `baseline${order}` : `pair${pair}-${condition}`}`,
+          task,
+          dreamRoot,
+          logPath: path.join(evidenceDir, `measure-${order}-${condition}.log`),
+          signal,
+          beforeSpawn,
+          evaluatorKey: `candidate-${baseline ? "baseline" : condition}:pair${pair}`,
+          ...(condition === "after" ? { patch } : {}),
+        });
+        outcomes.set(`${baseline ? "baseline" : `pair${pair}`}:${condition}:${order}`, outcome);
+        return { valid: validScore(outcome), value: typeof outcome.raw_score === "number" ? outcome.raw_score : outcome.score ?? Number.NaN };
+      },
+    });
+    const pairs: CandidateVerificationPair[] = measured.pairs.map((entry, index) => {
+      const find = (condition: "before" | "after"): ScoreOutcome => {
+        const value = [...outcomes.entries()].find(([key]) => key.startsWith(`pair${index}:${condition}:`))?.[1];
+        if (!value) throw new Error(`measurement outcome missing for pair ${index} ${condition}`);
+        return value;
+      };
+      const before = find("before");
+      const after = find("after");
+      const rawGain = validScore(before) && validScore(after) && typeof before.raw_score === "number" && typeof after.raw_score === "number"
+        ? (task.higher_is_better ? after.raw_score - before.raw_score : before.raw_score - after.raw_score)
+        : null;
+      return { before, after, gain: entry.gain, rawGain };
+    });
+    const medianPairedGain = median(pairs.map((pair) => pair.gain).filter((gain): gain is number => gain !== null));
+    const medianAfter = median(pairs.map((pair) => pair.after).filter(validScore).map((score) => score.score));
+    const medianAfterRaw = median(pairs.map((pair) => pair.after).filter(validScore).flatMap((score) => typeof score.raw_score === "number" ? [score.raw_score] : []));
+    const first = pairs[0];
+    const last = pairs.at(-1);
+    const baselineOutcome = [...outcomes.entries()].find(([key]) => key.startsWith("baseline:before:"))?.[1];
+    const before = first?.before ?? baselineOutcome ?? { score: null, raw_score: null, valid: false, fail_class: "invalid", error: "no baseline score" };
+    const after = last?.after ?? before;
+    return {
+      before,
+      after: { ...after, score: medianAfter, raw_score: medianAfterRaw },
+      improved: measured.decision.decision === "accept",
+      reason: measured.decision.decision === "accept" ? null : measured.decision.reason,
+      pairs,
+      medianPairedGain,
+      medianAfter,
+      medianAfterRaw,
+    };
+  }
   const expectedPairs = options.repeats ?? 1;
   const minimumGain = options.minimumGain ?? 0;
   const pairs: CandidateVerificationPair[] = [];
@@ -392,6 +526,26 @@ export async function verifyCandidatePatch(options: {
 
 interface JournalEntry { relative: string; to: string; kind: CandidatePatch["kind"]; beforeHash: string | null; afterHash: string | null; beforeMode: number | null; beforeIdentity: string | null; afterIdentity: string | null; backup: string | null; tombstone: string | null; untouched: boolean; from?: string; }
 interface PatchJournal { transactionId: string; seedRoot: string; patchHash: string; state: "prepared" | "applied" | "rolled_back"; written: string[]; backupDir: string; entries: JournalEntry[]; }
+
+function entryExists(file: string): boolean {
+  try {
+    fs.lstatSync(file);
+    return true;
+  } catch (e: unknown) {
+    return (e as NodeJS.ErrnoException).code !== "ENOENT";
+  }
+}
+
+function danglingLink(file: string): boolean {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isSymbolicLink()) return false;
+    fs.statSync(file);
+    return false;
+  } catch (e: unknown) {
+    return (e as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
 
 function fileIdentity(file: string): string | null {
   try {
@@ -448,13 +602,18 @@ function rollbackJournal(journal: PatchJournal, seedRoot: string): string[] {
   const actions: Array<{ entry: JournalEntry; target: string; action: "none" | "restore-delete" | "restore-write" | "remove-add" }> = [];
   for (const entry of [...journal.entries].reverse()) {
     const target = validatePatchEntry(seedRoot, { kind: entry.kind, relative: entry.relative, to: entry.to, ...(entry.kind === "write" ? { from: entry.from!, afterHash: entry.afterHash!, beforeHash: entry.beforeHash, beforeLines: 0, afterLines: 0 } : { beforeHash: entry.beforeHash!, beforeLines: 0 }) } as CandidatePatch);
+    if (danglingLink(target)) { conflicts.push(entry.relative); continue; }
     const current = fileHashOrNull(target, seedRoot);
     const identity = fileIdentity(target);
     if (entry.untouched) { actions.push({ entry, target, action: "none" }); continue; }
     if (entry.kind === "delete") {
-      const tombstoneIdentity = entry.tombstone ? fileIdentity(entry.tombstone) : null;
-      if (current === entry.beforeHash && identity === entry.beforeIdentity && tombstoneIdentity === null) { actions.push({ entry, target, action: "none" }); continue; }
-      if (current === null && entry.tombstone && tombstoneIdentity === entry.beforeIdentity) {
+      const tombstoneExists = entry.tombstone ? (danglingLink(entry.tombstone) || entryExists(entry.tombstone)) : false;
+      let tombstoneIdentity: string | null = null;
+      if (entry.tombstone && !danglingLink(entry.tombstone) && entryExists(entry.tombstone)) {
+        try { tombstoneIdentity = fileIdentity(entry.tombstone); } catch { tombstoneIdentity = null; }
+      }
+      if (current === entry.beforeHash && identity === entry.beforeIdentity && !tombstoneExists) { actions.push({ entry, target, action: "none" }); continue; }
+      if (current === null && entry.tombstone && tombstoneIdentity === entry.beforeIdentity && !danglingLink(entry.tombstone)) {
         actions.push({ entry, target, action: "restore-delete" });
         continue;
       }
@@ -472,7 +631,12 @@ function rollbackJournal(journal: PatchJournal, seedRoot: string): string[] {
     else if (action === "remove-add") fs.rmSync(target, { force: true });
   }
   for (const entry of journal.entries) {
-    if (entry.tombstone && fs.existsSync(entry.tombstone)) fs.rmSync(entry.tombstone, { force: true });
+    if (entry.tombstone && !danglingLink(entry.tombstone) && entryExists(entry.tombstone)) {
+      try {
+        const identity = fileIdentity(entry.tombstone);
+        if (identity && entry.beforeIdentity && identity === entry.beforeIdentity) fs.rmSync(entry.tombstone, { force: true });
+      } catch { /* unexpected tombstone type — do not delete an unowned colliding link */ }
+    }
   }
   journal.state = "rolled_back";
   return conflicts;
@@ -503,9 +667,30 @@ export function applyCandidatePatch(options: {
   journalDir: string;
   transactionId: string;
   signal?: AbortSignal;
+  expectedWorkspaceDigest?: string;
+  cycleSeedRoot?: string;
+  repoRoot?: string;
+  digestExclude?: string[];
 }): { written: string[]; backupDir: string } {
   const seedRoot = ensureDirectoryRoot(options.seedRoot);
   const file = journalPath(options.journalDir, options.transactionId);
+  const tombstoneExcludes = options.patch
+    .filter((operation) => operation.kind === "delete")
+    .map((operation) => `${safeRelative(operation.relative)}.dream-rsi-${options.transactionId}.deleted`);
+  for (const relative of tombstoneExcludes) {
+    const tombstone = path.join(seedRoot, ...relative.split("/"));
+    if (entryExists(tombstone)) throw new Error(`promotion tombstone already exists: ${relative}`);
+  }
+  const digestExclude = [...(options.digestExclude ?? []), ...tombstoneExcludes];
+  const assertWorkspaceDigest = (): void => {
+    if (options.expectedWorkspaceDigest !== undefined && workspaceDigest({
+      root: seedRoot,
+      cycleSeedRoot: options.cycleSeedRoot,
+      repoRoot: options.repoRoot,
+      exclude: digestExclude,
+    }) !== options.expectedWorkspaceDigest) throw new WorkspaceDriftDuringApplyError();
+  };
+  assertWorkspaceDigest();
   if (fs.existsSync(file)) {
     const receipt = reconcileCandidatePatch(options);
     const prior = JSON.parse(fs.readFileSync(file, "utf8")) as PatchJournal;
@@ -547,7 +732,7 @@ export function applyCandidatePatch(options: {
     }
     const beforeIdentity = currentHash === null ? null : fileIdentity(target);
     const tombstone = operation.kind === "delete" && !untouched ? `${target}.dream-rsi-${options.transactionId}.deleted` : null;
-    if (tombstone && fs.existsSync(tombstone)) throw new Error(`promotion tombstone already exists: ${operation.relative}`);
+    if (tombstone && entryExists(tombstone)) throw new Error(`promotion tombstone already exists: ${operation.relative}`);
     entries.push({ relative: operation.relative, to: target, kind: operation.kind, beforeHash: currentHash, afterHash: wantedHash, beforeMode: currentHash === null ? null : fs.statSync(target).mode & 0o777, beforeIdentity, afterIdentity: null, backup, tombstone, untouched, ...(operation.kind === "write" ? { from: operation.from } : {}) });
     if (!untouched) changed.push(operation.relative);
   }
@@ -574,6 +759,7 @@ export function applyCandidatePatch(options: {
       }
       writeJsonAtomic(file, journal);
     }
+    assertWorkspaceDigest();
     journal.state = "applied";
     writeJsonAtomic(file, journal);
     for (const entry of entries) if (entry.tombstone) fs.rmSync(entry.tombstone, { force: true });

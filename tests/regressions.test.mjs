@@ -33,7 +33,8 @@ const { recoverInterruptedLiveClaims } = await jump("engine/campaign.ts");
 const { makeReplayProbe } = await jump("engine/replay.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 const { findCandidate } = await jump("engine/improvements.ts");
-const { replaceFiles, resolveWithinRoot } = await jump("engine/apply.ts");
+const { resolveWithinRoot } = await jump("engine/apply.ts");
+const { buildCandidatePatch, applyCandidatePatch } = await jump("engine/campaign-patch.ts");
 
 const OK_COMMAND = {
   ok: true,
@@ -258,7 +259,7 @@ test("apply boundary resolution rejects a link that escapes the workspace", () =
   }
 });
 
-test("an apply that fails on a later file restores the files it already replaced", () => {
+test("journaled apply rejects a missing source without changing any target", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-apply-"));
   try {
     const file = (name, text) => {
@@ -270,9 +271,12 @@ test("an apply that fails on a later file restores the files it already replaced
     const files = [
       { relative: "a.py", from: file("candidate/a.py", "new a\n"), to: file("seed/a.py", "old a\n"), before: 2, after: 2 },
       { relative: "new.py", from: file("candidate/new.py", "new file\n"), to: file("seed/new.py"), before: 0, after: 2 },
-      { relative: "gone.py", from: file("candidate/gone.py"), to: file("seed/gone.py", "old gone\n"), before: 2, after: 0 },
+      { relative: "gone.py", from: file("candidate/gone.py", "new gone\n"), to: file("seed/gone.py", "old gone\n"), before: 2, after: 2 },
     ];
-    assert.throws(() => replaceFiles(files, path.join(dir, "replaced")));
+    const seed = path.join(dir, "seed");
+    const patch = buildCandidatePatch({ cycleSeedRoot: seed, targetRoot: seed, candidateRoot: path.join(dir, "candidate"), scope: ["."] });
+    fs.rmSync(files[2].from);
+    assert.throws(() => applyCandidatePatch({ seedRoot: seed, patch, journalDir: path.join(dir, "journal"), transactionId: "missing-source" }));
     assert.equal(fs.readFileSync(files[0].to, "utf8"), "old a\n", "a replaced file gets its previous content back");
     assert.equal(fs.existsSync(files[1].to), false, "a file the apply created is removed again");
     assert.equal(fs.readFileSync(files[2].to, "utf8"), "old gone\n");
@@ -379,8 +383,8 @@ test("copy_exclude keeps named directories out of an attempt workspace", async (
   }
 });
 
-test("deterministic guidance-off runs without timeouts record no diagnostic fields", async () => {
-  const project = makeProject({ task: { guidance: "off", k1: 1 } });
+test("deterministic runs without timeouts record no diagnostic fields", async () => {
+  const project = makeProject({ task: { k1: 1 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);

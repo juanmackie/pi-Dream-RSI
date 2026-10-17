@@ -16,10 +16,11 @@ import * as path from "node:path";
 import { copyWorkspace, childOwnership, stopRecoveredChild, runAgent, runShellCommand, type CommandResult } from "../agent/runner.ts";
 import { DiscoveryTree, isOpened, type TreeNode } from "./tree.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
+import { ledgerDigest } from "./ledger.ts";
 import { runPolicy } from "../policy/runner.ts";
 import type { EpisodeResult } from "../policy/api.ts";
 import type { ProbeFn, RevealedNode } from "../policy/host.ts";
-import type { AgentConfig, TaskConfig } from "./task.ts";
+import { formatCandidateBrief, type AgentConfig, type CandidateBrief, type TaskConfig } from "./task.ts";
 import { runningIterations } from "../state.ts";
 import { checkpointPath } from "./checkpoint.ts";
 import { allocator, acquirePhase, dreamIsActive } from "./ownership.ts";
@@ -27,7 +28,6 @@ import { ProgressRecorder, readProgress, type ProgressObserver } from "./progres
 import { readCheckpoint, saveCheckpoint, validateCheckpoint, freezePolicy, snapshotSeed, workspaceHash,
   type LiveCheckpoint, type PendingAttempt, type PreparedAttempt } from "./checkpoint.ts";
 import { normalizeTask, scoringFingerprint } from "./task.ts";
-import { renderDirectionGuidance } from "./guidance.ts";
 import { classifyAgentTimeout } from "./timeout.ts";
 import {
   archiveAttempt,
@@ -59,6 +59,8 @@ export interface LiveEpisodeOptions {
   dreamRoot: string;
   projectDir: string;
   task: TaskConfig;
+  candidateBrief?: CandidateBrief;
+  experimentDigest?: string;
   iteration: number;
   policyPath: string;
   policyName?: string | null;
@@ -76,6 +78,8 @@ export interface LiveEpisodeOptions {
   beforeEvaluatorSpawn?: (key: string) => void;
   /** Additional protected directories to keep out of full-workspace campaign snapshots. */
   workspaceExcludes?: string[];
+  /** Exact verifier files in project or attempt-workspace coordinates, used only for read telemetry. */
+  protectedReadPaths?: string[];
   /** Project-level claim owner, so another session cannot reclaim this in-flight cycle. */
   owner?: PhaseOwner;
   resume?: boolean;
@@ -287,9 +291,11 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     });
   }
   const basePromptVars = cp?.prompt_vars ?? {
-    // Pure Dream-RSI: semantic direction guidance is deliberately empty (paper §4 ablation).
-    // Opt-in experiment: task.guidance "summary" renders evaluated history (engine/guidance.ts).
-    direction_guidance: task.guidance === "summary" ? renderDirectionGuidance(tree.list()) : "",
+    direction_guidance: rawOptions.experimentDigest ?? "",
+    campaign_digest: rawOptions.experimentDigest ?? "",
+    attempt_budget: `${Math.floor(task.agent_timeout_ms / 1000)} seconds`,
+    scope_files: rawOptions.candidateBrief?.scope.join(", ") || task.eval_program,
+    candidate_brief: rawOptions.candidateBrief ? formatCandidateBrief(rawOptions.candidateBrief) : "",
     history_dir: historyDir(dreamRoot),
     baseline_dir: baselineDir(dreamRoot),
     eval_program: task.eval_program,
@@ -391,7 +397,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     fs.mkdirSync(record, { recursive: true });
     const promptVars =
       directionGuidance !== undefined
-        ? { ...basePromptVars, direction_guidance: directionGuidance, node_dir: workspace }
+        ? { ...basePromptVars, direction_guidance: directionGuidance, campaign_digest: directionGuidance, node_dir: workspace }
         : { ...basePromptVars, node_dir: workspace };
     const prompt = renderPrompt(promptTemplate, promptVars);
     const promptPath = path.join(record, "prompt.md");
@@ -459,11 +465,13 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       prompt: prepared.prompt,
       timeoutMs: task.agent_timeout_ms,
       logPath: prepared.logPath,
+      protectedReadPaths: options.protectedReadPaths,
       signal,
       beforeSpawn: () => options.beforeAgentSpawn?.(`live:${iteration}:${prepared.cell}:retry:${pending.retry}`),
       onOutput: (event) => progress.output(prepared.cell, false, event),
       onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
     });
+    if (agentRun.evidence) writeJson(path.join(recordDir, "attempt-evidence.json"), agentRun.evidence);
     pending.process = undefined;
     if (agentRun.aborted || signal.aborted) throw new Error("attempt interrupted during generation");
     if (!pending.agentRun) {
@@ -616,7 +624,10 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       // once: every sibling shares the same initial context, so a fast sibling's
       // result cannot change a slower sibling's prompt.
       const directionGuidance = perBatchGuidance
-        ? (task.guidance === "summary" ? renderDirectionGuidance(tree.list()) : "")
+        ? [(basePromptVars.direction_guidance ?? ""), ledgerDigest(tree.list().filter((node) => node.evaluated && node.meta.branch >= 0).slice(-8).map((node) => ({
+          v: 1, t: "", entryId: node.meta.cell_id, kind: "attempt", agent: "discovery", outcome: node.fail_class,
+          facts: { cell: node.meta.cell_id, measured: typeof node.score === "number", timedOut: node.partial ?? false },
+        })), 700)].filter(Boolean).join("\n").slice(0, 1500)
         : undefined;
       batch = {
         round,
@@ -630,7 +641,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
     // Reuse the saved guidance for interrupted batches. Never recompute from a
     // tree that already contains completed siblings from this same batch.
     const batchGuidance = perBatchGuidance
-      ? (batch.direction_guidance ?? (task.guidance === "summary" ? (basePromptVars.direction_guidance ?? "") : ""))
+      ? (batch.direction_guidance ?? basePromptVars.direction_guidance ?? "")
       : undefined;
     const currentBatch = batch;
     const settled = await Promise.allSettled(currentBatch.attempts.map(async (pending) => {

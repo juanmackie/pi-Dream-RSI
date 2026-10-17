@@ -6,7 +6,6 @@
  * wall-clock deadline (`worker.terminate()`), and gives replay a clean, deterministic sandbox.
  *
  * Modes:
- * - `grid`   — load the policy, call `plan_grid()`, return the plan. No episode runs.
  * - `live`   — run `solve()`; `probe_batch` requests are relayed to the host, which executes
  *              real generation-evaluation attempts.
  * - `replay` — run `solve()` against a frozen world; reveals resolve locally, no host round-trips.
@@ -24,15 +23,13 @@ import {
   resolveBeta,
   type Budget,
   type CellId,
-  type GridPlan,
-  type GridPlanningContext,
   type PolicyConfig,
   type QuestionView,
 } from "../policy/api.ts";
 
 export interface WorkerData {
   policyPath: string;
-  mode: "grid" | "live" | "replay";
+  mode: "live" | "replay";
   config?: Partial<PolicyConfig>;
   maxParallelism: number;
   slots?: number[];
@@ -43,7 +40,6 @@ export interface WorkerData {
   refineCount?: number;
   budget?: Budget | null;
   world?: TreeJSON | null;
-  gridPlanContext?: GridPlanningContext | null;
 }
 
 interface PendingProbe {
@@ -142,30 +138,6 @@ async function runEpisode(
 
 async function main(): Promise<void> {
   const data = workerData as WorkerData;
-  if (data.mode === "grid") {
-    const policy = await loadPolicy(data.policyPath);
-    const context: GridPlanningContext = data.gridPlanContext ?? {
-      history: [],
-      baseline_score: data.baselineScore ?? null,
-      max_parallelism: data.maxParallelism,
-      budget: null,
-    };
-    const plan = (await Promise.resolve(policy.plan_grid(context))) as GridPlan;
-    if (!plan || typeof plan.branch_count !== "number" || typeof plan.refine_count !== "number") {
-      fail("plan_grid() must return { branch_count, refine_count, reason }");
-    }
-    parentPort!.postMessage({
-      type: "grid-plan",
-      plan: {
-        branch_count: Math.max(1, Math.floor(plan.branch_count)),
-        refine_count: Math.max(1, Math.floor(plan.refine_count)),
-        reason: typeof plan.reason === "string" ? plan.reason : "",
-      },
-      beta: policy.beta,
-    });
-    return;
-  }
-
   if (data.mode === "replay") {
     const world = DiscoveryTree.fromJSON(data.world as TreeJSON);
     const host = buildReplayHost(world, data.maxParallelism);

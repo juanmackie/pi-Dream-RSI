@@ -87,14 +87,6 @@ export interface TaskConfig {
   copy_exclude: string[];
   /** How many recent iteration directories under `work/` to keep; older candidates are pruned. */
   work_retention: number;
-  /**
-   * Attempt-prompt direction guidance: `"off"` renders `$direction_guidance`
-   * empty (historical behavior); `"summary"` renders a deterministic,
-   * bounded summary of evaluated history (see `engine/guidance.ts`).
-   * Prompt-only: excluded from the scoring fingerprint. Experimental —
-   * measure on a scratch task before adopting (paper §4 ablation).
-   */
-  guidance: "off" | "summary";
 }
 
 export function defaultTask(name = "task"): TaskConfig {
@@ -120,10 +112,9 @@ export function defaultTask(name = "task"): TaskConfig {
     beta_grid: [0, 0.2, 0.4, 0.6, 0.8, 1],
     default_beta: 0.6,
     agent_timeout_ms: 30 * 60 * 1000,
-    evaluator_timeout_ms: 30 * 60 * 1000,
+    evaluator_timeout_ms: 300_000,
     copy_exclude: [],
     work_retention: 20,
-    guidance: "off",
     agent: {
       command: "pi",
       // Attempts are self-contained: instructions come from the prompt, history is read through tools —
@@ -152,6 +143,7 @@ export function validateTask(raw: unknown): string[] {
   if (typeof t.score_program !== "string" || t.score_program.trim() === "") {
     errors.push("score_program must be a non-empty command");
   }
+  if (typeof t.higher_is_better !== "boolean") errors.push("higher_is_better must be explicitly true or false");
   for (const key of ["score_path", "score_field"] as const) {
     if (typeof t[key] !== "string" || (t[key] as string).trim() === "") errors.push(`${key} must be a non-empty string`);
   }
@@ -164,6 +156,9 @@ export function validateTask(raw: unknown): string[] {
     ["beta1", 0, 1e6],
     ["beta2", 0, 1e6],
   ];
+  for (const key of ["agent_timeout_ms", "evaluator_timeout_ms"] as const) {
+    if (!Number.isSafeInteger(t[key]) || (t[key] ?? 0) < 1 || (t[key] ?? 0) > 2_147_483_647) errors.push(`${key} must be an integer from 1 through 2147483647 milliseconds`);
+  }
   for (const [key, min, max] of numbers) {
     const value = t[key];
     if (typeof value !== "number" || !Number.isFinite(value) || value < min || value > max) {
@@ -188,9 +183,6 @@ export function validateTask(raw: unknown): string[] {
       errors.push("work_retention must be a number in [1, 10000]");
     }
   }
-  if (t.guidance !== undefined && t.guidance !== "off" && t.guidance !== "summary") {
-    errors.push('guidance must be "off" or "summary"');
-  }
   const agent = t.agent as Partial<AgentConfig> | undefined;
   if (!agent || typeof agent.command !== "string" || agent.command.trim() === "") {
     errors.push("agent.command must be a non-empty executable name");
@@ -213,6 +205,28 @@ export function validateTask(raw: unknown): string[] {
     }
   }
   return errors;
+}
+
+export interface CandidateBrief {
+  goal: string;
+  direction: "maximize" | "minimize";
+  metric: string;
+  minimumGain?: number | string;
+  scope: string[];
+  gates: string[];
+  timeBudgetMs: number;
+}
+
+export function formatCandidateBrief(brief: CandidateBrief): string {
+  return [
+    `Goal: ${brief.goal}`,
+    `Direction: ${brief.direction} (larger measured values are better after normalization).`,
+    `Metric: ${brief.metric}`,
+    `Minimum gain: ${brief.minimumGain === undefined ? "calibrated from evaluator noise" : String(brief.minimumGain)}`,
+    `Editable scope: ${brief.scope.length ? brief.scope.join(", ") : "all files in the task workspace"}`,
+    `Correctness gates: ${brief.gates.length ? brief.gates.join(", ") : "none declared"}`,
+    `Time budget per attempt: ${Math.ceil(brief.timeBudgetMs / 1000)} seconds.`,
+  ].join("\n");
 }
 
 /**
@@ -270,6 +284,7 @@ export function normalizeTask(raw: Partial<TaskConfig>): TaskConfig {
     agent: { ...base.agent, ...(raw?.agent ?? {}) },
   };
   const errors = validateTask(merged);
+  if (typeof raw?.higher_is_better !== "boolean") errors.unshift("higher_is_better must be explicitly true or false");
   if (errors.length > 0) throw new Error(`invalid task:\n- ${errors.join("\n- ")}`);
   return merged;
 }

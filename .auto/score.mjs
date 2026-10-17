@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 
 import { replayEpisode } from "../extensions/pi-dream-rsi/engine/replay.ts";
 import { ensurePolicyRuntime } from "../extensions/pi-dream-rsi/engine/world.ts";
-import { planGrid, readPolicyViolations } from "../extensions/pi-dream-rsi/policy/runner.ts";
+import { readPolicyViolations } from "../extensions/pi-dream-rsi/policy/runner.ts";
 import { BENCHMARK_VERSION, REPLAY_CONFIG, createReplayWorlds } from "./replay-worlds.mjs";
 
 const TRUSTED_POLICY_DIR = fileURLToPath(new URL("../extensions/pi-dream-rsi/policy/", import.meta.url));
@@ -39,25 +39,6 @@ export async function scorePolicy(workspace, { timeoutMs = 2_000 } = {}) {
     fs.copyFileSync(path.resolve(workspace, POLICY_RELATIVE_PATH), policyPath);
     const violations = readPolicyViolations(policyPath);
     if (violations.length > 0) return verdict("guardrail_failure", violations.join("; "));
-
-    const planned = await planGrid({
-      policyPath,
-      maxParallelism: REPLAY_CONFIG.maxParallelism,
-      timeoutMs,
-      gridPlanContext: {
-        history: [],
-        baseline_score: 0,
-        max_parallelism: REPLAY_CONFIG.maxParallelism,
-        budget: { workers: REPLAY_CONFIG.maxParallelism, attempts: 6 },
-      },
-    });
-    if (!planned.ok) {
-      return verdict("policy_error", planned.error ?? "plan_grid failed");
-    }
-    if (!Number.isSafeInteger(planned.plan?.branch_count) || planned.plan.branch_count < 1 ||
-        !Number.isSafeInteger(planned.plan?.refine_count) || planned.plan.refine_count < 1) {
-      return verdict("policy_error", "plan_grid must return finite positive integer dimensions");
-    }
 
     for (const { id, world } of createReplayWorlds()) {
       const episode = await replayEpisode({

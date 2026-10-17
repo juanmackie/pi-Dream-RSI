@@ -150,13 +150,13 @@ test("framed watch fits its row cap, restores backgrounds, highlights selection 
     recorder.snapshot.tree = { cells };
     recorder.snapshot.attempts.b0a0.agent_tail = Array.from({ length: 40 }, (_, i) => `log line ${i}`).join("\n");
     fs.writeFileSync(progressPath(campaign.campaignRoot, 1), JSON.stringify(recorder.snapshot));
-    const rejectionPath = path.join(campaign.campaignRoot, "history", "rejections.jsonl");
+    const rejectionPath = path.join(campaign.campaignRoot, "history", "ledger.jsonl");
     fs.mkdirSync(path.dirname(rejectionPath), { recursive: true });
     fs.writeFileSync(rejectionPath, [
       { iteration: 1, cell: "b0a0", stage: "gate", reasons: ["unit test failed"] },
       { iteration: 2, cell: "b0a0", stage: "review", reasons: ["wrong-cycle secret"] },
       { cell: "b0a0", stage: "review", reasons: ["unscoped legacy secret"] },
-    ].map((item) => JSON.stringify(item)).join("\n") + "\n");
+    ].map((item) => JSON.stringify({ v: 1, t: new Date().toISOString(), entryId: "fixture", kind: "skip", outcome: "rejected", facts: { iteration: item.iteration, cell: item.cell, terminalStage: item.stage, reason: item.reasons.join("; ") } })).join("\n") + "\n");
 
     const { pi, context, harness } = mockPi();
     context.cwd = project.projectDir;

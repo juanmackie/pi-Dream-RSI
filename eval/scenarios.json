@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "seed_start": 730001,
+  "seeds": 20000,
+  "held_out_seed_start": 910001,
+  "held_out_seeds": 5000,
+  "max_cycles": 5,
+  "threshold": 0.05,
+  "scenarios": [
+    { "name": "null-gaussian", "kind": "gaussian", "effect": 0, "noise_sd": 0.06 },
+    { "name": "null-student5", "kind": "student", "df": 5, "effect": 0, "noise_sd": 0.06 },
+    { "name": "null-bootstrap", "kind": "bootstrap", "samples": [-0.09, -0.04, -0.02, 0, 0.01, 0.03, 0.07], "effect": 0 },
+    { "name": "null-drift", "kind": "drift", "effect": 0, "noise_sd": 0.06, "drift_per_run": 0.01 },
+    { "name": "boundary-gaussian", "kind": "gaussian", "effect": 0.05, "noise_sd": 0.06 },
+    { "name": "boundary-student5", "kind": "student", "df": 5, "effect": 0.05, "noise_sd": 0.06 },
+    { "name": "boundary-bootstrap", "kind": "bootstrap", "samples": [-0.09, -0.04, -0.02, 0, 0.01, 0.03, 0.07], "effect": 0.05 },
+    { "name": "boundary-drift", "kind": "drift", "effect": 0.05, "noise_sd": 0.06, "drift_per_run": 0.01 },
+    { "name": "win-10pct-6pct-noise", "kind": "gaussian", "effect": 0.10, "noise_sd": 0.06 },
+    { "name": "win-15pct-6pct-noise", "kind": "gaussian", "effect": 0.15, "noise_sd": 0.06 },
+    { "name": "win-25pct-6pct-noise", "kind": "gaussian", "effect": 0.25, "noise_sd": 0.06 },
+    { "name": "win-10pct-12pct-noise", "kind": "gaussian", "effect": 0.10, "noise_sd": 0.12 },
+    { "name": "win-lower-is-better-10pct", "kind": "gaussian", "effect": 0.10, "noise_sd": 0.06, "higher_is_better": false }
+  ]
+}

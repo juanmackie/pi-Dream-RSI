@@ -124,3 +124,32 @@ test("an invalid after score in a confirming pair vetoes promotion", async (t) =
   assert.equal(result.improved, false);
   assert.equal(starts.length, 4, "invalid confirmation stops later evaluator starts");
 });
+
+test("measurement-plan adapter keeps verified score outcomes and accepts an exact gain", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-measure-adapter-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const seed = path.join(root, "seed");
+  const target = path.join(root, "target");
+  const candidate = path.join(root, "candidate");
+  for (const dir of [seed, target, candidate]) fs.mkdirSync(dir, { recursive: true });
+  for (const dir of [seed, target, candidate]) fs.writeFileSync(path.join(dir, "value.txt"), "0\n");
+  fs.writeFileSync(path.join(candidate, "value.txt"), "1\n");
+  const scorer = path.join(root, "score.mjs");
+  const counter = path.join(root, "counter.txt");
+  fs.writeFileSync(scorer, `import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";\nconst n = existsSync(${JSON.stringify(counter)}) ? Number(readFileSync(${JSON.stringify(counter)}, "utf8")) : 0;\nwriteFileSync(${JSON.stringify(counter)}, String(n + 1));\nconst value = 10 + Number(readFileSync("value.txt", "utf8"));\nmkdirSync("eval", {recursive:true});\nwriteFileSync("eval/score.json", JSON.stringify({score:value,raw_score:value,valid:true,fail_class:"ok",error:null}));\n`);
+  const { buildCandidatePatch, verifyCandidatePatch } = await jump("engine/campaign-patch.ts");
+  const { planTest } = await jump("engine/measure.ts");
+  const patch = buildCandidatePatch({ cycleSeedRoot: seed, targetRoot: target, candidateRoot: candidate });
+  const starts = [];
+  const task = { workspace: ".", score_program: `node "${scorer}"`, score_path: "eval/score.json", score_field: "score", valid_field: "valid", fail_class_field: "fail_class", error_field: "error", higher_is_better: true, evaluator_timeout_ms: 5000, copy_exclude: [] };
+  const result = await verifyCandidatePatch({
+    dreamRoot: path.join(root, "dream"), projectDir: target, task, patch, evidenceDir: path.join(root, "evidence"),
+    measurementPlan: planTest({ baseline: [10, 10, 10], higherIsBetter: true, threshold: 0.5, maxCycles: 5, deterministic: true }),
+    beforeSpawn: (key) => starts.push(key),
+  });
+  assert.equal(starts.length, 2);
+  assert.equal(result.pairs.length, 1);
+  assert.equal(result.pairs[0].gain, 1);
+  assert.equal(result.medianAfter, 11);
+  assert.equal(result.improved, true);
+});

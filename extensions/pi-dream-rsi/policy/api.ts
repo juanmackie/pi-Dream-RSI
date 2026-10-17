@@ -80,27 +80,6 @@ export interface SimResult {
   stopped: string | null;
 }
 
-export interface GridPlanningContext {
-  /** Completed iterations, oldest first, as recorded in each live-cycle manifest sidecar. */
-  history: {
-    iteration: number;
-    best_score: number | null;
-    baked_beta: number | null;
-    /** Archived beta-sweep summary for that iteration, when available. */
-    sweep: BetaSweepSummary | null;
-  }[];
-  baseline_score: number | null;
-  max_parallelism: number;
-  budget: { workers: number; attempts: number } | null;
-}
-
-/** Answer to "how many directions, how deep" for the next live grid. */
-export interface GridPlan {
-  branch_count: number;
-  refine_count: number;
-  reason: string;
-}
-
 export interface BetaSweepSummary {
   auc: number;
   pareto_reward: number;
@@ -109,8 +88,7 @@ export interface BetaSweepSummary {
 }
 
 /**
- * Base class for exploration policies. Subclasses implement `solve` and may override `plan_grid` and
- * `default_beta`. (Named after the paper's `LLMDesignedMethod`; the surface is identical.)
+ * Base class for exploration policies. Subclasses implement `solve` and may override `default_beta`. (Named after the paper's `LLMDesignedMethod`; the surface is identical.)
  */
 export class LLMDesignedMethod {
   config: PolicyConfig;
@@ -131,19 +109,6 @@ export class LLMDesignedMethod {
    */
   solve(_question: QuestionView, _budget?: Budget | null): EpisodeResult | Promise<EpisodeResult> {
     throw new Error("solve() is not implemented");
-  }
-
-  /**
-   * Runs before a new live grid is created; never inspects the current episode.
-   * Default: one branch per worker, full refinement depth.
-   */
-  plan_grid(context: GridPlanningContext): GridPlan {
-    const branch_count = Math.max(1, context.max_parallelism);
-    return {
-      branch_count,
-      refine_count: context.budget?.attempts ? Math.max(1, Math.ceil(context.budget.attempts / branch_count)) : 1,
-      reason: "default: open one branch per worker and refine to the round budget",
-    };
   }
 
   /** Convenience used by the shipped policy and by tests. */

@@ -42,7 +42,7 @@ test("pi JSONL decoding handles chunk boundaries, tool events and malformed raw 
     JSON.stringify({ type: "tool_execution_end", toolCallId: "x", result: { content: [] } }), "plain fallback", "{bad"].join("\n");
   for (const char of lines) decoder.feed("stdout", char); decoder.finish();
   assert.equal(events[0].text, "hé🙂"); assert.deepEqual(events.slice(1, 4).map((e) => e.kind), ["tool-start", "tool-update", "tool-end"]);
-  assert.match(events.at(-1).text, /bad/);
+  assert.match(events.at(-1).text, /malformed pi JSON event omitted/);
   const tail = new BoundedTail(); for (let i = 0; i < 1000; i++) tail.append("🙂".repeat(500) + "\n");
   assert.ok(Buffer.byteLength(tail.text) <= 65536); assert.ok(tail.text.split("\n").length <= 200);
   const mode = defaultTask().agent;
@@ -317,18 +317,18 @@ test("checkpoint write failure aborts children and preserves the last durable co
   } finally { mutableFs.renameSync = rename; syncBuiltinESMExports(); p.cleanup(); }
 });
 
-test("resumed and restarted attempts preserve their batch guidance", async () => {
-  const p = makeProject({ task: { k1: 2, guidance: "summary" } });
+test("resumed and restarted attempts preserve the frozen campaign digest", async () => {
+  const p = makeProject({ task: { k1: 2 } });
   try {
     const controlled = controlledAgent(p); await setup(p);
     const abort = new AbortController();
-    const run = runLiveEpisode(options(p, { signal: abort.signal }));
+    const run = runLiveEpisode(options(p, { signal: abort.signal, experimentDigest: "Prior attempt: timeout, unmeasured, try a different mechanism." }));
     await until(() => { try { return readCheckpoint(p.dreamRoot, 1).batches[0]?.attempts.some((a) => a.record) && controlled.calls().length === 2; } catch { return false; } });
     abort.abort(); await run;
     const interrupted = readCheckpoint(p.dreamRoot, 1);
     assert.equal(interrupted.timeout_recovery_version, 2);
     const firstGuidance = interrupted.batches[0].direction_guidance;
-    assert.match(firstGuidance ?? "", /no evaluated attempts yet/);
+    assert.match(firstGuidance ?? "", /Prior attempt: timeout, unmeasured/);
     // The interrupted batch must not be recomputed from a tree containing its own completed sibling.
     fs.writeFileSync(controlled.gate, "yes");
     const resumed = await runLiveEpisode(options(p, { resume: true }));
@@ -340,7 +340,8 @@ test("resumed and restarted attempts preserve their batch guidance", async () =>
     assert.doesNotMatch(restartedPrompt, /b0a0  .*\/ ok.*b1a0/, "restarted prompt does not see its own completed sibling");
     // A later batch still receives earlier diagnostics.
     if (saved.batches.length >= 2) {
-      assert.match(saved.batches[1].direction_guidance ?? "", /b0a0/);
+      assert.match(saved.batches[1].direction_guidance, /Prior attempt: timeout, unmeasured/);
+      assert.match(saved.batches[1].direction_guidance, /factual events/);
     }
   } finally { p.cleanup(); }
 });

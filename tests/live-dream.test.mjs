@@ -448,8 +448,8 @@ test("evaluator interpretation is a pure function of the command result and the 
   assert.equal(interpretEvaluation(task, ok, { score: 3, valid: false, fail_class: "ok" }).valid, false, "the evaluator's validity flag is preserved");
 });
 
-test("per-batch guidance delivers timeout diagnostics with identical sibling prompts", async () => {
-  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { guidance: "summary", k1: 2 } });
+test("per-batch ledger memory delivers timeout outcomes with identical sibling prompts", async () => {
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { k1: 2 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);
@@ -460,11 +460,11 @@ test("per-batch guidance delivers timeout diagnostics with identical sibling pro
     assert.equal(cp.timeout_recovery_version, 2, "new phase-2 cycles receive marker 2");
     assert.ok(cp.batches.length >= 2, "two rounds produce two batches");
     const [first, second] = cp.batches;
-    assert.match(first.direction_guidance ?? "", /no evaluated attempts yet/);
+    assert.match(first.direction_guidance ?? "", /0 factual events/);
     // Second batch was rendered before its siblings ran: it sees the first round's timeouts.
     // Marker-2 first-round timeouts are assessed (timeout_scored with silent diagnostics).
     assert.match(second.direction_guidance ?? "", /timeout/);
-    assert.match(second.direction_guidance ?? "", /no output/);
+    assert.match(second.direction_guidance ?? "", /2 timeouts/);
     // Sibling prompts share the identical saved guidance despite different completion times.
     const secondCells = second.attempts.map((a) => a.cell).filter(Boolean);
     assert.ok(secondCells.length >= 1, "second batch has attempts");
@@ -527,8 +527,8 @@ test("phase-1 checkpoints with marker 1 do not assess timeout workspaces", async
   }
 });
 
-test("guidance off produces an empty direction slot", async () => {
-  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { guidance: "off", k1: 1 } });
+test("new episodes receive factual ledger context without a guidance configuration flag", async () => {
+  const project = makeProject({ agent: "agent-hang.mjs", agentTimeoutMs: 5000, task: { k1: 1 } });
   try {
     await writeTaskJson(project);
     await deployShippedPolicy(project);
@@ -536,7 +536,7 @@ test("guidance off produces an empty direction slot", async () => {
     const episode = await liveCycle(project, 1, { grid: { branch_count: 2, refine_count: 1 } });
     assert.equal(episode.ok, true, episode.error ?? "");
     const cp = readCheckpoint(project.dreamRoot, 1);
-    assert.equal(cp.batches[0].direction_guidance ?? "missing", "", "guidance off checkpoints an empty slot");
+    assert.match(cp.batches[0].direction_guidance, /0 factual events/, "an empty history remains factual");
     const prompt = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "prompt.md"), "utf8");
     assert.doesNotMatch(prompt, /Direction guidance:/);
   } finally {

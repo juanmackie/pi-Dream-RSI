@@ -127,6 +127,7 @@ process.stdin.on("end", () => {
           eval_program: "solution.py",
           score_program: `node "${scorer}"`,
           problem_file: "PROBLEM.md",
+          higher_is_better: true,
           agent_command: process.execPath,
           agent_args: [agent, recorderPath],
           agent_timeout_ms: 30_000,
@@ -138,13 +139,13 @@ process.stdin.on("end", () => {
         const relative = await improve.execute("relative-check", {
           action: "check", project_dir: projectDir,
           task: { ...task, score_program: "node ../score.mjs" },
-          verifier_inputs: verifierInputs, runs: 1,
+          verifier_inputs: verifierInputs,
         }, undefined, undefined, ctx);
         assert.match(relative.content[0].text, /use an absolute path/);
 
         const checked = await improve.execute("preflight-check", {
           action: "check", project_dir: projectDir, task,
-          verifier_inputs: verifierInputs, gates, runs: 1,
+          verifier_inputs: verifierInputs, gates,
         }, undefined, undefined, ctx);
         assert.equal(checked.details.check.runs[0].valid, true, checked.content[0].text);
         assert.equal(checked.details.check.gateRuns[0].passed, true, checked.content[0].text);
@@ -160,10 +161,9 @@ process.stdin.on("end", () => {
         assert.equal(campaign.state.kind, "complete", started.content[0].text);
         assert.deepEqual(campaign.completedCycles, [1]);
         const campaignRecord = JSON.parse(fs.readFileSync(path.join(campaign.campaignRoot, "campaign.json"), "utf8"));
-        assert.equal(campaignRecord.minimumGainSource, "calibrated");
-        assert.equal(campaignRecord.baselineScores.length, 3);
+        assert.equal(campaignRecord.baselineScores.length, 5);
         assert.ok(campaign.currentScore > Math.max(...campaignRecord.baselineScores) + campaignRecord.minimumGain,
-          "the median paired score exceeds the calibrated baseline threshold");
+          "the final score exceeds the requested minimum gain over the five-score baseline");
         const after = fs.readFileSync(recorderPath, "utf8").trim().split(/\r?\n/).filter(Boolean).slice(beforeStart).map((line) => JSON.parse(line));
         const recordedAgentStarts = after.filter((row) => ["probe", "live", "dream", "review"].includes(row.role)).length;
         const recordedEvaluatorStarts = after.filter((row) => ["scorer", "gate"].includes(row.role)).length;
@@ -171,10 +171,15 @@ process.stdin.on("end", () => {
         assert.equal(campaign.evaluatorRuns, recordedEvaluatorStarts, "evaluator ledger equals captured scorer/gate subprocesses");
         assert.ok(after.some((row) => row.role === "probe"));
         assert.ok(after.some((row) => row.role === "live"));
-        assert.ok(after.some((row) => row.role === "dream"));
+        assert.equal(after.some((row) => row.role === "dream"), false,
+          "one-cycle campaigns skip policy dreaming until two eligible worlds exist");
         assert.ok(after.some((row) => row.role === "review"));
         assert.ok(after.some((row) => row.role === "gate"));
-        assert.ok(after.filter((row) => row.role === "scorer").length >= 9, "calibration and noisy paired verification used repeated scoring");
+        assert.ok(after.filter((row) => row.role === "scorer").length >= 10, "five baseline and five final verification measurements ran");
+        const baselineRows = after.filter((row) => row.role === "scorer").slice(0, 5);
+        const firstAgentIndex = after.findIndex((row) => ["probe", "live", "dream", "review"].includes(row.role));
+        assert.equal(after.indexOf(baselineRows.at(-1)) < firstAgentIndex, true,
+          "all baseline measurements finish before the probe starts");
         const appliedFile = path.join(seed, "solution.py");
         const appliedBytes = fs.readFileSync(appliedFile);
         const appliedSource = appliedBytes.toString("utf8");
@@ -182,6 +187,11 @@ process.stdin.on("end", () => {
         const appliedRecords = fs.readFileSync(path.join(campaign.campaignRoot, "history", "applied.jsonl"), "utf8")
           .trim().split(/\r?\n/).map((line) => JSON.parse(line));
         assert.equal(appliedRecords.length, 1);
+        const ledgerText = fs.readFileSync(path.join(campaign.campaignRoot, "history", "ledger.jsonl"), "utf8");
+        const dreamSkip = ledgerText.trim().split(/\r?\n/).map((line) => JSON.parse(line))
+          .find((entry) => entry.kind === "dream" && entry.outcome === "skipped");
+        assert.ok(dreamSkip && dreamSkip.facts.eligibleWorlds < 2,
+          "the ledger explains that fewer than two eligible worlds were available for dreaming");
         const applied = appliedRecords[0];
         const evidenceDir = path.join(campaign.campaignRoot, "history", "r0001_campaign", applied.cell);
         const reviewDir = path.join(evidenceDir, "review");
@@ -191,7 +201,11 @@ process.stdin.on("end", () => {
         const pairsLine = /^Paired measurements: (.+)$/m.exec(reviewText)?.[1];
         assert.ok(pairsLine, "the accepted review includes saved paired measurement evidence");
         const pairs = JSON.parse(pairsLine);
-        assert.equal(pairs.length, 3);
+        const confirmationPairs = fs.readFileSync(path.join(campaign.campaignRoot, "history", "ledger.jsonl"), "utf8")
+          .trim().split(/\r?\n/).map((line) => JSON.parse(line))
+          .filter((entry) => entry.kind === "confirm" && entry.facts?.iteration === applied.iteration && entry.facts?.cell === applied.cell);
+        assert.equal(pairs.length, confirmationPairs.length, "the review evidence contains every recorded confirmation pair");
+        assert.ok(pairs.length >= 1, "the sequential test records at least one confirmation pair");
         assert.ok(pairs.every((pair) => pair.before.valid && pair.after.valid && pair.gain > campaignRecord.minimumGain));
         const reviewedAfter = fs.readFileSync(path.join(reviewDir, "after", "solution.py"));
         assert.deepEqual(appliedBytes, reviewedAfter, "the bytes reviewed by the accepting agent are the bytes applied");
@@ -211,14 +225,15 @@ process.stdin.on("end", () => {
           routedSkills: skillRoutes.map((route) => route.content),
           signal: signalResult.content[0].text,
           relativeCheck: relative.content[0].text,
-          calibrated: campaignRecord.minimumGainSource,
           baselineScores: campaignRecord.baselineScores,
+          agentStartsAtBaseline: 0,
           cycle: campaign.completedCycles[0],
           counters: { agentStarts: campaign.agentStarts, recordedAgentStarts, evaluatorRuns: campaign.evaluatorRuns, recordedEvaluatorStarts },
           roles: after.map((row) => row.role),
           finalState: campaign.state,
           applied: fs.existsSync(path.join(campaign.campaignRoot, "history", "applied.jsonl")),
           pairedMeasurements: pairs,
+          confirmationCount: confirmationPairs.length,
           reviewVerdict: review.verdict,
           appliedHash: journalEntry.afterHash,
           resolvedModel: expectedModel,

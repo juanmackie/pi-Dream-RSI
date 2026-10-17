@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { promisify } from "node:util";
 
 import { parseSessionEntries } from "@earendil-works/pi-coding-agent";
+import { ledgerDigest, readLedger, type LedgerEntry } from "./ledger.ts";
 
 const execFileAsync = promisify(execFile);
 const SESSION_MAX_BYTES = 20 * 1024 * 1024;
@@ -22,10 +24,17 @@ export interface SignalEvidence {
 }
 
 export interface SignalWeakness {
-  kind: "session-failure" | "slow-command" | "post-failure-edits" | "git-hotspot" | "git-churn" | "evaluator" | "campaign-failure" | "campaign-rejection";
+  kind: "session-failure" | "slow-command" | "post-failure-edits" | "session-tool-error" | "repeated-tool-retry" | "aborted-session" | "session-compaction" | "session-model-change" | "dream-improve" | "git-hotspot" | "git-churn" | "evaluator" | "campaign-failure" | "campaign-rejection" | "campaign-health";
   summary: string;
   evidence: SignalEvidence[];
   suggestedMetric: string;
+  /**
+   * Project-relative files edited right after recorded command failures in the
+   * sessions where this command failed. Command levers use them as the patch
+   * scope, so a failing command can become a campaign without inventing a
+   * scope that no recorded evidence supports. Absent when no such edit exists.
+   */
+  scopeHints?: string[];
 }
 
 export interface SignalsResult {
@@ -40,6 +49,20 @@ export interface CollectSignalsOptions {
   /** Supplied by the active session manager; never inferred from a project path. */
   sessionDir?: string;
   now: Date;
+}
+
+/** Collect only bounded same-project campaign facts; digest consumers never receive ledger paths. */
+export function collectLedgerEntries(projectDir: string): LedgerEntry[] {
+  const root = path.join(path.resolve(projectDir), ".dream-rsi", "campaigns");
+  let campaigns: string[];
+  try { campaigns = fs.readdirSync(root).sort().slice(-50); } catch { return []; }
+  const entries: LedgerEntry[] = [];
+  for (const campaign of campaigns) entries.push(...readLedger(path.join(root, campaign, "history", "ledger.jsonl")).entries);
+  return entries;
+}
+
+export function collectCampaignDigest(projectDir: string, maxChars = 1500): string {
+  return ledgerDigest(collectLedgerEntries(projectDir), maxChars);
 }
 
 interface ToolCallRecord {
@@ -62,6 +85,9 @@ interface SessionFacts {
   failures: Map<string, { count: number; lastSeen: number; error: string }>;
   durations: Map<string, { count: number; total: number; max: number }>;
   edits: Map<string, number>;
+  /** Files edited right after a failure of each head, keyed by that head. */
+  editsByHead: Map<string, Map<string, number>>;
+  structural: Map<string, number>;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -135,7 +161,16 @@ function commandHead(value: unknown): string {
     if (script.startsWith("bench")) return "npm benchmark";
     return "npm performance";
   }
+  // Other JS runners execute the same package scripts; bucket them with npm test.
+  if (/^(?:yarn|pnpm|bun)(?:\.exe)?\s+test(?=$|[\s;&|])/i.test(command)) return "npm test";
   if (/^(?:python(?:3(?:\.\d+)?)?\s+-m\s+pytest|pytest)(?=$|[\s;&|])/i.test(command)) return "pytest";
+  // Language-agnostic test heads: safe canonical labels only, never raw command text.
+  if (/^cargo(?:\.exe)?\s+bench(?=$|[\s;&|])/i.test(command)) return "cargo benchmark";
+  if (/^cargo(?:\.exe)?\s+(?:test|nextest)(?=$|[\s;&|])/i.test(command)) return "cargo test";
+  if (/^go(?:\.exe)?\s+test(?=$|[\s;&|])/i.test(command)) return "go test";
+  if (/^(?:mvn(?:\.cmd|\.exe)?|mvnw(?:\.cmd)?)\s+(?:[^\s;&|]+\s+)*test(?=$|[\s;&|])/i.test(command)) return "maven test";
+  if (/^(?:gradle(?:\.exe|\.bat)?|gradlew(?:\.bat)?)(?=$|[\s;&|])/i.test(command) && /(^|[\s;&|])test(?=$|[\s;&|])/i.test(command)) return "gradle test";
+  if (/^dotnet(?:\.exe)?\s+test(?=$|[\s;&|])/i.test(command)) return "dotnet test";
   if (/^node(?:\.exe)?(?=$|[\s;&|])/i.test(command)) return "node";
   if (/^git(?:\.exe)?(?=$|[\s;&|])/i.test(command)) return "git";
   return "shell command";
@@ -213,6 +248,7 @@ function collectOneSession(projectDir: string, content: string): SessionFacts | 
   const failures = new Map<string, { count: number; lastSeen: number; error: string }>();
   const durations = new Map<string, { count: number; total: number; max: number }>();
   const edits = new Map<string, number>();
+  const editsByHead = new Map<string, Map<string, number>>();
   const callResults = new Map<string, { call: ToolCallRecord; result: ToolResultRecord }>();
   for (const call of calls) {
     const result = resultById.get(call.id);
@@ -236,20 +272,47 @@ function collectOneSession(projectDir: string, content: string): SessionFacts | 
   for (const call of calls) {
     const failed = callResults.get(call.id);
     if (!failed || failed.result.message.isError !== true || (call.name !== "bash" && call.name !== "powershell")) continue;
+    const head = commandHead(failed.call.args.command ?? failed.call.args.script);
     const laterCalls = calls.filter((next) => next.order > failed.result.order).slice(0, 3);
     for (const next of laterCalls) {
       if (next.name !== "edit" && next.name !== "write") continue;
       const outcome = callResults.get(next.id);
       if (!outcome || outcome.result.message.isError === true) continue;
       const file = safeProjectPath(projectDir, next.args.path);
-      if (file) edits.set(file, (edits.get(file) ?? 0) + 1);
+      if (!file) continue;
+      edits.set(file, (edits.get(file) ?? 0) + 1);
+      const bucket = editsByHead.get(head) ?? new Map<string, number>();
+      bucket.set(file, (bucket.get(file) ?? 0) + 1);
+      editsByHead.set(head, bucket);
     }
   }
-  return { failures, durations, edits };
+  const structural = new Map<string, number>();
+  const bump = (key: string): void => { structural.set(key, (structural.get(key) ?? 0) + 1); };
+  const retryCounts = new Map<string, number>();
+  for (const { call, result } of callResults.values()) {
+    const isError = result.message.isError === true;
+    if (isError) bump("tool-error");
+    // Hash arguments only; neither raw arguments nor hashes leave this in-memory mining pass.
+    const argsHash = createHash("sha256").update(JSON.stringify(call.args)).digest("hex");
+    if (isError) retryCounts.set(`${call.name}:${argsHash}`, (retryCounts.get(`${call.name}:${argsHash}`) ?? 0) + 1);
+    if (call.name === "dream_rsi_improve" || call.name === "dream-rsi-improve") bump("dream-improve");
+  }
+  structural.set("repeated-retries", [...retryCounts.values()].filter((count) => count >= 3).length);
+  const models = new Set<string>();
+  for (const entry of entries) {
+    if (entry.type === "compaction" || entry.type === "compaction_summary") bump("compaction");
+    if (entry.type !== "message" || !isRecord(entry.message)) continue;
+    const message = entry.message;
+    if (message.role !== "assistant") continue;
+    if (["aborted", "error", "length"].includes(String(message.stopReason))) bump(`stop-${message.stopReason}`);
+    if (typeof message.model === "string") models.add(message.model);
+  }
+  if (models.size > 1) structural.set("model-change", models.size - 1);
+  return { failures, durations, edits, editsByHead, structural };
 }
 
 function aggregateSessionFacts(facts: SessionFacts[]): SessionFacts {
-  const aggregate: SessionFacts = { failures: new Map(), durations: new Map(), edits: new Map() };
+  const aggregate: SessionFacts = { failures: new Map(), durations: new Map(), edits: new Map(), editsByHead: new Map(), structural: new Map() };
   for (const session of facts) {
     for (const [key, value] of session.failures) {
       const current = aggregate.failures.get(key);
@@ -264,6 +327,12 @@ function aggregateSessionFacts(facts: SessionFacts[]): SessionFacts {
       aggregate.durations.set(key, { count: current.count + value.count, total: current.total + value.total, max: Math.max(current.max, value.max) });
     }
     for (const [key, value] of session.edits) aggregate.edits.set(key, (aggregate.edits.get(key) ?? 0) + value);
+    for (const [head, files] of session.editsByHead) {
+      const bucket = aggregate.editsByHead.get(head) ?? new Map<string, number>();
+      for (const [file, count] of files) bucket.set(file, (bucket.get(file) ?? 0) + count);
+      aggregate.editsByHead.set(head, bucket);
+    }
+    for (const [key, value] of session.structural) aggregate.structural.set(key, (aggregate.structural.get(key) ?? 0) + value);
   }
   return aggregate;
 }
@@ -311,22 +380,31 @@ function collectSessionSignals(projectDir: string, sessionDir: string | undefine
   }
   if (skipped > 0) diagnostics.push(`Session-log signals skipped ${skipped} unreadable, oversized, or unrelated session files.`);
   const aggregate = aggregateSessionFacts(facts);
+  // Per-command edit hints: files edited right after a failure of this very
+  // head. Command levers use them as the patch scope, so a failing command can
+  // become a campaign without inventing a scope that no evidence supports.
+  const scopeHintsFor = (head: string): string[] => [...(aggregate.editsByHead.get(head) ?? new Map<string, number>())]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 5).map(([file]) => file);
   const weaknesses: SignalWeakness[] = [];
   for (const [head, failure] of [...aggregate.failures].sort((a, b) => b[1].count - a[1].count || a[0].localeCompare(b[0]))) {
     const lastSeen = new Date(failure.lastSeen).toISOString();
+    const hints = scopeHintsFor(head);
     weaknesses.push({
       kind: "session-failure",
       summary: `${head} failed ${failure.count} times; last seen ${lastSeen}.${failure.error ? ` First error: ${failure.error}` : ""}`,
       evidence: [{ source: "session", ref: head, count: failure.count }],
       suggestedMetric: `Reduce failed ${head} runs in recent session logs.`,
+      ...(hints.length > 0 ? { scopeHints: hints } : {}),
     });
   }
   for (const [head, duration] of [...aggregate.durations].sort((a, b) => b[1].max - a[1].max || a[0].localeCompare(b[0])).slice(0, 3)) {
+    const hints = scopeHintsFor(head);
     weaknesses.push({
       kind: "slow-command",
       summary: `${head} took up to ${Math.round(duration.max)} ms across ${duration.count} recorded calls.`,
       evidence: [{ source: "session", ref: head, count: duration.count }],
       suggestedMetric: `Reduce the duration of ${head}.`,
+      ...(hints.length > 0 ? { scopeHints: hints } : {}),
     });
   }
   const topEdits = [...aggregate.edits].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 5);
@@ -338,7 +416,55 @@ function collectSessionSignals(projectDir: string, sessionDir: string | undefine
       suggestedMetric: "Reduce failures that require follow-up file edits.",
     });
   }
+  const structuralLabels: Record<string, { kind: SignalWeakness["kind"]; summary: (count: number) => string; metric: string }> = {
+    "tool-error": { kind: "session-tool-error", summary: (count) => `${count} tool errors were recorded across recent sessions.`, metric: "Reduce tool errors across recent sessions." },
+    "repeated-retries": { kind: "repeated-tool-retry", summary: (count) => `${count} tool and argument combinations failed at least three times.`, metric: "Avoid repeating an unchanged failing tool call." },
+    "stop-aborted": { kind: "aborted-session", summary: (count) => `${count} assistant runs ended as aborted.`, metric: "Reduce aborted assistant runs." },
+    "stop-error": { kind: "aborted-session", summary: (count) => `${count} assistant runs ended with an error stop reason.`, metric: "Reduce assistant runs ending with an error." },
+    "stop-length": { kind: "aborted-session", summary: (count) => `${count} assistant runs stopped at the output limit.`, metric: "Reduce assistant runs reaching the output limit." },
+    compaction: { kind: "session-compaction", summary: (count) => `${count} session compactions were recorded.`, metric: "Reduce repeated context compaction where possible." },
+    "model-change": { kind: "session-model-change", summary: (count) => `${count} model transitions were recorded in sessions.`, metric: "Keep model changes deliberate and observable." },
+    "dream-improve": { kind: "dream-improve", summary: (count) => `${count} Dream-RSI improvement tool calls were recorded.`, metric: "Review Dream-RSI improvement outcomes against confirms." },
+  };
+  for (const [key, count] of aggregate.structural) {
+    if (count <= 0) continue;
+    const label = structuralLabels[key];
+    if (label) weaknesses.push({ kind: label.kind, summary: label.summary(count), evidence: [{ source: "session", ref: key, count }], suggestedMetric: label.metric });
+  }
   return weaknesses;
+}
+
+/** Discover recent project roots from session headers; returned paths stay in-process for mining only. */
+export function discoverSessionProjects(sessionDir: string | undefined, now = new Date()): string[] {
+  if (!sessionDir) return [];
+  let names: string[];
+  try {
+    if (!fs.lstatSync(sessionDir).isDirectory()) return [];
+    names = fs.readdirSync(sessionDir).filter((name) => name.endsWith(".jsonl"));
+  } catch { return []; }
+  const oldest = now.getTime() - SESSION_AGE_MS;
+  const candidates = names.flatMap((name) => {
+    const file = path.join(sessionDir, name);
+    try {
+      const stats = fs.lstatSync(file);
+      if (!stats.isFile() || stats.size > SESSION_MAX_BYTES || stats.mtimeMs < oldest || stats.mtimeMs > now.getTime()) return [];
+      return [{ file, modified: stats.mtimeMs }];
+    } catch { return []; }
+  }).sort((a, b) => b.modified - a.modified || a.file.localeCompare(b.file)).slice(0, SESSION_LIMIT);
+  const projects = new Set<string>();
+  for (const candidate of candidates) {
+    const content = readBoundedRegularFile(candidate.file, SESSION_MAX_BYTES);
+    if (content === null) continue;
+    try {
+      const entries = parseSessionEntries(content);
+      if (!Array.isArray(entries)) continue;
+      const header = entries.find((entry) => isRecord(entry) && entry.type === "session");
+      if (!isRecord(header) || typeof header.cwd !== "string") continue;
+      const real = fs.realpathSync(header.cwd);
+      if (fs.statSync(real).isDirectory()) projects.add(real);
+    } catch { /* An unreadable or stale project is simply not a mining source. */ }
+  }
+  return [...projects].sort();
 }
 
 interface GitCommit {
@@ -458,6 +584,40 @@ function evaluatorSignals(projectDir: string, diagnostics: string[]): SignalWeak
       }
     }
   }
+  // Language-agnostic manifests: presence of a standard build file implies its
+  // conventional test entry point (cargo test, go test, mvn test, ...). Only
+  // claim a benchmark target when the manifest names one.
+  const manifestTests: Array<{ file: string }> = [
+    { file: "Cargo.toml" },
+    { file: "go.mod" },
+    { file: "pom.xml" },
+    { file: "build.gradle" },
+    { file: "build.gradle.kts" },
+    { file: "composer.json" },
+    { file: "Gemfile" },
+    { file: "mix.exs" },
+  ];
+  for (const { file } of manifestTests) {
+    try {
+      if (!fs.lstatSync(path.join(projectDir, file)).isFile()) continue;
+    } catch { continue; }
+    if (file === "Cargo.toml") {
+      const content = readBoundedRegularFile(path.join(projectDir, file), SMALL_FILE_MAX_BYTES);
+      if (content !== null && /\[\[bench\]\]|criterion/i.test(content)) {
+        const value = categories.get("benchmark") ?? { source: file, count: 0 };
+        categories.set("benchmark", { source: value.source, count: value.count + 1 });
+      }
+    }
+    const value = categories.get("test") ?? { source: file, count: 0 };
+    categories.set("test", { source: value.source, count: value.count + 1 });
+  }
+  try {
+    const top = fs.readdirSync(projectDir, { withFileTypes: true });
+    if (top.some((entry) => entry.isFile() && /\.(csproj|sln)$/i.test(entry.name))) {
+      const value = categories.get("test") ?? { source: "dotnet", count: 0 };
+      categories.set("test", { source: value.source, count: value.count + 1 });
+    }
+  } catch { /* An unreadable project directory simply yields no dotnet signal. */ }
   if (fs.existsSync(path.join(projectDir, "package.json")) && packageJson === null) diagnostics.push("Evaluator signals skipped an unreadable or oversized package.json.");
   return [...categories].map(([category, value]) => ({
     kind: "evaluator",
@@ -521,6 +681,13 @@ function collectCampaignSignals(projectDir: string, diagnostics: string[]): Sign
   if (skipped > 0) diagnostics.push(`Campaign history skipped ${skipped} unreadable campaign records.`);
   if (skippedRejectionFiles > 0) diagnostics.push(`Campaign history skipped ${skippedRejectionFiles} unreadable or oversized rejection files.`);
   const output: SignalWeakness[] = [];
+  const ledger = collectLedgerEntries(projectDir);
+  if (ledger.length) {
+    const timeouts = ledger.filter((item) => item.kind === "attempt" && (item.outcome === "timeout" || item.facts?.timedOut === true)).length;
+    const noEdits = ledger.filter((item) => item.kind === "attempt" && (item.editCount ?? 0) === 0).length;
+    const agents = new Set(ledger.flatMap((item) => item.agent ? [item.agent] : []));
+    output.push({ kind: "campaign-health", summary: `Prior campaign ledgers record ${ledger.length} events, ${timeouts} timeouts, ${noEdits} no-edit attempts, and ${agents.size} agents.`, evidence: [{ source: "campaign", ref: "ledger events", count: ledger.length }], suggestedMetric: "Improve confirmation rate while reducing timeout and no-edit attempts." });
+  }
   for (const [category, count] of failures) {
     output.push({ kind: "campaign-failure", summary: `${count} past campaigns ended with ${category}.`, evidence: [{ source: "campaign", ref: category, count }], suggestedMetric: `Resolve the recurring ${category} before another campaign.` });
   }
@@ -545,12 +712,19 @@ function signalPriority(weakness: SignalWeakness): number {
   switch (weakness.kind) {
     case "session-failure": return 0;
     case "post-failure-edits": return 1;
-    case "slow-command": return 2;
-    case "campaign-failure": return 3;
-    case "campaign-rejection": return 4;
-    case "git-hotspot": return 5;
-    case "git-churn": return 6;
-    case "evaluator": return 7;
+    case "session-tool-error": return 2;
+    case "repeated-tool-retry": return 3;
+    case "aborted-session": return 4;
+    case "dream-improve": return 5;
+    case "slow-command": return 6;
+    case "session-compaction": return 7;
+    case "session-model-change": return 8;
+    case "campaign-failure": return 9;
+    case "campaign-health": return 10;
+    case "campaign-rejection": return 11;
+    case "git-hotspot": return 12;
+    case "git-churn": return 13;
+    case "evaluator": return 14;
   }
 }
 

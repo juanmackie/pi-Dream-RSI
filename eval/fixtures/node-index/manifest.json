@@ -1,0 +1,21 @@
+{
+  "name": "node-index-lookup",
+  "goal": "Reduce lookup work while preserving first-match and missing-key behavior.",
+  "metric": "total key comparisons (lower is better)",
+  "direction": "minimize",
+  "workspace": "workspace",
+  "scope_files": ["lookup.mjs"],
+  "candidate_program": "lookup.mjs",
+  "evaluator": "evaluate.mjs",
+  "gate": "gate.mjs",
+  "control_patch": "control.patch",
+  "verifier_inputs": ["evaluate.mjs", "gate.mjs", "control.patch"],
+  "evaluator_kind": "deterministic command",
+  "interpreter": "node",
+  "readiness": "ready",
+  "baseline_gate_passes": true,
+  "levers": [
+    { "goal": "Index stable lookup keys once", "scope_files": ["lookup.mjs"], "metric": "total key comparisons", "evaluator_kind": "command", "readiness": "ready" },
+    { "goal": "Use binary search for ordered keys", "scope_files": ["lookup.mjs"], "metric": "total key comparisons", "evaluator_kind": "command", "readiness": "needs_setup" }
+  ]
+}

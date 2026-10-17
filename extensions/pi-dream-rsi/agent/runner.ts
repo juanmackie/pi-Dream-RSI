@@ -10,11 +10,12 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { OutputDecoder, type OutputEvent } from "./output.ts";
+import { OutputDecoder, type AgentOutputEvidence, type OutputEvent } from "./output.ts";
 
 import { THINKING_LEVELS, type AgentConfig } from "../engine/task.ts";
 
 const TAIL_BYTES = 64 * 1024;
+const AGENT_LOG_BYTES = 50 * 1024;
 
 export interface CommandResult {
   ok: boolean;
@@ -38,6 +39,8 @@ export interface CommandResult {
    * checking `stdoutTail`/`stderrTail` instead of inferring silence.
    */
   hadOutput?: boolean;
+  /** Structural, content-free telemetry decoded from pi JSONL output. */
+  evidence?: AgentOutputEvidence;
 }
 
 export interface RunOptions {
@@ -51,10 +54,20 @@ export interface RunOptions {
   timeoutMs: number;
   logPath?: string | null;
   env?: Record<string, string>;
+  /**
+   * Do not inherit the parent environment at all; use only `env`. Probes,
+   * instruments and gates for an unvetted repository run this way so provider
+   * keys, tokens and session identity cannot reach them.
+   */
+  envOnly?: boolean;
   /** Kill the whole process tree, not just the direct child. */
   killTree?: boolean;
   /** Cancellation: aborting kills the process tree and resolves once it is gone. */
   signal?: AbortSignal;
+  /** Exact verifier files whose reads should be counted; paths are never retained in evidence. */
+  protectedReadPaths?: string[];
+  /** Store decoded, bounded presentation text and tool names instead of raw JSONL. */
+  compactAgentLog?: boolean;
 }
 
 /**
@@ -110,7 +123,8 @@ async function collect(
 ): Promise<CommandResult> {
   const started = Date.now();
   if (options.logPath) fs.mkdirSync(path.dirname(options.logPath), { recursive: true });
-  const logStream = options.logPath
+  const compactAgentLog = options.compactAgentLog ?? false;
+  const logStream = options.logPath && !compactAgentLog
     ? fs.createWriteStream(options.logPath, { flags: "a" })
     : null;
   // A disk-full or permission error on the log must not crash the host: record it as an outcome.
@@ -133,9 +147,38 @@ async function collect(
       })
     : Promise.resolve();
   // Observer failures cannot change execution or the score.
+  const evidence: AgentOutputEvidence = { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, stopReasons: {}, modelChanges: 0, editCount: 0, verifierRead: false };
+  let lastModel: string | undefined;
+  let compactLog = Buffer.alloc(0);
+  const appendCompactLog = (line: string, newline = true): void => {
+    const combined = Buffer.concat([compactLog, Buffer.from(newline ? `${line}\n` : line, "utf8")]);
+    compactLog = combined.length > AGENT_LOG_BYTES ? combined.subarray(combined.length - AGENT_LOG_BYTES) : combined;
+    while (compactLog.length && (compactLog[0]! & 0xc0) === 0x80) compactLog = compactLog.subarray(1);
+  };
+  const compactText = (text: string): string => (options.protectedReadPaths ?? []).reduce((safe, file) => {
+    const absolute = path.resolve(options.cwd, file);
+    const variants = new Set([file, absolute, absolute.replaceAll("\\", "/"), absolute.replaceAll("/", "\\")]);
+    return [...variants].filter(Boolean).reduce((current, value) => current.split(value).join("[protected path]"), safe);
+  }, text);
   const decoder = new OutputDecoder(options.outputFormat === "pi-json", (event) => {
+    if (compactAgentLog) {
+      if (event.kind === "text" && event.text) appendCompactLog(compactText(event.text), false);
+      else if (event.kind.startsWith("tool-")) appendCompactLog(`${event.kind} ${event.toolName ?? "tool"}`);
+      else if (event.kind === "usage") appendCompactLog(`usage ${event.model ?? ""} ${event.stopReason ?? ""} ${event.usage?.total ?? 0}`.trim());
+    }
+    if (event.kind === "usage") {
+      for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) evidence.usage[key] += event.usage?.[key] ?? 0;
+      if (event.stopReason) evidence.stopReasons[event.stopReason] = (evidence.stopReasons[event.stopReason] ?? 0) + 1;
+      if (event.model) {
+        if (lastModel && lastModel !== event.model) evidence.modelChanges += 1;
+        lastModel = event.model;
+      }
+    }
+    if (event.kind === "tool-start" && event.edit) evidence.editCount += 1;
+    // A tool's read name is evidence only that a read happened. File paths and arguments are never retained.
+    if (event.kind === "tool-start" && event.verifierRead) evidence.verifierRead = true;
     try { options.onOutput?.(event); } catch { /* presentation only */ }
-  });
+  }, { protectedReadPaths: options.protectedReadPaths, cwd: options.cwd });
   const stdoutDecoder = new StringDecoder("utf8");
   const stderrDecoder = new StringDecoder("utf8");
   let stdoutTail = "";
@@ -163,6 +206,10 @@ async function collect(
       const stderrEnd = stderrDecoder.end();
       stdoutTail = append(stdoutTail, stdoutEnd); stderrTail = append(stderrTail, stderrEnd);
       decoder.feed("stdout", stdoutEnd); decoder.feed("stderr", stderrEnd); decoder.finish();
+      if (compactAgentLog && options.logPath) {
+        try { fs.writeFileSync(options.logPath, compactLog, { flag: "w" }); }
+        catch (error) { logError = error instanceof Error ? error.message : String(error); }
+      }
       if (timer) clearTimeout(timer);
       if (grace) clearTimeout(grace);
       options.signal?.removeEventListener("abort", onAbort);
@@ -185,6 +232,7 @@ async function collect(
           stderrTail,
           logPath: options.logPath ?? null,
           hadOutput: sawOutput,
+          evidence,
           ...result,
         }),
       );
@@ -201,8 +249,8 @@ async function collect(
     try {
       // Session identity is stripped unless the caller re-adds it: a nested attempt must not
       // attach to the session it was spawned from (see STRIPPED_SESSION_ENV).
-      const env: NodeJS.ProcessEnv = { ...process.env };
-      for (const key of STRIPPED_SESSION_ENV) delete env[key];
+      const env: NodeJS.ProcessEnv = options.envOnly ? {} : { ...process.env };
+      if (!options.envOnly) for (const key of STRIPPED_SESSION_ENV) delete env[key];
       Object.assign(env, options.env ?? {});
       // With a shell, quote each argument before joining it. Agent executables can opt into quoting;
       // runShellCommand keeps its caller-owned command line intact.
@@ -444,7 +492,7 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
   const modeIndex = args.indexOf("--mode");
   const json = agent.output_format === "pi-json" || (agent.output_format !== "text" &&
     (args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json")));
-  options = { ...options, outputFormat: json ? "pi-json" : "text" };
+  options = { ...options, outputFormat: json ? "pi-json" : "text", compactAgentLog: true };
   const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
   if (agent.prompt_via === "arg") {
     return collect(command, [...invocationArgs, options.prompt], { ...options, shell, quoteExecutable: shell, env });
