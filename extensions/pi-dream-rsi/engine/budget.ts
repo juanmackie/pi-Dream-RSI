@@ -1,9 +1,9 @@
 /**
  * Durable accounting for one autonomous run.
  *
- * Every phase that can start a process — discovery probes, evaluator authoring,
- * instrument qualification, campaign candidates, review, post-apply checks and
- * optimizer trials — spends from the same parent allowance. A grant is written
+ * Every phase that can start a process — discovery probes, instrument qualification,
+ * campaign candidates, review, post-apply checks and
+ * dream replay — spends from the same parent allowance. A grant is written
  * before the child is dispatched, and a reservation left behind by a dead
  * process is charged on the next run instead of being handed out twice.
  *
@@ -14,10 +14,11 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { writeFileAtomic } from "./world.ts";
+import { writeFileAtomic } from "./fsutil.ts";
+import { allocator } from "./ownership.ts";
 
 /** Phases that consume the run allowance. */
-export const LOOP_PHASES = ["discovery", "metric-author", "qualification", "campaign", "post-apply", "optimizer"] as const;
+export const LOOP_PHASES = ["discovery", "qualification", "campaign", "dream", "post-apply"] as const;
 export type LoopPhase = (typeof LOOP_PHASES)[number];
 
 export interface LoopBudgetLimits {
@@ -25,10 +26,6 @@ export interface LoopBudgetLimits {
   maxAgentStarts: number;
   maxEvaluatorRuns: number;
   deadlineMs: number;
-  /** Plateau restarts that re-explore a lever through another signal. */
-  maxRestarts?: number;
-  /** Reserved sub-allowance for optimizer (self-improvement) trials. */
-  maxOptimizerTrials?: number;
 }
 
 /** One dispatch grant, written before the child runs. */
@@ -38,6 +35,10 @@ export interface LoopReservation {
   evaluator_runs: number;
   /** Campaigns this reservation may start; absent in legacy reservations, which cost one. */
   campaigns?: number;
+  /** Campaign identity lets recovery reconcile actual process starts instead of the entire grant. */
+  campaign_id?: string;
+  campaign_agent_starts_before?: number;
+  campaign_evaluator_runs_before?: number;
   at: string;
 }
 
@@ -52,22 +53,16 @@ export interface LoopBudgetFile {
   max_campaigns: number;
   max_agent_starts: number;
   max_evaluator_runs: number;
-  max_restarts: number;
   campaigns: number;
   agent_starts: number;
   evaluator_runs: number;
-  restarts: number;
   open_campaign: LoopReservation | null;
-  /** Added with phase accounting; absent in a legacy budget file. */
-  max_optimizer_trials?: number;
-  optimizer_trials?: number;
   /** Accumulated wall time of finished runs; absent in a legacy budget file. */
   wall_ms?: number;
-  /** Per-phase spend, for reporting and for reconciling optimizer allowances. */
+  /** Per-phase spend for reporting and durable reconciliation. */
   phases?: Partial<Record<LoopPhase, LoopPhaseSpend>>;
 }
 
-const DEFAULT_MAX_RESTARTS = 1;
 
 function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`loop limit ${label} must be a positive integer`);
@@ -77,11 +72,9 @@ function isCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function compareLimits(value: Partial<LoopBudgetFile>, limits: LoopBudgetLimits, maxRestarts: number, maxOptimizerTrials: number): void {
+function compareLimits(value: Partial<LoopBudgetFile>, limits: LoopBudgetLimits): void {
   if (value.max_campaigns !== limits.maxCampaigns || value.max_agent_starts !== limits.maxAgentStarts
-    || value.max_evaluator_runs !== limits.maxEvaluatorRuns
-    || (value.max_restarts !== undefined && value.max_restarts !== maxRestarts)
-    || (value.max_optimizer_trials !== undefined && value.max_optimizer_trials !== maxOptimizerTrials)) {
+    || value.max_evaluator_runs !== limits.maxEvaluatorRuns) {
     throw new Error("loop budget limits are immutable once created; keep the same limits or move the loop state aside to start a fresh budget");
   }
 }
@@ -99,25 +92,16 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
   assertPositiveInteger(limits.maxAgentStarts, "maxAgentStarts");
   assertPositiveInteger(limits.maxEvaluatorRuns, "maxEvaluatorRuns");
   assertPositiveInteger(limits.deadlineMs, "deadlineMs");
-  const maxRestarts = limits.maxRestarts ?? DEFAULT_MAX_RESTARTS;
-  if (!Number.isSafeInteger(maxRestarts) || maxRestarts < 0) throw new Error("loop limit maxRestarts must be a non-negative integer");
-  const maxOptimizerTrials = limits.maxOptimizerTrials ?? 0;
-  if (!Number.isSafeInteger(maxOptimizerTrials) || maxOptimizerTrials < 0) throw new Error("loop limit maxOptimizerTrials must be a non-negative integer");
-
   if (!fs.existsSync(file)) {
     const created: LoopBudgetFile = {
       version: 1,
       max_campaigns: limits.maxCampaigns,
       max_agent_starts: limits.maxAgentStarts,
       max_evaluator_runs: limits.maxEvaluatorRuns,
-      max_restarts: maxRestarts,
       campaigns: 0,
       agent_starts: 0,
       evaluator_runs: 0,
-      restarts: 0,
       open_campaign: null,
-      max_optimizer_trials: maxOptimizerTrials,
-      optimizer_trials: 0,
       wall_ms: 0,
       phases: emptyPhases(),
     };
@@ -137,18 +121,7 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
     || counters.some((entry) => entry === undefined || entry < 0)) {
     throw new Error("loop budget file does not match the expected schema; refusing to continue on corrupted state");
   }
-  compareLimits(value, limits, maxRestarts, maxOptimizerTrials);
-
-  // A present-but-invalid counter is corruption, not legacy absence: an explicit
-  // null must not hand the restart allowance back.
-  const restarts = value.restarts === undefined ? 0 : value.restarts;
-  if (typeof restarts !== "number" || !Number.isSafeInteger(restarts) || restarts < 0 || restarts > maxRestarts) {
-    throw new Error("loop budget restart counter does not match the expected schema; refusing to continue on corrupted state");
-  }
-  const optimizerTrials = value.optimizer_trials === undefined ? 0 : value.optimizer_trials;
-  if (!isCount(optimizerTrials) || optimizerTrials > maxOptimizerTrials) {
-    throw new Error("loop budget optimizer-trial counter does not match the expected schema; refusing to continue on corrupted state");
-  }
+  compareLimits(value, limits);
   const wallMs = value.wall_ms === undefined ? 0 : value.wall_ms;
   if (!isCount(wallMs)) throw new Error("loop budget wall-time counter does not match the expected schema; refusing to continue on corrupted state");
 
@@ -157,6 +130,9 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
     if (typeof openCampaign !== "object" || openCampaign === null
       || !isCount(openCampaign.agent_starts) || !isCount(openCampaign.evaluator_runs)
       || typeof openCampaign.at !== "string" || !Number.isFinite(Date.parse(openCampaign.at))
+      || (openCampaign.campaign_id !== undefined && typeof openCampaign.campaign_id !== "string")
+      || (openCampaign.campaign_agent_starts_before !== undefined && !isCount(openCampaign.campaign_agent_starts_before))
+      || (openCampaign.campaign_evaluator_runs_before !== undefined && !isCount(openCampaign.campaign_evaluator_runs_before))
       || (openCampaign.campaigns !== undefined && !isCount(openCampaign.campaigns))
       || (openCampaign.phase !== undefined && !LOOP_PHASES.includes(openCampaign.phase))) {
       throw new Error("loop budget carries an unreadable open-campaign reservation; refusing to continue on corrupted state");
@@ -169,14 +145,10 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
     max_campaigns: value.max_campaigns as number,
     max_agent_starts: value.max_agent_starts as number,
     max_evaluator_runs: value.max_evaluator_runs as number,
-    max_restarts: maxRestarts,
     campaigns: value.campaigns as number,
     agent_starts: value.agent_starts as number,
     evaluator_runs: value.evaluator_runs as number,
-    restarts,
     open_campaign: openCampaign,
-    max_optimizer_trials: maxOptimizerTrials,
-    optimizer_trials: optimizerTrials,
     wall_ms: wallMs,
     phases,
   };
@@ -212,25 +184,34 @@ export function writeLoopBudget(file: string, budget: LoopBudgetFile): void {
  * reservation costs one campaign; a phase reservation states its own count, so a
  * discovery probe is not billed as a campaign.
  */
-export function reconcileOpenReservation(budget: LoopBudgetFile): { budget: LoopBudgetFile; charged: LoopReservation } | null {
+export function reconcileOpenReservation(
+  budget: LoopBudgetFile,
+  observed?: { agentStarts: number; evaluatorRuns: number; campaigns?: number },
+): { budget: LoopBudgetFile; charged: LoopReservation } | null {
   const open = budget.open_campaign;
   if (!open) return null;
-  const campaigns = open.campaigns ?? 1;
+  const campaigns = observed?.campaigns ?? open.campaigns ?? 1;
+  const agentStarts = observed
+    ? Math.min(open.agent_starts, Math.max(0, observed.agentStarts - (open.campaign_agent_starts_before ?? 0)))
+    : open.agent_starts;
+  const evaluatorRuns = observed
+    ? Math.min(open.evaluator_runs, Math.max(0, observed.evaluatorRuns - (open.campaign_evaluator_runs_before ?? 0)))
+    : open.evaluator_runs;
   const phase = open.phase ?? "campaign";
   const phases = { ...(budget.phases ?? {}) };
   const prior = phases[phase] ?? { agent_starts: 0, evaluator_runs: 0, campaigns: 0 };
   phases[phase] = {
-    agent_starts: prior.agent_starts + open.agent_starts,
-    evaluator_runs: prior.evaluator_runs + open.evaluator_runs,
+    agent_starts: prior.agent_starts + agentStarts,
+    evaluator_runs: prior.evaluator_runs + evaluatorRuns,
     campaigns: prior.campaigns + campaigns,
   };
   return {
-    charged: { ...open, campaigns, phase },
+    charged: { ...open, agent_starts: agentStarts, evaluator_runs: evaluatorRuns, campaigns, phase },
     budget: {
       ...budget,
       campaigns: budget.campaigns + campaigns,
-      agent_starts: budget.agent_starts + open.agent_starts,
-      evaluator_runs: budget.evaluator_runs + open.evaluator_runs,
+      agent_starts: budget.agent_starts + agentStarts,
+      evaluator_runs: budget.evaluator_runs + evaluatorRuns,
       open_campaign: null,
       phases,
     },
@@ -241,7 +222,6 @@ export interface RemainingAllowance {
   campaigns: number;
   agentStarts: number;
   evaluatorRuns: number;
-  optimizerTrials: number;
 }
 
 export function remainingAllowance(budget: LoopBudgetFile): RemainingAllowance {
@@ -249,7 +229,6 @@ export function remainingAllowance(budget: LoopBudgetFile): RemainingAllowance {
     campaigns: budget.max_campaigns - budget.campaigns,
     agentStarts: budget.max_agent_starts - budget.agent_starts,
     evaluatorRuns: budget.max_evaluator_runs - budget.evaluator_runs,
-    optimizerTrials: (budget.max_optimizer_trials ?? 0) - (budget.optimizer_trials ?? 0),
   };
 }
 
@@ -284,13 +263,91 @@ export function settleReservation(
     campaigns: budget.campaigns + campaigns,
     agent_starts: budget.agent_starts + observed.agentStarts,
     evaluator_runs: budget.evaluator_runs + observed.evaluatorRuns,
-    optimizer_trials: (budget.optimizer_trials ?? 0) + (reservation.phase === "optimizer" ? 1 : 0),
     open_campaign: null,
     phases,
   };
 }
 
-/** Total wall time a run may still use, from the durable residue and this run's cap. */
-export function wallTimeAllowance(budget: LoopBudgetFile): number {
-  return budget.wall_ms ?? 0;
+/** Process-start ledger owned by one campaign. */
+export type CampaignProcessKind = "agent" | "evaluator";
+
+export interface CampaignProcessLedger {
+  version: 1;
+  agent_limit: number;
+  evaluator_limit: number;
+  agent_starts: number;
+  evaluator_runs: number;
+  last_start: { kind: CampaignProcessKind; key: string; reserved_at: string } | null;
+}
+
+export class CampaignLimitError extends Error {
+  readonly kind: CampaignProcessKind;
+  readonly limit: number;
+  constructor(kind: CampaignProcessKind, limit: number) {
+    super(`campaign ${kind} start limit reached (${limit})`);
+    this.name = "CampaignLimitError";
+    this.kind = kind;
+    this.limit = limit;
+  }
+}
+
+/** Durable process-start reservations shared by every phase in one campaign. */
+export class CampaignBudget {
+  readonly path: string;
+  readonly root: string;
+  readonly agentLimit: number;
+  readonly evaluatorLimit: number;
+
+  constructor(root: string, agentLimit: number, evaluatorLimit: number, createIfMissing = false) {
+    this.root = root;
+    this.agentLimit = agentLimit;
+    this.evaluatorLimit = evaluatorLimit;
+    this.path = path.join(root, "campaign-processes.json");
+    fs.mkdirSync(root, { recursive: true });
+    if (!fs.existsSync(this.path) && createIfMissing) {
+      this.write({ version: 1, agent_limit: agentLimit, evaluator_limit: evaluatorLimit, agent_starts: 0, evaluator_runs: 0, last_start: null });
+    }
+    if (!fs.existsSync(this.path)) throw new Error("campaign process ledger is missing; refusing to renew its budget");
+  }
+
+  read(): CampaignProcessLedger {
+    const parsed: unknown = JSON.parse(fs.readFileSync(this.path, "utf8"));
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("campaign process ledger is invalid");
+    const value = parsed as Record<string, unknown>;
+    if (value.version !== 1 || value.agent_limit !== this.agentLimit || value.evaluator_limit !== this.evaluatorLimit
+      || typeof value.agent_starts !== "number" || !Number.isSafeInteger(value.agent_starts) || value.agent_starts < 0 || value.agent_starts > this.agentLimit
+      || typeof value.evaluator_runs !== "number" || !Number.isSafeInteger(value.evaluator_runs) || value.evaluator_runs < 0 || value.evaluator_runs > this.evaluatorLimit
+      || !(value.last_start === null || (typeof value.last_start === "object" && value.last_start !== null && !Array.isArray(value.last_start)))) {
+      throw new Error("campaign process ledger does not match the saved limits");
+    }
+    const lastStart = value.last_start as Record<string, unknown> | null;
+    if (lastStart && ((lastStart.kind !== "agent" && lastStart.kind !== "evaluator")
+      || typeof lastStart.key !== "string" || typeof lastStart.reserved_at !== "string")) {
+      throw new Error("campaign process ledger last_start is invalid");
+    }
+    return {
+      version: 1, agent_limit: this.agentLimit, evaluator_limit: this.evaluatorLimit,
+      agent_starts: value.agent_starts as number, evaluator_runs: value.evaluator_runs as number,
+      last_start: lastStart as CampaignProcessLedger["last_start"],
+    };
+  }
+
+  reserve(kind: CampaignProcessKind, key: string): void {
+    allocator(this.root, () => {
+      const ledger = this.read();
+      if (kind === "agent") {
+        if (ledger.agent_starts >= ledger.agent_limit) throw new CampaignLimitError(kind, ledger.agent_limit);
+        ledger.agent_starts += 1;
+      } else {
+        if (ledger.evaluator_runs >= ledger.evaluator_limit) throw new CampaignLimitError(kind, ledger.evaluator_limit);
+        ledger.evaluator_runs += 1;
+      }
+      ledger.last_start = { kind, key, reserved_at: new Date().toISOString() };
+      this.write(ledger);
+    });
+  }
+
+  private write(ledger: CampaignProcessLedger): void {
+    writeFileAtomic(this.path, `${JSON.stringify(ledger, null, 2)}\n`, true);
+  }
 }

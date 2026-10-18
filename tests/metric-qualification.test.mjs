@@ -15,12 +15,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { absoluteGain, normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { buildReconInventory, reconProject } from "../extensions/pi-dream-rsi/engine/recon.ts";
-import { qualifyInstrument, resolveGainThreshold, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
+import { qualifyInstrument, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
 
 /** Deterministic busy work, so the measured span is the project's work. */
 const WORK = `export function work(ms) {
+  if (ms <= 0) return 0;
   const until = performance.now() + ms;
   let spins = 0;
   while (performance.now() < until) spins += 1;
@@ -63,6 +64,7 @@ process.exit(1);
 
 const TEST_OK = `import { work } from "./src/work.mjs";
 if (work(1) <= 0) { console.error("work did not run"); process.exit(1); }
+if (work(0) !== 0) { console.error("zero work changed"); process.exit(1); }
 `;
 
 const TEST_ALWAYS_PASSES = `console.log("nothing checked");
@@ -134,11 +136,21 @@ async function qualifyOnce(projectDir, runContract, overrides = {}) {
   const inventory = buildReconInventory({ contract: runContract, recon });
   assert.equal(inventory.levers.length, 1, `expected one lever, got ${JSON.stringify(inventory.rejected)}`);
   const lever = inventory.levers[0];
+  const evaluator = runContract.outcome.evaluator;
   const plan = await synthesizeMetric({
     projectDir,
     loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
     lever,
     ...(lever.command ? { command: lever.command } : {}),
+    ...(lever.metricKind === "score" && evaluator ? {
+      scoreEvaluator: {
+        argv: [...evaluator.argv],
+        output: evaluator.output,
+        ...(evaluator.inputs ? { inputs: [...evaluator.inputs] } : {}),
+        unit: runContract.outcome.unit,
+        higherIsBetter: runContract.outcome.higherIsBetter,
+      },
+    } : {}),
     qualification: {
       contract: runContract,
       workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
@@ -153,9 +165,9 @@ async function qualifyOnce(projectDir, runContract, overrides = {}) {
 }
 
 test("a threshold of a fixed percentage resolves against the measured baseline", () => {
-  assert.equal(resolveGainThreshold(25, 1000), 25);
-  assert.equal(resolveGainThreshold("20%", 500), 100);
-  assert.equal(resolveGainThreshold("2.5%", 1000), 25);
+  assert.equal(absoluteGain(25, 1000), 25);
+  assert.equal(absoluteGain("20%", 500), 100);
+  assert.equal(absoluteGain("2.5%", 1000), 25);
 });
 
 test("an instrument is qualified without any supplied winning patch", async () => {
@@ -177,8 +189,59 @@ test("an instrument is qualified without any supplied winning patch", async () =
   }
   const sensitivity = report.checks.find((check) => check.name === "sensitivity");
   assert.equal(sensitivity.passed, true, sensitivity.detail);
+  assert.equal(named.includes("mutation"), false, "qualification does not run mutation testing");
   assert.ok(plan.evaluationContract.baseline.length >= 2, "the contract records its baseline readings");
   assert.ok(plan.evaluationContract.sensitivity > 0, "the contract records the measured response to the degraded control");
+});
+
+test("a deterministic failing suite qualifies when inert code causes additional test failures", async () => {
+  const projectDir = project({
+    "package.json": `${JSON.stringify({ name: "suite-failure-qualify", private: true, type: "module", scripts: { "test:broken": "node broken.mjs", "test:smoke": "node smoke.mjs" } }, null, 2)}\n`,
+    "broken.mjs": `import * as work from "./src/work.mjs";\nimport { spawnSync } from "node:child_process";\nconst result = spawnSync(process.execPath, ["--test", "broken.test.mjs"], { encoding: "utf8" });\nprocess.stdout.write(result.stdout ?? "");\nprocess.stderr.write(result.stderr ?? "");\nprocess.exit(result.status ?? 1);\n`,
+    "broken.test.mjs": `import test from "node:test";\nimport assert from "node:assert/strict";\nimport * as work from "./src/work.mjs";\ntest("existing deterministic failure", () => assert.equal(work.work(), 2));\ntest("editable export exists", () => assert.equal(typeof work.work, "function"));\n`,
+    "smoke.mjs": 'import { work } from "./src/work.mjs";\nif (work() !== 1) process.exit(1);\n',
+    "src/work.mjs": "export const work = () => 1;\n",
+  });
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir, contract: runContract,
+    probeImpl: async (command) => command.label === "npm run test:broken"
+      ? { label: command.label, ok: false, durationMs: 20, timedOut: false, error: "one assertion failed", exitCode: 1, spawnFailed: false }
+      : { label: command.label, ok: true, durationMs: 20, timedOut: false, error: null, exitCode: 0, spawnFailed: false },
+  });
+  const lever = buildReconInventory({ contract: runContract, recon }).levers.find((candidate) => candidate.metricKind === "suite-failures");
+  assert.ok(lever);
+  const plan = await synthesizeMetric({
+    projectDir, loopRoot: path.join(projectDir, ".dream-rsi", "loop"), lever,
+    ...(lever.command ? { command: lever.command } : {}),
+    qualification: {
+      contract: runContract, workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
+      outcome: runContract.outcome.statement, minimumUsefulGain: runContract.outcome.minimumUsefulGain,
+    },
+  });
+  const sensitivity = plan.qualification?.checks.find((check) => check.name === "sensitivity");
+  const baseline = plan.qualification?.checks.find((check) => check.name === "baseline");
+  assert.equal(plan.ready, true, JSON.stringify(plan.rejections));
+  assert.match(baseline?.detail ?? "", /median 3/);
+  assert.equal(sensitivity?.passed, true, sensitivity?.detail);
+  assert.match(sensitivity?.detail ?? "", /failure control moved the score/);
+});
+
+test("measurement refuses an insufficient evaluator allowance before spending", async () => {
+  const projectDir = nodeProject();
+  let started = 0;
+  const { plan, report } = await qualify(projectDir, contract(), {
+    availableEvaluatorRuns: 10,
+    beforeEvaluatorRun: () => { started += 1; },
+  });
+
+  assert.equal(report.passed, false);
+  assert.equal(plan.ready, false);
+  assert.equal(started, 0, "budget admission happens before any evaluator process starts");
+  assert.equal(report.checks.length, 1, "an infeasible measurement returns a direct admission diagnosis");
+  assert.equal(report.checks[0].name, "budget-fit");
+  assert.match(report.checks[0].detail, /before spending evaluator runs/);
+  assert.match(report.checks[0].detail, /only 10 evaluator run\(s\) remain/);
 });
 
 test("an instrument that cannot resolve the useful gain is refused, not accommodated", async () => {
@@ -231,56 +294,139 @@ test("a workload that does not complete on the unchanged target is refused immed
   assert.ok(report.checks.length < 8, "qualification stops at the first failing prerequisite instead of running the rest");
 });
 
-test("a provided known-better control patch still takes the supplied-control path", async () => {
-  const projectDir = nodeProject();
-  const runContract = contract();
-  const recon = await reconProject({
-    projectDir, contract: runContract,
-    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 120, timedOut: false, error: null }),
-  });
-  const lever = buildReconInventory({ contract: runContract, recon }).levers[0];
-  const controlPatchPath = path.join(projectDir, "control.patch");
-  fs.writeFileSync(controlPatchPath, "diff --git a/src/work.mjs b/src/work.mjs\n");
+// ---------------------------------------------------------------------------
+// W10: a contract-declared score evaluator is the instrument
+// ---------------------------------------------------------------------------
 
-  const plan = await synthesizeMetric({
-    projectDir,
-    loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
-    lever,
-    ...(lever.command ? { command: lever.command } : {}),
-    controlPatchPath,
-    qualification: {
-      contract: runContract,
-      workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
-      outcome: runContract.outcome.statement,
-      minimumUsefulGain: runContract.outcome.minimumUsefulGain,
+const SCORE_MODEL = "export const accuracy = () => 0.62;\n";
+const SCORE_TEST_OK = `import { accuracy } from "./src/model.mjs";
+if (!(accuracy() >= 0.6)) { console.error("accuracy regressed"); process.exit(1); }
+`;
+const SCORE_TEST_ALWAYS_PASSES = `console.log("nothing checked");
+`;
+const SCORE_EVAL_JSON = `import { accuracy } from "../src/model.mjs";
+import * as fs from "node:fs";
+fs.mkdirSync("eval", { recursive: true });
+fs.writeFileSync("eval/score.json", JSON.stringify({ score: accuracy(), raw_score: accuracy(), valid: true, fail_class: "ok", error: null }));
+`;
+
+/**
+ * Each launch alternates between two very different scores, so the repeated
+ * baseline readings disagree deterministically. A score instrument that cannot
+ * reproduce its own reading cannot resolve a useful gain.
+ */
+const SCORE_EVAL_NOISY = (marker) => `import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+const count = existsSync(${JSON.stringify(marker)}) ? Number(readFileSync(${JSON.stringify(marker)}, "utf8")) : 0;
+writeFileSync(${JSON.stringify(marker)}, String(count + 1));
+mkdirSync("eval", { recursive: true });
+writeFileSync("eval/score.json", JSON.stringify({ score: count % 2 === 0 ? 0.4 : 0.9, valid: true, fail_class: "ok", error: null }));
+`;
+
+function scoreProject({ evaluator = SCORE_EVAL_JSON, testScript = SCORE_TEST_OK } = {}) {
+  return project({
+    "package.json": `${JSON.stringify({
+      name: "score-qualify", private: true, type: "module",
+      scripts: { bench: "node bench.mjs", test: "node test.mjs" },
+    }, null, 2)}\n`,
+    "bench.mjs": 'import { accuracy } from "./src/model.mjs";\nconsole.log(accuracy());\n',
+    "test.mjs": testScript,
+    "src/model.mjs": SCORE_MODEL,
+    "eval/score.mjs": evaluator,
+  });
+}
+
+function scoreContract(overrides = {}) {
+  return contract({
+    outcome: {
+      statement: "raise the benchmark accuracy",
+      unit: "points",
+      higherIsBetter: true,
+      minimumUsefulGain: "10%",
+      evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] },
     },
+    budgets: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 240, deadlineMs: 240_000, falseAcceptBudget: 0.01 },
+    ...overrides,
   });
+}
 
+test("a declared score evaluator is qualified as the instrument, with its inputs pinned", async () => {
+  const projectDir = scoreProject();
+  const runContract = scoreContract();
+  const { plan, report } = await qualify(projectDir, runContract);
+
+  assert.equal(report.passed, true, `expected qualification to pass: ${JSON.stringify(report.rejections)}`);
   assert.equal(plan.ready, true);
-  assert.equal(plan.controlPatchPath, controlPatchPath);
-  assert.equal(plan.qualification, undefined, "a supplied control is validated by the campaign preflight, not by this path");
+  assert.equal(plan.metricKind, "score");
+  assert.deepEqual(plan.argv, ["node", "eval/score.mjs"], "the declared evaluator is the measured program");
+  assert.deepEqual(plan.evaluatorInputs, ["eval/score.mjs"], "the evaluator code is pinned, never candidate-editable");
+  assert.equal(plan.evaluatorOutput, "score-json");
+
+  const frozen = plan.evaluationContract;
+  assert.ok(frozen, "a qualified score instrument is frozen as an evaluation contract");
+  assert.equal(frozen.metricKind, "score");
+  assert.equal(frozen.unit, "points");
+  assert.equal(frozen.higherIsBetter, true);
+  assert.deepEqual(frozen.gates, ["npm run test"], "the declared test command is still the oracle");
+  assert.ok(frozen.assets.some((asset) => asset.path === "eval/score.mjs"), "the paused evaluator input is digested into the identity");
+  assert.ok(frozen.assets.some((asset) => /evaluate\.mjs$/.test(asset.path)), "the generated instrument is digested too");
+  assert.ok(frozen.baseline.length >= 2, "the contract records repeated baseline readings");
+
+  const named = report.checks.map((check) => check.name);
+  for (const required of ["workload", "baseline", "stability", "direction", "sensitivity", "missing-workload", "oracle", "budget-fit"]) {
+    assert.ok(named.includes(required), `qualification must report the ${required} check`);
+  }
+  const sensitivity = report.checks.find((check) => check.name === "sensitivity");
+  assert.equal(sensitivity.passed, true, sensitivity.detail);
+  assert.match(sensitivity.detail, /inert|editable/i, "the score control is the inert editable scope");
 });
 
-test("an empty control patch is still refused even when qualification is available", async () => {
-  const projectDir = nodeProject();
-  const runContract = contract();
-  const recon = await reconProject({
-    projectDir, contract: runContract,
-    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 120, timedOut: false, error: null }),
-  });
-  const lever = buildReconInventory({ contract: runContract, recon }).levers[0];
-  const controlPatchPath = path.join(projectDir, "control.patch");
-  fs.writeFileSync(controlPatchPath, "   \n");
+test("the score budget-fit check reports the promotion floor the confirmation actually needs", async () => {
+  const projectDir = scoreProject();
+  const { report } = await qualify(projectDir, scoreContract());
+  const budget = report.checks.find((check) => check.name === "budget-fit");
+  assert.equal(budget.passed, true, budget.detail);
+  assert.match(budget.detail, /deterministic/, "an exact score reading plans the two-run confirmation");
+  assert.match(budget.detail, /promotion floor|evaluator run/i, "the check explains the floor instead of repeating the old timeout estimate");
 
-  const plan = await synthesizeMetric({
-    projectDir,
-    loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
-    lever,
-    ...(lever.command ? { command: lever.command } : {}),
-    controlPatchPath,
-  });
+  const tightProject = scoreProject();
+  const tight = await qualify(tightProject, scoreContract({ budgets: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 240, deadlineMs: 90_000, falseAcceptBudget: 0.01 } }));
+  const tightBudget = tight.report.checks.find((check) => check.name === "budget-fit");
+  assert.equal(tightBudget.passed, false, "a deadline below the promotion floor is refused");
+  assert.match(tightBudget.detail, /does not fit|does not cover/);
+});
+
+test("a score evaluator that ignores the editable code is refused: inert code must invalidate or worsen the score", async () => {
+  // The evaluator always reports 0.62, so inert editable code changes nothing.
+  const projectDir = scoreProject({ evaluator: `import * as fs from "node:fs";\nfs.mkdirSync("eval", { recursive: true });\nfs.writeFileSync("eval/score.json", JSON.stringify({ score: 0.62, valid: true, fail_class: "ok", error: null }));\n` });
+  const { plan, report } = await qualify(projectDir, scoreContract());
+
+  assert.equal(report.passed, false, "an insensitive score instrument must be refused");
+  const sensitivity = report.checks.find((check) => check.name === "sensitivity");
+  assert.equal(sensitivity.passed, false);
+  assert.match(sensitivity.detail, /did not change the score|wrong direction/);
   assert.equal(plan.ready, false);
-  assert.match(plan.rejections.join("; "), /control patch file is empty/);
+});
+
+test("a score instrument whose declared gate accepts inert code cannot be qualified", async () => {
+  const projectDir = scoreProject({ testScript: SCORE_TEST_ALWAYS_PASSES });
+  const { report } = await qualify(projectDir, scoreContract());
+
+  assert.equal(report.passed, false);
+  const oracle = report.checks.find((check) => check.name === "oracle");
+  assert.equal(oracle.passed, false);
+  assert.match(oracle.detail, /an inert version of the editable code still passes/);
+});
+
+test("a noisy score evaluator cannot resolve the useful gain", async () => {
+  const marker = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-score-noise-")), "toggle");
+  const projectDir = scoreProject({ evaluator: SCORE_EVAL_NOISY(marker) });
+  const { plan, report } = await qualify(projectDir, scoreContract(), { attempts: 1 });
+
+  assert.equal(report.passed, false);
+  const stability = report.checks.find((check) => check.name === "stability");
+  assert.equal(stability.passed, false, "a noisy score channel cannot resolve a 10% change");
+  assert.match(stability.detail, /cannot be distinguished from noise/);
+  assert.equal(plan.ready, false);
 });
 
 void qualifyInstrument;

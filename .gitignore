@@ -16,6 +16,8 @@ eval/*
 !eval/tier2.mjs
 !eval/assess.mjs
 !eval/fixtures/
+!eval/tournament/
+!eval/tournament/**
 
 # Local runtime state (lock files, in-progress markers)
 state/

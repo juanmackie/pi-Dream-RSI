@@ -6,10 +6,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
-import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
-import type { ApplyVerification } from "./apply.ts";
+import { interpretEvaluation, readScoreFile, type ApplyVerification, type ScoreOutcome } from "./score.ts";
 import type { TaskConfig } from "./task.ts";
 import { runPaired, type MeasurementPlan } from "./measure.ts";
+import { pathWithin } from "./scope.ts";
 
 export interface CandidateWrite {
   kind: "write";
@@ -93,12 +93,9 @@ function normalizeScopes(scopes?: string[]): string[] | null {
 }
 
 function withinScopes(relative: string, scopes: string[] | null): boolean {
-  if (scopes === null) return true;
-  const candidate = process.platform === "win32" ? relative.toLowerCase() : relative;
-  return scopes.some((scope) => {
-    const normalized = process.platform === "win32" ? scope.toLowerCase() : scope;
-    return normalized === "" || candidate === normalized || candidate.startsWith(`${normalized}/`);
-  });
+  return process.platform === "win32"
+    ? pathWithin(relative.toLowerCase(), scopes?.map((scope) => scope.toLowerCase()) ?? null)
+    : pathWithin(relative, scopes);
 }
 
 function ensureDirectoryRoot(root: string): string {
@@ -341,7 +338,7 @@ async function scoreCopy(options: {
       signal,
       beforeSpawn: () => beforeSpawn?.(evaluatorKey),
     });
-    return interpretEvaluation(task, command, readScoreFile(scratch, task));
+    return { ...interpretEvaluation(task, command, readScoreFile(scratch, task)), processDurationMs: command.durationMs };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

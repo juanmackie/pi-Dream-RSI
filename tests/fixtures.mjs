@@ -107,71 +107,6 @@ process.exit(4);
   "score-nofile.mjs": `
 process.exit(0);
 `,
-  "agent-router.mjs": `
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
-let prompt = "";
-process.stdin.on("data", (d) => (prompt += d));
-process.stdin.on("end", () => {
-  // One CLI, two prompts: discover whether the discovery prompt or the improvement prompt arrived.
-  const policyWork = prompt.includes("prefix-only exploration policy");
-  appendFileSync("agent-prompts.log", (policyWork ? "development" : "discovery") + " " + prompt.length + "\\n");
-  if (policyWork) {
-    const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
-    const src = readFileSync(file, "utf8");
-    const next = src.includes("default_beta = 0.8;") ? "0.7" : "0.8";
-    writeFileSync(file, src.replace(/default_beta = [0-9.]+;/, "default_beta = " + next + ";"));
-    return;
-  }
-  const depth = (readFileSync("solution.py", "utf8").match(/x/g) ?? []).length;
-  appendFileSync("solution.py", "x".repeat(1 + (depth % 3)) + "\\n");
-  writeFileSync("proposal.md", "# mechanism\\ndepth=" + depth + "\\nprompt_bytes=" + prompt.length + "\\n");
-});
-`,
-  "developer-improve.mjs": `
-import { readFileSync, writeFileSync } from "node:fs";
-let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
-process.stdin.on("end", () => {
-  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
-  const src = readFileSync(file, "utf8");
-  const next = src.includes("default_beta = 0.8;") ? "0.6" : "0.8";
-  writeFileSync(file, src.replace(/default_beta = [0-9.]+;/, "default_beta = " + next + ";")
-    .replace("// EVOLVE-BLOCK-START", "// EVOLVE-BLOCK-START (revised; prompt bytes " + prompt.length + ")"));
-});
-`,
-  "developer-regress.mjs": `
-import { readFileSync, writeFileSync } from "node:fs";
-let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
-process.stdin.on("end", () => {
-  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
-  const src = readFileSync(file, "utf8");
-  // A policy that refuses to probe anything: worse on every world, so selection must keep pi_0.
-  writeFileSync(file, src.replace(
-    "    while (!_budget_done(question, budget)) {",
-    "    while (false) {",
-  ));
-});
-`,
-  "developer-delete.mjs": `
-import { rmSync } from "node:fs";
-let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
-process.stdin.on("end", () => {
-  // The failure mode that used to take the deployed policy down with it: the agent removes the file
-  // it was asked to edit. With staging, this must not touch the deployed policy or crash the phase.
-  const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
-  rmSync(file, { force: true });
-});
-`,
-  "developer-reads-feedback.mjs": `
-import { existsSync, appendFileSync } from "node:fs";
-let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
-process.stdin.on("end", () => {
-  // The agent runs from the dream root; the revision's own replay feedback must already be on disk.
-  const results = "history/r0001_dream/proposal_results";
-  const sweep = existsSync(results + "/beta_sweep.json");
-  const traces = existsSync(results + "/policy_execution_traces.jsonl");
-  appendFileSync("feedback.log", (sweep ? "sweep" : "no-sweep") + " " + (traces ? "traces" : "no-traces") + "\\n");
-});
-`,
 };
 
 /** Build a throwaway project. Returns paths plus a task object already pointing at the fixtures. */
@@ -192,12 +127,6 @@ export function makeProject(options = {}) {
     score_program: `node "${path.join(projectDir, options.scorer ?? "score-ok.mjs")}"`,
     problem_file: "PROBLEM.md",
     higher_is_better: true,
-    workers: 2,
-    k1: 3,
-    k2: 4,
-    revisions: 2,
-    beta_grid: [0, 0.6],
-    default_beta: 0.6,
     agent_timeout_ms: options.agentTimeoutMs ?? 20_000,
     evaluator_timeout_ms: options.evaluatorTimeoutMs ?? 20_000,
     agent: {
@@ -222,14 +151,6 @@ export function makeProject(options = {}) {
 export async function writeTaskJson(project) {
   fs.mkdirSync(project.dreamRoot, { recursive: true });
   fs.writeFileSync(path.join(project.dreamRoot, "task.json"), `${JSON.stringify(project.task, null, 2)}\n`, "utf8");
-}
-
-/** Deploy the shipped policy into the project, with its relative imports. */
-export async function deployShippedPolicy(project, source = null) {
-  const world = await jump("engine/world.ts");
-  world.ensurePolicyRuntime(project.dreamRoot, path.join(EXT, "policy"));
-  const shipped = source ?? fs.readFileSync(path.join(EXT, "policy", "method.ts"), "utf8");
-  return world.deployPolicy(project.dreamRoot, shipped);
 }
 
 /** Mock of the pi ExtensionAPI surface this extension uses. */

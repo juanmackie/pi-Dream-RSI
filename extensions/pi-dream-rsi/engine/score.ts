@@ -16,8 +16,59 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
-import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import type { TaskConfig } from "./task.ts";
+
+/** Evaluation outcome for one attempt, after normalizing the task's score convention. */
+export interface ScoreOutcome {
+  score: number | null;
+  raw_score: number | null;
+  valid: boolean;
+  fail_class: string;
+  error: string | null;
+  processDurationMs?: number;
+}
+
+/** Interpret an evaluator result without spawning a process. */
+export function interpretEvaluation(
+  task: TaskConfig,
+  command: CommandResult,
+  scoreJson: Record<string, unknown> | null,
+): ScoreOutcome {
+  if (command.timedOut) return { score: null, raw_score: null, valid: false, fail_class: "timeout", error: "evaluator timed out" };
+  if (command.aborted) return { score: null, raw_score: null, valid: false, fail_class: "cancelled", error: "evaluator cancelled" };
+  if (command.spawnError) return { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: command.spawnError };
+  if (!command.ok) {
+    const tail = command.stderrTail.trim().split("\n").filter(Boolean).slice(-3).join(" | ");
+    return { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: `evaluator exited with code ${command.code}${tail ? `: ${tail}` : ""}` };
+  }
+  if (!scoreJson) return { score: null, raw_score: null, valid: false, fail_class: "eval_error", error: `evaluator wrote no ${task.score_path}` };
+  const reportedClass = scoreJson[task.fail_class_field];
+  const reportedError = scoreJson[task.error_field];
+  const reportedValid = scoreJson[task.valid_field];
+  const raw = scoreJson[task.score_field];
+  const failClass = typeof reportedClass === "string" && reportedClass ? reportedClass : null;
+  const errorText = typeof reportedError === "string" && reportedError.trim() !== ""
+    ? reportedError
+    : typeof reportedError === "object" && reportedError !== null ? JSON.stringify(reportedError) : null;
+  if (failClass && failClass !== "ok") {
+    return { score: null, raw_score: typeof raw === "number" ? raw : null, valid: false,
+      fail_class: failClass, error: errorText ?? `evaluator reported fail_class=${failClass}` };
+  }
+  if (typeof raw !== "number" || !Number.isFinite(raw)) {
+    return { score: null, raw_score: null, valid: false, fail_class: "invalid_score",
+      error: `score field "${task.score_field}" is missing or not a finite number` };
+  }
+  return { score: task.higher_is_better ? raw : -raw, raw_score: raw, valid: reportedValid === false ? false : true,
+    fail_class: "ok", error: errorText };
+}
+
+/** Read the scorer's verdict file from a workspace. */
+export function readScoreFile(workspace: string, task: TaskConfig): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(workspace, task.score_path), "utf8")) as unknown;
+    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
 
 /** One file an apply copies from the candidate workspace (`from`) over the user's workspace (`to`). */
 export interface ApplyFile {
@@ -114,7 +165,7 @@ export async function scoreSeedCopy(options: {
       beforeSpawn: () => options.beforeEvaluatorSpawn?.(options.evaluatorKey ?? "apply-score"),
     });
     options.onCommand?.(command);
-    return interpretEvaluation(task, command, readScoreFile(scratch, task));
+    return { ...interpretEvaluation(task, command, readScoreFile(scratch, task)), processDurationMs: command.durationMs };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

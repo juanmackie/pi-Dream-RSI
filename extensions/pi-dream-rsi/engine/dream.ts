@@ -1,686 +1,158 @@
-/**
- * Dreaming: the offline phase (paper §3, "Offline evaluation" + "Policy improvement and selection"),
- * driven by the prompt in `prompts/policy-improvement.md`.
- *
- *   fixed history H_t  ->  evaluate pi_0 .. pi_{M-1} on EVERY world (replay only, no new generation)
- *                      ->  revise the executable policy between revisions
- *                      ->  pi_{t+1} = argmax_m V_m        (V_m = mean over worlds of Eq. 1)
- *                      ->  deploy the winner for the next live episode
- *
- * Because pi_0 (the policy that just ran live) is always among the candidates, the selection satisfies
- * `V* >= V_0`. That guarantee is asserted, not assumed: if it breaks, something non-deterministic or
- * non-prefix-only happened and the iteration is reported as failed instead of deploying a regression.
- */
-
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { allocator, acquirePhase } from "./ownership.ts";
-import { ProgressRecorder, type ProgressObserver } from "./progress.ts";
-import { activeRuns } from "../state.ts";
-import { runAgent } from "../agent/runner.ts";
-import { loadPrompt, renderPrompt } from "./prompt.ts";
-import { readManifest, readTree } from "./world.ts";
-import { replayEpisode } from "./replay.ts";
-import { sweepSummary, type BetaSweepPoint } from "./reward.ts";
-import type { BetaSweepSummary } from "../policy/api.ts";
-import type { DiscoveryTree } from "./tree.ts";
-import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
-import { BUNDLED_POLICY_DIR } from "../layout.ts";
-import {
-  archivePolicyVersion,
-  baselineDir,
-  deployPolicy,
-  deployedBetaPath,
-  ensurePolicyRuntime,
-  historyDir,
-  liveMethodPath,
-  proposalResultsDir,
-  recentManifests,
-  roundDir,
-  stagingPolicyPath,
-  tracePoolDir,
-  writeFileAtomic,
-  writeJson,
-  writeJsonl,
-} from "./world.ts";
+import type { ExperimentNode, ExperimentWorld, SearchConfig } from "./experiment.ts";
+import { defaultSearchConfig, selectActions } from "./experiment.ts";
+import { readJson, writeFileAtomic, writeJson } from "./fsutil.ts";
+import { runAgent, type CommandResult } from "../agent/runner.ts";
+import type { AgentConfig } from "./task.ts";
 
+export const DREAM_BETA1 = 0.02;
+export const DREAM_BETA2 = 0.01;
+export const DREAM_MIN_MARGIN = 0.01;
+export const DREAM_MIN_COVERAGE = 0.6;
+
+export interface ReplayResult {
+  best: number;
+  revealed: string[];
+  coverage: number;
+  rounds: number;
+}
+
+export interface WorldValueInput { baseline: number; threshold: number; nodes: ExperimentNode[]; rounds: number; }
+
+function validNodes(world: Pick<ExperimentWorld, "nodes">): ExperimentNode[] {
+  return world.nodes.filter((node) => node.stage === "done" && node.valid && typeof node.score === "number");
+}
+
+/** Replay a config against recorded nodes only; unrecorded actions reduce coverage. */
+export function replayWorld(world: ExperimentWorld, config: SearchConfig): ReplayResult {
+  const recorded = world.nodes.filter((node) => node.stage === "done").sort((a, b) => a.seq - b.seq);
+  const revealed = new Set<string>();
+  const done: ExperimentNode[] = [];
+  let best = world.baseline;
+  let rounds = 0;
+  let requestedActions = 0;
+  let noGainRounds = 0;
+  for (let round = 1; round <= config.maxRounds && noGainRounds < config.patience; round += 1) {
+    const previousBest = best;
+    const actions = selectActions(done, config, round);
+    if (actions.length === 0) break;
+    rounds = round;
+    requestedActions += actions.length;
+    const unused = [...recorded];
+    for (let index = unused.length - 1; index >= 0; index -= 1) if (revealed.has(unused[index]!.id)) unused.splice(index, 1);
+    for (const action of actions) {
+      const nextIndex = unused.findIndex((node) => node.kind === action.kind && node.parent === action.parent);
+      if (nextIndex < 0) continue;
+      const [next] = unused.splice(nextIndex, 1);
+      if (!next) continue;
+      revealed.add(next.id);
+      done.push(next);
+      if (next.valid && typeof next.score === "number") best = Math.max(best, next.score);
+    }
+    noGainRounds = best > previousBest && best - previousBest >= world.threshold ? 0 : noGainRounds + 1;
+  }
+  const coverage = Math.max(recorded.length, requestedActions) === 0
+    ? 0
+    : revealed.size / Math.max(recorded.length, requestedActions);
+  return { best, revealed: [...revealed], coverage, rounds };
+}
+
+/** Unitless objective used for comparing search configs across different score scales. */
+export function worldValue(world: WorldValueInput, replay: ReplayResult): number {
+  const valid = validNodes(world as Pick<ExperimentWorld, "nodes">);
+  const worldMax = valid.length ? Math.max(...valid.map((node) => node.score as number)) : world.baseline;
+  const scale = Math.max(worldMax - world.baseline, world.threshold, Number.EPSILON);
+  const gain = (replay.best - world.baseline) / scale;
+  const cost = replay.revealed.length;
+  return gain - DREAM_BETA1 * cost + DREAM_BETA2 * cost / Math.max(1, replay.rounds);
+}
+
+export function scoreSearchConfig(worlds: ExperimentWorld[], config: SearchConfig): { score: number; coverage: number } {
+  if (worlds.length === 0) return { score: 0, coverage: 0 };
+  const results = worlds.map((world) => replayWorld(world, config));
+  return { score: results.reduce((sum, result, index) => sum + worldValue(worlds[index]!, result), 0) / worlds.length,
+    coverage: results.reduce((sum, result) => sum + result.coverage, 0) / results.length };
+}
+
+export interface ScoredConfig { config: SearchConfig; score: number; coverage: number; }
+
+/** Pick the best eligible challenger; incumbent wins ties and low-coverage contests. */
+export function chooseSearchConfig(candidates: ScoredConfig[], incumbent: SearchConfig): SearchConfig {
+  const current = candidates.find((candidate) => JSON.stringify(candidate.config) === JSON.stringify(incumbent));
+  if (!current) return incumbent;
+  const winner = candidates.filter((candidate) => candidate.coverage >= DREAM_MIN_COVERAGE)
+    .sort((a, b) => b.score - a.score)[0];
+  return winner && winner.score > current.score + DREAM_MIN_MARGIN ? winner.config : incumbent;
+}
+
+export function validateSearchConfig(value: unknown): SearchConfig | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as Record<string, unknown>;
+  const keys = ["version", "batchSize", "exploreShare", "refineTop", "maxRounds", "patience"];
+  if (Object.keys(item).length !== keys.length || keys.some((key) => !Object.hasOwn(item, key))) return null;
+  if (item.version !== 1 || !Number.isInteger(item.batchSize) || (item.batchSize as number) < 1 || (item.batchSize as number) > 4
+    || typeof item.exploreShare !== "number" || item.exploreShare < 0 || item.exploreShare > 1
+    || !Number.isInteger(item.refineTop) || (item.refineTop as number) < 1 || (item.refineTop as number) > 3
+    || !Number.isInteger(item.maxRounds) || (item.maxRounds as number) < 1 || (item.maxRounds as number) > 6
+    || !Number.isInteger(item.patience) || (item.patience as number) < 1 || (item.patience as number) > 3) return null;
+  return item as unknown as SearchConfig;
+}
 
 export interface DreamOptions {
-  dreamRoot: string;
   projectDir: string;
-  task: TaskConfig;
-  iteration: number;
-  /** Overrides the deployed policy for revision 0 (used by tests). */
-  policyPath?: string;
+  loopRoot: string;
+  agent: AgentConfig;
+  resolveAgent?: (agent: AgentConfig) => AgentConfig | null;
+  beforeAgentSpawn: (key: string) => void;
   log?: (message: string) => void;
-  onProgress?: ProgressObserver;
-  /** Wall-clock cap per policy-development agent call. */
-  developmentTimeoutMs?: number;
-  /** Skip the policy-development agent (revision 0 only) — useful for smoke tests. */
-  evaluateOnly?: boolean;
-  /** Cancellation: stops replay workers and the development agent, and blocks deployment. */
-  signal?: AbortSignal;
-  /** Durable campaign reservation immediately before each policy revision child starts. */
-  beforeAgentSpawn?: (key: string) => void;
-  resolveAgent?: (savedAgent: AgentConfig) => AgentConfig | null;
-  /** Durable evaluator reservation for the campaign's seed/apply scorer runs. */
-  beforeEvaluatorSpawn?: (key: string) => void;
+  onAgentComplete?: (result: CommandResult) => void;
+  signal: AbortSignal;
+  worlds?: ExperimentWorld[];
+  incumbent?: SearchConfig;
 }
 
-export interface VersionEvaluation {
-  revision: number;
-  policy_path: string;
-  policy_name: string | null;
-  /** The version's baked-in default beta, as resolved from the policy itself. */
-  default_beta: number;
-  /** V_m — mean replay score across the fixed history at the version's default beta. */
-  v_mean: number;
-  deterministic: boolean | null;
-  per_world: {
-    iteration: number;
-    value: number;
-    probes: number;
-    rounds: number;
-    attainment: number | null;
-    auc: number;
-    parallel_penalty: number;
-    ok: boolean;
-    error: string | null;
-  }[];
-  /** Archived sweep of the beta grid for this version. */
-  points: BetaSweepPoint[];
-  summary: BetaSweepSummary;
-  error: string | null;
-}
-
-export interface DreamResult {
-  ok: boolean;
-  error: string | null;
-  iteration: number;
-  worlds: number;
-  revisions: number;
-  evaluations: VersionEvaluation[];
-  /** Index into `evaluations` of the selected version. */
-  selected: number | null;
-  selected_policy: string | null;
-  /** The beta baked into the deployed policy. */
-  deployed_beta: number;
-  /** True when the policy-development agent changed the method file at least once. */
-  improved: boolean;
-  report: string;
-}
-
-function developmentPrompt(options: DreamOptions, worldCount: number): string {
-  const template = loadPrompt("policy-improvement.md");
-  return renderPrompt(template, {
-    // The agent edits the *staging* copy; the deployed policy is replaced only after the winner is
-    // selected, so a failed or interrupted revision cannot leave an unevaluated policy active.
-    method_file: stagingPolicyPath(options.dreamRoot),
-    history_dir: historyDir(options.dreamRoot),
-    trace_pool: tracePoolDir(options.dreamRoot),
-    baseline_dir: baselineDir(options.dreamRoot),
-    worlds: worldCount,
-    iteration: options.iteration,
-  });
-}
-
-/** How many replay episodes run at once. Each is a worker thread, so this bounds CPU and file I/O. */
-const REPLAY_CONCURRENCY = 4;
-
-/** Run `worker` over `items` with at most `limit` in flight, preserving input order in the result. */
-async function mapLimit<T, R>(items: T[], limit: number, worker: (item: T, index: number) => Promise<R>): Promise<R[]> {
-  const results = new Array<R>(items.length);
-  let next = 0;
-  const run = async (): Promise<void> => {
-    for (;;) {
-      const index = next;
-      next += 1;
-      if (index >= items.length) return;
-      results[index] = await worker(items[index], index);
-    }
-  };
-  const count = Math.min(Math.max(1, limit), Math.max(1, items.length));
-  const runners: Promise<void>[] = [];
-  for (let index = 0; index < count; index += 1) runners.push(run());
-  await Promise.all(runners);
-  return results;
-}
-
-export async function runDreamPhase(rawOptions: DreamOptions): Promise<DreamResult> {
-  const release = allocator(rawOptions.dreamRoot, () => {
-    if (activeRuns(rawOptions.dreamRoot).length) throw new Error("live cycles are still in flight");
-    return acquirePhase(rawOptions.dreamRoot, "dream");
-  });
-  const progress = new ProgressRecorder(rawOptions.dreamRoot, rawOptions.iteration, "dream",
-    rawOptions.evaluateOnly ? 1 : rawOptions.task.revisions, 4, rawOptions.onProgress);
-  try {
-    const result = await runOwnedDreamPhase(rawOptions, progress);
-    progress.finish(rawOptions.signal?.aborted ? "interrupted" : result.ok ? "complete" : "failed");
-    return result;
-  } catch (error) { progress.activity(String(error)); progress.finish(rawOptions.signal?.aborted ? "interrupted" : "failed"); throw error; }
-  finally { release(); }
-}
-
-async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRecorder): Promise<DreamResult> {
-  // Normalize at the boundary, same as the live phase.
-  const options: DreamOptions = { ...rawOptions, task: normalizeTask(rawOptions.task) };
-  const { dreamRoot, task, iteration } = options;
-  const log = options.log ?? (() => {});
-  ensurePolicyRuntime(dreamRoot, BUNDLED_POLICY_DIR);
-  const currentPolicy = options.policyPath ?? liveMethodPath(dreamRoot);
-  if (!fs.existsSync(currentPolicy)) throw new Error(`no policy to improve at ${currentPolicy}`);
-
-  // --- fixed history ------------------------------------------------------
-  // Only worlds recorded under the current scoring contract may be replayed: a world from a previous
-  // objective puts scores on another scale into every V estimate the beta sweep is based on.
-  const fingerprint = scoringFingerprint(task);
-  const iterations: number[] = [];
-  const worlds: DiscoveryTree[] = [];
-  let skippedStale = 0;
-  for (let t = 1; t <= iteration; t += 1) {
-    const tree = readTree(dreamRoot, t);
-    if (!tree) continue;
-    const manifest = readManifest(dreamRoot, t);
-    if (manifest && manifest.status !== "complete") continue;
-    const fromOtherContract =
-      (manifest?.task_fingerprint !== undefined && manifest.task_fingerprint !== fingerprint) ||
-      // Pre-fingerprint worlds: a stored score that is not `higher ? raw : -raw` under the current
-      // task was normalized under a flipped `higher_is_better`.
-      tree
-        .list()
-        .some((node) => typeof node.score === "number" && !scoreMatchesDirection(task, node.score, node.raw_score));
-    if (fromOtherContract) {
-      skippedStale += 1;
-      continue;
-    }
-    iterations.push(t);
-    worlds.push(tree);
+export async function maybeDream(options: DreamOptions): Promise<SearchConfig> {
+  const incumbent = options.incumbent ?? readJson<SearchConfig>(path.join(options.loopRoot, "search-config.json")) ?? defaultSearchConfig;
+  const worlds = (options.worlds ?? []).filter((world) => world.status === "complete" && validNodes(world).length >= 3);
+  const worldIds = worlds.map((world) => world.worldId ?? `${world.fingerprint}:${world.cycle}`);
+  const priorDream = readJson<{ worldIds?: string[] }>(path.join(options.loopRoot, "dream-state.json"));
+  if (worlds.length < 2 || worldIds.every((id) => priorDream?.worldIds?.includes(id))) return incumbent;
+  const scratch = path.join(options.loopRoot, "dream-work");
+  fs.mkdirSync(scratch, { recursive: true });
+  const proposalFile = path.join(scratch, "configs.json");
+  fs.rmSync(proposalFile, { force: true });
+  const promptFile = path.join(scratch, "DREAM.md");
+  const traces = worlds.slice(-12).map((world) => ({ cycle: world.cycle, config: world.config, baseline: world.baseline, threshold: world.threshold,
+    rounds: world.rounds, nodes: world.nodes.map(({ id, parent, kind, round, score, valid, timedOut, cost }) => ({ id, parent, kind, round, score, valid, timedOut, cost })) }));
+  writeFileAtomic(promptFile, `Propose up to four search configs as JSON in ${proposalFile}. Schema: {"configs":[{"version":1,"batchSize":1-4,"exploreShare":0-1,"refineTop":1-3,"maxRounds":1-6,"patience":1-3}]}. Incumbent: ${JSON.stringify(incumbent)}. Objective: mean replay value; beta1=${DREAM_BETA1}, beta2=${DREAM_BETA2}. Traces:\n${JSON.stringify(traces, null, 2)}\n`);
+  const result = await runAgent({ agent: options.agent, resolveAgent: options.resolveAgent, cwd: scratch, prompt: fs.readFileSync(promptFile, "utf8"),
+    timeoutMs: 120_000, logPath: path.join(scratch, "agent.log"), signal: options.signal,
+    beforeSpawn: () => options.beforeAgentSpawn("dream-config"), onComplete: options.onAgentComplete });
+  if (!result.ok || !fs.existsSync(proposalFile)) {
+    options.log?.("[dream] config proposal unavailable; retaining the incumbent search config");
+    return incumbent;
   }
-  if (worlds.length === 0) {
-    throw new Error(
-      skippedStale > 0
-        ? `every recorded world (${skippedStale}) belongs to a different scoring configuration — record a world for this task`
-        : "no recorded worlds to replay; run a live cycle first",
-    );
-  }
-
-  const rewardConfig = {
-    maxParallelism: task.workers,
-    beta1: task.beta1,
-    beta2: task.beta2,
-    lambda: 1,
-    baselineScore: worlds[0].baselineScore,
-  };
-
-  const evaluations: VersionEvaluation[] = [];
-  const traces: Record<string, unknown>[] = [];
-  const revisions = options.evaluateOnly ? 1 : Math.max(1, task.revisions);
-  let improved = false;
-
-  /** Evaluate one policy version: selection beta first, then the full grid for the sweep. */
-  const evaluate = async (revision: number, policyPath: string): Promise<VersionEvaluation> => {
-    progress.snapshot.round = revision + 1;
-    progress.activity(`replay revision ${revision}: selection and beta sweep`);
-    const perWorld: VersionEvaluation["per_world"] = [];
-    const errors: string[] = [];
-    const values: number[] = [];
-    let defaultBeta = task.default_beta;
-    let policyName: string | null = null;
-    let deterministic: boolean | null = null;
-
-    const selectionRuns = await mapLimit(
-      worlds.map((_, index) => index),
-      REPLAY_CONCURRENCY,
-      async (index) => {
-        const cell = `r${revision}-world${iterations[index]}-selection`;
-        progress.stage(cell, "root", revision + 1, "evaluation");
-        const result = await replayEpisode({
-          policyPath,
-          world: worlds[index],
-          beta: null, // the version's own baked-in default beta
-          maxParallelism: task.workers,
-          k2: task.k2,
-          beta1: task.beta1,
-          beta2: task.beta2,
-          lambda: rewardConfig.lambda,
-          timeoutMs: 120_000,
-          verifyDeterminism: index === 0,
-          signal: options.signal,
-        });
-        progress.stage(cell, "root", revision + 1, result.ok ? "complete" : "failed", 0, result.metrics.value, result.error);
-        return result;
-      },
-    );
-    for (let index = 0; index < selectionRuns.length; index += 1) {
-      const episode = selectionRuns[index];
-      if (typeof episode.beta === "number" && Number.isFinite(episode.beta)) defaultBeta = episode.beta;
-      if (episode.deterministic === false && deterministic !== false) deterministic = false;
-      else if (episode.deterministic === true && deterministic === null) deterministic = true;
-      const metrics = episode.metrics;
-      // A version that cannot run a world must not be credited with the zeroed metrics of a failed run.
-      const value = episode.ok ? metrics.value : Number.NEGATIVE_INFINITY;
-      values.push(value);
-      perWorld.push({
-        iteration: iterations[index],
-        value,
-        probes: metrics.probes,
-        rounds: metrics.rounds,
-        attainment: metrics.attainment,
-        auc: metrics.auc,
-        parallel_penalty: metrics.parallel_penalty,
-        ok: episode.ok,
-        error: episode.error,
-      });
-      if (!episode.ok && episode.error) errors.push(`world ${iterations[index]}: ${episode.error}`);
-      traces.push(
-        ...episode.trace.map((decision) => ({
-          iteration,
-          revision,
-          world: iterations[index],
-          beta: "default",
-          round: decision.round,
-          prefix: decision.observed,
-          batch: decision.batch,
-          revealed: decision.revealed,
-          best_after: decision.best_after,
-          value: metrics.value,
-          probes: metrics.probes,
-          rounds: metrics.rounds,
-          attainment: metrics.attainment,
-        })),
-      );
-    }
-
-    // Sweep the beta grid: the diagnostic that tells the agent whether beta buys anything.
-    const points: BetaSweepPoint[] = [];
-    for (const beta of task.beta_grid) {
-      const attainments: number[] = [];
-      const works: number[] = [];
-      const parallelisms: number[] = [];
-      const valuesAtBeta: number[] = [];
-      const penalties: number[] = [];
-      const traceAucs: number[] = [];
-      const betaErrors: string[] = [];
-      const betaRuns = await mapLimit(
-        worlds.map((_, index) => index),
-        REPLAY_CONCURRENCY,
-        async (index) => {
-          const cell = `r${revision}-world${iterations[index]}-beta${beta}`;
-          progress.stage(cell, "root", revision + 1, "evaluation");
-          const result = await replayEpisode({
-            policyPath,
-            world: worlds[index],
-            beta,
-            maxParallelism: task.workers,
-            k2: task.k2,
-            beta1: task.beta1,
-            beta2: task.beta2,
-            lambda: rewardConfig.lambda,
-            timeoutMs: 120_000,
-            signal: options.signal,
-          });
-          progress.stage(cell, "root", revision + 1, result.ok ? "complete" : "failed", 0, result.metrics.value, result.error);
-          return result;
-        },
-      );
-      for (let index = 0; index < betaRuns.length; index += 1) {
-        const episode = betaRuns[index];
-        const metrics = episode.metrics;
-        if (!episode.ok) {
-          // Failed episodes are recorded, never averaged in as if they had scored zero.
-          betaErrors.push(`beta ${beta} world ${iterations[index]}: ${episode.error ?? "failed"}`);
-          traces.push(
-            ...episode.trace.map((decision) => ({
-              iteration,
-              revision,
-              world: iterations[index],
-              beta,
-              round: decision.round,
-              prefix: decision.observed,
-              batch: decision.batch,
-              revealed: decision.revealed,
-              best_after: decision.best_after,
-              ok: false,
-            })),
-          );
-          continue;
-        }
-        attainments.push(metrics.attainment ?? 0);
-        works.push(metrics.probes);
-        parallelisms.push(metrics.probes === 0 ? 0 : metrics.probes / Math.max(1, metrics.rounds));
-        valuesAtBeta.push(metrics.value);
-        penalties.push(metrics.parallel_penalty);
-        traceAucs.push(metrics.auc);
-        traces.push(
-          ...episode.trace.map((decision) => ({
-            iteration,
-            revision,
-            world: iterations[index],
-            beta,
-            round: decision.round,
-            prefix: decision.observed,
-            batch: decision.batch,
-            revealed: decision.revealed,
-            best_after: decision.best_after,
-            value: metrics.value,
-            probes: metrics.probes,
-            rounds: metrics.rounds,
-            attainment: metrics.attainment,
-          })),
-        );
-      }
-      const mean = (list: number[]): number => (list.length === 0 ? 0 : list.reduce((a, b) => a + b, 0) / list.length);
-      points.push({
-        beta,
-        attainment: mean(attainments),
-        work: mean(works),
-        parallelism: mean(parallelisms),
-        value: valuesAtBeta.length === 0 ? Number.NEGATIVE_INFINITY : mean(valuesAtBeta),
-        penalty: mean(penalties),
-        trace_auc: mean(traceAucs),
-        errors: betaErrors,
-      });
-    }
-
-    // The version's own baked-in default beta was read from the selection run above.
-    const summary = sweepSummary(points, rewardConfig.lambda);
-    const vMean = values.length === 0 ? Number.NEGATIVE_INFINITY : values.reduce((a, b) => a + b, 0) / values.length;
-    return {
-      revision,
-      policy_path: policyPath,
-      policy_name: policyName,
-      default_beta: defaultBeta,
-      v_mean: vMean,
-      deterministic,
-      per_world: perWorld,
-      points,
-      summary,
-      error: errors.length > 0 ? errors.join("; ") : null,
-    };
-  };
-
-  log(`[dream ${iteration}] fixed history: ${worlds.length} world(s); M=${revisions} revision(s)`);
-
-  /** Persist the sweep and traces; `final` also writes the selection sidecar. */
-  const writeResults = (final: boolean, selected: number | null, deployedBeta: number | null, monotone: boolean | null): void => {
-    const resultsDir = proposalResultsDir(dreamRoot, iteration);
-    const bestEval = selected === null ? null : (evaluations[selected] ?? null);
-    writeJson(path.join(resultsDir, "beta_sweep.json"), {
-      iteration,
-      final,
-      lambda: rewardConfig.lambda,
-      beta1: task.beta1,
-      beta2: task.beta2,
-      worlds: iterations,
-      selected_revision: selected,
-      selected_policy: bestEval?.policy_path ?? null,
-      deployed_beta: deployedBeta,
-      auc: bestEval?.summary.auc ?? 0,
-      pareto_reward: bestEval?.summary.pareto_reward ?? 0,
-      parallel_penalty: bestEval?.summary.parallel_penalty ?? 0,
-      frontier: bestEval?.summary.frontier ?? [],
-      versions: evaluations.map((e) => ({
-        revision: e.revision,
-        v_mean: e.v_mean,
-        default_beta: e.default_beta,
-        deterministic: e.deterministic,
-        auc: e.summary.auc,
-        pareto_reward: e.summary.pareto_reward,
-        parallel_penalty: e.summary.parallel_penalty,
-        frontier: e.summary.frontier,
-        points: e.points.map((p) => ({
-          beta: p.beta,
-          attainment: p.attainment,
-          work: p.work,
-          parallelism: p.parallelism,
-          value: p.value,
-          penalty: p.penalty,
-          trace_auc: p.trace_auc,
-        })),
-        per_world: e.per_world,
-        error: e.error,
-      })),
-    });
-    writeJsonl(path.join(resultsDir, "policy_execution_traces.jsonl"), traces);
-    if (final) {
-      writeJson(path.join(resultsDir, "selection.json"), {
-        iteration,
-        selected_revision: selected,
-        monotone,
-        v_mean: evaluations.map((e) => e.v_mean),
-        deployed_beta: deployedBeta,
-      });
-    }
-  };
-
-  // Version 0 is the policy that just ran live: it must be evaluated from a stable, immutable path.
-  const baseSource = fs.readFileSync(currentPolicy, "utf8");
-  let candidatePath = archivePolicyVersion(dreamRoot, iteration, 0, baseSource);
-  // The development agent edits a staging copy, never the deployed policy: an exception, a crash, or a
-  // half-finished revision cannot leave an unevaluated (or deleted) policy active.
-  const staging = stagingPolicyPath(dreamRoot);
-  writeFileAtomic(staging, baseSource);
-
-  try {
-    for (let revision = 0; revision < revisions; revision += 1) {
-      const evaluation = await evaluate(revision, candidatePath);
-      evaluations.push(evaluation);
-      if (Number.isFinite(evaluation.v_mean)) progress.snapshot.best = Math.max(progress.snapshot.best ?? Number.NEGATIVE_INFINITY, evaluation.v_mean);
-      progress.activity(`revision ${revision} evaluated: V=${evaluation.v_mean}`);
-      log(
-        `[dream ${iteration}] pi_${revision}: V=${evaluation.v_mean.toFixed(4)} beta=${evaluation.default_beta} ` +
-          `pareto.reward=${evaluation.summary.pareto_reward.toFixed(4)} auc=${evaluation.summary.auc.toFixed(4)} ` +
-          `penalty=${evaluation.summary.parallel_penalty.toFixed(4)} deterministic=${evaluation.deterministic ?? "n/a"}`,
-      );
-      if (evaluation.deterministic === false) {
-        evaluation.error = `${evaluation.error ? `${evaluation.error}; ` : ""}non-deterministic replay`;
-        evaluation.v_mean = Number.NEGATIVE_INFINITY;
-      }
-      const isLast = revision === revisions - 1;
-      if (isLast || options.evaluateOnly) continue;
-
-      // --- revise the executable policy (the paper's policy-development agent) ---
-      // Persist the sweep and traces *before* asking for the next revision: the agent reads them, and
-      // in-memory-only results were invisible to the very call they were meant to guide.
-      writeResults(false, null, null, null);
-      const before = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : baseSource;
-      const prompt = developmentPrompt(options, worlds.length);
-      const cell = `revision-${revision + 1}`;
-      progress.stage(cell, "root", revision + 1, "agent");
-      const agentRun = await runAgent({
-        agent: task.agent,
-        resolveAgent: options.resolveAgent,
-        cwd: dreamRoot,
-        prompt,
-        timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
-        logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
-        signal: options.signal,
-        beforeSpawn: () => options.beforeAgentSpawn?.(`dream:${iteration}:revision:${revision + 1}`),
-        onOutput: (event) => progress.output(cell, false, event),
-      });
-      progress.stage(cell, "root", revision + 1, agentRun.ok ? "complete" : "failed", 0, null, agentRun.spawnError);
-      const after = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : "";
-      if (!agentRun.ok || after === before) {
-        log(
-          `[dream ${iteration}] revision ${revision + 1} left the policy unchanged (${agentRun.ok ? "no edit" : (agentRun.spawnError ?? "agent failed")})`,
-        );
-      } else {
-        improved = true;
-      }
-      const nextSource = after === "" ? before : after;
-      candidatePath = archivePolicyVersion(dreamRoot, iteration, revision + 1, nextSource);
-      // Keep staging in sync so the next revision revises this one.
-      writeFileAtomic(staging, nextSource);
-    }
-
-    progress.activity("selecting best policy revision");
-    // --- selection ----------------------------------------------------------
-    if (options.signal?.aborted) throw new Error("dream phase aborted");
-    let selected = 0;
-    for (let index = 1; index < evaluations.length; index += 1) {
-      if (evaluations[index].v_mean > evaluations[selected].v_mean) selected = index;
-    }
-    const best = evaluations[selected];
-    // Apply the paper's cross-cycle default-beta rule before deploying.
-    const deployedBeta = crossCycleBeta(dreamRoot, best.default_beta, fingerprint);
-    // The guarantee is `V* >= V_0` over the candidate set. It also has to *exist*: if every version
-    // failed to score, deploying anything (or reporting success) would be a lie.
-    const scored = evaluations.filter((e) => Number.isFinite(e.v_mean));
-    const monotone =
-      scored.length > 0 && Number.isFinite(best.v_mean) && best.v_mean >= (scored[0]?.v_mean ?? Number.NEGATIVE_INFINITY);
-    // Eq. 1 trades peak attainment against probe cost, so the winner can explore less than a loser
-    // with a higher best score. That is the paper's intended trade-off, but on a [0, 1] metric (or any
-    // scale where beta1/beta2 dwarf meaningful gains) it silently deploys a policy that stops early.
-    // Name it so the operator can retune beta instead of wondering why exploration shrank.
-    const scaleNote = efficiencyOverturnNote(evaluations, selected);
-    if (monotone) {
-      deployPolicy(dreamRoot, fs.readFileSync(best.policy_path, "utf8"));
-      // Record the beta the next live episode will actually run at; the planner forces it, so the
-      // reported deployed_beta matches behavior instead of describing an adjustment that was never used.
-      writeJson(deployedBetaPath(dreamRoot), { beta: deployedBeta, iteration, policy: best.policy_path });
-    }
-    writeResults(true, selected, deployedBeta, monotone);
-
-    const report = [
-      `iteration ${iteration}: ${worlds.length} replay world(s), ${evaluations.length} version(s) evaluated`,
-      ...evaluations.map(
-        (e) =>
-          `  pi_${e.revision}: V=${e.v_mean.toFixed(4)} beta=${e.default_beta} pareto.reward=${e.summary.pareto_reward.toFixed(4)}` +
-          ` probes=${meanOf(e.per_world.map((w) => w.probes)).toFixed(1)} rounds=${meanOf(e.per_world.map((w) => w.rounds)).toFixed(1)}` +
-          ` attainment=${meanAttainment(e) === null ? "n/a" : (meanAttainment(e) as number).toFixed(4)}` +
-          (e.error ? ` error=${e.error}` : ""),
-      ),
-      `selected pi_${selected} (V* >= V_0: ${monotone}) -> deployed with beta=${deployedBeta}`,
-      ...(scaleNote ? [scaleNote] : []),
-    ].join("\n");
-
-    return {
-      ok: monotone,
-      error: monotone
-        ? null
-        : scored.length === 0
-          ? "no policy version produced a finite replay score (all failed or non-deterministic)"
-          : "selection violated V* >= V_0 (non-deterministic or non-prefix-only policy)",
-      iteration,
-      worlds: worlds.length,
-      revisions: evaluations.length,
-      evaluations,
-      selected,
-      selected_policy: best.policy_path,
-      deployed_beta: deployedBeta,
-      improved,
-      report,
-    };
-  } catch (error) {
-    // Never leave a staged, deleted, or unevaluated policy active: restore what was deployed.
-    writeFileAtomic(currentPolicy, baseSource);
-    throw error;
-  } finally {
-    fs.rmSync(staging, { force: true });
-  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(proposalFile, "utf8")); } catch { return incumbent; }
+  const proposed = parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray((parsed as Record<string, unknown>).configs)
+    ? (parsed as { configs: unknown[] }).configs.slice(0, 4).flatMap((value) => { const config = validateSearchConfig(value); return config ? [config] : []; }) : [];
+  const configs = [incumbent, ...proposed, ...neighbors(incumbent)];
+  const scored = configs.map((config) => ({ config, ...scoreSearchConfig(worlds, config) }));
+  const adopted = chooseSearchConfig(scored, incumbent);
+  fs.mkdirSync(options.loopRoot, { recursive: true });
+  writeJson(path.join(options.loopRoot, "search-config.json"), adopted);
+  fs.appendFileSync(path.join(options.loopRoot, "dreams.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), worldIds: worlds.map((world) => world.cycle), incumbent, candidates: scored, adopted })}\n`);
+  writeJson(path.join(options.loopRoot, "dream-state.json"), { worldIds });
+  return adopted;
 }
 
-function meanOf(list: number[]): number {
-  return list.length === 0 ? 0 : list.reduce((a, b) => a + b, 0) / list.length;
-}
-
-/** Mean attainment over successfully replayed worlds; null when none replayed. */
-export function meanAttainment(evaluation: Pick<VersionEvaluation, "per_world">): number | null {
-  const values = evaluation.per_world
-    .filter((w) => w.ok && typeof w.attainment === "number")
-    .map((w) => w.attainment as number);
-  return values.length === 0 ? null : values.reduce((a, b) => a + b, 0) / values.length;
-}
-
-/**
- * Warn when Eq. 1 efficiency overturned peak attainment: the selected version has a higher V but a
- * lower mean attainment than another version. Returns null when V and attainment agree.
- */
-export function efficiencyOverturnNote(
-  evaluations: Pick<VersionEvaluation, "revision" | "v_mean" | "per_world">[],
-  selected: number,
-): string | null {
-  const best = evaluations[selected];
-  if (!best) return null;
-  const bestAttainment = meanAttainment(best);
-  if (bestAttainment === null) return null;
-  const overturned = evaluations.filter((e, index) => {
-    if (index === selected || !Number.isFinite(e.v_mean)) return false;
-    const attainment = meanAttainment(e);
-    return attainment !== null && attainment > bestAttainment && e.v_mean < best.v_mean;
-  });
-  if (overturned.length === 0) return null;
-  return (
-    `note: pi_${selected} won on efficiency (V) with lower mean attainment ` +
-    `(${bestAttainment.toFixed(4)}) than ${overturned.map((e) => `pi_${e.revision} (${(meanAttainment(e) ?? 0).toFixed(4)})`).join(", ")} — ` +
-    `if peak score matters more than probe cost, lower beta1/beta2 (defaults 0.01 assume scores of order 1-10 per probe)`
-  );
-}
-
-function readSweep(dreamRoot: string, iteration: number): BetaSweepSummary | null {
-  const file = path.join(proposalResultsDir(dreamRoot, iteration), "beta_sweep.json");
-  if (!fs.existsSync(file)) return null;
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<BetaSweepSummary>;
-    if (typeof parsed.auc !== "number" || typeof parsed.pareto_reward !== "number") return null;
-    return {
-      auc: parsed.auc,
-      pareto_reward: parsed.pareto_reward,
-      parallel_penalty: typeof parsed.parallel_penalty === "number" ? parsed.parallel_penalty : 0,
-      frontier: Array.isArray(parsed.frontier) ? parsed.frontier : [],
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Cross-cycle default-beta rule (paper §3, cross-cycle selection).
- * Adjusts the deployed beta based on live trend and sweep evidence.
- *  - live best still improving: keep prior default beta unless sweep clearly shows a better nearby beta
- *  - live best plateaued, higher beta reaches higher attainment: raise by 0.1–0.2, clamped to [0,1]
- *  - high default beta already tried through plateau, high-beta sweep points add work without higher attainment: lower by a small step
- *  - history insufficient or evidence conflicts: use ~0.6
- */
-function crossCycleBeta(dreamRoot: string, currentDefault: number, fingerprint: string): number {
-  const manifests = recentManifests(dreamRoot, 3).filter(
-    (manifest) => manifest.task_fingerprint === undefined || manifest.task_fingerprint === fingerprint,
-  );
-  if (manifests.length < 2) return currentDefault;
-  const latest = manifests[manifests.length - 1];
-  const previous = manifests[manifests.length - 2];
-  const latestSweep = readSweep(dreamRoot, latest.iteration);
-  if (!latestSweep || latestSweep.frontier.length === 0) return currentDefault;
-  const improving = latest.best_score !== null && previous.best_score !== null && latest.best_score > previous.best_score;
-  const plateaued = latest.best_score !== null && previous.best_score !== null && latest.best_score === previous.best_score;
-  const sortedFrontier = latestSweep.frontier.slice().sort((a, b) => a.beta - b.beta);
-  const bestFrontierPoint = sortedFrontier[sortedFrontier.length - 1];
-  // If evidence conflicts (frontier empty or no clear best), use ~0.6.
-  if (!bestFrontierPoint) return 0.6;
-  if (improving) {
-    // Keep prior default unless sweep clearly shows a better nearby beta.
-    const nearby = sortedFrontier.filter((p) => Math.abs(p.beta - currentDefault) <= 0.2);
-    const betterNearby = nearby.find((p) => p.attainment > (latest.best_score ?? -Infinity));
-    if (betterNearby && betterNearby.attainment > (latest.best_score ?? -Infinity) + 0.01) return clamp01(betterNearby.beta);
-    return currentDefault;
-  }
-  if (plateaued) {
-    // Higher beta reaches higher attainment: raise by 0.1–0.2, clamped to [0,1].
-    const higherBetaPoint = sortedFrontier.filter((p) => p.beta > currentDefault + 0.05);
-    if (higherBetaPoint.length > 0 && higherBetaPoint[higherBetaPoint.length - 1].attainment > (latest.best_score ?? -Infinity)) {
-      return clamp01(currentDefault + 0.15);
-    }
-    // High default beta already tried through plateau, high-beta sweep points add work without higher attainment: lower by a small step.
-    const highBetaPoint = sortedFrontier.filter((p) => p.beta >= currentDefault);
-    if (highBetaPoint.length > 0 && highBetaPoint[highBetaPoint.length - 1].work > 0 && highBetaPoint[highBetaPoint.length - 1].attainment <= (latest.best_score ?? -Infinity)) {
-      return clamp01(currentDefault - 0.1);
-    }
-    return currentDefault;
-  }
-  // No clear trend: use ~0.6.
-  return 0.6;
-}
-
-function clamp01(value: number): number {
-  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0.6));
+function neighbors(config: SearchConfig): SearchConfig[] {
+  return [
+    { ...config, batchSize: Math.max(1, config.batchSize - 1) },
+    { ...config, batchSize: Math.min(4, config.batchSize + 1) },
+    { ...config, maxRounds: Math.max(1, config.maxRounds - 1) },
+    { ...config, maxRounds: Math.min(6, config.maxRounds + 1) },
+  ];
 }

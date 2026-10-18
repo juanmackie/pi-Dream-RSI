@@ -16,6 +16,8 @@ export interface OutputEvent {
 
 export interface AgentOutputEvidence {
   usage: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+  /** Wall time spent in this fresh agent process; it is not a monetary price. */
+  durationMs?: number;
   stopReasons: Record<string, number>;
   modelChanges: number;
   editCount: number;

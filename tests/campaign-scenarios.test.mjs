@@ -5,7 +5,7 @@ import * as os from "node:os";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { jump, makeProject } from "./fixtures.mjs";
-import { runControllerBenchmark } from "../eval/controller.mjs";
+import { runControllerBenchmark } from "./helpers/controller.mjs";
 
 test("controller benchmark rejects forged success and ledger claims when its independent gate fails", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-forged-controller-"));
@@ -61,11 +61,24 @@ test("integrated campaigns enforce win, gate, review, no-op, direction, timeout,
       scope: ["solution.py"],
       verifierInputs: [project.script("score-ok.mjs"), ...(scenario.gate ? [project.script("gate-no-cheat.mjs")] : [])],
       gates: scenario.gate ? [`node "${project.script("gate-no-cheat.mjs")}"`] : [],
+      mechanism: "paired-hill-climb",
+      parentCampaignId: "prior-campaign",
       limits: { maxCycles: 1, maxAgentStarts: 18, maxEvaluatorRuns: 80, deadlineMs: 90_000, plateauCycles: 1, maxCandidatesPerCycle: 3 },
     });
     const appliedFile = path.join(result.campaignRoot, "history", "applied.jsonl");
     const applied = fs.existsSync(appliedFile) ? fs.readFileSync(appliedFile, "utf8").trim().split(/\r?\n/).filter(Boolean) : [];
     assert.equal(applied.length > 0, scenario.applied, JSON.stringify(result.rejections));
+    const ledger = fs.readFileSync(path.join(result.campaignRoot, "history", "ledger.jsonl"), "utf8")
+      .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    if (scenario.applied && scenario.scenario === "truewin") {
+      const apply = ledger.find((entry) => entry.kind === "apply" && entry.outcome === "success");
+      assert.ok(apply, "the promoted event is present in the experiment ledger");
+      assert.match(apply.provenance.contractId, /^[a-f0-9]{64}$/);
+      assert.match(apply.provenance.instrumentId, /^[a-f0-9]{64}$/);
+      assert.match(apply.provenance.baselineFingerprint, /^[a-f0-9]{64}$/);
+      assert.equal(apply.provenance.mechanism, "paired-hill-climb");
+      assert.equal(apply.provenance.parentCampaignId, "prior-campaign");
+    }
     assert.ok(result.agentStarts <= 18);
     assert.ok(result.evaluatorRuns <= 80);
     if (scenario.gate) assert.ok(result.rejections.some((entry) => entry.stage === "gate"));
@@ -77,10 +90,10 @@ test("integrated campaigns enforce win, gate, review, no-op, direction, timeout,
         "campaign records the timed-out edit attempt and its observed diff");
     }
     if (scenario.scenario === "duplicate") {
-      const ledger = fs.readFileSync(path.join(result.campaignRoot, "history", "ledger.jsonl"), "utf8");
-      const attempts = ledger.trim().split(/\r?\n/).map((line) => JSON.parse(line)).filter((record) => record.kind === "attempt");
-      assert.ok(attempts.filter((record) => record.title === "# Same candidate").length > 1,
-        "multiple candidate cells produced the same proposal");
+      const world = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "cycles", "c0001", "world.json"), "utf8"));
+      const proposals = world.nodes.map((node) => path.join(result.campaignRoot, "cycles", "c0001", "attempts", node.id, "proposal.md"))
+        .filter((file) => fs.existsSync(file)).map((file) => fs.readFileSync(file, "utf8"));
+      assert.ok(proposals.some((proposal) => proposal.includes("# Same candidate")), "the experiment world retains the proposal");
       assert.equal(applied.length, 1);
     }
     const seedSource = fs.readFileSync(path.join(project.seed, "solution.py"), "utf8");
@@ -176,13 +189,14 @@ test("unpatched workspace drift after pending-apply persistence prevents promoti
     fs.writeFileSync(script, `import { createRequire } from "node:module";
 const require_ = createRequire(import.meta.url);
 const cjsFs = require_("node:fs");
+const { syncBuiltinESMExports } = require_("node:module");
 const path = require_("node:path");
 const config = JSON.parse(cjsFs.readFileSync(process.argv[2], "utf8"));
 let fired = false;
 const realWrite = cjsFs.writeFileSync;
 cjsFs.writeFileSync = (file, data, ...args) => {
   const result = realWrite(file, data, ...args);
-  if (!fired && typeof data === "string" && path.basename(file).startsWith("campaign.json.tmp-")) {
+  if (!fired && typeof file === "string" && typeof data === "string" && path.basename(file).startsWith("campaign.json.tmp-")) {
     try {
       if (JSON.parse(data).pendingApply) {
         fired = true;
@@ -192,6 +206,7 @@ cjsFs.writeFileSync = (file, data, ...args) => {
   }
   return result;
 };
+syncBuiltinESMExports();
 const { runCampaign } = await import(config.campaignUrl);
 const result = await runCampaign(config.options);
 realWrite(config.resultFile, JSON.stringify({ fired, state: result.state, rejections: result.rejections, campaignRoot: result.campaignRoot }));
@@ -215,7 +230,7 @@ realWrite(config.resultFile, JSON.stringify({ fired, state: result.state, reject
     });
     assert.equal(exit.code, 0, `boundary child exited ${exit.code}: ${exit.stderr.slice(-1200)}`);
     const result = JSON.parse(fs.readFileSync(resultFile, "utf8"));
-    assert.equal(result.fired, true, "the unpatched dependency changed after pendingApply was persisted");
+    assert.equal(result.fired, true, `the unpatched dependency changed after pendingApply was persisted: ${JSON.stringify(result)}`);
     assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false,
       "the late workspace drift prevents a recorded apply");
     assert.ok(result.rejections.some((entry) => entry.stage === "apply"

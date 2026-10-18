@@ -5,7 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
-  attemptsFromMemory, emptyMemory, isCurrentExperiment, mementoNotes, plateauState, readMemory,
+  attemptsFromMemory, emptyMemory, isCurrentExperiment, mementoNotes, readMemory,
   recordCampaignOutcome, ucbSelect, writeMemory,
 } from "../extensions/pi-dream-rsi/engine/search.ts";
 
@@ -107,37 +107,6 @@ test("readMemory rejects impossible counters, unknown outcomes, and non-string n
       assert.throws(() => readMemory(file), /refusing to continue on corrupted state/, name);
     }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("plateauState counts the trailing no-win run, skips screening, and a win resets it", () => {
-  let memory = emptyMemory();
-  memory = recordCampaignOutcome(memory, record("alpha", "win"));
-  memory = recordCampaignOutcome(memory, record("gamma", "rejected"));
-  memory = recordCampaignOutcome(memory, record("alpha", "no-win"));
-  memory = recordCampaignOutcome(memory, record("beta", "no-win"));
-  const plateaued = plateauState(memory, 2);
-  assert.equal(plateaued.plateaued, true);
-  assert.equal(plateaued.consecutiveNoWin, 2, "rejected screening outcomes do not count as campaigns");
-  assert.equal(plateaued.leverId, null, "a streak across two levers has no single owner");
-
-  const withinOne = plateauState(memory, 3);
-  assert.equal(withinOne.plateaued, false);
-
-  memory = recordCampaignOutcome(memory, record("beta", "win"));
-  assert.equal(plateauState(memory, 2).plateaued, false, "a verified win resets the plateau");
-  assert.equal(plateauState(memory, 1).consecutiveNoWin, 0);
-
-  // A streak across three levers must not resurrect the oldest lever as owner.
-  let trio = emptyMemory();
-  trio = recordCampaignOutcome(trio, record("alpha", "no-win"));
-  trio = recordCampaignOutcome(trio, record("beta", "no-win"));
-  trio = recordCampaignOutcome(trio, record("gamma", "no-win"));
-  assert.equal(plateauState(trio, 3).leverId, null, "a mixed streak has no single owner");
-  assert.equal(plateauState(trio, 3).plateaued, true);
-  let solo = emptyMemory();
-  solo = recordCampaignOutcome(solo, record("alpha", "no-win"));
-  solo = recordCampaignOutcome(solo, record("alpha", "no-win"));
-  assert.equal(plateauState(solo, 2).leverId, "alpha", "a single-lever streak reports its owner");
 });
 
 test("utility allocation ranks measured gain per confirmation run, and stale experiments are excluded", () => {

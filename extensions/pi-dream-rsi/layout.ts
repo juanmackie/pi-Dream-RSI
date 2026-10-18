@@ -32,5 +32,3 @@ export const PACKAGE_DIR = findPackageRoot(EXTENSION_DIR) ?? path.resolve(EXTENS
 
 export const PROMPTS_DIR = path.join(PACKAGE_DIR, "prompts");
 export const SKILLS_DIR = path.join(PACKAGE_DIR, "skills");
-/** The shipped policy API + baseline policy that gets seeded into a project. */
-export const BUNDLED_POLICY_DIR = path.join(EXTENSION_DIR, "policy");

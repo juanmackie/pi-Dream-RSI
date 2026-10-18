@@ -68,6 +68,8 @@ export interface RunOptions {
   protectedReadPaths?: string[];
   /** Store decoded, bounded presentation text and tool names instead of raw JSONL. */
   compactAgentLog?: boolean;
+  /** Persist process-level accounting after output decoding and duration measurement. */
+  onComplete?: (result: CommandResult) => void;
 }
 
 /**
@@ -202,6 +204,7 @@ async function collect(
     const finish = (result: Partial<CommandResult>): void => {
       if (settled) return;
       settled = true;
+      evidence.durationMs = Date.now() - started;
       const stdoutEnd = stdoutDecoder.end();
       const stderrEnd = stderrDecoder.end();
       stdoutTail = append(stdoutTail, stdoutEnd); stderrTail = append(stderrTail, stderrEnd);
@@ -218,8 +221,8 @@ async function collect(
       } catch {
         // the stream is already gone; the error listener recorded why
       }
-      void logClosed.then(() =>
-        resolve({
+      void logClosed.then(() => {
+        const completed: CommandResult = {
           ok: false,
           code: null,
           signal: null,
@@ -234,8 +237,15 @@ async function collect(
           hadOutput: sawOutput,
           evidence,
           ...result,
-        }),
-      );
+        };
+        try {
+          options.onComplete?.(completed);
+        } catch (error) {
+          completed.ok = false;
+          completed.spawnError = `failed to persist process accounting: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        resolve(completed);
+      });
     };
 
     /** Cancel: kill the tree, then wait (bounded) for it to actually go away before resolving. */

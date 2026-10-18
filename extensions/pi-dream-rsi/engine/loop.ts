@@ -2,31 +2,33 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { readCampaignStatus, runCampaign, type CampaignOptions, type CampaignResult } from "./campaign.ts";
+import {
+  CAMPAIGN_DEADLINE_MAX_MS, CampaignInfeasibleError, campaignVerifierIdentity, readCampaignStatus, resumeCampaign, runCampaign,
+  type CampaignOptions, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings,
+} from "./campaign.ts";
 import {
   ContractNotApprovedError, approveRunContract, contractFile, contractIdentity, projectFingerprint, readStoredContract,
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
-import {
-  applyPromotionDecision, decidePromotion, loadActiveGeneration, readGenerationState,
-  type PromotionEvidence,
-} from "./generation.ts";
 import { readLedger } from "./ledger.ts";
-import { buildReconInventory, reconProject, type ReconResult } from "./recon.ts";
-import { measureWorkload, verifyPostApply } from "./verify.ts";
+import { buildReconInventory, reconProject, type ReconOptions, type ReconResult } from "./recon.ts";
+import { measureEvaluatorReading, measureWorkload, verifyPostApply, type PostApplyEvaluator } from "./verify.ts";
 import {
   hasAllowance, readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
-  type LoopBudgetFile, type LoopReservation,
-} from "./loop-budget.ts";
-import { buildLeverInventory, type LeverInventory, type LeverMetricKind, type LeverProposal } from "./levers.ts";
-import { synthesizeMetric, type MetricPlan } from "./metrics.ts";
+  type LoopBudgetFile, type LoopPhase, type LoopReservation,
+} from "./budget.ts";
+import type { LeverInventory, LeverMetricKind, LeverProposal } from "./levers.ts";
+import { synthesizeMetric, type EvaluationContract, type MetricPlan } from "./metrics.ts";
 import {
-  attemptsFromMemory, isCurrentExperiment, MAX_NOTES, mementoNotes, plateauState, readMemory, recordCampaignOutcome,
-  ucbSelect, writeMemory, type LeverRankingEntry, type LoopMemory, type LoopMemoryRecord, type PlateauState,
+  attemptsFromMemory, isCurrentExperiment, MAX_NOTES, mementoNotes, readMemory, recordCampaignOutcome,
+  ucbSelect, writeMemory, type LeverRankingEntry, type LoopMemory, type LoopMemoryRecord,
 } from "./search.ts";
 import { collectSignals, type SignalsResult } from "./signals.ts";
 import { defaultTask, type TaskConfig } from "./task.ts";
-import { writeFileAtomic } from "./world.ts";
+import { readJson, writeFileAtomic, writeJson } from "./fsutil.ts";
+import { phaseIsActive } from "./ownership.ts";
+import { defaultSearchConfig, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
+import { maybeDream, validateSearchConfig } from "./dream.ts";
 
 /**
  * The unattended loop: one iteration = recon, ranked lever, synthesized or
@@ -35,14 +37,12 @@ import { writeFileAtomic } from "./world.ts";
  * closed: budgets live in a durable loop file with immutable limits, spend is
  * reserved before a campaign starts and reconciled after it ends, a lever
  * without a truthful metric is recorded as rejected instead of explored, and
- * the loop stops on empty inventory, budget exhaustion, blocked state, or
- * plateau after the bounded restart allowance is used.
+ * the loop stops when recon finds no eligible lever, the budget is exhausted, or
+ * the durable budget is reached.
  */
 
 /** A lease heartbeat older than this is stale; its owner is assumed gone. */
 const LEASE_STALE_MS = 45 * 60 * 1000;
-/** Bounded plateau restarts that re-explore a tried lever with an alternate metric. */
-const DEFAULT_MAX_RESTARTS = 1;
 
 export interface LoopLimits {
   /** Campaigns the loop may start in total, across runs (durable). */
@@ -53,19 +53,12 @@ export interface LoopLimits {
   maxEvaluatorRuns: number;
   /** Wall-clock budget for one run. */
   deadlineMs: number;
-  /** Consecutive campaigns without a verified win before the plateau stop. */
-  plateauK?: number;
-  /** Plateau restarts that measure an alternate signal on the same lever (default 1). */
-  maxRestarts?: number;
-  /** Reserved optimizer-trial allowance, spent from the same durable budget. */
-  maxOptimizerTrials?: number;
 }
 
 export interface LeverCampaignSetup {
   task: TaskConfig;
   verifierInputs: string[];
   gates?: string[];
-  controlPatch?: string;
   goal?: string;
   scope?: string[];
 }
@@ -92,13 +85,10 @@ export interface LoopOptions {
   focus?: string;
   includeLogs?: boolean;
   sessionDir?: string;
-  /**
-   * The approved run contract. When supplied, the loop works only inside it and
-   * uses cold-start discovery; when absent it keeps the legacy signal-driven path.
-   */
-  contract?: RunContract;
-  /** Known-better control patch forwarded to metric synthesis. */
-  controlPatchPath?: string;
+  /** Approved run contract; the loop never executes without trusted-local consent. */
+  contract: RunContract;
+  /** Resume the paused campaign recorded in the loop's durable active context, then keep looping. */
+  resumeActiveCampaign?: boolean;
   /** How many declared workloads one cold-start recon pass may measure. */
   reconProbes?: number;
   /** Passed through to the campaign when supplied; calibrated inside the campaign otherwise. */
@@ -120,18 +110,14 @@ export interface LoopOptions {
   onPhaseProgress?: CampaignOptions["onPhaseProgress"];
   /** Test seam replacing the campaign engine. */
   runCampaignImpl?: (options: CampaignOptions) => Promise<CampaignResult>;
+  /** Test seam replacing the saved campaign resume path. */
+  resumeCampaignImpl?: (options: CampaignResumeOptions) => Promise<CampaignResult>;
   /** Test seam replacing the independent post-apply measurement. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
-  /**
-   * Optimizer trial seam. Supplied by a harness that owns the sealed confirmation
-   * split; the loop never fabricates the evidence a promotion depends on.
-   */
-  optimizerTrial?: (context: { projectDir: string; loopRoot: string; generation: string | null }) => Promise<{
-    challengerId: string;
-    evidence: PromotionEvidence;
-  } | { retain: string }>;
   /** Test seam replacing signal collection. */
   collectSignalsImpl?: (options: { projectDir: string; focus?: string; includeLogs?: boolean; sessionDir?: string }) => Promise<Pick<SignalsResult, "weaknesses" | "diagnostics">>;
+  /** Test seam replacing manifest probing and source attribution. */
+  reconProjectImpl?: (options: ReconOptions) => Promise<ReconResult>;
 }
 
 export interface LoopCampaignRecord extends LoopMemoryRecord {
@@ -155,8 +141,6 @@ export interface LoopResult {
   memento: string;
   /** Identity of the approved contract this run worked inside, if any. */
   contract: { fingerprint: string; approvedAt: string } | null;
-  /** Optimizer generation this run used, or null for the installed code. */
-  generation: string | null;
   /** Independent post-apply verifications recorded by this run. */
   verifications: LoopVerification[];
 }
@@ -185,22 +169,6 @@ export interface LoopVerification {
 }
 
 
-/** The generation a fresh process would load, for reporting. A corrupt ledger is not fatal here. */
-function activeGenerationLabel(loopRoot: string): string | null {
-  try { return loadActiveGeneration(loopRoot)?.id ?? readGenerationState(loopRoot).active; }
-  catch { return null; }
-}
-
-/** The alternate signal a plateau restart measures on the same lever evidence. */
-function alternateMetricKind(lever: LeverProposal): LeverMetricKind | null {
-  switch (lever.metricKind) {
-    case "command-success": return "command-duration";
-    case "command-duration": return "command-success";
-    case "suite-failures": return "command-duration";
-    default: return null;
-  }
-}
-
 /** The frozen baseline a post-apply check compares against. */
 interface CapturedInstrument {
   argv: string[];
@@ -211,14 +179,42 @@ interface CapturedInstrument {
   minimumUsefulGain: number | `${number}%`;
   /** Timeout for one workload measurement, from the instrument's own sampling plan. */
   timeoutMs: number;
+  /** How the applied state is measured: wall clock, or the declared score instrument. */
+  kind: LeverMetricKind;
+  /** Present for every non-duration kind: the pinned program that reports the score. */
+  evaluator?: PostApplyEvaluator;
+}
+
+interface LoopResumeContext {
+  version: 1;
+  contractId: string;
+  campaignId?: string;
+  lever: LeverProposal;
+  setup: LeverCampaignSetup;
+  plan: MetricPlan;
+  instrument: CapturedInstrument;
+  baselineFingerprint: string;
+  phase?: "campaign" | "post-apply";
+}
+
+/**
+ * The evaluator that measures a synthesized instrument inside a candidate copy.
+ *
+ * For every non-duration metric kind the score comes from the pinned wrapper under
+ * the loop's protected subtree, run with the current node binary. A score kind's
+ * wrapper in turn runs the contract's declared evaluator; post-apply verification
+ * therefore measures the same number the campaign promoted.
+ */
+function instrumentEvaluator(projectDir: string, plan: MetricPlan): PostApplyEvaluator | undefined {
+  if (plan.metricKind === "command-duration" || plan.metricKind === "unmeasurable") return undefined;
+  return { argv: [process.execPath, path.resolve(projectDir, plan.evaluatorPath)], output: "score-json" };
 }
 
 /**
  * Capture the pre-campaign baseline for one approved run.
  *
- * A qualified instrument already recorded its readings. Otherwise (a supplied
- * control patch, or a task provider) the baseline is measured now with the same
- * procedure the post-apply check repeats, so every promoted change can be
+ * A qualified instrument already recorded its readings. Otherwise the baseline
+ * is measured now with the same procedure the post-apply check repeats, so every promoted change can be
  * verified against a baseline that existed before any candidate ran. Returns null
  * when no such baseline can be established, which means the change must not be
  * promoted on faith.
@@ -234,6 +230,8 @@ async function captureInstrument(options: {
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
 }): Promise<CapturedInstrument | null> {
   const gates = [...new Set([...(options.contract.preserved.gates ?? []), ...options.gates])];
+  const kind = options.plan.metricKind;
+  const evaluator = instrumentEvaluator(options.projectDir, options.plan);
   const qualified = options.plan.evaluationContract;
   if (qualified) {
     return {
@@ -244,21 +242,34 @@ async function captureInstrument(options: {
       higherIsBetter: qualified.higherIsBetter,
       minimumUsefulGain: qualified.minimumUsefulGain,
       timeoutMs: options.plan.sampleTimeoutMs,
+      kind,
+      ...(evaluator ? { evaluator } : {}),
     };
   }
   if (options.plan.argv.length === 0) return null;
+  const scratch = options.projectDir;
+  const measuredEvaluator = evaluator;
   const readings: number[] = [];
   for (let index = 0; index < 3; index += 1) {
-    const reading = options.measureImpl
-      ? await options.measureImpl(options.plan.argv, options.projectDir)
-      : await measureWorkload({
-        argv: options.plan.argv,
-        cwd: options.projectDir,
-        contract: options.contract,
-        timeoutMs: options.plan.sampleTimeoutMs,
-        beforeProcess: options.beforeProcess,
-        ...(options.signal ? { signal: options.signal } : {}),
-      });
+    const reading = measuredEvaluator
+      ? await measureEvaluatorReading({
+          evaluator: measuredEvaluator,
+          cwd: scratch,
+          contract: options.contract,
+          timeoutMs: options.plan.sampleTimeoutMs,
+          beforeProcess: options.beforeProcess,
+          ...(options.signal ? { signal: options.signal } : {}),
+      })
+      : options.measureImpl
+        ? await options.measureImpl(options.plan.argv, scratch)
+        : await measureWorkload({
+            argv: options.plan.argv,
+            cwd: scratch,
+            contract: options.contract,
+            timeoutMs: options.plan.sampleTimeoutMs,
+            beforeProcess: options.beforeProcess,
+            ...(options.signal ? { signal: options.signal } : {}),
+        });
     if (reading === null) return null;
     readings.push(reading);
   }
@@ -270,6 +281,8 @@ async function captureInstrument(options: {
     higherIsBetter: options.plan.higherIsBetter,
     minimumUsefulGain: options.contract.outcome.minimumUsefulGain,
     timeoutMs: options.plan.sampleTimeoutMs,
+    kind,
+    ...(evaluator ? { evaluator } : {}),
   };
 }
 
@@ -281,9 +294,9 @@ function readConsumedWallMs(loopRoot: string): number {
   } catch { return 0; }
 }
 
-/** The contract's durable budgets, or null when this run has no approved contract. */
-function approvedContract(contract: RunContract | undefined): RunContract["budgets"] | null {
-  return contract ? contract.budgets : null;
+/** The contract's durable budget ceiling. */
+function approvedContract(contract: RunContract): RunContract["budgets"] {
+  return contract.budgets;
 }
 
 /**
@@ -308,29 +321,6 @@ function comparableMemory(memory: LoopMemory, current: { contractId: string | nu
     ...(current.evaluatorId ? { evaluatorId: current.evaluatorId } : {}),
   }));
   return { ...memory, leverStats, outcomes };
-}
-
-/** Prefer the plateaued lever, then the highest-ranked lever; skip screened-out and solved levers. */
-function pickRestartLever(
-  inventory: LeverInventory,
-  plateau: PlateauState,
-  memory: LoopMemory,
-  rejectedThisRun: Set<string>,
-): LeverProposal | null {
-  const order: LeverProposal[] = [];
-  const consider = (lever: LeverProposal | undefined): void => {
-    if (lever && !order.some((entry) => entry.id === lever.id)) order.push(lever);
-  };
-  if (plateau.leverId) consider(inventory.levers.find((lever) => lever.id === plateau.leverId));
-  for (const lever of inventory.levers) consider(lever);
-  for (const lever of order) {
-    if (rejectedThisRun.has(lever.id)) continue;
-    const stats = memory.leverStats[lever.id];
-    if (!stats || stats.campaigns === 0 || stats.lastOutcome === "win") continue;
-    if (alternateMetricKind(lever) === null) continue;
-    return lever;
-  }
-  return null;
 }
 
 interface LoopLease { pid: number; host: string | null; startedAt: string; heartbeatAt: string; }
@@ -452,6 +442,34 @@ function acquireLease(file: string, self: LoopLease, isFresh: (holder: LoopLease
   return { held: false, holder, publishing: !holder && leaseIsPublishing(file) };
 }
 
+/**
+ * Copy declared evaluator inputs into the loop's protected subtree and return
+ * their absolute paths.
+ *
+ * The campaign refuses verifier inputs inside the editable workspace (it cannot
+ * hash untrusted workspace content into the instrument identity), so the declared
+ * evaluator code and data are pinned by copies under the trusted subtree. The
+ * evaluator still runs from its declared project-relative argv in the candidate
+ * copy; the candidate's patch scope cannot reach that code, and editing the
+ * original input changes the pinned identity instead of silently redefining the
+ * score.
+ */
+function pinEvaluatorInputs(options: { projectDir: string; loopRoot: string; leverId: string; inputs: string[] }): string[] {
+  if (options.inputs.length === 0) return [];
+  const root = path.join(options.loopRoot, "verifiers", options.leverId);
+  const pinned: string[] = [];
+  for (const input of options.inputs) {
+    const source = path.resolve(options.projectDir, input);
+    if (!fs.existsSync(source)) continue;
+    const target = path.join(root, ...input.replace(/\\/g, "/").split("/"));
+    fs.rmSync(target, { recursive: true, force: true });
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.cpSync(source, target, { recursive: true });
+    pinned.push(target);
+  }
+  return pinned;
+}
+
 /** Default setup: synthesize the evaluator, then point a repo-root task at it. */
 function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCampaignSetup | { reject: string } {
   const { lever, plan, projectDir } = context;
@@ -459,6 +477,9 @@ function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCa
   if (!plan) return { reject: `lever ${lever.id} has no metric plan` };
   if (!plan.ready) return { reject: `lever ${lever.id} metric is not ready: ${plan.rejections.join("; ")}` };
   const evaluatorAbsolute = path.resolve(projectDir, plan.evaluatorPath);
+  // A score instrument's declared code/data must stay pinned: a candidate that can
+  // edit the evaluator or its fixtures can redefine "improved".
+  const pinnedInputs = pinEvaluatorInputs({ projectDir, loopRoot: context.loopRoot, leverId: lever.id, inputs: plan.evaluatorInputs });
   const base = defaultTask(lever.id);
   const task: TaskConfig = {
     ...base,
@@ -476,12 +497,58 @@ function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCa
   };
   return {
     task,
-    verifierInputs: [evaluatorAbsolute],
+    verifierInputs: [...new Set([evaluatorAbsolute, ...pinnedInputs])],
     // The contract's preserved gates are as binding as the instrument's own.
     gates: [...new Set([...(context.contract?.preserved.gates ?? []), ...plan.gates])],
-    ...(plan.controlPatchPath ? { controlPatch: plan.controlPatchPath } : {}),
     goal: lever.goal,
     scope: [...lever.scopeFiles],
+  };
+}
+
+/**
+ * Project-relative paths a unified diff touches, read from its headers.
+ *
+ * Handles git patches (`diff --git a/x b/y`, renames, new and deleted files) and
+ * plain unified diffs (`--- a/x` / `+++ b/y`), including the timestamps some tools
+ * append. Deleted (`/dev/null`) sides and duplicates are dropped. The result is
+ * sorted so callers can compare sets deterministically.
+ */
+export interface SeedReadingsOptions {
+  projectDir: string;
+  /** Fingerprint recorded when the instrument qualification began. */
+  qualificationFingerprint: string;
+  task: TaskConfig;
+  verifierInputs: string[];
+  gates: string[];
+  /** Contract-declared evaluator files, hashed into the identity separately from pinned inputs. */
+  identityInputs?: string[];
+  /** Frozen instrument baseline, when qualification produced one. */
+  evaluationContract?: EvaluationContract | null;
+}
+
+/**
+ * Reuse a qualified instrument's readings as the campaign's evaluator check, so the
+ * loop does not pay for the same baseline twice. Only valid while the project still
+ * matches the tree the approximation-free baseline was measured on: the same verifier
+ * identity over edited content would seed a stale number.
+ *
+ * The campaign stores scores normalized to "higher is better" (a lower-is-better
+ * reading is recorded as its negation), so a raw instrument baseline is negated for
+ * a minimizing contract before it is seeded. Seeding raw values would make the
+ * campaign treat a measurement of "more is worse" as if it were already normalized.
+ */
+export function campaignSeedReadings(options: SeedReadingsOptions): CampaignSeedReadings | null {
+  const qualified = options.evaluationContract;
+  if (!qualified || qualified.baseline.length === 0) return null;
+  if (projectFingerprint(options.projectDir) !== options.qualificationFingerprint) return null;
+  return {
+    identity: campaignVerifierIdentity(options.projectDir, options.task, options.verifierInputs, options.gates, options.identityInputs ?? []),
+    runs: qualified.baseline.map((reading) => ({
+      durationMs: 0, code: null, valid: true, failClass: "ok",
+      score: qualified.higherIsBetter ? reading : -reading,
+      error: null,
+      stdoutTail: "seeded from loop qualification", logPath: null,
+    })),
   };
 }
 
@@ -492,9 +559,6 @@ function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCa
  */
 export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const limits = options.limits;
-  const plateauK = Math.max(1, Math.round(limits.plateauK ?? 3));
-  const maxRestarts = limits.maxRestarts ?? DEFAULT_MAX_RESTARTS;
-  if (!Number.isSafeInteger(maxRestarts) || maxRestarts < 0) throw new Error("loop limit maxRestarts must be a non-negative integer");
 
   const projectDir = path.resolve(options.projectDir);
   if (!fs.existsSync(projectDir)) throw new Error(`loop project directory does not exist: ${projectDir}`);
@@ -510,11 +574,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const startedMs = Date.now();
   // A contract run's wall-clock allowance is durable across restarts; a legacy run
   // keeps the per-run window its callers already rely on.
-  const consumedWallMs = options.contract ? (readStoredContract(loopRoot) ? readConsumedWallMs(loopRoot) : 0) : 0;
+  const consumedWallMs = readStoredContract(loopRoot) ? readConsumedWallMs(loopRoot) : 0;
   const remainingWallMs = Math.max(0, limits.deadlineMs - consumedWallMs);
-  const deadlineAt = startedMs + (options.contract ? remainingWallMs : limits.deadlineMs);
+  const deadlineAt = startedMs + remainingWallMs;
   const budgetPath = path.join(loopRoot, "budget.json");
   const memoryPath = path.join(loopRoot, "memory.json");
+  const activeContextPath = path.join(loopRoot, "active.json");
   let memory = readMemory(memoryPath);
   const records: LoopCampaignRecord[] = [];
   const verifications: LoopVerification[] = [];
@@ -525,17 +590,25 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let ranking: LeverRankingEntry[] = [];
   let inventory: LeverInventory | null = null;
   let stopReason = "";
+  let resumePending = options.resumeActiveCampaign === true;
   let approved: ApprovedContract | null = null;
   let recon: ReconResult | null = null;
   const rejectedThisRun = new Set<string>();
   const progress = options.onProgress ?? (() => {});
   const collectSignalsImpl = options.collectSignalsImpl ?? ((input: { projectDir: string; focus?: string; includeLogs?: boolean; sessionDir?: string }) => collectSignals({ ...input, now: now() }));
+  const reconProjectImpl = options.reconProjectImpl ?? reconProject;
   const runCampaignImpl = options.runCampaignImpl ?? runCampaign;
+  const resumeCampaignImpl = options.resumeCampaignImpl ?? resumeCampaign;
+  const searchConfigPath = path.join(loopRoot, "search-config.json");
+  const readSearchConfig = (): SearchConfig => {
+    try { return validateSearchConfig(JSON.parse(fs.readFileSync(searchConfigPath, "utf8"))) ?? defaultSearchConfig; }
+    catch { return defaultSearchConfig; }
+  };
   const campaignDefaults = {
     maxCycles: 2,
     maxAgentStarts: 18,
     maxEvaluatorRuns: 48,
-    deadlineMs: 30 * 60 * 1000,
+    deadlineMs: 60 * 60 * 1000,
     ...options.campaignDefaults,
   };
 
@@ -584,25 +657,125 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     writeFileAtomic(leasePath, `${JSON.stringify({ ...lease, heartbeatAt: now().toISOString() }, null, 2)}\n`, true);
   };
   let budget: LoopBudgetFile | null = null;
-  // The optimizer-trial allowance comes from the caller or, when the caller defers,
-  // from the contract the run is approved under. Both are durable once the budget exists.
+  const chargeOne = (phase: LoopPhase, process: "agent" | "evaluator"): void => {
+    if (!budget) throw new LoopBudgetExhaustedError(`${phase} process`);
+    const spend = process === "agent" ? { agentStarts: 1 } : { evaluatorRuns: 1 };
+    if (!hasAllowance(budget, spend)) throw new LoopBudgetExhaustedError(`${phase} process`);
+    const grant: LoopReservation = {
+      phase, agent_starts: process === "agent" ? 1 : 0,
+      evaluator_runs: process === "evaluator" ? 1 : 0, campaigns: 0, at: now().toISOString(),
+    };
+    budget = settleReservation(budget, grant, { agentStarts: grant.agent_starts, evaluatorRuns: grant.evaluator_runs, campaigns: 0 });
+    writeLoopBudget(budgetPath, budget);
+  };
+  const resumeSavedCampaign = async (): Promise<void> => {
+    const context = readJson<LoopResumeContext>(activeContextPath);
+    if (!context || context.version !== 1 || !context.lever?.id || !context.setup?.task || !context.plan || !context.instrument) {
+      throw new Error("saved loop resume context is missing or invalid; the campaign cannot continue safely");
+    }
+    const before = readCampaignStatus(baseRoot);
+    if (!before) throw new Error("the saved loop context has no campaign");
+    const terminal = before.state.kind === "complete" || before.state.kind === "failed";
+    if (!terminal && before.state.kind !== "paused" && before.state.kind !== "running") throw new Error("the saved loop context has no paused or interrupted campaign");
+    if (before.state.kind === "running" && phaseIsActive(before.campaignRoot, "campaign")) throw new Error("the saved campaign is still running in another process");
+    let result: CampaignResult;
+    let agentDelta = 0;
+    let evaluatorDelta = 0;
+    if (terminal) {
+      // A crash after the campaign committed but before independent verification
+      // leaves a terminal campaign plus its frozen instrument in active.json.
+      result = { ...before, stopped: true, stopReason: before.state.kind === "complete" || before.state.kind === "failed" ? before.state.reason : "" };
+    } else {
+      if (!budget) throw new LoopBudgetExhaustedError("campaign resume");
+      const remaining = remainingAllowance(budget);
+      if (remaining.agentStarts <= 0 || remaining.evaluatorRuns <= 0) throw new LoopBudgetExhaustedError("campaign resume");
+      const reservation: LoopReservation = {
+        phase: "campaign", agent_starts: remaining.agentStarts, evaluator_runs: remaining.evaluatorRuns,
+        campaigns: 0, campaign_id: before.id,
+        campaign_agent_starts_before: before.agentStarts, campaign_evaluator_runs_before: before.evaluatorRuns,
+        at: now().toISOString(),
+      };
+      budget = { ...budget, open_campaign: reservation };
+      writeLoopBudget(budgetPath, budget);
+      try {
+        result = await resumeCampaignImpl({
+        baseRoot, projectDir,
+        ...(options.signal ? { signal: options.signal } : {}),
+        ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+        ...(options.onCampaignUpdate ? { onUpdate: options.onCampaignUpdate } : {}),
+        ...(options.onPhaseProgress ? { onPhaseProgress: options.onPhaseProgress } : {}),
+        onProgress: progress,
+        });
+      } catch (error) {
+        budget = settleReservation(budget, reservation, { agentStarts: reservation.agent_starts, evaluatorRuns: reservation.evaluator_runs, campaigns: 0 });
+        writeLoopBudget(budgetPath, budget);
+        throw error;
+      }
+      agentDelta = Math.max(0, result.agentStarts - before.agentStarts);
+      evaluatorDelta = Math.max(0, result.evaluatorRuns - before.evaluatorRuns);
+      budget = settleReservation(budget, reservation, { agentStarts: agentDelta, evaluatorRuns: evaluatorDelta, campaigns: 0 });
+      writeLoopBudget(budgetPath, budget);
+    }
+    evaluatorId = context.plan.evaluationContract?.id ?? null;
+    contractId = context.contractId;
+    lastCampaignId = result.id;
+    writeJson(activeContextPath, { ...context, campaignId: result.id, phase: "post-apply" } satisfies LoopResumeContext);
+
+    const applied = readLedger(path.join(result.campaignRoot, "history", "ledger.jsonl")).entries
+      .some((entry) => entry.kind === "apply" && entry.outcome === "success");
+    const failed = result.state.kind === "failed";
+    const paused = result.state.kind === "paused";
+    let postApplyFailure: string | null = null;
+    let verifiedGain: number | undefined;
+    if (applied) {
+      if (!approved) postApplyFailure = "the saved loop contract is unavailable for independent verification";
+      else {
+        try {
+          const checked = await verifyPostApply({
+            projectDir, contract: approved.contract,
+            argv: context.instrument.argv, gates: context.instrument.gates, baseline: context.instrument.baseline,
+            minimumUsefulGain: context.instrument.minimumUsefulGain, unit: context.instrument.unit,
+            higherIsBetter: context.instrument.higherIsBetter,
+            ...(context.instrument.kind !== "command-duration" ? { kind: context.instrument.kind, ...(context.instrument.evaluator ? { evaluator: context.instrument.evaluator } : {}) } : {}),
+            workRoot: path.join(loopRoot, "post-apply"), timeoutMs: context.instrument.timeoutMs,
+            beforeProcess: () => chargeOne("post-apply", "evaluator"),
+            ...(options.signal ? { signal: options.signal } : {}),
+            ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
+          });
+          if (checked.passed) verifiedGain = checked.gain ?? undefined;
+          else postApplyFailure = checked.reason ?? "the resumed apply did not pass its independent post-apply check";
+          verifications.push({ leverId: context.lever.id, campaignId: result.id, outcome: "win", passed: checked.passed, reason: checked.reason, at: now().toISOString() });
+        } catch (error) {
+          postApplyFailure = error instanceof Error ? error.message : String(error);
+          verifications.push({ leverId: context.lever.id, campaignId: result.id, outcome: "win", passed: false, reason: postApplyFailure, at: now().toISOString() });
+        }
+      }
+    }
+    const outcome: LoopMemoryRecord["outcome"] = postApplyFailure ? "no-win" : applied ? "win" : failed ? "error" : paused ? "error" : "no-win";
+    const reason = postApplyFailure ?? result.stopReason;
+    recordOutcome({
+      leverId: context.lever.id, outcome, stopReason: reason.slice(0, 200),
+      evaluatorRuns: evaluatorDelta, agentStarts: agentDelta, wallMs: 0, at: now().toISOString(),
+      ...(verifiedGain === undefined ? {} : { verifiedGain }),
+      provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
+    }, result.campaignRoot);
+    if (!paused) fs.rmSync(activeContextPath, { force: true });
+    if (paused) stopReason = "paused";
+    else if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
+    else if (failed) stopReason = `campaign failed: ${result.stopReason}`;
+    else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
+  };
+  // The durable limits come from the caller and are capped by the approved contract.
   // The approved contract is an upper bound on durable spend, not a suggestion. A
   // caller asking for more than the contract approved gets the contract's figure; a
   // caller asking for less gets less. Nothing may widen its own allowance.
   const approvedBudgets = approvedContract(options.contract);
-  const optimizerTrialCeiling = Math.min(
-    limits.maxOptimizerTrials ?? Number.MAX_SAFE_INTEGER,
-    approvedBudgets?.optimizerTrials ?? Number.MAX_SAFE_INTEGER,
-  );
   const durableLimits = {
     maxCampaigns: Math.min(limits.maxCampaigns, approvedBudgets?.maxCampaigns ?? limits.maxCampaigns),
     maxAgentStarts: Math.min(limits.maxAgentStarts, approvedBudgets?.maxAgentStarts ?? limits.maxAgentStarts),
     maxEvaluatorRuns: Math.min(limits.maxEvaluatorRuns, approvedBudgets?.maxEvaluatorRuns ?? limits.maxEvaluatorRuns),
     deadlineMs: Math.min(limits.deadlineMs, approvedBudgets?.deadlineMs ?? limits.deadlineMs),
   };
-  if (optimizerTrialCeiling !== Number.MAX_SAFE_INTEGER && optimizerTrialCeiling < 0) {
-    throw new Error("loop limit maxOptimizerTrials must be a non-negative integer");
-  }
 
   try {
     if (leaseHeld) {
@@ -611,12 +784,15 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         maxAgentStarts: durableLimits.maxAgentStarts,
         maxEvaluatorRuns: durableLimits.maxEvaluatorRuns,
         deadlineMs: durableLimits.deadlineMs,
-        maxRestarts,
-        maxOptimizerTrials: optimizerTrialCeiling === Number.MAX_SAFE_INTEGER ? 0 : optimizerTrialCeiling,
       });
       // Crash-safe accounting: a leftover reservation means the previous process
       // died mid-phase, so charge the granted budget before spending more.
-      const recovered = reconcileOpenReservation(budget);
+      const open = budget.open_campaign;
+      const recoveredCampaign = open?.phase === "campaign" && open.campaign_id ? readCampaignStatus(baseRoot) : null;
+      const observed = recoveredCampaign && recoveredCampaign.id === open?.campaign_id
+        ? { agentStarts: recoveredCampaign.agentStarts, evaluatorRuns: recoveredCampaign.evaluatorRuns, campaigns: open?.campaigns ?? 1 }
+        : undefined;
+      const recovered = reconcileOpenReservation(budget, observed);
       if (recovered) {
         budget = recovered.budget;
         writeLoopBudget(budgetPath, budget);
@@ -626,7 +802,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     }
     // The approved contract is honoured before any discovery or probe: without
     // trusted-local consent nothing runs on this host.
-    if (leaseHeld && options.contract) {
+    if (leaseHeld && !options.contract) {
+      noteLocally("not-approved: a trusted-local run contract is required before repository commands can run");
+      stopReason = "not-approved";
+    } else if (leaseHeld) {
       try {
         approved = approveRunContract(projectDir, options.contract);
         const stored = readStoredContract(loopRoot);
@@ -654,7 +833,18 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       const remainingCampaigns = remaining.campaigns;
       const remainingAgents = remaining.agentStarts;
       const remainingEvaluators = remaining.evaluatorRuns;
-      if (remainingCampaigns <= 0 || remainingAgents <= 0 || remainingEvaluators <= 0) { stopReason = "budget"; break; }
+      if ((!resumePending && remainingCampaigns <= 0) || remainingAgents <= 0 || remainingEvaluators <= 0) { stopReason = "budget"; break; }
+
+      if (resumePending) {
+        resumePending = false;
+        try { await resumeSavedCampaign(); }
+        catch (error) {
+          if (error instanceof LoopBudgetExhaustedError) stopReason = "budget";
+          else stopReason = `resume failed: ${error instanceof Error ? error.message : String(error)}`;
+          addNote(stopReason);
+        }
+        if (stopReason) break;
+      }
 
       const activeRecord = readCampaignStatus(baseRoot);
       if (activeRecord && (activeRecord.state.kind === "running" || activeRecord.state.kind === "paused")) {
@@ -672,111 +862,51 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         }
       }
 
+      if (!approved) { stopReason = "not-approved"; break; }
+      // The contract's objective, scopes, gates, and workload allowlist govern every
+      // discovery run. Session signals only rank recon findings; they cannot create a
+      // legacy lever or bypass qualification.
       let evidenceCount = 0;
-      if (approved) {
-        // Cold start: measure the project's own declared workloads and attribute the
-        // measurement to the code it imports. No session history is required.
-        recon = await reconProject({
+      try {
+        recon = await reconProjectImpl({
           projectDir,
           contract: approved.contract,
           maxProbes: options.reconProbes ?? 3,
           ...(options.signal ? { signal: options.signal } : {}),
-          // Charge one evaluator run before the probe starts. `beforeProbe` runs
-          // immediately before the process spawns, so the spend is durable first.
-          beforeProbe: () => {
-            const grant: LoopReservation = { phase: "discovery", agent_starts: 0, evaluator_runs: 1, campaigns: 0, at: now().toISOString() };
-            if (!hasAllowance(budget!, { evaluatorRuns: 1 })) {
-              throw new LoopBudgetExhaustedError("discovery probe");
-            }
-            budget = settleReservation(budget!, grant, { agentStarts: 0, evaluatorRuns: 1, campaigns: 0 });
-            writeLoopBudget(budgetPath, budget);
-          },
+          beforeProbe: () => chargeOne("discovery", "evaluator"),
           onProgress: progress,
         });
-        inventory = buildReconInventory({ contract: approved.contract, recon, attempts: attemptsFromMemory(memory) });
-        evidenceCount = recon.probes.length;
-        for (const blocker of recon.blockers) addNote(`recon blocker: ${blocker}`);
-      } else {
-        const signals = await collectSignalsImpl({
-          projectDir,
-          ...(options.focus ? { focus: options.focus } : {}),
-          ...(options.includeLogs !== undefined ? { includeLogs: options.includeLogs } : {}),
-          ...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
-        });
-        inventory = buildLeverInventory({ weaknesses: signals.weaknesses, attempts: attemptsFromMemory(memory) });
-        evidenceCount = signals.weaknesses.length;
+      } catch (error) {
+        if (!(error instanceof LoopBudgetExhaustedError)) throw error;
+        addNote(`${error.message}; discovery stops before the durable evaluator cap is exceeded.`);
+        stopReason = "budget";
+        break;
       }
+      const sessionSignals = await collectSignalsImpl({
+        projectDir,
+        ...(options.focus ? { focus: options.focus } : {}),
+        ...(options.includeLogs !== undefined ? { includeLogs: options.includeLogs } : {}),
+        ...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
+      });
+      const usageSignals = sessionSignals.weaknesses.filter((weakness) => weakness.evidence.some((item) => item.source === "session"));
+      inventory = buildReconInventory({ contract: approved.contract, recon, attempts: attemptsFromMemory(memory), signals: usageSignals });
+      evidenceCount = recon.probes.length;
+      for (const blocker of recon.blockers) addNote(`recon blocker: ${blocker}`);
       // Experiments measured under another objective or another instrument are not
       // comparable; they stay in the durable history but do not steer this run.
       const comparable = comparableMemory(memory, { contractId, evaluatorId });
-      const selection = ucbSelect(inventory.levers, comparable, { strategy: approved ? "utility" : "win-rate" });
+      const selection = ucbSelect(inventory.levers, comparable, { strategy: "utility" });
       ranking = selection.ranking;
       progress(`loop: ${inventory.levers.length} lever(s) ranked from ${evidenceCount} measured or recorded signal(s); top candidate ${selection.selected?.id ?? "none"}`);
 
-      const plateau = plateauState(comparable, plateauK);
-      const allTried = inventory.levers.length > 0 && inventory.levers.every((lever) => (memory.leverStats[lever.id]?.campaigns ?? 0) > 0);
-      let restart: { leverId: string; metricKind: LeverMetricKind } | null = null;
-      if (plateau.plateaued && allTried) {
-        // Memento-style restart: before the plateau stop, spend one bounded
-        // restart on a different signal, because re-running the same metric is a
-        // repeat of the same evaluation rather than new exploration.
-        const restartCandidate = budget.restarts < maxRestarts && !options.taskProvider
-          ? pickRestartLever(inventory, plateau, comparable, rejectedThisRun)
-          : null;
-        const restartMetric = restartCandidate ? alternateMetricKind(restartCandidate) : null;
-        if (restartCandidate && restartMetric) {
-          restart = { leverId: restartCandidate.id, metricKind: restartMetric };
-          budget = { ...budget, restarts: budget.restarts + 1 };
-          writeLoopBudget(budgetPath, budget);
-          addNote(`plateau restart ${budget.restarts}/${maxRestarts}: re-exploring lever ${restartCandidate.id} through the alternate ${restartMetric} metric instead of stopping.`);
-          progress(`loop: plateau restart ${budget.restarts}/${maxRestarts} on lever ${restartCandidate.id} (${restartCandidate.metricKind} -> ${restartMetric})`);
-        }
-        if (!restart) {
-          // Before stopping, spend at most one reserved optimizer trial. The loop does
-          // not run the trial itself: a harness that owns the sealed split supplies the
-          // evidence, and the decision is recorded either way.
-          const optimizerCeiling = budget.max_optimizer_trials ?? 0;
-          if (approved && optimizerCeiling > 0
-            && (budget.optimizer_trials ?? 0) < optimizerCeiling && options.optimizerTrial) {
-            try {
-              const trial = await options.optimizerTrial({ projectDir, loopRoot, generation: loadActiveGeneration(loopRoot)?.id ?? null });
-              if ("retain" in trial) {
-                addNote(`optimizer trial: champion retained (${trial.retain}).`);
-              } else {
-                const decision = decidePromotion(trial.evidence);
-                budget = { ...budget, optimizer_trials: (budget.optimizer_trials ?? 0) + 1 };
-                writeLoopBudget(budgetPath, budget);
-                if (decision.outcome === "promote") {
-                  // The ledger's own ceiling is the authority; the caller may only lower it.
-                  applyPromotionDecision(loopRoot, trial.challengerId, decision);
-                  addNote(`optimizer trial promoted ${trial.challengerId}: ${decision.reason}. It activates in the next process, not this one.`);
-                } else {
-                  addNote(`optimizer trial ${decision.outcome} for ${trial.challengerId}: ${decision.reason}`);
-                }
-              }
-            } catch (error) {
-              addNote(`optimizer trial did not complete: ${error instanceof Error ? error.message : String(error)}. The champion is retained.`);
-            }
-          } else if (approved && optimizerCeiling > 0 && (budget.optimizer_trials ?? 0) >= optimizerCeiling) {
-            addNote("optimizer trial not run: the reserved optimizer allowance is spent. The champion is retained.");
-          } else if (approved) {
-            addNote("optimizer trial not run: no sealed confirmation harness is configured, so no challenger can be scored. The champion is retained.");
-          }
-          addNote(`plateau: ${plateau.consecutiveNoWin} consecutive campaign(s) without a verified win across all known levers; the loop stops here because a plain re-run repeats the same evaluation. Change the target or budget before restarting.`);
-          stopReason = "plateau";
-          break;
-        }
-      }
-
-      const restartLever = restart ? inventory.levers.find((lever) => lever.id === restart.leverId) ?? null : null;
       const ordered: LeverProposal[] = [];
-      for (const lever of [restartLever, selection.selected, ...inventory.levers]) {
+      for (const lever of [selection.selected, ...inventory.levers]) {
         if (lever && !ordered.some((entry) => entry.id === lever.id)) ordered.push(lever);
       }
       if (ordered.length === 0) {
         // With an approved contract, recon already ran and named its blockers; the
         // honest reason is that nothing verifiable was found, not that no evidence exists.
-        stopReason = approved ? "no verifiable lever" : "empty inventory";
+        stopReason = "no verifiable lever";
         break;
       }
 
@@ -785,38 +915,50 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (rejectedThisRun.has(lever.id)) continue;
         if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
         let plan: MetricPlan | null = null;
+        /** Contract-declared evaluator files the campaign must hash into its identity. */
+        let campaignIdentityInputs: string[] | undefined;
+        let qualificationFingerprint: string | undefined;
         let setup: LeverCampaignSetup | { reject: string };
-        const metricOverride = restart && restart.leverId === lever.id ? { metricKind: restart.metricKind } : null;
         if (options.taskProvider) {
           setup = options.taskProvider({ lever, plan: null, projectDir, loopRoot });
         } else {
           if (lever.metricKind === "unmeasurable") { rejectLever(lever, `lever ${lever.id} (${lever.sourceKind}) has no measurable metric kind`); continue; }
           if (lever.scopeFiles.length === 0) { rejectLever(lever, `lever ${lever.id} (${lever.sourceKind}) has no known patch scope yet; scope discovery must run before a campaign`); continue; }
+          if (!approved) { rejectLever(lever, "a trusted run contract is required before a metric can be qualified"); continue; }
+          const effectiveKind = lever.metricKind;
+          const declaredScore = approved.contract.outcome.evaluator;
+          // A score lever measures the contract's declared evaluator, never a
+          // synthesized duration or failure count.
+          const scoreEvaluator = effectiveKind === "score" && declaredScore ? {
+            argv: [...declaredScore.argv],
+            output: declaredScore.output,
+            ...(declaredScore.inputs ? { inputs: [...declaredScore.inputs] } : {}),
+            unit: approved.contract.outcome.unit,
+            higherIsBetter: approved.contract.outcome.higherIsBetter,
+          } : null;
+          // The declared evaluator runs from its project paths, outside the campaign's
+          // trusted verifier subtree. Hashing its files into the campaign identity makes
+          // editing them abort the campaign instead of silently redefining the score.
+          campaignIdentityInputs = scoreEvaluator && declaredScore?.inputs?.length
+            ? declaredScore.inputs.map((input) => path.resolve(projectDir, input))
+            : undefined;
           try {
+          qualificationFingerprint = projectFingerprint(projectDir);
           plan = await synthesizeMetric({
             projectDir,
             loopRoot,
             lever,
             ...(lever.command ? { command: lever.command } : {}),
-            ...(options.controlPatchPath ? { controlPatchPath: options.controlPatchPath } : {}),
-            ...(metricOverride ? { metricOverride } : {}),
-            ...(approved && !options.controlPatchPath ? {
-              qualification: {
-                contract: approved.contract,
-                workRoot: path.join(loopRoot, "qualification"),
-                outcome: approved.contract.outcome.statement,
-                minimumUsefulGain: approved.contract.outcome.minimumUsefulGain,
-                ...(options.signal ? { signal: options.signal } : {}),
-                beforeEvaluatorRun: () => {
-                  const grant: LoopReservation = { phase: "qualification", agent_starts: 0, evaluator_runs: 1, campaigns: 0, at: now().toISOString() };
-                  if (!hasAllowance(budget!, { evaluatorRuns: 1 })) {
-                    throw new LoopBudgetExhaustedError("instrument qualification");
-                  }
-                  budget = settleReservation(budget!, grant, { agentStarts: 0, evaluatorRuns: 1, campaigns: 0 });
-                  writeLoopBudget(budgetPath, budget);
-                },
-              },
-            } : {}),
+            ...(scoreEvaluator ? { scoreEvaluator } : {}),
+            qualification: {
+              contract: approved.contract,
+              workRoot: path.join(loopRoot, "qualification"),
+              outcome: approved.contract.outcome.statement,
+              minimumUsefulGain: approved.contract.outcome.minimumUsefulGain,
+              availableEvaluatorRuns: remainingAllowance(budget!).evaluatorRuns,
+              ...(options.signal ? { signal: options.signal } : {}),
+              beforeEvaluatorRun: () => chargeOne("qualification", "evaluator"),
+            },
           });
           } catch (error) {
             // Running out of budget is a stop condition, not a defect in the lever.
@@ -835,29 +977,23 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (fresh.campaigns <= 0 || fresh.agentStarts <= 0 || fresh.evaluatorRuns <= 0) { stopReason = "budget"; break; }
         const grantedAgents = Math.min(campaignDefaults.maxAgentStarts, fresh.agentStarts);
         const grantedEvaluators = Math.min(campaignDefaults.maxEvaluatorRuns, fresh.evaluatorRuns);
-        const campaignDeadlineMs = Math.max(1_000, Math.min(campaignDefaults.deadlineMs, deadlineAt - Date.now()));
+        const campaignDeadlineMs = Math.max(1_000, Math.min(campaignDefaults.deadlineMs, CAMPAIGN_DEADLINE_MAX_MS, deadlineAt - Date.now()));
         const campaignStartedMs = Date.now();
         // Reserve the grant durably before the campaign runs: if this process dies
         // mid-campaign, the next run charges the reservation instead of losing it.
         // Independent verification needs a baseline recorded BEFORE any candidate runs.
-        // A qualified instrument already carries one; a supplied control patch does not,
-        // so measure it here with the same procedure the post-apply check repeats.
-        const instrument = approved && plan ? await captureInstrument({
+        // The qualified instrument carries the baseline needed for independent verification.
+        const instrument = plan ? await captureInstrument({
           plan,
           contract: approved.contract,
           gates: setup.gates ?? [],
           projectDir,
           workRoot: path.join(loopRoot, "post-apply"),
-          beforeProcess: () => {
-            const grant: LoopReservation = { phase: "post-apply", agent_starts: 0, evaluator_runs: 1, campaigns: 0, at: now().toISOString() };
-            if (!hasAllowance(budget!, { evaluatorRuns: 1 })) throw new LoopBudgetExhaustedError("pre-campaign baseline");
-            budget = settleReservation(budget!, grant, { agentStarts: 0, evaluatorRuns: 1, campaigns: 0 });
-            writeLoopBudget(budgetPath, budget);
-          },
+          beforeProcess: () => chargeOne("post-apply", "evaluator"),
           ...(options.signal ? { signal: options.signal } : {}),
           ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
         }) : null;
-        if (approved && plan && !instrument) {
+        if (plan && !instrument) {
           // Without an independent instrument this change could not be verified, so it
           // is not run: an unverifiable win would be recorded on faith.
           rejectLever(lever, `lever ${lever.id} has no independently measurable instrument, so an applied change could not be verified`);
@@ -866,10 +1002,32 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
 
         // Recorded before the campaign so the experiment names the baseline it started from.
         const baselineFingerprint = projectFingerprint(projectDir);
+        // A qualified instrument in an approved contract run already paid for its baseline
+        // readings: hand them to the campaign when the tree is still the approved one.
+        const seedReadings = plan
+          ? campaignSeedReadings({
+            projectDir,
+            qualificationFingerprint: qualificationFingerprint ?? approved.fingerprint,
+            task: setup.task,
+            verifierInputs: setup.verifierInputs,
+            gates: setup.gates ?? [],
+            ...(campaignIdentityInputs?.length ? { identityInputs: campaignIdentityInputs } : {}),
+            evaluationContract: plan.evaluationContract,
+          })
+          : null;
+        // The approved contract's outcome threshold binds every chained campaign unless
+        // the caller supplied an explicit one.
+        const chainedMinimumGain = options.minimumGain ?? approved.contract.outcome.minimumUsefulGain;
 
         const reserved: LoopReservation = {
           phase: "campaign", agent_starts: grantedAgents, evaluator_runs: grantedEvaluators, campaigns: 1, at: now().toISOString(),
         };
+        if (plan && instrument) {
+          writeJson(activeContextPath, {
+            version: 1, contractId: contractId ?? contractIdentity(approved.contract), lever,
+            setup, plan, instrument, baselineFingerprint,
+          } satisfies LoopResumeContext);
+        }
         budget = { ...budget, open_campaign: reserved };
         writeLoopBudget(budgetPath, budget);
         let result: CampaignResult;
@@ -878,22 +1036,47 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             baseRoot,
             projectDir,
             task: setup.task,
+            searchConfig: readSearchConfig(),
             goal: setup.goal ?? lever.goal,
             scope: setup.scope ?? [...lever.scopeFiles],
+            mechanism: lever.mechanism,
+            ...(lastCampaignId ? { parentCampaignId: lastCampaignId } : {}),
             verifierInputs: setup.verifierInputs,
             gates: setup.gates ?? [],
-            ...(options.minimumGain !== undefined ? { minimumGain: options.minimumGain } : {}),
-            ...(setup.controlPatch ? { controlPatch: setup.controlPatch } : {}),
+            allowFailingBaselineGates: true,
+            ...(chainedMinimumGain !== undefined ? { minimumGain: chainedMinimumGain } : {}),
+            ...(seedReadings ? { seedReadings } : {}),
+            ...(campaignIdentityInputs?.length ? { identityInputs: campaignIdentityInputs } : {}),
             limits: { maxCycles: campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
             // The run's rare-event allowance is shared across the campaigns it may confirm.
-            ...(approved ? { confirmationAlpha: approved.contract.budgets.falseAcceptBudget / approved.contract.budgets.maxCampaigns } : {}),
+            confirmationAlpha: approved.contract.budgets.falseAcceptBudget / approved.contract.budgets.maxCampaigns,
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
-            ...(options.onCampaignUpdate ? { onUpdate: options.onCampaignUpdate } : {}),
+            onUpdate: (status) => {
+              const saved = readJson<LoopResumeContext>(activeContextPath);
+              if (saved && saved.version === 1) writeJson(activeContextPath, { ...saved, campaignId: status.id });
+              if (budget?.open_campaign?.phase === "campaign") {
+                budget = { ...budget, open_campaign: { ...budget.open_campaign, campaign_id: status.id } };
+                writeLoopBudget(budgetPath, budget);
+              }
+              options.onCampaignUpdate?.(status);
+            },
             ...(options.onPhaseProgress ? { onPhaseProgress: options.onPhaseProgress } : {}),
             onProgress: progress,
           });
         } catch (error) {
+          if (error instanceof CampaignInfeasibleError) {
+            // The campaign refused its own caps before creating a directory or running a
+            // scorer. Charge nothing, record the screening outcome, and try the next lever.
+            budget = settleReservation(budget, reserved, { agentStarts: 0, evaluatorRuns: 0, campaigns: 0 });
+            writeLoopBudget(budgetPath, budget);
+            fs.rmSync(activeContextPath, { force: true });
+            addNote(`infeasible campaign for lever ${lever.id}: ${error.message}. Floors: evaluator runs ${error.floor.evaluatorRuns}, agent starts ${error.floor.agentStarts}, ${Math.ceil(error.floor.durationMs / 1000)} s evaluator time; recommended caps: maxEvaluatorRuns ${error.recommended.evaluatorRuns}, maxAgentStarts ${error.recommended.agentStarts}, max_deadline_minutes ${Math.ceil(error.recommended.deadlineMs / 60_000)}. No campaign evaluator or agent spend was charged.`);
+            recordOutcome({ leverId: lever.id, outcome: "rejected", stopReason: `campaign infeasible: ${error.message}`.slice(0, 200), evaluatorRuns: 0, agentStarts: 0, wallMs: Date.now() - campaignStartedMs, at: now().toISOString() }, null);
+            progress(`loop: campaign refused lever ${lever.id} as infeasible (${error.message}); no spend was charged and the next lever is screened`);
+            rejectedThisRun.add(lever.id);
+            continue;
+          }
           const message = error instanceof Error ? error.message : String(error);
           stopReason = `campaign failed: ${message}`;
           // A thrown campaign's real spend is unknown, so charge the reserved
@@ -909,7 +1092,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
 
         budget = settleReservation(budget, reserved, { agentStarts: result.agentStarts, evaluatorRuns: result.evaluatorRuns });
         writeLoopBudget(budgetPath, budget);
-
+        if (result.state.kind !== "paused" && result.state.kind !== "running") {
+          const saved = readJson<LoopResumeContext>(activeContextPath);
+          if (saved?.version === 1) writeJson(activeContextPath, { ...saved, campaignId: result.id, phase: "post-apply" } satisfies LoopResumeContext);
+        }
         const applied = readLedger(path.join(result.campaignRoot, "history", "ledger.jsonl")).entries
           .some((entry) => entry.kind === "apply" && entry.outcome === "success");
         const cancelled = options.signal?.aborted === true || /stopped by request/i.test(result.stopReason);
@@ -927,7 +1113,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // instrument moved; this proves the resulting tree agrees with it.
         let verifiedGain: number | undefined;
         let postApplyFailure: string | null = null;
-        if (applied && approved) {
+        if (applied) {
           if (!instrument) {
             postApplyFailure = "the applied change had no independent instrument to verify it against";
           }
@@ -944,16 +1130,13 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             minimumUsefulGain: instrument.minimumUsefulGain,
             unit: instrument.unit,
             higherIsBetter: instrument.higherIsBetter,
+            ...(instrument.kind !== "command-duration" ? {
+              kind: instrument.kind,
+              ...(instrument.evaluator ? { evaluator: instrument.evaluator } : {}),
+            } : {}),
             workRoot: path.join(loopRoot, "post-apply"),
             timeoutMs: instrument.timeoutMs,
-            beforeProcess: () => {
-              const grant: LoopReservation = { phase: "post-apply", agent_starts: 0, evaluator_runs: 1, campaigns: 0, at: now().toISOString() };
-              if (!hasAllowance(budget!, { evaluatorRuns: 1 })) {
-                throw new LoopBudgetExhaustedError("post-apply verification");
-              }
-              budget = settleReservation(budget!, grant, { agentStarts: 0, evaluatorRuns: 1, campaigns: 0 });
-              writeLoopBudget(budgetPath, budget);
-            },
+            beforeProcess: () => chargeOne("post-apply", "evaluator"),
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
           });
@@ -968,7 +1151,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               leverId: lever.id, outcome: "no-win", stopReason: postApplyFailure.slice(0, 200),
               evaluatorRuns: result.evaluatorRuns, agentStarts: result.agentStarts,
               wallMs: Date.now() - campaignStartedMs, at: now().toISOString(),
-              provenance: { ...(contractId ? { contractId } : {}), ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir) },
+              provenance: { ...(contractId ? { contractId } : {}), ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), strategyClass: lever.sourceKind },
             }, result.campaignRoot);
             stopReason = `post-apply check failed: ${postApplyFailure}`;
             launched = true;
@@ -1005,9 +1188,39 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(evaluatorId ? { evaluatorId } : {}),
             baselineFingerprint: baselineFingerprint ?? projectFingerprint(projectDir),
             mechanism: lever.mechanism.slice(0, 200),
+            strategyClass: lever.sourceKind,
             ...(lastCampaignId ? { parentCampaign: lastCampaignId.slice(0, 200) } : {}),
           },
         }, result.campaignRoot);
+        // The frozen instrument remains available until post-apply verification
+        // and the durable outcome record have both completed.
+        fs.rmSync(activeContextPath, { force: true });
+        try {
+          const worlds: ExperimentWorld[] = [];
+          const campaignsDir = path.join(baseRoot, "campaigns");
+          for (const campaign of fs.readdirSync(campaignsDir, { withFileTypes: true })) {
+            if (!campaign.isDirectory()) continue;
+            const cyclesDir = path.join(campaignsDir, campaign.name, "cycles");
+            if (!fs.existsSync(cyclesDir)) continue;
+            for (const cycle of fs.readdirSync(cyclesDir, { withFileTypes: true })) {
+              if (!cycle.isDirectory()) continue;
+              try {
+                const world = JSON.parse(fs.readFileSync(path.join(cyclesDir, cycle.name, "world.json"), "utf8")) as ExperimentWorld;
+                if (world.status === "complete") worlds.push(world);
+              } catch { /* An incomplete or unreadable world is not replay evidence. */ }
+            }
+          }
+          const incumbent = readSearchConfig();
+          const adopted = await maybeDream({
+            projectDir, loopRoot, agent: setup.task.agent, resolveAgent: options.resolveAgent,
+            signal: options.signal ?? new AbortController().signal, worlds, incumbent,
+            beforeAgentSpawn: () => chargeOne("dream", "agent"),
+          });
+          if (JSON.stringify(adopted) !== JSON.stringify(incumbent)) addNote(`dream adopted search config ${JSON.stringify(adopted)}`);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          addNote(`dream step skipped: ${reason.slice(0, 180)}`);
+        }
         lastCampaignId = result.id;
         progress(`loop: campaign ${result.id} finished as ${postApplyFailure ? "no-win (post-apply check failed)" : outcome} (${(postApplyFailure ?? result.stopReason) || "no reason"})`);
         launched = true;
@@ -1029,14 +1242,19 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       }
       if (stopReason) break;
       if (!launched) {
-        stopReason = inventory.levers.length === 0 && !approved ? "empty inventory" : "no verifiable lever";
+        const afterScreening = remainingAllowance(budget);
+        if (afterScreening.campaigns <= 0 || afterScreening.agentStarts <= 0 || afterScreening.evaluatorRuns <= 0) {
+          stopReason = "budget";
+          break;
+        }
+        stopReason = "no verifiable lever";
         break;
       }
     }
   } finally {
     if (leaseHeld) {
       // Charge this run's wall time durably so a resume inherits what is left.
-      if (budget && options.contract) {
+      if (budget) {
         try {
           budget = { ...budget, wall_ms: (budget.wall_ms ?? 0) + Math.max(0, Date.now() - startedMs) };
           writeLoopBudget(budgetPath, budget);
@@ -1064,6 +1282,5 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     memento: mementoNotes(memory),
     contract: approved ? { fingerprint: approved.fingerprint, approvedAt: approved.approvedAt } : null,
     verifications,
-    generation: approved ? activeGenerationLabel(loopRoot) : null,
   };
 }

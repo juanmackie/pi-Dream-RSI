@@ -1,5 +1,5 @@
 /**
- * pi-dream-rsi — campaign based project improvement for pi (arXiv 2609.14858).
+ * Dream-RSI assessment and autonomous improvement loop for pi.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -7,82 +7,18 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Dashboard } from "./dashboard.ts";
-import { campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignCheckReport, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
-import { resolveWithinRoot } from "./engine/apply.ts";
+import { campaignRuntimeDiagnostics, failPausedV2Campaign, readCampaignStatus, runCampaign, stopCampaign, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { runLoop, type LoopLimits } from "./engine/loop.ts";
 import { phaseIsActive } from "./engine/ownership.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { mementoNotes, readMemory } from "./engine/search.ts";
-import { loadActiveGeneration } from "./engine/generation.ts";
 import { normalizeRunContract, readStoredContract } from "./engine/intake.ts";
 import { collectSignals } from "./engine/signals.ts";
-import { defaultTask, normalizeTask, validateTask, type TaskConfig } from "./engine/task.ts";
+import { defaultTask, type TaskConfig } from "./engine/task.ts";
 import { SKILLS_DIR } from "./layout.ts";
 
 const MODE_ENTRY = "pi-dream-rsi/mode";
 const LOOP_TARGET_ENTRY = "pi-dream-rsi/loop-target";
-const campaignTaskParams = {
-  type: "object",
-  properties: {
-    name: { type: "string", description: "Campaign task name." },
-    workspace: { type: "string", description: "Seed workspace directory, relative to project_dir." },
-    eval_program: { type: "string", description: "Candidate program path, relative to workspace." },
-    score_program: { type: "string", description: "Fixed scoring command that writes the configured score file." },
-    problem_file: { type: "string", description: "Optional problem statement path, relative to project_dir." },
-    score_path: { type: "string", description: "Score JSON path (default eval/score.json)." },
-    score_field: { type: "string", description: "Numeric score field (default score)." },
-    valid_field: { type: "string", description: "Boolean correctness field (default valid)." },
-    fail_class_field: { type: "string", description: "Failure-class field (default fail_class)." },
-    error_field: { type: "string", description: "Error field (default error)." },
-    higher_is_better: { type: "boolean", description: "False when the score is a cost." },
-    beta1: { type: "number", description: "Optional base exploration beta." },
-    beta2: { type: "number", description: "Optional refinement beta." },
-    beta_grid: { type: "array", items: { type: "number" }, description: "Optional beta values used by replay." },
-    default_beta: { type: "number", description: "Initial exploration beta." },
-    agent_timeout_ms: { type: "number", description: "Maximum time allowed for one agent call." },
-    evaluator_timeout_ms: { type: "number", description: "Maximum time allowed for one evaluator call." },
-    copy_exclude: { type: "array", items: { type: "string" }, description: "Workspace-relative paths omitted from copied attempts." },
-    work_retention: { type: "number", description: "Number of recent attempt workspaces to retain." },
-    agent_command: { type: "string", description: "Agent CLI executable." },
-    agent_args: { type: "array", items: { type: "string" }, description: "Arguments passed to the agent CLI." },
-  },
-  required: ["name", "workspace", "eval_program", "score_program", "higher_is_better"],
-  additionalProperties: false,
-};
-
-const improveParams = {
-  type: "object",
-  properties: {
-    action: { type: "string", enum: ["check", "start", "status", "stop", "resume"], description: "Check an evaluator or start, inspect, stop or resume a campaign." },
-    goal: { type: "string", description: "Concrete improvement goal. Required for start." },
-    project_dir: { type: "string", description: "Local project or managed clone path; defaults to the current project." },
-    task: { ...campaignTaskParams, description: "Direct task/evaluator configuration for this isolated campaign. Does not change the legacy task." },
-    lever: {
-      type: "object",
-      description: "Structured lever returned by project assessment. A ready lever can supply goal and scope.",
-      properties: {
-        goal: { type: "string", description: "Measurable target behavior." },
-        scope_files: { type: "array", items: { type: "string" }, description: "Files the candidate may change." },
-        metric: { type: "string", description: "Metric label and units." },
-        evaluator_kind: { type: "string", enum: ["command"], description: "Supported fixed evaluator kind." },
-        readiness: { type: "string", enum: ["ready", "needs_setup", "blocked"], description: "Whether the evaluator and scope are ready for a campaign." },
-      },
-      required: ["goal", "scope_files", "metric", "evaluator_kind", "readiness"],
-      additionalProperties: false,
-    },
-    scope: { type: "array", items: { type: "string" }, description: "Workspace-relative files the campaign may change and apply." },
-    verifier_inputs: { type: "array", items: { type: "string" }, description: "Required evaluator/test inputs outside the editable workspace; use project-relative paths or canonical absolute paths. Their content is hashed and they are excluded from promotion." },
-    max_cycles: { type: "integer", minimum: 1, maximum: 5, description: "Optional lower cycle cap (campaign default 5). Use this to honor a request such as 'run 2 cycles'." },
-    max_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Optional lower spawned-agent cap (campaign default 36)." },
-    max_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Optional lower evaluator-run cap (campaign default 100)." },
-    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units, as a number, or a percentage such as '3%'. Omit it to use the preflight-resolved threshold." },
-    gates: { type: "array", items: { type: "string" }, description: "Optional correctness commands, such as the project's test command. Their inputs belong in verifier_inputs." },
-    control_patch: { type: "string", description: "Optional fixed control candidate patch, relative to project_dir." },
-  },
-  required: ["action"],
-  additionalProperties: false,
-};
-
 const signalsParams = {
   type: "object",
   properties: {
@@ -95,22 +31,29 @@ const signalsParams = {
 const loopParams = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["start", "status"], description: "Start the unattended loop or inspect its durable budget, memory and active campaign." },
+    action: { type: "string", enum: ["start", "status", "stop", "resume"], description: "Start, inspect, stop or resume the unattended loop." },
     project_dir: { type: "string", description: "Local project path; defaults to the current project." },
-    focus: { type: "string", description: "Optional plain-language intent used to rank levers." },
+    consent: { type: "boolean", description: "Required for start: discovered repository code runs on this host with host access." },
+    focus: { type: "string", description: "Improvement goal. Defaults to reducing declared workload wall-clock time without changing results." },
     include_logs: { type: "boolean", description: "Read bounded local session aggregates. Defaults to true; false skips all session-file access." },
+    unit: { type: "string", description: "Metric unit; defaults to ms when no evaluator is supplied." },
+    higher_is_better: { type: "boolean", description: "Metric direction; defaults to false without an evaluator." },
+    minimum_gain: { type: ["number", "string"], description: "Minimum useful gain, default 5%." },
+    proxy_justification: { type: "string", description: "Why a proxy metric represents the stated goal." },
+    evaluator: { type: "object", properties: {
+      argv: { type: "array", items: { type: "string" } },
+      output: { type: "string", enum: ["score-json", "stdout-number"] },
+      inputs: { type: "array", items: { type: "string" } },
+    }, required: ["argv", "output"], additionalProperties: false },
+    scope_roots: { type: "array", items: { type: "string" }, description: "Editable project roots. Defaults to recon's discovered scope." },
+    protected_assets: { type: "array", items: { type: "string" } },
+    gates: { type: "array", items: { type: "string" }, description: "Correctness commands that must continue to pass." },
+    command_categories: { type: "array", items: { type: "string", enum: ["test", "benchmark", "build", "custom"] }, description: "Allowed repository command categories; defaults to all." },
+    env_allowlist: { type: "array", items: { type: "string" } },
     max_campaigns: { type: "integer", minimum: 1, maximum: 64, description: "Durable campaign cap across runs. Default 6." },
     max_agent_starts: { type: "integer", minimum: 1, maximum: 1000, description: "Durable spawned-agent cap across runs. Default 72." },
     max_evaluator_runs: { type: "integer", minimum: 1, maximum: 5000, description: "Durable evaluator-run cap across runs. Default 200." },
     deadline_minutes: { type: "integer", minimum: 1, maximum: 720, description: "Wall-clock budget for this run in minutes. Default 120." },
-    plateau_k: { type: "integer", minimum: 1, maximum: 10, description: "Consecutive campaigns without a verified win before stopping. Default 3." },
-    optimizer_trials: { type: "integer", minimum: 0, maximum: 8, description: "Reserved optimizer-trial allowance for this run. Default 0: no self-improvement trial is attempted. A trial only runs at a plateau, only with a sealed confirmation harness, and its outcome is decided by the promotion rule." },
-    campaign_cycles: { type: "integer", minimum: 1, maximum: 5, description: "Cycle cap for each chained campaign. Default 2." },
-    campaign_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Agent-start cap for each chained campaign. Default 18." },
-    campaign_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Evaluator-run cap for each chained campaign. Default 48." },
-    contract: { type: "object", description: "Approved run contract for cold-start operation: outcome, unit, direction, minimum useful gain, preserved gates, editable scope, trusted-local consent, allowed command categories, approved providers, and durable budgets. Without it the loop keeps the legacy signal-driven path." },
-    control_patch: { type: "string", description: "Known-better control patch used to calibrate synthesized metrics. Without it, a contract run qualifies the instrument from independent evidence; a legacy run records the lever as rejected." },
-    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units or a percentage such as '3%'. Omit it to use the preflight-resolved threshold." },
     agent_command: { type: "string", description: "Agent CLI executable for chained campaigns." },
     agent_args: { type: "array", items: { type: "string" }, description: "Arguments passed to the agent CLI." },
     agent_timeout_ms: { type: "number", description: "Maximum time allowed for one agent call." },
@@ -139,11 +82,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       model: `${model.provider}/${model.id}`,
       thinking: ctx.thinkingLevel ?? savedAgent.thinking,
     };
-  };
-  const stateFor = (ctx: ExtensionContext): { mode: boolean } => {
-    const id = ctx.sessionManager.getSessionId();
-    if (!modes.has(id)) modes.set(id, false);
-    return { get mode() { return modes.get(id) === true; } };
   };
   const setMode = (ctx: ExtensionContext, enabled: boolean): void => {
     modes.set(ctx.sessionManager.getSessionId(), enabled);
@@ -182,166 +120,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // -- tools ---------------------------------------------------------------
 
   pi.registerTool({
-    name: "dream_rsi_improve",
-    label: "Dream-RSI Improve",
-    description:
-      "Check an evaluator before starting a bounded Dream-RSI campaign, then inspect, stop or resume it. The controller applies only verified, gated, adversarially reviewed changes and counts review calls against the agent budget.",
-    promptSnippet: "Control the active isolated Dream-RSI campaign. Start only for an explicit improvement request; assess requests are read-only.",
-    promptGuidelines: [
-      "For dream_rsi_improve, use action=start only after the user explicitly asks to improve or optimize a target and intake has defined a measurable goal, correctness gate, task workspace, candidate program and fixed evaluator outside the candidate workspace, declared in verifier_inputs. Absolute external verifier paths are allowed.",
-      "For dream_rsi_improve, pass the direct task and project_dir from intake. Do not read or overwrite a different task in the base .dream-rsi directory.",
-      "For dream_rsi_improve, pass a structured lever object from assess when available; its goal and scope_files are validated and used to start, and readiness must be ready.",
-      "For dream_rsi_improve, assess a target-only request and offer measurable goals first. Do not call start from /dream-rsi assess or a generic question.",
-      "For dream_rsi_improve, start/resume is enabled only after an explicit improve request has activated Dream-RSI mode; status and stop remain controllable while mode is off.",
-      "For dream_rsi_improve, use status, stop and resume against the active campaign. Resume uses its frozen goal, task, scope and verifier inputs.",
-      "For dream_rsi_improve, start always performs evaluator, gate, noise, and detectability preflight before any agent call; use action=check when a separate diagnosis is requested.",
-      "For dream_rsi_improve, omit minimum_gain to use the preflight-resolved practical threshold derived from baseline noise and minimum detectable effect. Set an explicit absolute score delta or percent only when justified. Every gate input must be declared in verifier_inputs.",
-      "For dream_rsi_improve, every candidate must pass its metric and gates, then receive an accepting adversarial review before apply. Review agent starts count against the saved agent budget.",
-      "For dream_rsi_improve, resolve the active session model and thinking level at each agent call; use the campaign record only when no session value is available.",
-      "For dream_rsi_improve, the campaign applies at most one in-scope candidate per cycle, only after its verifier measures a strict improvement. Report the final stop reason and call budget.",
-    ],
-    parameters: improveParams,
-    async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
-      const baseRoot = dreamRoot(ctx);
-      const action = typeof params.action === "string" ? params.action : "";
-      if ((action === "start" || action === "resume" || action === "check") && !stateFor(ctx).mode) {
-        return { content: [{ type: "text", text: "Start, resume or check requires an explicit improvement request. Use /dream-rsi improve <what you want> first." }], details: { ok: false } };
-      }
-      if (action === "status") {
-        const campaign = readCampaignStatus(baseRoot);
-        const runtime = campaignRuntimeDiagnostics();
-        const manualDataNotice = fs.existsSync(path.join(baseRoot, "task.json")) || fs.existsSync(path.join(baseRoot, "history"))
-          ? "\nManual-loop data from an earlier version is in .dream-rsi/ (task.json, history/). 2.0 does not use it."
-          : "";
-        return campaign
-          ? { content: [{ type: "text", text: `${renderCampaignStatus(campaign, runtime)}${manualDataNotice}` }], details: { campaign, runtime } }
-          : { content: [{ type: "text", text: `No campaign yet. Run /dream-rsi assess.${manualDataNotice}\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
-      }
-      if (action === "stop") {
-        const runtime = campaignRuntimeDiagnostics();
-        let where = baseRoot;
-        if (!readCampaignStatus(baseRoot)) {
-          const target = loopTargetRoot(ctx);
-          if (target && target !== baseRoot && readCampaignStatus(target)) where = target;
-        }
-        const campaign = stopCampaign(where);
-        return campaign
-          ? { content: [{ type: "text", text: `Stop requested${where === baseRoot ? "" : ` for the loop target ${path.dirname(where)}`}.\n${renderCampaignStatus(campaign, runtime)}` }], details: { campaign, runtime, root: where } }
-          : { content: [{ type: "text", text: `No active improvement campaign under ${baseRoot}.\n${renderCampaignRuntime(runtime)}` }], details: { campaign: null, runtime } };
-      }
-      if (action !== "start" && action !== "resume" && action !== "check") {
-        return { content: [{ type: "text", text: "action must be check, start, status, stop or resume." }], details: { ok: false } };
-      }
-      if (action === "check") {
-        const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
-        if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
-        const parsed = parseCampaignTask(params.task, ctx);
-        if (parsed.errors.length > 0 || !parsed.task) return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
-        const task = parsed.task;
-        const errors = validateCampaignPaths(projectDir, task);
-        const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
-        const gates = readStringArray(params.gates, "gates");
-        const runs = 5;
-        const gainResult = parseCampaignMinimumGain(params.minimum_gain);
-        const controlPatch = params.control_patch;
-        if (verifierInputs.error || gates.error || !Number.isSafeInteger(runs) || runs < 1 || runs > 5 || gainResult.error || (controlPatch !== undefined && (typeof controlPatch !== "string" || !controlPatch.trim()))) {
-          const messages = [verifierInputs.error, gates.error, (!Number.isSafeInteger(runs) || runs < 1 || runs > 5) ? "runs must be an integer from 1 to 5" : null, gainResult.error, (controlPatch !== undefined && (typeof controlPatch !== "string" || !controlPatch.trim())) ? "control_patch must be a non-empty path string" : null].filter((message): message is string => message !== null);
-          return { content: [{ type: "text", text: messages.join("\n") }], details: { ok: false, errors: messages } };
-        }
-        if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
-        const inputErrors = validateCampaignInputs(baseRoot, projectDir, task, [task.eval_program], verifierInputs.values);
-        if (inputErrors.length > 0) return { content: [{ type: "text", text: `Campaign inputs are invalid:\n- ${inputErrors.join("\n- ")}` }], details: { ok: false, errors: inputErrors } };
-        const report = await checkCampaignEvaluator({
-          baseRoot,
-          projectDir,
-          task,
-          ...(verifierInputs.values ? { verifierInputs: verifierInputs.values } : {}),
-          ...(gates.values ? { gates: gates.values } : {}),
-          runs,
-          ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
-          ...(typeof controlPatch === "string" ? { controlPatch } : {}),
-          signal,
-        });
-        const text = renderCampaignCheckReport(report);
-        return { content: [{ type: "text", text }], details: { check: report } };
-      }
-
-      const projectDir = action === "start"
-        ? resolveCampaignProjectDir(params.project_dir, ctx.cwd)
-        : readCampaignStatus(baseRoot)?.projectDir ?? null;
-      if (!projectDir) {
-        return { content: [{ type: "text", text: action === "resume" ? "No resumable campaign with a saved project directory." : "project_dir must name an existing local project directory." }], details: { ok: false } };
-      }
-      if (action === "start") {
-        const obsolete = ["workers", "max_loops", "k1", "k2", "revisions", "runs", "guidance"];
-        const suppliedObsolete = obsolete.filter((key) => Object.hasOwn(params, key));
-        if (suppliedObsolete.length) {
-          const errors = suppliedObsolete.map((key) => `${key} is not a supported public campaign intake field`);
-          return { content: [{ type: "text", text: errors.join("\n") }], details: { ok: false, errors } };
-        }
-        const lever = parseAssessedLever(params.lever);
-        if (lever.error) return { content: [{ type: "text", text: lever.error }], details: { ok: false, errors: [lever.error] } };
-        const goal = typeof params.goal === "string" ? params.goal.trim() : lever.value?.goal ?? "";
-        if (!goal) return { content: [{ type: "text", text: "action=start requires a concrete measurable goal." }], details: { ok: false } };
-        const parsed = parseCampaignTask(params.task, ctx);
-        if (parsed.errors.length > 0 || !parsed.task) {
-          return { content: [{ type: "text", text: `Campaign task is invalid:\n- ${parsed.errors.join("\n- ")}` }], details: { ok: false, errors: parsed.errors } };
-        }
-        const task = parsed.task;
-        const errors = validateCampaignPaths(projectDir, task);
-        if (errors.length > 0) return { content: [{ type: "text", text: `Campaign target is invalid:\n- ${errors.join("\n- ")}` }], details: { ok: false, errors } };
-        const scope = readStringArray(params.scope, "scope");
-        const verifierInputs = readStringArray(params.verifier_inputs, "verifier_inputs");
-        const gates = readStringArray(params.gates, "gates");
-        if (scope.error || verifierInputs.error || gates.error) {
-          const errors = [scope.error, verifierInputs.error, gates.error].filter((error): error is string => error !== null);
-          return { content: [{ type: "text", text: errors.join("\n") }], details: { ok: false, errors } };
-        }
-        const campaignScope = scope.values?.length ? scope.values : lever.value?.scope_files ?? [task.eval_program];
-        const inputErrors = validateCampaignInputs(baseRoot, projectDir, task, campaignScope, verifierInputs.values);
-        if (inputErrors.length > 0) return { content: [{ type: "text", text: `Campaign inputs are invalid:\n- ${inputErrors.join("\n- ")}` }], details: { ok: false, errors: inputErrors } };
-        const limitResult = parseCampaignLimits(params);
-        if (limitResult.error) return { content: [{ type: "text", text: limitResult.error }], details: { ok: false } };
-        const gainResult = parseCampaignMinimumGain(params.minimum_gain);
-        if (gainResult.error) return { content: [{ type: "text", text: gainResult.error }], details: { ok: false } };
-        setMode(ctx, true);
-        const result = await runCampaign({
-          baseRoot,
-          projectDir,
-          task,
-          goal,
-          scope: campaignScope,
-          ...(verifierInputs.values ? { verifierInputs: verifierInputs.values } : {}),
-          ...(gates.values ? { gates: gates.values } : {}),
-          ...(limitResult.limits ? { limits: limitResult.limits } : {}),
-          ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
-          ...(typeof params.control_patch === "string" ? { controlPatch: params.control_patch } : {}),
-          resolveAgent: resolveAgent(ctx),
-          signal,
-          onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-          onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-          onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-        });
-        const runtime = campaignRuntimeDiagnostics();
-        return { content: [{ type: "text", text: renderCampaignStatus(result, runtime) }], details: { campaign: result, runtime } };
-      }
-      setMode(ctx, true);
-      const result = await resumeCampaign({
-        baseRoot,
-        projectDir,
-        sessionId: ctx.sessionManager.getSessionId(),
-        resolveAgent: resolveAgent(ctx),
-        signal,
-        onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-        onProgress: campaignProgress(ctx, baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-        onUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-      });
-      const runtime = campaignRuntimeDiagnostics();
-      return { content: [{ type: "text", text: renderCampaignStatus(result, runtime) }], details: { campaign: result, runtime } };
-    },
-  });
-
-  pi.registerTool({
     name: "dream_rsi_signals",
     label: "Dream-RSI Signals",
     description: "Read bounded, privacy-filtered project signals for lever assessment. The tool is free and read-only.",
@@ -372,14 +150,14 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     name: "dream_rsi_loop",
     label: "Dream-RSI Loop",
     description:
-      "Run the unattended multi-lever Dream-RSI loop: rank levers from project signals, synthesize and calibrate a pinned evaluator when intake has none, chain bounded campaigns until a verified win is applied, then re-rank from fresh evidence. Every step fails closed: durable budgets, no metric without a validated control patch, and stop on budget, deadline, blocked state, empty inventory or plateau. Applied patches stay uncommitted with recovery journals.",
+      "Run a bounded Dream-RSI loop: rank project levers, qualify a metric, explore isolated experiments, review and confirm candidates, then independently verify applied changes. Repository code runs on this host with host access.",
     promptSnippet: "Run or inspect the unattended multi-lever Dream-RSI loop. Start only after an explicit improvement request.",
     promptGuidelines: [
-      "For dream_rsi_loop, use action=start only after an explicit improvement request and when the user wants unattended multi-lever improvement; a single targeted change still uses dream_rsi_improve.",
-      "For dream_rsi_loop, pass control_patch whenever a known-better change exists; without it, levers that need a synthesized metric are recorded as rejected because every new metric must validate a known-better control.",
+      "For dream_rsi_loop, use action=start when the user asks for autonomous improvement and pass consent=true after the user accepts trusted-local execution.",
+      "For dream_rsi_loop, without an evaluator the default objective is to reduce declared workload wall-clock time without changing results. With an evaluator, require the user to declare its unit and score direction.",
       "For dream_rsi_loop, set the durable caps explicitly when the user names a budget; defaults are 6 campaigns, 72 agent starts, 200 evaluator runs and 120 minutes.",
       "For dream_rsi_loop, never edit .dream-rsi/loop by hand; action=status reports the durable budget, lever memory and the active campaign.",
-      "For dream_rsi_loop, report the final stop reason, campaigns and verified wins, spend against the caps, and the memory path. Stop reasons include budget, deadline, plateau, blocked, cancelled, empty inventory and no verifiable lever.",
+      "For dream_rsi_loop, report the final stop reason, campaigns and verified wins, spend against the caps, and the memory path. Stop reasons include budget, deadline, blocked, cancelled, and no verifiable lever.",
     ],
     parameters: loopParams,
     async execute(_id, params: any, signal, onUpdate: any, ctx): Promise<any> {
@@ -413,49 +191,131 @@ export default function dreamRsi(pi: ExtensionAPI): void {
             const stored = readStoredContract(loopRoot);
             lines.push(stored
               ? `Run contract: "${stored.contract.outcome.statement}" (${stored.contract.outcome.unit}, ${stored.contract.outcome.higherIsBetter ? "higher" : "lower"} is better), approved ${stored.approvedAt}.`
-              : "No run contract stored for this project; a start without one keeps the legacy signal-driven path.");
+              : "No run contract stored for this project; the next start requires explicit consent and objective details.");
           } catch { lines.push("The stored run contract is unreadable; the next start fails closed."); }
-          try {
-            const generation = loadActiveGeneration(loopRoot);
-            lines.push(generation ? `Optimizer generation: ${generation.id} (loaded by the next process).` : "Optimizer generation: installed code.");
-          } catch { lines.push("The active generation marker is unreadable; roll back before running again."); }
           try { lines.push(mementoNotes(readMemory(memoryPath))); }
           catch { lines.push("Loop memory is unreadable; the next start fails closed."); }
         }
         lines.push(campaign ? renderCampaignStatus(campaign) : "No active campaign.");
         return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath }, campaign } };
       }
-      if (action !== "start") {
-        return { content: [{ type: "text", text: "action must be start or status." }], details: { ok: false } };
+      if (action === "stop") {
+        const campaign = stopCampaign(path.join(resolveCampaignProjectDir(params.project_dir, ctx.cwd) ?? ctx.cwd, ".dream-rsi"));
+        return campaign
+          ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign)}` }], details: { campaign } }
+          : { content: [{ type: "text", text: "No active loop campaign." }], details: { campaign: null } };
       }
-      if (!stateFor(ctx).mode) {
-        return { content: [{ type: "text", text: "Starting the loop requires an explicit improvement request. Use /dream-rsi loop <what you want> first." }], details: { ok: false } };
+      if (action === "resume") {
+        const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
+        if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
+        const baseRoot = path.join(projectDir, ".dream-rsi");
+        const legacyFailure = failPausedV2Campaign(baseRoot);
+        if (legacyFailure) return { content: [{ type: "text", text: legacyFailure }], details: { ok: false, reason: legacyFailure } };
+        const campaign = readCampaignStatus(baseRoot);
+        if (!campaign || (campaign.state.kind !== "paused" && campaign.state.kind !== "running")) {
+          return { content: [{ type: "text", text: "No paused or interrupted campaign is available to resume." }], details: { ok: false, campaign } };
+        }
+        if (campaign.state.kind === "running" && phaseIsActive(campaign.campaignRoot, "campaign")) {
+          return { content: [{ type: "text", text: "The campaign is already running." }], details: { ok: false, campaign } };
+        }
+        setMode(ctx, true);
+        pi.appendEntry(LOOP_TARGET_ENTRY, { version: 1, project: projectDir });
+        const loopRoot = path.join(baseRoot, "loop");
+        const stored = readStoredContract(loopRoot);
+        if (!stored) return { content: [{ type: "text", text: "The paused campaign has no saved loop contract; it cannot resume safely." }], details: { ok: false } };
+        let durable: { max_campaigns?: number; max_agent_starts?: number; max_evaluator_runs?: number };
+        try { durable = JSON.parse(fs.readFileSync(path.join(loopRoot, "budget.json"), "utf8")) as typeof durable; }
+        catch { return { content: [{ type: "text", text: "The durable loop budget is unreadable; resume stopped without spending." }], details: { ok: false } };
+        }
+        if (![durable.max_campaigns, durable.max_agent_starts, durable.max_evaluator_runs].every((value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0)) {
+          return { content: [{ type: "text", text: "The durable loop budget is invalid; resume stopped without spending." }], details: { ok: false } };
+        }
+        const result = await runLoop({
+          projectDir, baseRoot, loopRoot, contract: stored.contract, resumeActiveCampaign: true,
+          limits: {
+            maxCampaigns: durable.max_campaigns!, maxAgentStarts: durable.max_agent_starts!,
+            maxEvaluatorRuns: durable.max_evaluator_runs!, deadlineMs: stored.contract.budgets.deadlineMs,
+          },
+          includeLogs: params.include_logs !== false,
+          ...(ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
+          resolveAgent: resolveAgent(ctx), signal,
+          onProgress: (message) => onUpdate?.({ content: [{ type: "text", text: `Dream-RSI resume: ${message}` }], details: { campaign: readCampaignStatus(baseRoot) } }),
+          onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+          onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
+        });
+        return {
+          content: [{ type: "text", text: `Resumed Dream-RSI loop: ${result.stopReason}; ${result.campaigns} campaign(s), ${result.wins} verified win(s).` }],
+          details: { ok: result.stopReason !== "resume failed", loop: result },
+        };
       }
+      if (action !== "start") return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
+      if (params.consent !== true) return { content: [{ type: "text", text: "consent must be true: discovered repository code runs on this host with host access." }], details: { ok: false } };
+      setMode(ctx, true);
       const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
       if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
       // Progress and phase callbacks report the campaign state of the project
       // the loop actually runs in, which may differ from the calling directory.
       const baseRoot = path.join(projectDir, ".dream-rsi");
+      const loopRoot = path.join(baseRoot, "loop");
       const limitResult = parseLoopLimits(params);
       if (limitResult.error || !limitResult.value) return { content: [{ type: "text", text: limitResult.error ?? "loop limits are invalid" }], details: { ok: false } };
-      const gainResult = parseCampaignMinimumGain(params.minimum_gain);
-      if (gainResult.error) return { content: [{ type: "text", text: gainResult.error }], details: { ok: false } };
-      if (params.control_patch !== undefined && (typeof params.control_patch !== "string" || !params.control_patch.trim())) {
-        return { content: [{ type: "text", text: "control_patch must be a non-empty path string" }], details: { ok: false } };
+      let limits = limitResult.value.limits;
+      const campaignDefaults = limitResult.value.campaignDefaults;
+      const evaluatorInput = params.evaluator;
+      const evaluator = evaluatorInput === undefined ? undefined : evaluatorInput;
+      if (evaluator !== undefined && (typeof params.unit !== "string" || !params.unit.trim() || typeof params.higher_is_better !== "boolean")) {
+        return { content: [{ type: "text", text: "unit and higher_is_better are required when an evaluator is supplied." }], details: { ok: false } };
       }
-      let contract: ReturnType<typeof normalizeRunContract> | undefined;
-      if (params.contract !== undefined) {
-        try {
-          contract = normalizeRunContract(params.contract);
-        } catch (error) {
-          return { content: [{ type: "text", text: `contract is not valid: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } };
-        }
-        if (!contract.execution.consent) {
-          return {
-            content: [{ type: "text", text: "The run contract must record trusted-local consent: discovered repository code runs on this host with host access, so the operator has to approve that risk once before any probe runs." }],
-            details: { ok: false },
+      const asList = (key: string): string[] => {
+        const value = params[key];
+        if (value === undefined) return [];
+        if (!Array.isArray(value) || value.some((entry: unknown) => typeof entry !== "string" || !entry.trim())) throw new Error(`${key} must be an array of non-empty strings`);
+        return value.map((entry: string) => entry.trim());
+      };
+      let contract: ReturnType<typeof normalizeRunContract>;
+      try {
+        const contractFields = ["focus", "unit", "higher_is_better", "minimum_gain", "proxy_justification", "evaluator", "scope_roots", "protected_assets", "gates", "command_categories", "env_allowlist", "max_campaigns", "max_agent_starts", "max_evaluator_runs", "deadline_minutes"];
+        const hasContractFields = contractFields.some((key) => params[key] !== undefined);
+        const stored = readStoredContract(loopRoot);
+        if (stored && !hasContractFields) {
+          contract = stored.contract;
+          limits = {
+            maxCampaigns: contract.budgets.maxCampaigns,
+            maxAgentStarts: contract.budgets.maxAgentStarts,
+            maxEvaluatorRuns: contract.budgets.maxEvaluatorRuns,
+            deadlineMs: contract.budgets.deadlineMs,
           };
+        } else {
+        const minimumGain = params.minimum_gain ?? "5%";
+        const statement = typeof params.focus === "string" && params.focus.trim()
+          ? params.focus.trim()
+          : "Reduce the wall-clock time of the project's declared workloads without changing their results";
+        const hasEvaluator = evaluator !== undefined;
+        const categories = asList("command_categories");
+        contract = normalizeRunContract({
+          version: 1,
+          outcome: {
+            statement,
+            unit: typeof params.unit === "string" && params.unit.trim() ? params.unit.trim() : "ms",
+            higherIsBetter: typeof params.higher_is_better === "boolean" ? params.higher_is_better : false,
+            minimumUsefulGain: minimumGain,
+            ...(typeof params.proxy_justification === "string" && params.proxy_justification.trim() ? { proxyJustification: params.proxy_justification.trim() } : {}),
+            ...(hasEvaluator ? { evaluator } : {}),
+          },
+          preserved: { gates: asList("gates") },
+          scope: { roots: asList("scope_roots"), protectedAssets: asList("protected_assets") },
+          execution: { consent: true, envAllowlist: asList("env_allowlist"), allowedCommandCategories: categories.length ? categories : ["test", "benchmark", "build", "custom"] },
+          budgets: {
+            maxCampaigns: limits.maxCampaigns,
+            maxAgentStarts: limits.maxAgentStarts,
+            maxEvaluatorRuns: limits.maxEvaluatorRuns,
+            deadlineMs: limits.deadlineMs,
+            falseAcceptBudget: 0.10,
+          },
+        });
         }
+      } catch (error) {
+        return { content: [{ type: "text", text: `loop settings are invalid: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } };
       }
       const agentArgs = stringArray(params.agent_args);
       if (params.agent_args !== undefined && !agentArgs) {
@@ -478,14 +338,12 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const includeLogs = params.include_logs !== false;
       const result = await runLoop({
         projectDir,
-        limits: limitResult.value.limits,
-        campaignDefaults: limitResult.value.campaignDefaults,
+        limits,
+        campaignDefaults,
         ...(typeof params.focus === "string" && params.focus.trim() ? { focus: params.focus.trim() } : {}),
         includeLogs,
         ...(includeLogs && ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
-        ...(contract ? { contract } : {}),
-        ...(typeof params.control_patch === "string" ? { controlPatchPath: params.control_patch } : {}),
-        ...(gainResult.minimumGain !== undefined ? { minimumGain: gainResult.minimumGain } : {}),
+        contract,
         ...(Object.keys(taskDefaults).length > 0 ? { taskDefaults } : {}),
         resolveAgent: resolveAgent(ctx),
         signal,
@@ -502,7 +360,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         `  spend this run: ${result.agentStarts} agent start(s), ${result.evaluatorRuns} evaluator run(s)`,
         `  levers ranked: ${result.inventory?.levers.length ?? 0}; memory: ${result.memoryPath}`,
         ...(result.contract ? [`  contract: ${result.contract.fingerprint.slice(0, 12)} (approved ${result.contract.approvedAt})`] : []),
-        ...(result.generation ? [`  optimizer generation: ${result.generation} (activates in a fresh process)`] : []),
         ...(result.verifications.length > 0
           ? [`  independent post-apply checks: ${result.verifications.filter((check) => check.passed).length}/${result.verifications.length} passed`]
           : []),
@@ -518,7 +375,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: assess | improve | loop | watch | status | stop | resume",
+    description: "Dream-RSI: assess | loop | watch | status | stop | resume",
     getArgumentCompletions: commandCompletions,
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
@@ -531,7 +388,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       };
       const manualDataNotice = (): string | null =>
         fs.existsSync(path.join(root, "task.json")) || fs.existsSync(path.join(root, "history"))
-          ? "Manual-loop data from an earlier version is in .dream-rsi/ (task.json, history/). 1.0 does not use it."
+          ? "Data from a pre-3.0 manual campaign is in .dream-rsi/ (task.json, history/). The 3.0 loop does not use it."
           : null;
       const sendWhenReady = (message: string): void => {
         pi.sendUserMessage(message, { expandPromptTemplates: true, ...(ctx.isIdle() ? {} : { deliverAs: "followUp" }) });
@@ -544,12 +401,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         sendWhenReady(`/skill:dream-rsi-assess ${rest}`.trim());
         return;
       }
-      if (verb === "improve") {
-        setMode(ctx, true);
-        sendWhenReady(`/skill:dream-rsi-improve ${rest}`.trim());
-        report("Dream-RSI improvement intake started. A target without a measurable goal is assessed first.");
-        return;
-      }
       if (verb === "loop") {
         setMode(ctx, true);
         const focus = rest.trim();
@@ -557,20 +408,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         report("Dream-RSI unattended loop starting: bounded campaigns until a stop rule. Use /dream-rsi status to inspect or /dream-rsi stop to halt the active campaign.");
         return;
       }
-      if (verb === "start") {
-        const intakePath = rest ? path.resolve(ctx.cwd, normalizePathArg(rest)) : "";
-        let intake: unknown;
-        try { intake = JSON.parse(fs.readFileSync(intakePath, "utf8")); }
-        catch (error) { report(`Could not read intake JSON: ${(error as Error).message}`, "error"); return; }
-        const errors = validatePublicIntake(intake, ctx);
-        if (errors.length) { report(`Invalid Dream-RSI intake:\n- ${errors.join("\n- ")}`, "error"); return; }
-        setMode(ctx, true);
-        sendWhenReady(`/skill:dream-rsi-improve Start the campaign using this validated intake JSON:\n${JSON.stringify(intake, null, 2)}`);
-        report("Dream-RSI campaign intake accepted from JSON.");
-        return;
-      }
-      if (verb === "watch" && rest === "legacy") {
-        report("watch legacy was removed in 1.0. Use /dream-rsi improve <what you want>.");
+      if (verb === "improve" || verb === "start") {
+        report(`${verb} was removed in 3.0. Use /dream-rsi loop.`);
         return;
       }
       if (verb === "status") {
@@ -580,7 +419,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           if (target && target !== root && readCampaignStatus(target)) where = target;
         }
         const campaign = readCampaignStatus(where);
-        const lines = [campaign ? renderCampaignStatus(campaign) : "No campaign yet. Run /dream-rsi assess."];
+        const lines = [campaign ? renderCampaignStatus(campaign) : "No campaign yet. Run /dream-rsi loop."];
         if (campaign && where !== root) lines.push(`(loop target: ${path.dirname(where)})`);
         const notice = manualDataNotice();
         if (notice) lines.push(notice);
@@ -598,39 +437,39 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           ? where === root
             ? `Stop requested.\n${renderCampaignStatus(campaign)}`
             : `Stop requested for the loop target ${path.dirname(where)}.\n${renderCampaignStatus(campaign)}`
-          : "No active improvement campaign is recorded here.", campaign ? "info" : "error");
+          : "No active campaign is recorded here.", campaign ? "info" : "error");
         return;
       }
       if (verb === "resume") {
         if (rest) {
-          report(`resume ${rest} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
+          report(`resume ${rest} was removed in 3.0. Use /dream-rsi loop.`);
           return;
         }
         const campaign = readCampaignStatus(root);
         const interrupted = campaign?.state.kind === "running";
         const canResume = campaign?.state.kind === "paused" || interrupted;
         if (interrupted && campaign && phaseIsActive(campaign.campaignRoot, "campaign")) {
-          report("The improvement campaign is already running. Use /dream-rsi status, watch or stop.", "info");
+          report("The campaign is already running. Use /dream-rsi status, watch or stop.", "info");
         } else if (canResume) {
           setMode(ctx, true);
-          sendWhenReady("/skill:dream-rsi-improve resume");
+          sendWhenReady("Resume the saved Dream-RSI loop using dream_rsi_loop with action=resume.");
           report(interrupted
             ? "Recovering the interrupted Dream-RSI campaign through its guarded resume path."
-            : "Resuming the paused Dream-RSI improvement campaign with its saved goal, target and remaining budgets.");
+            : "Resuming the paused Dream-RSI campaign with its saved goal and remaining budget.");
         } else {
-          report("No paused improvement campaign is available to resume.", "error");
+          report("No paused campaign is available to resume.", "error");
         }
         return;
       }
       if (verb === "watch") {
         if (rest) {
-          report(`watch ${rest} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
+          report("watch takes no arguments.");
           return;
         }
         const campaign = readCampaignStatus(root);
         if (!campaign) {
           const notice = manualDataNotice();
-          report(notice ? `No campaign yet. Run /dream-rsi assess.\n${notice}` : "No campaign yet. Run /dream-rsi assess.", "info");
+          report(notice ? `No campaign yet. Run /dream-rsi loop.\n${notice}` : "No campaign yet. Run /dream-rsi loop.", "info");
           return;
         }
         const summary = await dashboardFor(ctx).watch(resolveWatchRoot(campaign));
@@ -639,7 +478,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       }
       const removed = new Set(["create", "suggest", "best", "live", "dream", "run", "off"]);
       if (removed.has(verb)) {
-        report(`${verb} was removed in 1.0. Use /dream-rsi improve <what you want>.`);
+        report(`${verb} was removed in 3.0. Use /dream-rsi loop.`);
         return;
       }
       report(`Unknown Dream-RSI command. Use /dream-rsi help.`);
@@ -649,7 +488,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
 
   pi.registerShortcut("ctrl+shift+d", { description: "Watch the Dream-RSI campaign", handler: async (ctx) => {
     const campaign = readCampaignStatus(dreamRoot(ctx));
-    if (!campaign) { ctx.ui.notify("No campaign yet. Run /dream-rsi assess.", "info"); return; }
+    if (!campaign) { ctx.ui.notify("No campaign yet. Run /dream-rsi loop.", "info"); return; }
     await dashboardFor(ctx).watch(resolveWatchRoot(campaign));
   } });
   pi.on("input", async (event, ctx) => {
@@ -678,9 +517,7 @@ function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
     "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
-    "  /dream-rsi improve <what you want>  run a verified improvement campaign",
     "  /dream-rsi loop [what you want]  unattended bounded loop over levers",
-    "  /dream-rsi start <intake.json>  start from a validated JSON intake file",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
@@ -690,9 +527,7 @@ function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
     { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
-    { value: "improve", label: "improve <what you want>", description: "Run a bounded improvement campaign" },
     { value: "loop", label: "loop [what you want]", description: "Run the unattended bounded loop over ranked levers" },
-    { value: "start", label: "start <intake.json>", description: "Start from a validated intake file" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },
     { value: "stop", label: "stop", description: "Stop the active campaign" },
@@ -727,137 +562,6 @@ function resolveCampaignProjectDir(value: unknown, cwd: string): string | null {
     return null;
   }
 }
-function parseCampaignTask(value: unknown, ctx: ExtensionContext): { task: TaskConfig | null; errors: string[] } {
-  if (!isRecord(value)) return { task: null, errors: ["task must be an object with name, workspace, eval_program and score_program"] };
-  const raw = value;
-  const forbidden = ["workers", "max_loops", "k1", "k2", "revisions", "runs", "guidance"];
-  const forbiddenKeys = forbidden.filter((key) => Object.hasOwn(raw, key));
-  if (forbiddenKeys.length) return { task: null, errors: forbiddenKeys.map((key) => `${key} is not a supported public task intake field`) };
-  const accepted = new Set(["name", "workspace", "eval_program", "score_program", "problem_file", "score_path", "score_field", "valid_field", "fail_class_field", "error_field", "higher_is_better", "beta1", "beta2", "beta_grid", "default_beta", "agent_timeout_ms", "evaluator_timeout_ms", "copy_exclude", "work_retention", "agent_command", "agent_args"]);
-  const unknownKeys = Object.keys(raw).filter((key) => !accepted.has(key));
-  if (unknownKeys.length) return { task: null, errors: unknownKeys.map((key) => `unknown task field: ${key}`) };
-  if (typeof raw.higher_is_better !== "boolean") return { task: null, errors: ["higher_is_better must be explicitly true or false"] };
-  const betaGrid = numberArray(raw.beta_grid);
-  const copyExclude = stringArray(raw.copy_exclude);
-  const agentArgs = stringArray(raw.agent_args);
-  const malformed = [
-    ...(raw.beta_grid !== undefined && !betaGrid ? ["beta_grid must be an array of numbers"] : []),
-    ...(raw.copy_exclude !== undefined && !copyExclude ? ["copy_exclude must be an array of strings"] : []),
-    ...(raw.agent_args !== undefined && !agentArgs ? ["agent_args must be an array of strings"] : []),
-  ];
-  if (malformed.length > 0) return { task: null, errors: malformed };
-  try {
-    const task: TaskConfig = normalizeTask({
-      name: typeof raw.name === "string" ? raw.name : "",
-      workspace: typeof raw.workspace === "string" ? normalizePathArg(raw.workspace) : "",
-      eval_program: typeof raw.eval_program === "string" ? normalizePathArg(raw.eval_program) : "",
-      score_program: typeof raw.score_program === "string" ? raw.score_program : "",
-      ...(typeof raw.problem_file === "string" ? { problem_file: normalizePathArg(raw.problem_file) } : {}),
-      ...(typeof raw.score_path === "string" ? { score_path: raw.score_path } : {}),
-      ...(typeof raw.score_field === "string" ? { score_field: raw.score_field } : {}),
-      ...(typeof raw.valid_field === "string" ? { valid_field: raw.valid_field } : {}),
-      ...(typeof raw.fail_class_field === "string" ? { fail_class_field: raw.fail_class_field } : {}),
-      ...(typeof raw.error_field === "string" ? { error_field: raw.error_field } : {}),
-      ...(typeof raw.higher_is_better === "boolean" ? { higher_is_better: raw.higher_is_better } : {}),
-      ...(typeof raw.beta1 === "number" ? { beta1: raw.beta1 } : {}),
-      ...(typeof raw.beta2 === "number" ? { beta2: raw.beta2 } : {}),
-      ...(betaGrid ? { beta_grid: betaGrid } : {}),
-      ...(typeof raw.default_beta === "number" ? { default_beta: raw.default_beta } : {}),
-      ...(typeof raw.agent_timeout_ms === "number" ? { agent_timeout_ms: raw.agent_timeout_ms } : {}),
-      ...(typeof raw.evaluator_timeout_ms === "number" ? { evaluator_timeout_ms: raw.evaluator_timeout_ms } : {}),
-      ...(copyExclude ? { copy_exclude: copyExclude } : {}),
-      ...(typeof raw.work_retention === "number" ? { work_retention: raw.work_retention } : {}),
-      agent: {
-        ...defaultTask().agent,
-        ...(typeof raw.agent_command === "string" ? { command: raw.agent_command } : {}),
-        ...(agentArgs ? { args: agentArgs } : {}),
-        model: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
-        thinking: (ctx.thinkingLevel as TaskConfig["agent"]["thinking"] | undefined) ?? null,
-      },
-    });
-    return { task, errors: validateTask(task) };
-  } catch (error) {
-    return { task: null, errors: [(error as Error).message] };
-  }
-}
-
-function validateCampaignPaths(projectDir: string, task: TaskConfig): string[] {
-  const errors: string[] = [];
-  const workspace = resolveWithinRoot(projectDir, task.workspace);
-  if (!workspace || !fs.existsSync(workspace) || !fs.statSync(workspace).isDirectory()) errors.push(`workspace must exist inside the project directory: ${task.workspace}`);
-  if (task.problem_file) {
-    const problemFile = resolveWithinRoot(projectDir, task.problem_file);
-    if (!problemFile || !fs.existsSync(problemFile)) errors.push(`problem_file must exist inside the project directory: ${task.problem_file}`);
-  }
-  if (!workspace) return errors;
-  const candidate = resolveWithinRoot(workspace, task.eval_program);
-  if (!candidate || !fs.existsSync(candidate)) errors.push(`eval_program must exist inside the campaign workspace: ${task.eval_program}`);
-  return errors;
-}
-
-function validateCampaignInputs(baseRoot: string, projectDir: string, task: TaskConfig, scope?: string[], verifierInputs?: string[]): string[] {
-  const errors: string[] = [];
-  const workspace = path.resolve(projectDir, task.workspace);
-  let realWorkspace: string | null = null;
-  try { realWorkspace = fs.realpathSync(workspace); } catch { /* validateCampaignPaths reports the missing workspace */ }
-  let realTrustedRoot: string | null = null;
-  try { realTrustedRoot = fs.realpathSync(baseRoot); } catch { /* it is created when the campaign starts */ }
-  if (!verifierInputs || verifierInputs.length === 0) errors.push("verifier_inputs must declare at least one fixed evaluator or test input outside the editable workspace");
-  for (const relative of scope ?? []) {
-    if (path.isAbsolute(relative) || !resolveWithinRoot(workspace, relative)) errors.push(`scope entry must stay inside the campaign workspace: ${relative}`);
-  }
-  for (const input of verifierInputs ?? []) {
-    let resolved: string | null = null;
-    if (path.isAbsolute(input)) {
-      try {
-        const actual = fs.realpathSync(input);
-        if (path.resolve(input).toLowerCase() !== actual.toLowerCase()) {
-          errors.push(`absolute verifier input must be canonical (real) path: ${input}`);
-          continue;
-        }
-        resolved = actual;
-      } catch {
-        errors.push(`absolute verifier input does not exist: ${input}`);
-        continue;
-      }
-    } else {
-      resolved = resolveWithinRoot(projectDir, input);
-    }
-    if (!resolved || !fs.existsSync(resolved)) {
-      errors.push(`verifier input does not exist or escapes the project directory: ${input}`);
-      continue;
-    }
-    const actual = fs.realpathSync(resolved);
-    const insideWorkspace = realWorkspace !== null && isPathWithin(realWorkspace, actual);
-    const insideTrustedRoot = realTrustedRoot !== null && isPathWithin(realTrustedRoot, actual);
-    if (insideWorkspace && !insideTrustedRoot) {
-      errors.push(`verifier input must be outside the editable workspace or inside the trusted host .dream-rsi subtree: ${input}`);
-    }
-  }
-  return errors;
-}
-
-function isPathWithin(parent: string, candidate: string): boolean {
-  const relative = path.relative(parent, candidate);
-  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
-}
-
-function readStringArray(value: unknown, name: string): { values?: string[]; error: string | null } {
-  if (value === undefined) return { error: null };
-  if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
-    return { error: `${name} must be an array of non-empty strings` };
-  }
-  return { values: value.map((entry) => entry.trim()), error: null };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function numberArray(value: unknown): number[] | null {
-  return Array.isArray(value) && value.every((entry): entry is number => typeof entry === "number") ? value : null;
-}
-
 function stringArray(value: unknown): string[] | null {
   return Array.isArray(value) && value.every((entry): entry is string => typeof entry === "string") ? value : null;
 }
@@ -894,6 +598,7 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
     `  calls: ${campaign.agentStarts}/${campaign.limits.maxAgentStarts} agent starts, ${campaign.evaluatorRuns}/${campaign.limits.maxEvaluatorRuns} evaluator runs`,
     `  effective evaluator timeout: ${campaign.effectiveEvaluatorTimeoutMs}ms`,
     `  deadline: ${campaign.deadlineAt}`,
+    ...(campaign.check ? renderCampaignCheckStatus(campaign.check) : []),
     renderCampaignRuntime(runtime),
   ];
   if (campaign.health) lines.push(
@@ -909,30 +614,21 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
   return lines.join("\n");
 }
 
-function renderCampaignCheckReport(report: CampaignCheckReport): string {
-  const lines = ["Evaluator check", ...report.runs.map((run, index) =>
-    `  run ${index + 1}: ${Math.ceil(run.durationMs / 1000)}s, exit ${run.code ?? "unknown"}, ${run.valid ? `score ${run.score}` : `${run.failClass}${run.error ? `: ${run.error}` : ""}`}`),
-  `  spread: ${report.spread ?? "unavailable"}`,
-  `  direction: ${report.direction}; deterministic: ${report.deterministic}`,
-  `  baseline noise: ${report.noise_rel === null ? "unavailable" : `${(report.noise_rel * 100).toFixed(2)}%`}; minimum detectable effect: ${report.mde_rel === null ? "unavailable" : `${(report.mde_rel * 100).toFixed(2)}%`}`,
-  `  resolved minimum gain: ${report.threshold_resolved}; confirmation cost: ${Math.ceil(report.confirmationCostMs / 1000)}s`,
-  `  control: ${report.control.validated ? `validated (gain ${report.control.gain})` : report.control.reason}`,
-  `  recommended evaluator_timeout_ms: ${report.recommendedEvaluatorTimeoutMs}`,
-  `  recommended minimum_gain: ${report.recommendedMinimumGain}`,
-  ...report.gateRuns.map((gate) => `  gate ${gate.passed ? "passed" : "failed"}: exit ${gate.code ?? "unknown"}${gate.error ? ` (${gate.error})` : ""}`),
-  ...(report.diagnoses.length ? report.diagnoses.map((diagnosis) => `  diagnosis: ${diagnosis}`) : ["  diagnoses: none"]),
-  `  report: ${report.reportPath}`];
-  return lines.join("\n");
-}
-
-function campaignProgress(ctx: ExtensionContext, baseRoot: string, onUpdate: ((update: any) => void) | undefined, isClosing: () => boolean): (progress: string) => void {
-  return (progress) => {
-    const campaign = readCampaignStatus(baseRoot);
-    if (!isClosing()) {
-      ctx.ui.setStatus("dream-rsi", `dream-rsi: ${campaign?.state.kind === "running" ? campaign.state.phase : "improving"} (${campaign?.completedCycles.length ?? 0}/${campaign?.limits.maxCycles ?? 5})`);
-    }
-    onUpdate?.({ content: [{ type: "text", text: `Dream-RSI campaign: ${progress}` }], details: { campaign } });
-  };
+/**
+ * Render the evaluator preflight evidence persisted with a campaign. The check may be
+ * partial (readings persisted after an abort) or complete, so both `reportPath` and the
+ * diagnoses list are optional here.
+ */
+function renderCampaignCheckStatus(check: NonNullable<CampaignStatus["check"]>): string[] {
+  const lines = [`  evaluator check: ${check.qualified ? "qualified" : "unqualified"}; ${check.runs.length} reading${check.runs.length === 1 ? "" : "s"}`];
+  check.runs.forEach((run, index) => {
+    const log = run.logPath === null ? "; seeded" : run.logPath ? `; log ${run.logPath}` : "";
+    const result = run.valid ? `score ${run.score}` : `${run.failClass}${run.error ? `: ${run.error}` : ""}`;
+    lines.push(`    reading ${index + 1}: ${Math.ceil(run.durationMs / 1000)}s, exit ${run.code ?? "unknown"}, ${result}${log}`);
+  });
+  for (const diagnosis of check.diagnoses) lines.push(`    diagnosis: ${diagnosis}`);
+  if (check.reportPath) lines.push(`    report: ${check.reportPath}`);
+  return lines;
 }
 
 function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void) | undefined, isClosing: () => boolean): (campaign: CampaignStatus) => void {
@@ -945,25 +641,7 @@ function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void)
   };
 }
 
-function parseCampaignLimits(params: Record<string, unknown>): { limits?: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number }; error?: string } {
-  const fields = [
-    ["max_cycles", "maxCycles", 5],
-    ["max_agent_starts", "maxAgentStarts", 36],
-    ["max_evaluator_runs", "maxEvaluatorRuns", 100],
-  ] as const;
-  const limits: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number } = {};
-  for (const [input, output, maximum] of fields) {
-    const value = params[input];
-    if (value === undefined) continue;
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > maximum) {
-      return { error: `${input} must be an integer from 1 to ${maximum}` };
-    }
-    limits[output] = value;
-  }
-  return { ...(Object.keys(limits).length > 0 ? { limits } : {}) };
-}
-
-function parseLoopLimits(params: Record<string, unknown>): { value?: { limits: LoopLimits; campaignDefaults: { maxCycles: number; maxAgentStarts: number; maxEvaluatorRuns: number } }; error?: string } {
+function parseLoopLimits(params: Record<string, unknown>): { value?: { limits: LoopLimits; campaignDefaults: { maxCycles: number; maxAgentStarts: number; maxEvaluatorRuns: number; deadlineMs: number } }; error?: string } {
   const read = (input: string, fallback: number, maximum: number): number | string => {
     const value = params[input];
     if (value === undefined) return fallback;
@@ -976,11 +654,6 @@ function parseLoopLimits(params: Record<string, unknown>): { value?: { limits: L
     maxAgentStarts: read("max_agent_starts", 72, 1000),
     maxEvaluatorRuns: read("max_evaluator_runs", 200, 5000),
     deadlineMinutes: read("deadline_minutes", 120, 720),
-    plateauK: read("plateau_k", 3, 10),
-    maxOptimizerTrials: read("optimizer_trials", 0, 8),
-    campaignCycles: read("campaign_cycles", 2, 5),
-    campaignAgentStarts: read("campaign_agent_starts", 18, 36),
-    campaignEvaluatorRuns: read("campaign_evaluator_runs", 48, 100),
   };
   for (const value of Object.values(values)) {
     if (typeof value === "string") return { error: value };
@@ -993,59 +666,8 @@ function parseLoopLimits(params: Record<string, unknown>): { value?: { limits: L
         maxAgentStarts: numbers.maxAgentStarts,
         maxEvaluatorRuns: numbers.maxEvaluatorRuns,
         deadlineMs: numbers.deadlineMinutes * 60_000,
-        plateauK: numbers.plateauK,
-        ...(numbers.maxOptimizerTrials > 0 ? { maxOptimizerTrials: numbers.maxOptimizerTrials } : {}),
       },
-      campaignDefaults: { maxCycles: numbers.campaignCycles, maxAgentStarts: numbers.campaignAgentStarts, maxEvaluatorRuns: numbers.campaignEvaluatorRuns },
+      campaignDefaults: { maxCycles: 2, maxAgentStarts: 18, maxEvaluatorRuns: 48, deadlineMs: 60 * 60 * 1000 },
     },
   };
-}
-
-function parseCampaignMinimumGain(value: unknown): { minimumGain?: number | string; error?: string } {
-  if (value === undefined) return {};
-  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return { minimumGain: value };
-  if (typeof value === "string" && /^\s*(?:\d+(?:\.\d+)?|\.\d+)\s*%\s*$/.test(value) && Number.parseFloat(value) >= 0) {
-    return { minimumGain: value.trim() };
-  }
-  return { error: "minimum_gain must be a finite non-negative score delta or a percentage such as '3%'" };
-}
-
-function validatePublicIntake(value: unknown, ctx: ExtensionContext): string[] {
-  if (!isRecord(value)) return ["intake file must contain a JSON object"];
-  const allowed = new Set(["goal", "project_dir", "task", "lever", "scope", "verifier_inputs", "max_cycles", "max_agent_starts", "max_evaluator_runs", "minimum_gain", "gates", "control_patch"]);
-  const errors = Object.keys(value).filter((key) => !allowed.has(key)).map((key) => `unknown intake field: ${key}`);
-  const lever = parseAssessedLever(value.lever);
-  if (lever.error) errors.push(lever.error);
-  if ((typeof value.goal !== "string" || !value.goal.trim()) && !lever.value) errors.push("goal must be a non-empty measurable goal or come from a ready lever");
-  if (value.control_patch !== undefined && (typeof value.control_patch !== "string" || !value.control_patch.trim())) errors.push("control_patch must be a non-empty path string");
-  const task = parseCampaignTask(value.task, ctx);
-  errors.push(...task.errors.map((error) => `task: ${error}`));
-  const stringFields = ["scope", "verifier_inputs", "gates"] as const;
-  for (const field of stringFields) {
-    const fieldValue = value[field];
-    if (fieldValue !== undefined && (!Array.isArray(fieldValue) || fieldValue.some((entry) => typeof entry !== "string" || !entry.trim()))) errors.push(`${field} must be an array of non-empty strings`);
-  }
-  for (const field of ["max_cycles", "max_agent_starts", "max_evaluator_runs"] as const) {
-    if (value[field] !== undefined && (typeof value[field] !== "number" || !Number.isSafeInteger(value[field]) || value[field] < 1)) errors.push(`${field} must be a positive integer`);
-  }
-  if (value.minimum_gain !== undefined) {
-    const gain = parseCampaignMinimumGain(value.minimum_gain);
-    if (gain.error) errors.push(gain.error);
-  }
-  return [...new Set(errors)];
-}
-
-function parseAssessedLever(value: unknown): { value?: { goal: string; scope_files: string[]; metric: string }; error?: string } {
-  if (value === undefined) return {};
-  if (!isRecord(value)) return { error: "lever must be an assessed lever object" };
-  const allowed = new Set(["goal", "scope_files", "metric", "evaluator_kind", "readiness"]);
-  const unknown = Object.keys(value).find((key) => !allowed.has(key));
-  if (unknown) return { error: `unknown lever field: ${unknown}` };
-  if (typeof value.goal !== "string" || !value.goal.trim()) return { error: "lever.goal must be a non-empty measurable goal" };
-  if (!Array.isArray(value.scope_files) || value.scope_files.length === 0 || value.scope_files.some((file) => typeof file !== "string" || !file.trim())) return { error: "lever.scope_files must be a non-empty array of file paths" };
-  if (typeof value.metric !== "string" || !value.metric.trim()) return { error: "lever.metric must be a non-empty metric label with units" };
-  if (value.evaluator_kind !== "command") return { error: "lever.evaluator_kind must be command" };
-  if (value.readiness !== "ready") return { error: `lever readiness is ${String(value.readiness)}; only ready levers can start a campaign` };
-  const scopeFiles = value.scope_files.filter((file): file is string => typeof file === "string").map((file) => file.trim());
-  return { value: { goal: value.goal.trim(), scope_files: scopeFiles, metric: value.metric.trim() } };
 }

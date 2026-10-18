@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
-import { verifyPostApply } from "../extensions/pi-dream-rsi/engine/verify.ts";
+import { readEvaluatorReading, verifyPostApply } from "../extensions/pi-dream-rsi/engine/verify.ts";
 
 function project(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-verify-"));
@@ -167,6 +167,195 @@ test("a higher-is-better objective takes the opposite gain direction", async () 
   });
   assert.equal(result.passed, true, result.reason ?? "");
   assert.equal(result.gain, 200);
+});
+
+// ---------------------------------------------------------------------------
+// W10: post-apply verification through a declared score evaluator
+// ---------------------------------------------------------------------------
+
+function scoreContract(overrides = {}) {
+  return contract({
+    outcome: { statement: "raise the benchmark accuracy", unit: "points", higherIsBetter: true, minimumUsefulGain: "10%" },
+    ...overrides,
+  });
+}
+
+const SCORE_JSON_EVALUATOR = `import { accuracy } from "../src/model.mjs";
+import * as fs from "node:fs";
+fs.mkdirSync("eval", { recursive: true });
+fs.writeFileSync("eval/score.json", JSON.stringify({ score: accuracy(), raw_score: accuracy(), valid: true, fail_class: "ok", error: null }));
+`;
+const SCORE_STDOUT_EVALUATOR = `import { accuracy } from "../src/model.mjs";\nconsole.log(String(accuracy()));\n`;
+
+function scoreFixture({ evaluator = SCORE_JSON_EVALUATOR, testScript = TEST_OK } = {}) {
+  return project({
+    "package.json": `${JSON.stringify({ name: "verify-score", private: true, type: "module", scripts: { test: "node test.mjs", bench: "node bench.mjs" } }, null, 2)}\n`,
+    "bench.mjs": 'import { accuracy } from "./src/model.mjs";\nconsole.log(accuracy());\n',
+    "test.mjs": testScript,
+    "src/model.mjs": "export const accuracy = () => 0.62;\n",
+    "eval/score.mjs": evaluator,
+  });
+}
+
+function scoreExpectation(projectDir, overrides = {}) {
+  return {
+    projectDir,
+    contract: scoreContract(),
+    kind: "score",
+    evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json" },
+    argv: ["node", "bench.mjs"],
+    gates: [],
+    baseline: [0.5, 0.5, 0.5],
+    minimumUsefulGain: "10%",
+    unit: "points",
+    higherIsBetter: true,
+    workRoot: fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-verify-work-")),
+    timeoutMs: 60_000,
+    ...overrides,
+  };
+}
+
+test("a score-json evaluator measures the applied state in the declared units", async () => {
+  const projectDir = scoreFixture();
+  const result = await verifyPostApply(scoreExpectation(projectDir));
+
+  assert.equal(result.passed, true, result.reason ?? "");
+  assert.ok(Math.abs(result.gain - 0.12) < 1e-9, `expected the gain in points, got ${result.gain}`);
+  assert.match(result.detail, /evaluator 0\.5 -> 0\.62 points/);
+  assert.match(result.detail, /0 gate\(s\) passed/);
+});
+
+test("a stdout-number evaluator is read from the applied state", async () => {
+  const projectDir = scoreFixture({ evaluator: SCORE_STDOUT_EVALUATOR });
+  const result = await verifyPostApply(scoreExpectation(projectDir, {
+    evaluator: { argv: ["node", "eval/score.mjs"], output: "stdout-number" },
+  }));
+
+  assert.equal(result.passed, true, result.reason ?? "");
+  assert.ok(Math.abs(result.gain - 0.12) < 1e-9);
+});
+
+test("a score gain below the useful gain is refused, and a lower-is-better outcome takes the opposite direction", async () => {
+  const projectDir = scoreFixture();
+  const short = await verifyPostApply(scoreExpectation(projectDir, {
+    baseline: [0.6, 0.6, 0.6],
+    minimumUsefulGain: "20%",
+  }));
+  assert.equal(short.passed, false);
+  assert.match(short.reason, /short of the useful gain/);
+
+  const lower = await verifyPostApply(scoreExpectation(projectDir, {
+    kind: "score",
+    evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json" },
+    higherIsBetter: false,
+    unit: "error rate",
+    baseline: [12, 12, 12],
+    minimumUsefulGain: "20%",
+    evaluateImpl: async () => 9,
+  }));
+  assert.equal(lower.passed, true, lower.reason ?? "");
+  assert.equal(lower.gain, 3, "a minimizing outcome gains before - after");
+});
+
+test("the evaluator seam drives the score check without spawning, and records one independent reading", async () => {
+  const projectDir = scoreFixture();
+  let calls = 0;
+  const result = await verifyPostApply(scoreExpectation(projectDir, {
+    baseline: [0.4, 0.4],
+    evaluateImpl: async (spec, cwd) => {
+      calls += 1;
+      assert.deepEqual(spec.argv, ["node", "eval/score.mjs"]);
+      assert.equal(spec.output, "score-json");
+      assert.ok(cwd !== path.resolve(projectDir), "the evaluator runs against a throwaway copy of the applied state");
+      assert.equal(fs.existsSync(path.join(cwd, "eval", "score.mjs")), true, "the copy carries the pinned evaluator");
+      return 0.62;
+    },
+  }));
+  assert.equal(result.passed, true, result.reason ?? "");
+  assert.ok(Math.abs(result.gain - 0.22) < 1e-9);
+  assert.equal(calls, 1, "a score reading is one evaluator process, not a duration series");
+});
+
+test("a failing correctness gate is decisive before the evaluator runs", async () => {
+  const projectDir = scoreFixture({ testScript: TEST_FAILS });
+  let evaluated = false;
+  const result = await verifyPostApply(scoreExpectation(projectDir, {
+    gates: ["npm run test"],
+    evaluateImpl: async () => { evaluated = true; return 0.99; },
+  }));
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /the applied state fails "npm run test"/);
+  assert.equal(evaluated, false, "the score is not consulted when correctness already failed");
+});
+
+test("a score check without the declared evaluator fails closed instead of falling back to wall time", async () => {
+  const projectDir = scoreFixture();
+  let measured = false;
+  const result = await verifyPostApply(scoreExpectation(projectDir, {
+    evaluator: undefined,
+    measureImpl: async () => { measured = true; return 10; },
+  }));
+  assert.equal(result.passed, false);
+  assert.match(result.reason, /requires the declared evaluator/);
+  assert.equal(measured, false);
+});
+
+test("the duration path ignores an evaluator: a declared instrument changes nothing about wall-clock checks", async () => {
+  const projectDir = fixture();
+  const result = await verifyPostApply({
+    projectDir,
+    contract: contract(),
+    kind: "command-duration",
+    evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json" },
+    argv: ["node", "bench.mjs"],
+    gates: [],
+    baseline: [500, 500, 500],
+    minimumUsefulGain: "20%",
+    unit: "ms",
+    higherIsBetter: false,
+    workRoot: fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-verify-work-")),
+    timeoutMs: 60_000,
+    measureImpl: async () => 100,
+    evaluateImpl: async () => { throw new Error("the duration path must not consult a score evaluator"); },
+  });
+  assert.equal(result.passed, true, result.reason ?? "");
+  assert.match(result.detail, /workload 500 -> 100 ms/, "the existing duration detail is unchanged");
+});
+
+test("non-duration kinds other than score also measure through their evaluator", async () => {
+  const projectDir = scoreFixture();
+  const result = await verifyPostApply(scoreExpectation(projectDir, {
+    kind: "suite-failures",
+    evaluator: { argv: ["node", ".dream-rsi/loop/metrics/id/evaluate.mjs"], output: "score-json" },
+    unit: "failures",
+    higherIsBetter: false,
+    baseline: [9, 9, 9],
+    minimumUsefulGain: 4,
+    evaluateImpl: async () => 5,
+  }));
+  assert.equal(result.passed, true, result.reason ?? "");
+  assert.equal(result.gain, 4);
+  assert.match(result.detail, /failures/);
+});
+
+test("the evaluator reading is validated by the declared output form", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-verify-reading-"));
+  try {
+    fs.mkdirSync(path.join(dir, "eval"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "eval", "score.json"), JSON.stringify({ score: 3, valid: true }));
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "score-json" }), 3);
+    fs.writeFileSync(path.join(dir, "eval", "score.json"), JSON.stringify({ score: 3, valid: false, error: "no" }));
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "score-json" }), null, "an invalid verdict is not a score");
+    fs.writeFileSync(path.join(dir, "eval", "score.json"), "not json");
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "score-json" }), null);
+    fs.rmSync(path.join(dir, "eval", "score.json"));
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "score-json" }), null, "a missing score file is not a zero");
+
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "stdout-number", stdout: " 42.5 \n" }), 42.5);
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "stdout-number", stdout: "" }), null);
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "stdout-number", stdout: "1\n2" }), null, "the contract is one number");
+    assert.equal(readEvaluatorReading({ cwd: dir, output: "stdout-number", stdout: "Infinity" }), null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("the check runs the gates against a copy and leaves the project untouched", async () => {
