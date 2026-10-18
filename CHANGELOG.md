@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Hash-chain experiment ledger records to their predecessor, anchor the first linked record to any legacy prefix, serialize writers with an interprocess lock, reject malformed history, and refuse to append when verification fails. A missing external head means clean tail deletion and coordinated full-file rewrite remain undetected; a crashed writer can leave a stale lock requiring manual recovery.
+- Attach typed contract, instrument and baseline identities to campaign ledger events; link confirmations to attempts, gates and reviews to their evidence, and applies to the full preceding review path. Ledger records reject missing or forward parent references and are protected by the existing hash chain.
+- Refuse a campaign at start when its caps cannot fund one verified promotion: 7 agent starts (probe, five live attempts, review), five evaluator readings, a paired confirmation, and one evaluator process per gate. The refusal names the floor and recommended caps and is raised before a campaign directory exists or any evaluator or agent process runs; the deadline is checked after every reading and at resume because no reading has been observed at start.
+- Make the evaluator check fail-fast and resumable. Every reading is persisted as it completes with its duration, exit code, score or fail class and error, the last 2000 characters of stdout and stderr, and a per-reading log path. Resume reuses the paid readings instead of re-spending them and fails immediately on a saved invalid reading. A limit or deadline that runs out before a qualified baseline ends the campaign as a failed evaluator preflight rather than a complete campaign.
+- Accept `max_deadline_minutes` (1..720) on `dream_rsi_improve` start, and report the campaign check in status: qualified flag, one line per reading with its log path, diagnoses, and report path.
+- Let a run contract declare its score evaluator with `outcome.evaluator`: `argv`, an `output` of `score-json` or `stdout-number`, and pinned `inputs`. Recon ranks the declared evaluator first, duration levers are rejected unless the outcome is time-like or `outcome.proxyJustification` is given, and the post-apply check measures through the declared evaluator. The declaration is part of the contract identity.
+- Pass the contract's `minimumUsefulGain` to every chained campaign, seed its evaluator preflight with the loop's qualification readings when the instrument identity still matches, and give a control patch only to a lever whose scope covers every patched path.
+- Reject an infeasible lever at zero spend and continue the loop; a campaign refused before a qualified baseline is recorded as rejected, not completed.
+- Document the evaluator contract, limits, resume semantics, feasibility floors, seeded readings, control-patch scope, and score evaluator in the README, `docs/autonomous-loop.md`, and the improve and loop skills.
+
 ## 2.0.0
 
 - Add a cold-start path: an approved run contract plus bounded discovery let the loop find a measurable bottleneck in a repository it has never seen. Recon reads manifests and source under file, depth and size limits, classifies declared commands (test, benchmark, build, custom), probes each benchmark once, and walks that workload's local import graph so the patch scope is the code the measurement exercises. Session history is no longer required and is still optional.

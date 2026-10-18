@@ -42,9 +42,12 @@ test("percentage thresholds resolve in raw metric units before the probe", async
     const { runCampaign } = await jump("engine/campaign.ts");
     const scorer = project.script("score-scaled.mjs");
     fs.writeFileSync(scorer, 'import fs from "node:fs"; fs.mkdirSync("eval",{recursive:true}); fs.writeFileSync("eval/score.json",JSON.stringify({score:600,valid:true,fail_class:"ok",error:null}));\n');
+    // A campaign refuses caps that cannot fund one verified promotion, so the cheap
+    // stop is now the shared reservation before the probe spawn, not a 1-start cap.
     const result = await runCampaign({ baseRoot: project.dreamRoot, projectDir: project.projectDir,
       task: { ...project.task, score_program: `node "${scorer}"` }, goal: "Improve the metric", scope: ["solution.py"],
-      verifierInputs: [scorer], minimumGain: "5%", limits: { maxCycles: 1, maxAgentStarts: 1 } });
+      verifierInputs: [scorer], minimumGain: "5%", limits: { maxCycles: 1, maxAgentStarts: 7 },
+      beforeAgentSpawn: () => { throw new Error("cheap stop at the campaign probe"); } });
     const record = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign.json")));
     assert.equal(record.minimumGain, 30);
     assert.equal(record.checkReport.threshold_resolved, 30);

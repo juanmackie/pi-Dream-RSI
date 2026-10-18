@@ -39,7 +39,10 @@ export default function campaignCliE2e(pi) {
         assert.ok(improve && signals && command, "the real extension registered its command and tools through Pi");
 
         const guarded = await improve.execute("guard-before-mode", { action: "check" }, undefined, undefined, ctx);
-        assert.match(guarded.content[0].text, /requires an explicit improvement request/);
+        // An interactive/RPC host is asked first; a declining client gets the canceled
+        // path, which must not run the evaluator or create campaign state.
+        assert.match(guarded.content[0].text, /no confirmation was given/);
+        assert.equal(guarded.details.cancelled, true);
         assert.equal(fs.existsSync(path.join(ctx.cwd, ".dream-rsi", "campaigns")), false);
 
         await command.handler("assess make the parser faster", ctx);

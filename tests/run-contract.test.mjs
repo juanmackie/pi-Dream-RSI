@@ -433,6 +433,8 @@ test("a contract run that supplies a control patch still cannot record an unveri
   });
 
   assert.equal(calls.length, 1, "the campaign ran");
+  assert.equal(calls[0].minimumGain, "90%",
+    "the approved contract's minimum useful gain reaches the campaign when the caller passed none");
   assert.equal(result.verifications.length, 1, "the applied change was checked independently even on the control-patch path");
   assert.equal(result.verifications[0].passed, false, "the unchanged tree does not clear the useful gain");
   assert.equal(result.wins, 0, "a claim is not a win");

@@ -114,7 +114,9 @@ process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
   // One CLI, two prompts: discover whether the discovery prompt or the improvement prompt arrived.
   const policyWork = prompt.includes("prefix-only exploration policy");
-  appendFileSync("agent-prompts.log", (policyWork ? "development" : "discovery") + " " + prompt.length + "\\n");
+  const promptReceipt = (policyWork ? "development" : "discovery") + " " + prompt.length + " marker=" + prompt.includes("GENERATION_IMPROVEMENT_MARKER");
+  appendFileSync("agent-prompts.log", promptReceipt + "\\n");
+  process.stdout.write(promptReceipt + "\\n");
   if (policyWork) {
     const file = /Edit only \`([^\`]+)\` and implement/.exec(prompt)?.[1] ?? "policy/method.ts";
     const src = readFileSync(file, "utf8");
@@ -162,14 +164,16 @@ process.stdin.on("end", () => {
 });
 `,
   "developer-reads-feedback.mjs": `
-import { existsSync, appendFileSync } from "node:fs";
+import { existsSync } from "node:fs";
+import path from "node:path";
 let prompt = ""; process.stdin.on("data", (d) => (prompt += d));
 process.stdin.on("end", () => {
-  // The agent runs from the dream root; the revision's own replay feedback must already be on disk.
-  const results = "history/r0001_dream/proposal_results";
+  // The prompt supplies absolute campaign paths; inspect those read-only inputs from the isolated cwd.
+  const history = /Replay-diagnosis files live under \`([^\`]+)\`/.exec(prompt)?.[1] ?? "";
+  const results = path.join(history, "r0001_dream", "proposal_results");
   const sweep = existsSync(results + "/beta_sweep.json");
   const traces = existsSync(results + "/policy_execution_traces.jsonl");
-  appendFileSync("feedback.log", (sweep ? "sweep" : "no-sweep") + " " + (traces ? "traces" : "no-traces") + "\\n");
+  process.stdout.write((sweep ? "sweep" : "no-sweep") + " " + (traces ? "traces" : "no-traces") + "\\n");
 });
 `,
 };

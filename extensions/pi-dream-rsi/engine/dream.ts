@@ -13,12 +13,14 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 
 import { allocator, acquirePhase } from "./ownership.ts";
 import { ProgressRecorder, type ProgressObserver } from "./progress.ts";
 import { activeRuns } from "../state.ts";
-import { runAgent } from "../agent/runner.ts";
+import { runAgent, type CommandResult } from "../agent/runner.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { readManifest, readTree } from "./world.ts";
 import { replayEpisode } from "./replay.ts";
@@ -27,6 +29,7 @@ import type { BetaSweepSummary } from "../policy/api.ts";
 import type { DiscoveryTree } from "./tree.ts";
 import { normalizeTask, scoreMatchesDirection, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
 import { BUNDLED_POLICY_DIR } from "../layout.ts";
+import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
 import {
   archivePolicyVersion,
   baselineDir,
@@ -53,6 +56,8 @@ export interface DreamOptions {
   iteration: number;
   /** Overrides the deployed policy for revision 0 (used by tests). */
   policyPath?: string;
+  /** Generation-pinned policy development prompt; stored in the campaign snapshot. */
+  policyImprovementPrompt?: string;
   log?: (message: string) => void;
   onProgress?: ProgressObserver;
   /** Wall-clock cap per policy-development agent call. */
@@ -63,7 +68,11 @@ export interface DreamOptions {
   signal?: AbortSignal;
   /** Durable campaign reservation immediately before each policy revision child starts. */
   beforeAgentSpawn?: (key: string) => void;
+  /** Called once when a policy-development process exits, including failure or timeout. */
+  onAgentComplete?: (result: CommandResult) => void;
   resolveAgent?: (savedAgent: AgentConfig) => AgentConfig | null;
+  /** OS containment for policy-development agent processes. */
+  containment?: RepositoryCommandContainment;
   /** Durable evaluator reservation for the campaign's seed/apply scorer runs. */
   beforeEvaluatorSpawn?: (key: string) => void;
 }
@@ -111,12 +120,12 @@ export interface DreamResult {
   report: string;
 }
 
-function developmentPrompt(options: DreamOptions, worldCount: number): string {
-  const template = loadPrompt("policy-improvement.md");
+function developmentPrompt(options: DreamOptions, worldCount: number, methodFile: string): string {
+  const template = options.policyImprovementPrompt ?? loadPrompt("policy-improvement.md");
   return renderPrompt(template, {
     // The agent edits the *staging* copy; the deployed policy is replaced only after the winner is
     // selected, so a failed or interrupted revision cannot leave an unevaluated policy active.
-    method_file: stagingPolicyPath(options.dreamRoot),
+    method_file: methodFile,
     history_dir: historyDir(options.dreamRoot),
     trace_pool: tracePoolDir(options.dreamRoot),
     baseline_dir: baselineDir(options.dreamRoot),
@@ -485,22 +494,44 @@ async function runOwnedDreamPhase(rawOptions: DreamOptions, progress: ProgressRe
       // in-memory-only results were invisible to the very call they were meant to guide.
       writeResults(false, null, null, null);
       const before = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : baseSource;
-      const prompt = developmentPrompt(options, worlds.length);
       const cell = `revision-${revision + 1}`;
+      const agentRoot = path.join(os.tmpdir(), `dream-rsi-policy-${crypto.randomUUID()}`);
+      const agentMethod = path.join(agentRoot, "method.ts");
+      fs.mkdirSync(agentRoot, { recursive: true });
+      fs.writeFileSync(agentMethod, before, "utf8");
+      const prompt = developmentPrompt(options, worlds.length, agentMethod);
+      const containmentPolicy = options.containment ? {
+        readonlyRoots: [
+          ...(options.containment.readonlyRoots ?? []),
+          path.dirname(liveMethodPath(dreamRoot)),
+          historyDir(dreamRoot),
+          tracePoolDir(dreamRoot),
+          BUNDLED_POLICY_DIR,
+        ],
+      } : undefined;
+      const contained = workspaceContainment(containmentPolicy, agentRoot);
       progress.stage(cell, "root", revision + 1, "agent");
-      const agentRun = await runAgent({
-        agent: task.agent,
-        resolveAgent: options.resolveAgent,
-        cwd: dreamRoot,
-        prompt,
-        timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
-        logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
-        signal: options.signal,
-        beforeSpawn: () => options.beforeAgentSpawn?.(`dream:${iteration}:revision:${revision + 1}`),
-        onOutput: (event) => progress.output(cell, false, event),
-      });
+      let agentRun: CommandResult;
+      let after = "";
+      try {
+        agentRun = await runAgent({
+          agent: task.agent,
+          resolveAgent: options.resolveAgent,
+          cwd: agentRoot,
+          prompt,
+          timeoutMs: options.developmentTimeoutMs ?? task.agent_timeout_ms,
+          logPath: path.join(roundDir(dreamRoot, iteration, "dream"), `development_r${revision}_agent.log`),
+          signal: options.signal,
+          ...(contained ? { containment: contained } : {}),
+          beforeSpawn: () => options.beforeAgentSpawn?.(`dream:${iteration}:revision:${revision + 1}`),
+          onComplete: options.onAgentComplete,
+          onOutput: (event) => progress.output(cell, false, event),
+        });
+        after = fs.existsSync(agentMethod) ? fs.readFileSync(agentMethod, "utf8") : "";
+      } finally {
+        fs.rmSync(agentRoot, { recursive: true, force: true });
+      }
       progress.stage(cell, "root", revision + 1, agentRun.ok ? "complete" : "failed", 0, null, agentRun.spawnError);
-      const after = fs.existsSync(staging) ? fs.readFileSync(staging, "utf8") : "";
       if (!agentRun.ok || after === before) {
         log(
           `[dream ${iteration}] revision ${revision + 1} left the policy unchanged (${agentRun.ok ? "no edit" : (agentRun.spawnError ?? "agent failed")})`,

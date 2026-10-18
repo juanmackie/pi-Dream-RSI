@@ -14,10 +14,15 @@
  */
 
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 
-import { runShellCommand } from "../agent/runner.ts";
-import { restrictedEnvironment, type CommandCategory, type RunContract } from "./intake.ts";
+import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
+import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
+import {
+  restrictedEnvironment, type CommandCategory, type RunContract, type RunContractScoreEvaluator,
+} from "./intake.ts";
 import type { LeverAttempt, LeverInventory, LeverProposal } from "./levers.ts";
 import { leverId } from "./levers.ts";
 
@@ -37,7 +42,7 @@ const SKIP_DIRS = new Set([
 /** Path shapes that are never read or proposed: secrets, keys, private data. */
 const SECRET_PATH = /(?:^|[\\/])(?:\.env(?:\.|$)|secrets?|credentials?|id_rsa|id_ed25519|\.npmrc|\.netrc)(?:[\\/._-]|$)|(?:^|[\\/])[^\\/]*(?:key|token|secret|credential|password)[^\\/]*(?:$|[\\/])|\.(?:pem|p12|pfx|keystore)$/i;
 
-const SOURCE_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".py", ".rb", ".go", ".rs", ".java", ".kt", ".cs"]);
+const SOURCE_EXTENSIONS = new Set([".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".mts", ".cts", ".py", ".rb", ".go", ".rs", ".java", ".kt", ".kts", ".cs", ".fs", ".fsx", ".swift", ".php", ".ex", ".exs", ".scala", ".sc", ".c", ".h", ".cc", ".cpp", ".hpp"]);
 
 export interface DiscoveredCommand {
   /** Human-readable label, also the canonical metric name. */
@@ -66,6 +71,18 @@ export interface DiscoveredCommand {
  */
 export function directArgv(body: string, projectDir: string): string[] | null {
   const tokens = (body.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((value) => value.replace(/^(["'])(.*)\1$/, "$2"));
+  if (tokens.length === 3 && /^go$/i.test(tokens[0]) && tokens[1] === "run") {
+    const absoluteGoFile = path.resolve(projectDir, tokens[2]);
+    if (!isInside(projectDir, absoluteGoFile)) return null;
+    try {
+      const stat = fs.statSync(absoluteGoFile);
+      const runnable = stat.isFile() && absoluteGoFile.endsWith(".go")
+        || stat.isDirectory() && fs.readdirSync(absoluteGoFile, { withFileTypes: true }).some((entry) => entry.isFile() && entry.name.endsWith(".go"));
+      if (runnable) {
+        return ["go", "run", tokens[2]];
+      }
+    } catch { return null; }
+  }
   if (tokens.length !== 2) return null;
   const [runner, file] = tokens;
   if (!/^(?:node|nodejs|tsx|ts-node|bun|deno|python3?(?:\.\d+)?)$/i.test(runner)) return null;
@@ -118,6 +135,8 @@ export interface ReconOptions {
   /** Cap on probes in one recon pass. */
   maxProbes?: number;
   probeTimeoutMs?: number;
+  /** Run repository workloads from disposable, OS-contained copies. */
+  containment?: RepositoryCommandContainment;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
   /** Test seam replacing the probe process. */
@@ -160,7 +179,8 @@ function scanFiles(projectDir: string): ReconFile[] {
       if (entry.isDirectory()) { walk(absolute, relative); continue; }
       if (!entry.isFile()) continue;
       if (!SOURCE_EXTENSIONS.has(path.extname(entry.name).toLowerCase())
-        && !["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile", "pom.xml", "build.gradle", "composer.json", "Gemfile", "mix.exs"].includes(entry.name)) continue;
+        && !["package.json", "pyproject.toml", "Cargo.toml", "go.mod", "Makefile", "pom.xml", "build.gradle", "build.gradle.kts", "composer.json", "Gemfile", "Rakefile", "mix.exs", "Package.swift", "build.sbt", "CMakeLists.txt"].includes(entry.name)
+        && !entry.name.toLowerCase().endsWith(".csproj") && !entry.name.toLowerCase().endsWith(".fsproj")) continue;
       let stat: fs.Stats;
       try { stat = fs.lstatSync(absolute); } catch { continue; }
       const text = readText(absolute, MAX_SOURCE_BYTES);
@@ -211,6 +231,22 @@ export function scriptEntry(script: string, projectDir: string): string | null {
       if (next.startsWith("-")) continue;
       const absolute = path.resolve(projectDir, next);
       if (next && isInside(projectDir, absolute) && fs.existsSync(absolute)) return relativeOf(projectDir, absolute);
+    }
+    if (/^go$/i.test(token) && tokens[index + 1] === "run") {
+      const target = tokens[index + 2] ? unquote(tokens[index + 2]) : "";
+      if (!target || target.startsWith("-")) continue;
+      const absolute = path.resolve(projectDir, target);
+      if (!isInside(projectDir, absolute)) continue;
+      try {
+        const stat = fs.statSync(absolute);
+        if (stat.isFile() && absolute.endsWith(".go")) return relativeOf(projectDir, absolute);
+        if (stat.isDirectory()) {
+          const source = fs.readdirSync(absolute, { withFileTypes: true })
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".go"))
+            .sort((left, right) => (left.name === "main.go" ? -1 : right.name === "main.go" ? 1 : left.name.localeCompare(right.name)))[0];
+          if (source) return relativeOf(projectDir, path.join(absolute, source.name));
+        }
+      } catch { /* unresolved Go package paths remain unattributed */ }
     }
   }
   return null;
@@ -268,6 +304,54 @@ export function discoverCommands(projectDir: string, contract: RunContract): { c
   if (fs.existsSync(path.join(projectDir, "go.mod"))) {
     add({ label: "go test", argv: ["go", "test", "./..."], declaredArgv: ["go", "test", "./..."], category: "test", source: "go.mod", shim: false, entry: null });
   }
+  if (fs.existsSync(path.join(projectDir, "pom.xml"))) {
+    const wrapper = process.platform === "win32" ? "mvnw.cmd" : "./mvnw";
+    const executable = fs.existsSync(path.join(projectDir, wrapper)) ? wrapper : "mvn";
+    add({ label: "maven test", argv: [executable, "test"], declaredArgv: [executable, "test"], category: "test", source: fs.existsSync(path.join(projectDir, wrapper)) ? "mvnw" : "pom.xml", shim: process.platform === "win32", entry: null });
+  }
+  if (fs.existsSync(path.join(projectDir, "build.gradle")) || fs.existsSync(path.join(projectDir, "build.gradle.kts"))) {
+    const wrapper = process.platform === "win32" ? "gradlew.bat" : "./gradlew";
+    const executable = fs.existsSync(path.join(projectDir, wrapper)) ? wrapper : "gradle";
+    add({ label: "gradle test", argv: [executable, "test"], declaredArgv: [executable, "test"], category: "test", source: fs.existsSync(path.join(projectDir, wrapper)) ? "gradle wrapper" : "build.gradle", shim: process.platform === "win32", entry: null });
+  }
+  if (fs.existsSync(path.join(projectDir, "Package.swift"))) {
+    add({ label: "swift test", argv: ["swift", "test"], declaredArgv: ["swift", "test"], category: "test", source: "Package.swift", shim: false, entry: null });
+  }
+  if (fs.existsSync(path.join(projectDir, "build.sbt"))) {
+    add({ label: "sbt test", argv: ["sbt", "test"], declaredArgv: ["sbt", "test"], category: "test", source: "build.sbt", shim: process.platform === "win32", entry: null });
+  }
+  if (fs.existsSync(path.join(projectDir, "mix.exs"))) {
+    add({ label: "mix test", argv: ["mix", "test"], declaredArgv: ["mix", "test"], category: "test", source: "mix.exs", shim: process.platform === "win32", entry: null });
+  }
+  if (fs.existsSync(path.join(projectDir, "composer.json"))) {
+    const composer = readText(path.join(projectDir, "composer.json"), MAX_MANIFEST_BYTES);
+    try {
+      const parsed = composer ? JSON.parse(composer) as { scripts?: unknown } : null;
+      const scripts = parsed?.scripts;
+      if (scripts && typeof scripts === "object" && !Array.isArray(scripts)) {
+        for (const name of Object.keys(scripts as Record<string, unknown>)) {
+          if (!/^(?:test(?::|$)|spec(?::|$)|bench(?:mark)?(?::|$)|perf(?:ormance)?(?::|$)|profile(?::|$)|build(?::|$)|compile(?::|$))/i.test(name)) continue;
+          add({ label: `composer ${name}`, argv: ["composer", "run-script", name], declaredArgv: ["composer", "run-script", name], category: scriptCategory(name), source: `composer.json#scripts.${name}`, shim: process.platform === "win32", entry: null });
+        }
+      }
+    } catch { blockers.push("composer.json is not valid JSON, so its scripts cannot be read"); }
+  }
+  const rakefile = readText(path.join(projectDir, "Rakefile"), MAX_MANIFEST_BYTES);
+  if (rakefile !== null) {
+    for (const match of rakefile.matchAll(/^\s*(?:task\s+[:'\"]|Rake::TestTask\.new\s*\(?\s*[:'\"])([A-Za-z0-9_.-]+)/gm)) {
+      const name = match[1];
+      const category = scriptCategory(name);
+      if (category === "custom") continue;
+      const command = fs.existsSync(path.join(projectDir, "Gemfile")) ? ["bundle", "exec", "rake", name] : ["rake", name];
+      add({ label: `rake ${name}`, argv: command, declaredArgv: command, category, source: `Rakefile#${name}`, shim: process.platform === "win32", entry: null });
+    }
+  }
+  let hasDotnetProject = false;
+  try { hasDotnetProject = fs.readdirSync(projectDir, { withFileTypes: true }).some((entry) => entry.isFile() && /\.(?:cs|fs)proj$/i.test(entry.name)); }
+  catch { blockers.push("the repository root could not be scanned for .NET project files"); }
+  if (hasDotnetProject) {
+    add({ label: "dotnet test", argv: ["dotnet", "test"], declaredArgv: ["dotnet", "test"], category: "test", source: "*.csproj or *.fsproj", shim: false, entry: null });
+  }
   const makefile = readText(path.join(projectDir, "Makefile"), MAX_MANIFEST_BYTES);
   if (makefile !== null) {
     const lines = makefile.split(/\r?\n/);
@@ -294,8 +378,8 @@ export function discoverCommands(projectDir: string, contract: RunContract): { c
 function resolveSpecifier(projectDir: string, fromFile: string, specifier: string): string | null {
   const base = path.resolve(projectDir, path.dirname(fromFile), specifier);
   if (!isInside(projectDir, base)) return null;
-  const candidates = [base, `${base}.mjs`, `${base}.js`, `${base}.cjs`, `${base}.ts`, `${base}.tsx`, `${base}.jsx`, `${base}.py`,
-    path.join(base, "index.mjs"), path.join(base, "index.js"), path.join(base, "index.ts"), path.join(base, "__init__.py")];
+  const candidates = [base, ...[".mjs", ".js", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".rs", ".go", ".java", ".kt", ".cs"].map((extension) => `${base}${extension}`),
+    ...["index.mjs", "index.js", "index.ts", "__init__.py", "mod.rs"].map((name) => path.join(base, name))];
   for (const candidate of candidates) {
     try {
       if (fs.statSync(candidate).isFile()) return relativeOf(projectDir, candidate);
@@ -325,6 +409,63 @@ function pythonImports(source: string): string[] {
   return found;
 }
 
+function rustModules(source: string): string[] {
+  return [...source.matchAll(/^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;/gm)].map((match) => match[1]);
+}
+
+function resolveRustModule(projectDir: string, fromFile: string, module: string): string | null {
+  const directory = path.posix.dirname(fromFile);
+  const basename = path.posix.basename(fromFile);
+  const moduleDirectory = /^(?:lib|main|mod)\.rs$/.test(basename)
+    ? directory
+    : path.posix.join(directory, path.posix.basename(fromFile, ".rs"));
+  const base = path.resolve(projectDir, moduleDirectory, module);
+  if (!isInside(projectDir, base)) return null;
+  for (const candidate of [`${base}.rs`, path.join(base, "mod.rs")]) {
+    try { if (fs.statSync(candidate).isFile()) return relativeOf(projectDir, candidate); }
+    catch { /* try Rust's alternate module layout */ }
+  }
+  return null;
+}
+
+function goImports(source: string): string[] {
+  return [...source.matchAll(/^\s*import\s+(?:\([^)]*\)|(?:[A-Za-z_][A-Za-z0-9_]*\s+)?"[^"]+")/gms)]
+    .flatMap(([clause]) => [...clause.matchAll(/"([^"]+)"/g)].map((match) => match[1]));
+}
+
+function goModulePath(projectDir: string): string | null {
+  const goMod = readText(path.join(projectDir, "go.mod"), MAX_MANIFEST_BYTES);
+  return goMod?.match(/^\s*module\s+([^\s]+)\s*$/m)?.[1] ?? null;
+}
+
+function jvmImports(source: string): string[] {
+  return [...source.matchAll(/^\s*import\s+(static\s+)?([A-Za-z_][A-Za-z0-9_.$*]*)\s*;?/gm)]
+    .map((match) => match[1] ? match[2].split(".").slice(0, -1).join(".") : match[2]);
+}
+
+function localGoFiles(projectDir: string, relativeDirectory: string): string[] {
+  const directory = path.resolve(projectDir, relativeDirectory);
+  if (!isInside(projectDir, directory)) return [];
+  try {
+    return fs.readdirSync(directory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.endsWith(".go") && !isSecretPath(path.join(relativeDirectory, entry.name)))
+      .map((entry) => relativeOf(projectDir, path.join(directory, entry.name)));
+  } catch { return []; }
+}
+
+function resolveJvmImport(projectDir: string, specifier: string): string | null {
+  const classPath = specifier.replaceAll(".", "/");
+  if (classPath.endsWith("/*")) return null;
+  for (const sourceRoot of ["src/main/java", "src/test/java", "src/main/kotlin", "src/test/kotlin", "src"] ) {
+    for (const extension of [".java", ".kt", ".kts"]) {
+      const candidate = path.join(projectDir, `${sourceRoot}/${classPath}${extension}`);
+      try { if (fs.statSync(candidate).isFile()) return relativeOf(projectDir, candidate); }
+      catch { /* check the next conventional source root */ }
+    }
+  }
+  return null;
+}
+
 /**
  * Bounded walk of one workload's local import graph. Only project files are
  * followed: a dependency or a standard-library import ends the branch.
@@ -351,6 +492,30 @@ export function importGraph(projectDir: string, entry: string): { files: string[
       }
       continue;
     }
+    if (file.endsWith(".rs")) {
+      for (const module of rustModules(text)) {
+        const resolved = resolveRustModule(projectDir, file, module);
+        if (resolved) queue.push({ file: resolved, depth: depth + 1 });
+      }
+      continue;
+    }
+    if (file.endsWith(".go")) {
+      const module = goModulePath(projectDir);
+      if (!module) continue;
+      for (const specifier of goImports(text)) {
+        if (specifier !== module && !specifier.startsWith(`${module}/`)) continue;
+        const packagePath = specifier === module ? "." : specifier.slice(module.length + 1);
+        for (const imported of localGoFiles(projectDir, packagePath)) queue.push({ file: imported, depth: depth + 1 });
+      }
+      continue;
+    }
+    if (/\.(?:java|kt|kts)$/.test(file)) {
+      for (const specifier of jvmImports(text)) {
+        const resolved = resolveJvmImport(projectDir, specifier);
+        if (resolved) queue.push({ file: resolved, depth: depth + 1 });
+      }
+      continue;
+    }
     for (const specifier of staticImports(text)) {
       if (!specifier.startsWith(".") && !specifier.startsWith("/")) continue;
       const resolved = resolveSpecifier(projectDir, file, specifier);
@@ -364,18 +529,27 @@ export function importGraph(projectDir: string, entry: string): { files: string[
 export async function probeCommand(options: ReconOptions, command: DiscoveredCommand): Promise<ProbeReading> {
   options.beforeProbe?.(command);
   const commandLine = command.argv.map((part) => (/[\s"]/.test(part) ? `"${part.replace(/"/g, '""')}"` : part)).join(" ");
-  const result = await runShellCommand(commandLine, {
-    cwd: options.projectDir,
-    timeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
-    envOnly: true,
-    env: restrictedEnvironment(options.contract),
-    logPath: null,
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  const durationMs = result.durationMs;
-  const timedOut = result.timedOut;
-  const error = result.spawnError ?? (timedOut ? "probe timed out" : result.ok ? null : (result.stderrTail.trim().split(/\r?\n/, 1)[0] || `exit ${result.code}`));
-  return { label: command.label, ok: result.ok, durationMs, timedOut, error };
+  const scratch = options.containment ? path.join(os.tmpdir(), `dream-rsi-recon-${crypto.randomUUID()}`) : null;
+  try {
+    if (scratch) await copyWorkspace(options.projectDir, scratch, {
+      exclude: [path.join(options.projectDir, ".git"), path.join(options.projectDir, ".dream-rsi")],
+    });
+    const result = await runShellCommand(commandLine, {
+      cwd: scratch ?? options.projectDir,
+      timeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
+      envOnly: true,
+      env: restrictedEnvironment(options.contract),
+      logPath: null,
+      ...(scratch ? { containment: workspaceContainment(options.containment, scratch) } : {}),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    const durationMs = result.durationMs;
+    const timedOut = result.timedOut;
+    const error = result.spawnError ?? (timedOut ? "probe timed out" : result.ok ? null : (result.stderrTail.trim().split(/\r?\n/, 1)[0] || `exit ${result.code}`));
+    return { label: command.label, ok: result.ok, durationMs, timedOut, error };
+  } finally {
+    if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
+  }
 }
 
 /**
@@ -434,11 +608,122 @@ export interface ReconInventoryOptions {
   attempts?: LeverAttempt[];
 }
 
+/** Words that make a wall-clock duration an honest measure of the approved outcome. */
+const TIME_LIKE_WORDS = /(?:^|[^a-z])(?:ms|milliseconds?|seconds?|secs?|time|latency|durations?|minutes?|hours?)(?:[^a-z]|$)/i;
+
+/** True when the approved outcome is itself about time, so duration is not a proxy for it. */
+export function timeLikeOutcome(outcome: RunContract["outcome"]): boolean {
+  return TIME_LIKE_WORDS.test(outcome.unit) || TIME_LIKE_WORDS.test(outcome.statement);
+}
+
 /**
- * Turn recon evidence into ranked levers. The measured workload with the largest
- * attributable duration becomes a duration lever scoped to the code the
- * measurement actually exercises; a declared test command becomes the gate.
- * Everything else is rejected with the reason, never silently dropped.
+ * Why a wall-clock duration lever is not an honest measure of this outcome, or
+ * null when it is (the outcome is time-like, or the operator justified the proxy).
+ */
+export function durationProxyRefusal(contract: RunContract): string | null {
+  if (timeLikeOutcome(contract.outcome)) return null;
+  if (contract.outcome.proxyJustification) return null;
+  return `wall-clock duration is a proxy for the approved outcome ("${contract.outcome.statement}", ${contract.outcome.unit}); supply outcome.proxyJustification or approve a time-like unit/statement before measuring duration`;
+}
+
+/** Normalized path tokens from an evaluator argv/inputs declaration. */
+function pathTokens(values: string[] | undefined): string[] {
+  return (values ?? [])
+    .map((value) => value.replace(/\\/g, "/").replace(/^\.\//, ""))
+    .filter((value) => value !== "" && !value.startsWith("-"));
+}
+
+/** Only the argv entries that name a project file, not the interpreter or flags. */
+function argvPathTokens(argv: string[]): string[] {
+  return pathTokens(argv).filter((token) => token.includes("/")
+    || /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts|py|rb|go|rs|java|kt|cs|sh|ps1|json|ya?ml|toml|csv|txt)$/i.test(token));
+}
+
+/** True when a project-relative file is part of the pinned evaluator (never candidate-editable). */
+function pinnedEvaluatorFile(evaluator: RunContractScoreEvaluator, file: string): boolean {
+  const candidate = file.replace(/\\/g, "/");
+  const tokens = [...pathTokens(evaluator.inputs), ...argvPathTokens(evaluator.argv)];
+  return tokens.some((token) => candidate === token || candidate.startsWith(`${token.replace(/\/$/, "")}/`));
+}
+
+interface ScoreLeverBuild {
+  lever?: LeverProposal;
+  reason?: string;
+}
+
+/**
+ * The declared score evaluator is the primary instrument: a lever that measures
+ * its number, scoped to the code the measured workload exercises, with direction
+ * and unit taken from the approved outcome rather than guessed.
+ */
+function scoreEvaluatorLever(options: {
+  contract: RunContract;
+  evaluator: RunContractScoreEvaluator;
+  recon: ReconResult;
+  gates: string[];
+  attempt: LeverAttempt | undefined;
+}): ScoreLeverBuild {
+  const { contract, evaluator } = options;
+  const id = leverId("recon-command", ["contract.outcome.evaluator", evaluator.output, ...evaluator.argv]);
+  // Scope is the union of the measured workloads' import graphs: the evaluator may
+  // run more than one declared entry, but every proposed file must be exercised.
+  const graph = [...new Set(Object.values(options.recon.graphs).flat())].sort();
+  const inScope = graph.filter((file) => within(contract, file)
+    && !protectedAsset(contract, file)
+    && !pinnedEvaluatorFile(evaluator, file));
+  const outOfScope = graph.filter((file) => !inScope.includes(file));
+  if (inScope.length === 0) {
+    return {
+      reason: `the declared score evaluator ${evaluator.argv.join(" ")} is measurable but no file it exercises is inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"}), so no patch can be attributed to it`,
+    };
+  }
+  const attempt = options.attempt;
+  const demotion = attempt ? (attempt.outcome === "win" ? 0.15 : attempt.outcome === "no-win" ? 0.5 : attempt.outcome === "rejected" ? 0.35 : 0.6) : 1;
+  const measuredDurations = options.recon.probes
+    .filter((probe) => probe.ok && probe.durationMs !== null)
+    .map((probe) => probe.durationMs as number);
+  const costSeconds = measuredDurations.length > 0
+    ? Math.max(5, Math.min(600, Math.max(...measuredDurations) / 1000))
+    : 60;
+  const expectedGain = 0.5;
+  const readiness = options.gates.length > 0 ? 0.9 : 0.75;
+  const score = demotion * (expectedGain * readiness) / Math.pow(costSeconds, 0.25);
+  const direction = contract.outcome.higherIsBetter ? "maximize" : "minimize";
+  const pinned = [...new Set(pathTokens(evaluator.inputs))];
+  const lever: LeverProposal = {
+    id,
+    sourceKind: "recon-command",
+    goal: contract.outcome.statement,
+    mechanism: "improve the code the declared score evaluator exercises, measured by the evaluator itself",
+    metric: `${contract.outcome.statement} (${contract.outcome.unit}, ${contract.outcome.higherIsBetter ? "higher" : "lower"} is better)`,
+    metricKind: "score",
+    scopeFiles: inScope.slice(0, 8),
+    gates: [...options.gates],
+    estimates: { expectedGain, costSeconds, confidence: 0.6, readiness },
+    score,
+    evidence: [{ source: "evaluator", ref: `contract.outcome.evaluator:${evaluator.output}`, count: 1 }],
+    reasons: [
+      `declared score evaluator: ${evaluator.argv.join(" ")} reports ${evaluator.output}; direction ${direction}, unit ${contract.outcome.unit} (from the approved outcome)`,
+      `evaluator argv and inputs are pinned verifier inputs and never candidate-editable${pinned.length > 0 ? `: ${pinned.join(", ")}` : ""}`,
+      `scope: ${inScope.length} file(s) from the measured workload's import graph inside the approved editable scope; ${outOfScope.length} measured file(s) excluded`,
+      options.gates.length > 0
+        ? `gate: ${options.gates.join(", ")}`
+        : "no declared test gate; the declared evaluator's own validity verdict is the only oracle",
+      attempt ? `history: prior outcome ${attempt.outcome} for this lever; score adjusted.` : "history: no prior outcome for this lever",
+    ],
+    command: { argv: [...evaluator.argv], shim: false, source: "contract.outcome.evaluator", entry: null },
+  };
+  return { lever };
+}
+
+
+/**
+ * Turn recon evidence into ranked levers. A declared score evaluator becomes the
+ * first lever because it measures the approved outcome directly; otherwise the
+ * measured workload with the largest attributable duration becomes a duration
+ * lever scoped to the code the measurement actually exercises. A declared test
+ * command becomes the gate. Everything else is rejected with the reason, never
+ * silently dropped.
  */
 export function buildReconInventory(options: ReconInventoryOptions): LeverInventory {
   const { contract, recon } = options;
@@ -449,6 +734,18 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   const diagnostics: string[] = [...recon.notes];
   const gates = recon.commands.filter((command) => command.category === "test").map((command) => command.label);
   if (gates.length > 0) diagnostics.push(`Declared test gates: ${gates.join(", ")}.`);
+
+  // A declared score evaluator is the primary instrument: it says what the number
+  // is and which direction is better, so it outranks any proxy lever.
+  let scoreLever: LeverProposal | null = null;
+  if (contract.outcome.evaluator) {
+    const evaluator = contract.outcome.evaluator;
+    diagnostics.push(`Declared score evaluator: ${evaluator.argv.join(" ")} (${evaluator.output}, ${contract.outcome.unit}, ${contract.outcome.higherIsBetter ? "higher" : "lower"} is better).`);
+    const id = leverId("recon-command", ["contract.outcome.evaluator", evaluator.output, ...evaluator.argv]);
+    const built = scoreEvaluatorLever({ contract, evaluator, recon, gates, attempt: attemptByLever.get(id) });
+    if (built.lever) scoreLever = built.lever;
+    else if (built.reason) rejected.push({ id, sourceKind: "recon-command", reason: built.reason, readiness: 0.1 });
+  }
 
   const measured = recon.commands
     .filter((command) => command.category === "benchmark" || command.category === "custom")
@@ -469,6 +766,16 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
       rejected.push({
         id, sourceKind: "recon-command", readiness: 0.3,
         reason: `"${command.label}" is measurable but no file it imports is inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"})`,
+      });
+      continue;
+    }
+    // Wall time is only the outcome when the contract says so; otherwise it is a
+    // proxy that the operator has to justify explicitly.
+    const proxyRefusal = durationProxyRefusal(contract);
+    if (proxyRefusal) {
+      rejected.push({
+        id, sourceKind: "recon-command", readiness: 0.2,
+        reason: `"${command.label}" would measure wall-clock duration: ${proxyRefusal}`,
       });
       continue;
     }
@@ -510,6 +817,8 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   }
 
   levers.sort((a, b) => b.score - a.score || b.estimates.expectedGain - a.estimates.expectedGain || a.id.localeCompare(b.id));
+  // The declared outcome outranks every proxy, regardless of the uncalibrated prior.
+  if (scoreLever) levers.unshift(scoreLever);
   return { levers, rejected, diagnostics };
 }
 

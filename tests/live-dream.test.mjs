@@ -20,6 +20,8 @@ const { readTree, listIterations, readManifest, liveMethodPath, iterationDir, wr
 const { interpretEvaluation } = await jump("engine/live.ts");
 const { normalizeTask, scoringFingerprint } = await jump("engine/task.ts");
 const { runPolicyChecked } = await jump("policy/runner.ts");
+const { loadPrompt } = await jump("engine/prompt.ts");
+const { readProgress } = await jump("engine/progress.ts");
 const { DiscoveryTree } = await jump("engine/tree.ts");
 
 /** Policies in this suite follow the documented contract: import api.ts, extend the base class. */
@@ -38,9 +40,27 @@ async function liveCycle(project, iteration, extra = {}) {
     grid: extra.grid ?? GRID,
     baselineScore: extra.baselineScore ?? null,
     previousBestScore: extra.previousBestScore ?? null,
+    ...(extra.promptTemplate ? { promptTemplate: extra.promptTemplate } : {}),
+    ...(extra.researchOrgPolicy ? { researchOrgPolicy: extra.researchOrgPolicy } : {}),
     policyTimeoutMs: 60_000,
   });
 }
+
+test("live episodes use a generation-pinned discovery prompt", async () => {
+  const project = makeProject({ agent: "agent-router.mjs" });
+  try {
+    await writeTaskJson(project);
+    await deployShippedPolicy(project);
+    const promptTemplate = "GENERATION_DISCOVERY_MARKER\n";
+    const researchOrgPolicy = "GENERATION_RESEARCH_ORG_MARKER\n";
+    const episode = await liveCycle(project, 1, { grid: { branch_count: 1, refine_count: 1 }, promptTemplate, researchOrgPolicy });
+
+    assert.equal(episode.ok, true, episode.error ?? "");
+    const attemptPrompt = fs.readFileSync(path.join(project.dreamRoot, "history", "r0001_live", "attempt_b0a0", "prompt.md"), "utf8");
+    assert.match(attemptPrompt, /GENERATION_DISCOVERY_MARKER/);
+    assert.match(attemptPrompt, /GENERATION_RESEARCH_ORG_MARKER/);
+  } finally { project.cleanup(); }
+});
 
 test("a workspace that contains the Dream-RSI root still copies, minus the tool's own state", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-copy-"));
@@ -133,7 +153,8 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
     assert.equal(first.ok, true, first.error ?? "");
     assert.ok(first.manifest.best_score > 0, "discovery attempts scored real candidates");
 
-    const dream = await runDreamPhase({ dreamRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task, iteration: 1 });
+    const policyImprovementPrompt = `${loadPrompt("policy-improvement.md")}\nGENERATION_IMPROVEMENT_MARKER\n`;
+    const dream = await runDreamPhase({ dreamRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task, iteration: 1, policyImprovementPrompt });
 
     assert.equal(dream.ok, true, dream.error ?? "");
     assert.equal(dream.revisions, project.task.revisions, "M = pi_0 plus every revision evaluated");
@@ -145,9 +166,11 @@ test("two full iterations: dreaming deploys a selected version and iteration 2 u
     assert.equal(betaSidecar.beta, dream.deployed_beta, "the deployed beta is recorded for the next episode");
 
     // Both prompts were routed to the agent: discovery attempts, then policy revisions.
-    const prompts = fs.readFileSync(path.join(project.dreamRoot, "agent-prompts.log"), "utf8").trim().split("\n");
-    assert.ok(prompts.some((line) => line.startsWith("development")), "the improvement prompt reached the agent");
-    assert.equal(prompts.filter((line) => line.startsWith("development")).length, project.task.revisions - 1);
+    const dreamProgress = readProgress(project.dreamRoot, 1, "dream");
+    const prompts = Object.values(dreamProgress?.attempts ?? {}).map((attempt) => attempt.agent_tail);
+    assert.ok(prompts.some((tail) => /development/.test(tail)), "the improvement prompt reached the agent");
+    assert.ok(prompts.some((tail) => /development .*marker=true/.test(tail)), "the generation-pinned improvement prompt reached the agent");
+    assert.equal(prompts.filter((tail) => /development/.test(tail)).length, project.task.revisions - 1);
     assert.ok(
       fs.readFileSync(path.join(project.dreamRoot, "work", "r0001", "b0a0", "agent-prompts.log"), "utf8").startsWith("discovery"),
       "the discovery prompt reached the attempt agent",

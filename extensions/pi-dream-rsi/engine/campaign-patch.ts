@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
+import type { RepositoryCommandContainment } from "./containment.ts";
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
 import type { ApplyVerification } from "./apply.ts";
 import type { TaskConfig } from "./task.ts";
@@ -327,6 +328,7 @@ function validScore(outcome: ScoreOutcome): outcome is ScoreOutcome & { score: n
 async function scoreCopy(options: {
   sourceRoot: string; scratch: string; task: TaskConfig; logPath: string; dreamRoot: string;
   signal?: AbortSignal; beforeSpawn?: (key: string) => void; evaluatorKey: string; patch?: CandidatePatch[];
+  containment?: RepositoryCommandContainment;
 }): Promise<ScoreOutcome> {
   const { sourceRoot, scratch, task, logPath, signal, beforeSpawn, evaluatorKey } = options;
   try {
@@ -339,9 +341,10 @@ async function scoreCopy(options: {
       timeoutMs: task.evaluator_timeout_ms,
       logPath,
       signal,
+      ...(options.containment ? { containment: { writableRoots: [scratch], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
       beforeSpawn: () => beforeSpawn?.(evaluatorKey),
     });
-    return interpretEvaluation(task, command, readScoreFile(scratch, task));
+    return { ...interpretEvaluation(task, command, readScoreFile(scratch, task)), processDurationMs: command.durationMs };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
@@ -379,6 +382,7 @@ export async function runCampaignGate(options: {
   beforeSpawn?: (key: string) => void;
   key: string;
   patch?: CandidatePatch[];
+  containment?: RepositoryCommandContainment;
 }): Promise<GateRun> {
   try {
     await preparePatchedCopy({ sourceRoot: options.sourceRoot, scratch: options.scratch, patch: options.patch });
@@ -387,6 +391,7 @@ export async function runCampaignGate(options: {
       timeoutMs: options.timeoutMs,
       logPath: options.logPath ?? null,
       signal: options.signal,
+      ...(options.containment ? { containment: { writableRoots: [options.scratch], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
       beforeSpawn: () => options.beforeSpawn?.(options.key),
     });
     return { command: options.command, result, passed: result.ok && !result.timedOut && !result.aborted };
@@ -415,6 +420,7 @@ export async function verifyCandidatePatch(options: {
   minimumGain?: number;
   requireValidBeforeAfter?: boolean;
   measurementPlan?: MeasurementPlan;
+  containment?: RepositoryCommandContainment;
 }): Promise<CandidatePatchVerification> {
   const { dreamRoot, projectDir, task, patch, evidenceDir, signal, beforeSpawn } = options;
   const targetRoot = path.resolve(projectDir, task.workspace);
@@ -439,6 +445,7 @@ export async function verifyCandidatePatch(options: {
           signal,
           beforeSpawn,
           evaluatorKey: `candidate-${baseline ? "baseline" : condition}:pair${pair}`,
+          ...(options.containment ? { containment: options.containment } : {}),
           ...(condition === "after" ? { patch } : {}),
         });
         outcomes.set(`${baseline ? "baseline" : `pair${pair}`}:${condition}:${order}`, outcome);
@@ -485,12 +492,14 @@ export async function verifyCandidatePatch(options: {
       sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-before`, task, dreamRoot,
       logPath: path.join(evidenceDir, `pair${index}-before.log`), signal, beforeSpawn,
       evaluatorKey: `candidate-before:pair${index}`,
+      ...(options.containment ? { containment: options.containment } : {}),
     });
     stop();
     const after = await scoreCopy({
       sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-after`, task, dreamRoot,
       logPath: path.join(evidenceDir, `pair${index}-after.log`), signal, beforeSpawn,
       evaluatorKey: `candidate-after:pair${index}`, patch,
+      ...(options.containment ? { containment: options.containment } : {}),
     });
     stop();
     const bothValid = validScore(before) && validScore(after);

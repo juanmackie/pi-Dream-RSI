@@ -35,6 +35,13 @@ const FIXED_GUARD_RAILS = [
 ];
 /** Prefixes that are always fixed: budgets, approvals, recovery journals and checks. */
 const FIXED_GUARD_PREFIXES = [".dream-rsi/"];
+/** Only research-policy artifacts may vary; test, evaluator, package, and runner files stay fixed. */
+const EDITABLE_GENERATION_ARTIFACTS: ReadonlySet<string> = new Set([
+  "extensions/pi-dream-rsi/policy/method.ts",
+  "prompts/discovery-agent.md",
+  "prompts/policy-improvement.md",
+  "prompts/research-org.md",
+]);
 
 export interface GenerationArtifact {
   path: string;
@@ -52,6 +59,14 @@ export interface Generation {
   status: GenerationStatus;
 }
 
+export interface ActiveGeneration {
+  id: string;
+  label: string;
+  artifacts: GenerationArtifact[];
+  /** UTF-8 files verified against the immutable generation snapshot. */
+  files: Record<string, string>;
+}
+
 export interface GenerationState {
   version: 1;
   active: string | null;
@@ -60,6 +75,10 @@ export interface GenerationState {
   confirmationAttempts: number;
   /** Attempts authorised in total; a spent split is never renewed implicitly. */
   maxConfirmationAttempts: number;
+  /** Hashes of signed evaluator receipts already consumed; a sealed split is single-use. */
+  confirmationReceipts: string[];
+  /** Opaque identities of consumed evaluator splits; a split cannot judge two candidates. */
+  confirmationSplits: string[];
 }
 
 /** The measurements a promotion decision is made from. */
@@ -75,6 +94,43 @@ export interface PromotionEvidence {
   challengerCost: number;
   maxCostRatio: number;
   minimumPairs: number;
+}
+
+/** Signed report produced by an evaluator outside the candidate process. */
+export interface IndependentConfirmationReceipt {
+  version: 2;
+  challengerId: string;
+  candidateGenerationId: string;
+  splitId: string;
+  evaluatorId: string;
+  evaluatedAt: string;
+  freshProcessReproduced: boolean;
+  hiddenSuiteRegressions: number;
+  canaryManifestDigest: string;
+  canaries: SeededCanaryResult[];
+  evidence: PromotionEvidence;
+  signature: string;
+}
+
+/** Public commitment and result for one canary; the seed itself stays evaluator-side. */
+export interface SeededCanaryResult {
+  id: string;
+  seedCommitment: string;
+  detected: boolean;
+}
+
+/** Trust comes from the host/operator configuration, never the candidate repository. */
+export interface ConfirmationAuthority {
+  evaluatorId: string;
+  publicKey: string;
+  /** Host-pinned digest of the complete canary id/seed-commitment manifest. */
+  canaryManifestDigest: string;
+}
+
+export interface ConfirmationApplication {
+  state: GenerationState;
+  decision: PromotionDecision;
+  receiptHash: string;
 }
 
 export type PromotionDecision =
@@ -111,7 +167,7 @@ function normalized(relative: string): string {
 
 export function emptyGenerationState(maxConfirmationAttempts = 2): GenerationState {
   if (!isCount(maxConfirmationAttempts) || maxConfirmationAttempts < 1) throw new GenerationStateError("maxConfirmationAttempts must be a positive integer");
-  return { version: GENERATION_STATE_VERSION, active: null, generations: [], confirmationAttempts: 0, maxConfirmationAttempts };
+  return { version: GENERATION_STATE_VERSION, active: null, generations: [], confirmationAttempts: 0, maxConfirmationAttempts, confirmationReceipts: [], confirmationSplits: [] };
 }
 
 /** Content digest of a set of project-relative files. */
@@ -141,6 +197,74 @@ export function generationId(artifacts: GenerationArtifact[]): string {
   return digest.digest("hex").slice(0, 16);
 }
 
+function artifactStoreDir(root: string, id: string): string {
+  return path.join(stateDir(root), "artifacts", id);
+}
+
+function artifactStorePath(root: string, id: string, relative: string): string {
+  return path.join(artifactStoreDir(root, id), ...normalized(relative).split("/"));
+}
+
+function assertNoSymlinkPath(root: string, relative: string): string {
+  const absoluteRoot = fs.realpathSync(root);
+  let current = absoluteRoot;
+  for (const part of normalized(relative).split("/")) {
+    current = path.join(current, part);
+    const stats = fs.lstatSync(current);
+    if (stats.isSymbolicLink()) throw new GenerationStateError("generation artifacts may not traverse symlinks: " + relative);
+  }
+  const resolved = fs.realpathSync(current);
+  const fromRoot = path.relative(absoluteRoot, resolved);
+  if (!fromRoot || fromRoot === ".." || fromRoot.startsWith(".." + path.sep) || path.isAbsolute(fromRoot)) {
+    throw new GenerationStateError("generation artifact escaped its source root: " + relative);
+  }
+  return resolved;
+}
+
+/** Snapshot allowlisted source files into the immutable, content-addressed generation store. */
+export function archiveGenerationArtifacts(root: string, artifactRoot: string, artifacts: GenerationArtifact[]): void {
+  assertGuardRailsIntact(artifacts);
+  const actual = digestArtifacts(artifactRoot, artifacts.map((artifact) => artifact.path));
+  if (generationId(actual) !== generationId(artifacts)) throw new GenerationStateError("artifact source contents do not match the declared generation digest");
+  const id = generationId(artifacts);
+  const destination = artifactStoreDir(root, id);
+  if (fs.existsSync(destination)) throw new GenerationStateError("generation artifact snapshot already exists: " + id);
+  fs.mkdirSync(destination, { recursive: true });
+  try {
+    for (const artifact of artifacts) {
+      const source = assertNoSymlinkPath(artifactRoot, artifact.path);
+      if (!fs.statSync(source).isFile()) throw new GenerationStateError("generation artifact is not a regular file: " + artifact.path);
+      const content = fs.readFileSync(source);
+      const digest = crypto.createHash("sha256").update(content).digest("hex");
+      if (digest !== artifact.sha256) throw new GenerationStateError("generation artifact changed during snapshot: " + artifact.path);
+      const target = artifactStorePath(root, id, artifact.path);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      writeFileAtomic(target, content.toString("utf8"), true);
+    }
+  } catch (error) {
+    fs.rmSync(destination, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+function readStoredArtifact(root: string, generation: Generation, relative: string): string {
+  assertGuardRailsIntact([{ path: relative, sha256: "0".repeat(64) }]);
+  const artifact = generation.artifacts.find((entry) => normalized(entry.path) === normalized(relative));
+  if (!artifact) throw new GenerationStateError("artifact is not recorded in generation " + generation.id + ": " + relative);
+  const snapshotRoot = artifactStoreDir(root, generation.id);
+  let content: Buffer;
+  try {
+    const safeFile = assertNoSymlinkPath(snapshotRoot, artifact.path);
+    if (!fs.statSync(safeFile).isFile()) throw new Error("not a regular file");
+    content = fs.readFileSync(safeFile);
+  } catch {
+    throw new GenerationStateError("the immutable generation snapshot is missing or unsafe: " + artifact.path);
+  }
+  const digest = crypto.createHash("sha256").update(content).digest("hex");
+  if (digest !== artifact.sha256) throw new GenerationStateError("the immutable generation snapshot failed its digest check: " + artifact.path);
+  return content.toString("utf8");
+}
+
 /**
  * Refuse a generation that would replace the rules the loop is held to. These
  * files define the objective, the spend, the recovery boundary and the promotion
@@ -151,6 +275,12 @@ export function assertGuardRailsIntact(artifacts: GenerationArtifact[]): void {
     const relative = normalized(artifact.path);
     if (FIXED_GUARD_RAILS.includes(relative) || FIXED_GUARD_PREFIXES.some((prefix) => relative === prefix.replace(/\/$/, "") || relative.startsWith(prefix))) {
       throw new GenerationStateError(`a generation may not replace a fixed guard rail: ${relative}`);
+    }
+  }
+  for (const artifact of artifacts) {
+    const relative = normalized(artifact.path);
+    if (!EDITABLE_GENERATION_ARTIFACTS.has(relative)) {
+      throw new GenerationStateError("a generation artifact is outside the editable research-policy allowlist: " + relative);
     }
   }
 }
@@ -197,12 +327,22 @@ export function readGenerationState(root: string): GenerationState {
   const max = value.maxConfirmationAttempts;
   if (!isCount(max) || max < 1) throw new GenerationStateError("the generation ledger has an invalid confirmation-attempt allowance");
   if (value.confirmationAttempts > max) throw new GenerationStateError("the generation ledger spends more confirmation attempts than it allows");
+  const receipts = value.confirmationReceipts ?? [];
+  if (!Array.isArray(receipts) || receipts.some((receipt) => typeof receipt !== "string" || !/^[a-f0-9]{64}$/.test(receipt)) || new Set(receipts).size !== receipts.length) {
+    throw new GenerationStateError("the generation ledger has invalid confirmation receipt history");
+  }
+  const splits = value.confirmationSplits ?? [];
+  if (!Array.isArray(splits) || splits.some((split) => typeof split !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(split)) || new Set(splits).size !== splits.length) {
+    throw new GenerationStateError("the generation ledger has invalid confirmation split history");
+  }
   return {
     version: GENERATION_STATE_VERSION,
     active: value.active,
     generations: value.generations,
     confirmationAttempts: value.confirmationAttempts,
     maxConfirmationAttempts: max,
+    confirmationReceipts: receipts,
+    confirmationSplits: splits,
   };
 }
 
@@ -214,7 +354,7 @@ export function writeGenerationState(root: string, state: GenerationState): void
  * Stage a challenger against the current champion. Staging records only what was
  * built; it neither activates it nor spends a confirmation attempt.
  */
-export function registerChallenger(root: string, options: { label: string; artifacts: GenerationArtifact[]; now?: Date }): Generation {
+export function registerChallenger(root: string, options: { label: string; artifactRoot: string; artifacts: GenerationArtifact[]; now?: Date }): Generation {
   if (typeof options.label !== "string" || !options.label.trim()) throw new GenerationStateError("a challenger needs a label");
   assertGuardRailsIntact(options.artifacts);
   const state = readGenerationState(root);
@@ -222,6 +362,7 @@ export function registerChallenger(root: string, options: { label: string; artif
   if (state.generations.some((entry) => entry.id === id)) {
     throw new GenerationStateError(`this challenger is already registered: ${id}`);
   }
+  archiveGenerationArtifacts(root, options.artifactRoot, options.artifacts);
   const champion = state.generations.find((entry) => entry.status === "champion") ?? null;
   const challenger: Generation = {
     id,
@@ -305,10 +446,103 @@ function writeActiveMarker(root: string, id: string): void {
  * active pointer for the next process and retires the previous champion; the
  * running process keeps using the code it already loaded.
  */
-export function applyPromotionDecision(root: string, challengerId: string, decision: PromotionDecision, maxAttempts?: number): GenerationState {
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(canonicalJson).join(",") + "]";
+  const object = value as Record<string, unknown>;
+  return "{" + Object.keys(object).sort().map((key) => JSON.stringify(key) + ":" + canonicalJson(object[key])).join(",") + "}";
+}
+
+/** Derive a stable public id from a seed commitment without revealing the seed. */
+export function seededCanaryId(seedCommitment: string): string {
+  return crypto.createHash("sha256").update(`dream-rsi-canary-v1\0${seedCommitment}`).digest("hex");
+}
+
+/** Digest the complete public manifest; canary seeds remain in the evaluator's private store. */
+export function seededCanaryManifestDigest(canaries: readonly Pick<SeededCanaryResult, "id" | "seedCommitment">[]): string {
+  const manifest = canaries.map(({ id, seedCommitment }) => ({ id, seedCommitment })).sort((a, b) => a.id.localeCompare(b.id));
+  return crypto.createHash("sha256").update(canonicalJson(manifest)).digest("hex");
+}
+
+export function confirmationSigningBytes(receipt: Omit<IndependentConfirmationReceipt, "signature">): Buffer {
+  return Buffer.from(canonicalJson(receipt), "utf8");
+}
+
+function verifyConfirmationReceipt(
+  receipt: IndependentConfirmationReceipt,
+  challengerId: string,
+  challenger: Generation,
+  authority: ConfirmationAuthority,
+): string {
+  if (!authority || typeof authority.evaluatorId !== "string" || !authority.evaluatorId.trim()
+    || typeof authority.publicKey !== "string" || !authority.publicKey.trim()
+    || typeof authority.canaryManifestDigest !== "string" || !/^[a-f0-9]{64}$/.test(authority.canaryManifestDigest)) {
+    throw new GenerationStateError("a host-pinned confirmation authority is required");
+  }
+  if (!receipt || receipt.version !== 2 || receipt.challengerId !== challengerId || receipt.candidateGenerationId !== challenger.id) {
+    throw new GenerationStateError("confirmation receipt does not identify this staged challenger");
+  }
+  if (challenger.id !== generationId(challenger.artifacts)) throw new GenerationStateError("staged challenger artifacts do not match their recorded identity");
+  if (typeof receipt.splitId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/.test(receipt.splitId)) {
+    throw new GenerationStateError("confirmation receipt has an invalid hidden split identity");
+  }
+  if (typeof receipt.evaluatorId !== "string" || !receipt.evaluatorId || receipt.evaluatorId !== authority.evaluatorId) {
+    throw new GenerationStateError("confirmation receipt evaluator is not trusted by this host");
+  }
+  if (typeof receipt.evaluatedAt !== "string" || !Number.isFinite(Date.parse(receipt.evaluatedAt))) {
+    throw new GenerationStateError("confirmation receipt has an invalid evaluation timestamp");
+  }
+  if (typeof receipt.freshProcessReproduced !== "boolean" || !isCount(receipt.hiddenSuiteRegressions)
+    || typeof receipt.canaryManifestDigest !== "string" || !/^[a-f0-9]{64}$/.test(receipt.canaryManifestDigest)
+    || !Array.isArray(receipt.canaries) || receipt.canaries.length < 1 || receipt.canaries.length > 256) {
+    throw new GenerationStateError("confirmation receipt has invalid reproduction or oracle results");
+  }
+  const canaryIds = new Set<string>();
+  for (const canary of receipt.canaries) {
+    if (!canary || typeof canary !== "object" || typeof canary.id !== "string" || !/^[a-f0-9]{64}$/.test(canary.id)
+      || typeof canary.seedCommitment !== "string" || !/^[a-f0-9]{64}$/.test(canary.seedCommitment) || canary.id !== seededCanaryId(canary.seedCommitment)
+      || typeof canary.detected !== "boolean" || canaryIds.has(canary.id)) {
+      throw new GenerationStateError("confirmation receipt has invalid or duplicate seeded canary evidence");
+    }
+    canaryIds.add(canary.id);
+  }
+  const receiptManifestDigest = seededCanaryManifestDigest(receipt.canaries);
+  if (receipt.canaryManifestDigest !== authority.canaryManifestDigest || receiptManifestDigest !== authority.canaryManifestDigest) {
+    throw new GenerationStateError("confirmation receipt does not match the host-pinned seeded canary manifest");
+  }
+  if (typeof receipt.signature !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(receipt.signature)) {
+    throw new GenerationStateError("confirmation receipt has no valid Ed25519 signature encoding");
+  }
+  let key: crypto.KeyObject;
+  try { key = crypto.createPublicKey(authority.publicKey); }
+  catch { throw new GenerationStateError("the configured confirmation authority public key is invalid"); }
+  if (key.asymmetricKeyType !== "ed25519") throw new GenerationStateError("the confirmation authority key must be Ed25519");
+  const { signature, ...payload } = receipt;
+  let valid = false;
+  try { valid = crypto.verify(null, confirmationSigningBytes(payload), key, Buffer.from(signature, "base64")); }
+  catch { valid = false; }
+  if (!valid) throw new GenerationStateError("confirmation receipt signature is invalid");
+  return crypto.createHash("sha256").update(canonicalJson(receipt)).digest("hex");
+}
+
+export function applyConfirmationReceipt(
+  root: string,
+  challengerId: string,
+  receipt: IndependentConfirmationReceipt,
+  authority: ConfirmationAuthority,
+  maxAttempts?: number,
+): ConfirmationApplication {
   const state = readGenerationState(root);
-  // The challenger must exist before any decision is applied to it.
-  findGeneration(state, challengerId);
+  // A confirmation receipt applies once to a staged challenger. Replaying an old
+  // decision against a champion, rejected candidate, or retired generation would
+  // let stale evidence reactivate code without a new independent confirmation.
+  const challenger = findGeneration(state, challengerId);
+  if (challenger.status !== "challenger") {
+    throw new GenerationStateError("confirmation receipts require a staged challenger; " + challengerId + " is " + challenger.status);
+  }
+  const receiptHash = verifyConfirmationReceipt(receipt, challengerId, challenger, authority);
+  if (state.confirmationReceipts.includes(receiptHash)) throw new GenerationStateError("this independent confirmation receipt was already consumed");
+  if (state.confirmationSplits.includes(receipt.splitId)) throw new GenerationStateError("this hidden confirmation split was already consumed");
   // The ledger's own allowance is the ceiling. A caller may ask for fewer attempts
   // (for example a per-run reservation) but can never widen what the ledger permits.
   const requested = maxAttempts ?? state.maxConfirmationAttempts;
@@ -319,14 +553,32 @@ export function applyPromotionDecision(root: string, challengerId: string, decis
   }
   const attempts = state.confirmationAttempts + 1;
 
+  let decision: PromotionDecision;
+  if (!receipt.freshProcessReproduced) {
+    decision = { outcome: "reject", reason: "the independent evaluator could not reproduce the candidate in a fresh process" };
+  } else if (receipt.hiddenSuiteRegressions > 0) {
+    decision = { outcome: "reject", reason: "the hidden suite reported " + receipt.hiddenSuiteRegressions + " regression(s)" };
+  } else if (receipt.canaries.some((canary) => !canary.detected)) {
+    const detected = receipt.canaries.filter((canary) => canary.detected).length;
+    decision = { outcome: "reject", reason: "the evaluator detected " + detected + "/" + receipt.canaries.length + " seeded canary cheat(s)" };
+  } else if (!receipt.evidence || typeof receipt.evidence !== "object") {
+    decision = { outcome: "inconclusive", reason: "the signed receipt is missing promotion measurements" };
+  } else {
+    decision = decidePromotion({ ...receipt.evidence,
+      challengerRegressions: Math.max(isCount(receipt.evidence.challengerRegressions) ? receipt.evidence.challengerRegressions : 0, receipt.hiddenSuiteRegressions) });
+  }
+
   if (decision.outcome !== "promote") {
     const status: GenerationStatus = decision.outcome === "reject" ? "rejected" : "inconclusive";
-    writeGenerationState(root, {
+    const next: GenerationState = {
       ...state,
       confirmationAttempts: attempts,
+      confirmationReceipts: [...state.confirmationReceipts, receiptHash],
+      confirmationSplits: [...state.confirmationSplits, receipt.splitId],
       generations: state.generations.map((entry) => (entry.id === challengerId ? { ...entry, status } : entry)),
-    });
-    return readGenerationState(root);
+    };
+    writeGenerationState(root, next);
+    return { state: readGenerationState(root), decision, receiptHash };
   }
 
   const previousChampion = state.generations.find((entry) => entry.status === "champion" && entry.id !== challengerId) ?? null;
@@ -339,11 +591,13 @@ export function applyPromotionDecision(root: string, challengerId: string, decis
     ...state,
     active: challengerId,
     confirmationAttempts: attempts,
+    confirmationReceipts: [...state.confirmationReceipts, receiptHash],
+    confirmationSplits: [...state.confirmationSplits, receipt.splitId],
     generations,
   };
   writeGenerationState(root, next);
   writeActiveMarker(root, challengerId);
-  return next;
+  return { state: next, decision, receiptHash };
 }
 
 /**
@@ -387,11 +641,21 @@ function readActiveMarker(root: string): { id: string } | null {
  * The generation a *fresh process* should load. Reading is the only way a
  * promotion takes effect: nothing here mutates the code this process runs.
  */
-export function loadActiveGeneration(root: string): { id: string; label: string; artifacts: GenerationArtifact[] } | null {
+export function loadActiveGeneration(root: string): ActiveGeneration | null {
   const marker = readActiveMarker(root);
   if (!marker) return null;
   const state = readGenerationState(root);
+  // The activation marker is a cache for the next process, not an authority of
+  // its own. Require agreement with the durable ledger and a promoted status so
+  // a stale, edited, or partially-written marker cannot load rejected code.
+  if (state.active !== marker.id) return null;
   const generation = state.generations.find((entry) => entry.id === marker.id);
-  if (!generation) return null;
-  return { id: generation.id, label: generation.label, artifacts: generation.artifacts.map((artifact) => ({ ...artifact })) };
+  if (!generation || generation.status !== "champion") return null;
+  if (generation.id !== generationId(generation.artifacts)) {
+    throw new GenerationStateError("the active generation artifact digest does not match its recorded identity");
+  }
+  assertGuardRailsIntact(generation.artifacts);
+  const files: Record<string, string> = {};
+  for (const artifact of generation.artifacts) files[artifact.path] = readStoredArtifact(root, generation, artifact.path);
+  return { id: generation.id, label: generation.label, artifacts: generation.artifacts.map((artifact) => ({ ...artifact })), files };
 }

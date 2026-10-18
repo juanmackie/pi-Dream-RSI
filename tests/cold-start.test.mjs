@@ -266,6 +266,178 @@ test("cold start: a repository with no declared measurable command stops with th
 });
 
 // ---------------------------------------------------------------------------
+// W10: a contract-declared score evaluator proves an accuracy win
+// ---------------------------------------------------------------------------
+
+/**
+ * A declared score instrument the loop did not author: the agreed outcome is the
+ * classifier's accuracy on a fixed evaluation set, and `eval/score.mjs` writes
+ * that number to eval/score.json. The declared evaluator and its fixtures are
+ * pinned verifier inputs, so a candidate cannot redefine "improved".
+ */
+const SCORE_EVALUATOR = `import { classify } from "../src/classify.mjs";
+import * as fs from "node:fs";
+
+const cases = [
+  ...Array.from({ length: 25 }, (_, index) => ({ input: "cat-" + index, label: "cat" })),
+  ...Array.from({ length: 25 }, (_, index) => ({ input: "dog-" + index, label: "dog" })),
+];
+const correct = cases.filter((item) => classify(item.input) === item.label).length;
+const score = correct / cases.length;
+fs.mkdirSync("eval", { recursive: true });
+fs.writeFileSync("eval/score.json", JSON.stringify({ score, raw_score: score, valid: true, fail_class: "ok", error: null }));
+`;
+
+/** Always guessing one label: exactly 50% accuracy on the balanced set. */
+const GUESSING_CLASSIFIER = `export function classify(input) {
+  return "dog";
+}
+`;
+
+/** The intended rule: label each input by the animal it names. */
+const ACCURATE_CLASSIFIER = `export function classify(input) {
+  return String(input).includes("cat") ? "cat" : "dog";
+}
+`;
+
+const SCORE_BENCH = `import { classify } from "./src/classify.mjs";
+const label = classify("cat-0");
+if (typeof label !== "string" || label.length === 0) process.exit(1);
+console.log(label);
+`;
+
+/** The oracle holds before and after the change, and breaks when the module is inert. */
+const SCORE_CORRECTNESS = `import { classify } from "./src/classify.mjs";
+const label = classify("cat-0");
+if (label !== "cat" && label !== "dog") {
+  console.error("classifier returned an unknown label");
+  process.exit(1);
+}
+`;
+
+/** The stub agent replaces the guessing classifier and accepts the review. */
+function scoreAgentSource() {
+  return `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+let prompt = "";
+process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  // The review workspace is the one carrying REVIEW.md; the live agent works on
+  // the candidate copy.
+  if (/adversarial review/i.test(prompt) || existsSync("REVIEW.md")) {
+    writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
+    return;
+  }
+  const before = readFileSync("src/classify.mjs", "utf8");
+  if (!before.includes("includes(")) {
+    writeFileSync("src/classify.mjs", ${JSON.stringify(ACCURATE_CLASSIFIER)});
+  }
+  writeFileSync("proposal.md", "# Label each input by the animal it names instead of always guessing\\n");
+});
+`;
+}
+
+function scoreProject() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-cold-score-"));
+  const projectDir = path.join(dir, "proj");
+  fs.mkdirSync(path.join(projectDir, "src"), { recursive: true });
+  fs.mkdirSync(path.join(projectDir, "eval"), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, "package.json"), `${JSON.stringify({
+    name: "cold-start-score-fixture",
+    private: true,
+    type: "module",
+    scripts: { test: "node test.mjs", bench: "node bench.mjs" },
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(projectDir, "bench.mjs"), SCORE_BENCH);
+  fs.writeFileSync(path.join(projectDir, "test.mjs"), SCORE_CORRECTNESS);
+  fs.writeFileSync(path.join(projectDir, "src", "classify.mjs"), GUESSING_CLASSIFIER);
+  fs.writeFileSync(path.join(projectDir, "eval", "score.mjs"), SCORE_EVALUATOR);
+  const agentPath = path.join(projectDir, "score-agent.mjs");
+  fs.writeFileSync(agentPath, scoreAgentSource());
+  return { dir, projectDir, agentPath };
+}
+
+function scoreContractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "20%", maxAgentStarts = 24, maxEvaluatorRuns = 120, deadlineMs = 20 * 60 * 1000 }) {
+  return normalizeRunContract({
+    version: 1,
+    projectDir: null,
+    outcome: {
+      statement: "raise the classifier accuracy on the declared evaluation set",
+      unit: "accuracy",
+      higherIsBetter: true,
+      minimumUsefulGain,
+      evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] },
+    },
+    preserved: { gates: [] },
+    scope: { roots: ["src"], protectedAssets: [] },
+    execution: { mode: "trusted-local", consent: true, envAllowlist: [], allowedCommandCategories: ["test", "benchmark"] },
+    models: { providers: ["fixture"] },
+    budgets: { maxCampaigns, maxAgentStarts, maxEvaluatorRuns, deadlineMs, falseAcceptBudget: 0.01 },
+    agent: { command: process.execPath, args: [agentPath], prompt_via: "stdin", model: null, thinking: null },
+  });
+}
+
+/** Run the declared evaluator outside the loop and read its number. */
+function measureScore(projectDir) {
+  fs.rmSync(path.join(projectDir, "eval", "score.json"), { force: true });
+  const run = runFixtureCommand(projectDir, "eval/score.mjs");
+  assert.equal(run.status, 0, `the score evaluator must run: ${run.stderr}`);
+  return JSON.parse(fs.readFileSync(path.join(projectDir, "eval", "score.json"), "utf8")).score;
+}
+
+test("cold start: a contract-declared score evaluator proves an accuracy win independently", async () => {
+  const fixture = scoreProject();
+  const baselineAccuracy = measureScore(fixture.projectDir);
+  assert.ok(Math.abs(baselineAccuracy - 0.5) < 1e-9, `the guessing classifier scores 0.5, got ${baselineAccuracy}`);
+  assert.equal(runFixtureCommand(fixture.projectDir, "test.mjs").status, 0, "the fixture's correctness oracle passes before the change");
+  // The evaluator's own output is not part of the approved tree: the loop re-measures it.
+  fs.rmSync(path.join(fixture.projectDir, "eval", "score.json"), { force: true });
+
+  const contract = scoreContractFor({ agentPath: fixture.agentPath });
+  const messages = [];
+  const result = await runLoop({
+    projectDir: fixture.projectDir,
+    contract,
+    limits: { maxCampaigns: 2, maxAgentStarts: 24, maxEvaluatorRuns: 120, deadlineMs: 20 * 60 * 1000 },
+    now: () => new Date("2026-10-20T00:00:00.000Z"),
+    onProgress: (message) => messages.push(message),
+  });
+
+  assert.ok(result.campaigns >= 1, `the loop must run a campaign for the declared score evaluator; stopped with "${result.stopReason}"`);
+  assert.equal(result.wins, 1, `exactly one verified improvement; stop reason "${result.stopReason}"; ${messages.join(" | ")}`);
+  assert.ok(result.inventory?.levers.some((lever) => lever.metricKind === "score"), "recon turned the declared evaluator into a score lever");
+
+  const applied = fs.readFileSync(path.join(fixture.projectDir, "src", "classify.mjs"), "utf8");
+  assert.ok(applied.includes('includes("cat")'), "the applied patch replaced the guessing classifier");
+
+  // Independent of the loop's own instrumentation: the declared evaluator says the
+  // accuracy really improved, and the correctness oracle still holds.
+  const afterAccuracy = measureScore(fixture.projectDir);
+  assert.ok(afterAccuracy >= 0.99, `the declared evaluator must report the accuracy win, got ${afterAccuracy}`);
+  assert.ok(afterAccuracy > baselineAccuracy, "the score moved in the declared direction");
+  assert.equal(runFixtureCommand(fixture.projectDir, "test.mjs").status, 0, "the correctness oracle still passes after the apply");
+
+  assert.ok(result.verifications && result.verifications.length >= 1, "the loop records an independent post-apply verification");
+  assert.equal(result.verifications[0].passed, true, `post-apply verification: ${JSON.stringify(result.verifications[0])}`);
+
+  const win = result.records.find((record) => record.outcome === "win");
+  assert.ok(win?.provenance?.evaluatorId, "the win records the qualified score instrument identity");
+  assert.equal(typeof win.verifiedGain, "number");
+  assert.ok(win.verifiedGain > 0);
+
+  // The declared evaluator is pinned by a protected copy: the campaign hashes and
+  // protects it, so a candidate cannot edit the instrument that scored it.
+  const verifierRoot = path.join(fixture.projectDir, ".dream-rsi", "loop", "verifiers");
+  const pinned = fs.existsSync(verifierRoot)
+    ? fs.readdirSync(verifierRoot).flatMap((leverId) => {
+      const evaluatorCopy = path.join(verifierRoot, leverId, "eval", "score.mjs");
+      return fs.existsSync(evaluatorCopy) ? [evaluatorCopy] : [];
+    })
+    : [];
+  assert.ok(pinned.length > 0, "the declared score evaluator is pinned as a verifier input");
+  assert.equal(fs.readFileSync(pinned[0], "utf8"), SCORE_EVALUATOR, "the pinned copy is the approved evaluator");
+});
+
+// ---------------------------------------------------------------------------
 // Continued autonomy: a second bottleneck appears once the first is fixed
 // ---------------------------------------------------------------------------
 

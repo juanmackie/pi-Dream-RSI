@@ -60,6 +60,12 @@ test("installed Pi CLI loads Dream-RSI and runs a provider-free guarded campaign
         pending.get(event.id).resolve(event);
         pending.delete(event.id);
       }
+      // The extension's mode guard asks the RPC client before enabling Dream-RSI mode.
+      // This fixture is a non-interactive client, so it declines the dialog and the
+      // extension must fall back to its canceled path (nothing runs, nothing is spent).
+      if (event.type === "extension_ui_request" && event.method === "confirm") {
+        cli.stdin.write(`${JSON.stringify({ type: "extension_ui_response", id: event.id, confirmed: false })}\n`);
+      }
     }
   });
   cli.on("exit", (code) => {

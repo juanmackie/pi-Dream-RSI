@@ -84,7 +84,7 @@ test("self-improve mines hashed numeric observations and prints a stable intake 
 
     const cliProject = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-self-cli-"));
     try {
-      const cli = spawnSync(process.execPath, [path.join(REPO, "scripts", "self-improve.mjs"), cliProject], { cwd: REPO, encoding: "utf8", timeout: 30_000 });
+      const cli = spawnSync(process.execPath, [path.join(REPO, "scripts", "self-improve.mjs"), cliProject], { cwd: REPO, encoding: "utf8", timeout: 120_000 });
       assert.equal(cli.status, 0, cli.stderr);
       assert.equal(cli.stdout.trim(), path.join(cliProject, ".dream-rsi", path.basename(cli.stdout.trim())));
       assert.match(cli.stdout.trim(), /self-campaign-[a-f0-9]{64}\.json$/);

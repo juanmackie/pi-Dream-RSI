@@ -5,13 +5,29 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
+import type { RepositoryCommandContainment } from "./containment.ts";
 import { restrictedEnvironment, type RunContract } from "./intake.ts";
+import type { LeverMetricKind } from "./levers.ts";
 import { resolveGainThreshold } from "./metrics.ts";
+
+/** Where a score-json evaluator reports its number, relative to the checked copy. */
+export const SCORE_READING_PATH = "eval/score.json";
+
+/**
+ * A declared evaluator, invoked the way the contract approved it. The argv is a
+ * pinned verifier input and is never rebuilt from a candidate-editable label.
+ */
+export interface PostApplyEvaluator {
+  /** Exact evaluator argv. */
+  argv: string[];
+  /** `score-json` reads `eval/score.json`; `stdout-number` parses exactly one number. */
+  output: "score-json" | "stdout-number";
+}
 
 export interface PostApplyExpectation {
   projectDir: string;
   contract: RunContract;
-  /** Exact measured workload argv. */
+  /** Exact measured workload argv (the duration path only). */
   argv: string[];
   /** Correctness commands that must pass on the applied state. */
   gates: string[];
@@ -26,11 +42,23 @@ export interface PostApplyExpectation {
   /** Throwaway root for the checked copy. */
   workRoot: string;
   timeoutMs: number;
+  /**
+   * How the outcome is measured. Omitted means the legacy wall-clock duration
+   * path; any non-duration kind is measured through `evaluator`, never wall time.
+   */
+  kind?: LeverMetricKind;
+  /** The declared score instrument. Required for every non-duration kind. */
+  evaluator?: PostApplyEvaluator;
+  /** Evaluator readings to take. Defaults to 1 for a score kind, 3 for duration. */
+  readings?: number;
   /** Called immediately before each process starts, for durable accounting. */
   beforeProcess?: () => void;
   signal?: AbortSignal;
+  containment?: RepositoryCommandContainment;
   /** Test seam replacing the measurement process. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
+  /** Test seam replacing the evaluator process. */
+  evaluateImpl?: (evaluator: PostApplyEvaluator, projectDir: string) => Promise<number | null>;
 }
 
 /**
@@ -45,6 +73,7 @@ export async function measureWorkload(options: {
   timeoutMs: number;
   beforeProcess?: () => void;
   signal?: AbortSignal;
+  containment?: RepositoryCommandContainment;
 }): Promise<number | null> {
   options.beforeProcess?.();
   const started = performance.now();
@@ -55,6 +84,7 @@ export async function measureWorkload(options: {
     env: restrictedEnvironment(options.contract as RunContract),
     logPath: null,
     ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.containment ? { containment: { writableRoots: [options.cwd], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
   });
   if (!result.ok) return null;
   return performance.now() - started;
@@ -68,6 +98,68 @@ export interface PostApplyResult {
   detail: string;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * Read one evaluator reading from a checked copy.
+ *
+ * `score-json` requires the evaluator's own `valid: true` verdict and a finite
+ * number: a missing file, a malformed file, or a self-reported failure is not a
+ * zero score. `stdout-number` requires exactly one finite number, so a log line
+ * or a series cannot be mistaken for a reading.
+ */
+export function readEvaluatorReading(options: {
+  cwd: string;
+  output: "score-json" | "stdout-number";
+  /** Captured stdout of the evaluator process (used by stdout-number). */
+  stdout?: string;
+}): number | null {
+  if (options.output === "stdout-number") {
+    const text = (options.stdout ?? "").trim();
+    if (!/^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(text)) return null;
+    const value = Number(text);
+    return Number.isFinite(value) ? value : null;
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(fs.readFileSync(path.join(options.cwd, ...SCORE_READING_PATH.split("/")), "utf8")); }
+  catch { return null; }
+  if (!isRecord(parsed) || parsed.valid !== true) return null;
+  return typeof parsed.score === "number" && Number.isFinite(parsed.score) ? parsed.score : null;
+}
+
+/** Quote one pinned evaluator argv for the task's shell command line. */
+function evaluatorCommandLine(argv: string[]): string {
+  return argv.map((part) => (/[\s"]/.test(part) ? `"${part.replace(/"/g, '""')}"` : part)).join(" ");
+}
+
+/** Run one declared evaluator transaction in a checked copy and read its number. */
+export interface EvaluatorMeasurementOptions {
+  evaluator: PostApplyEvaluator;
+  cwd: string;
+  contract: RunContract;
+  timeoutMs: number;
+  beforeProcess?: () => void;
+  signal?: AbortSignal;
+  containment?: RepositoryCommandContainment;
+}
+
+export async function measureEvaluatorReading(options: EvaluatorMeasurementOptions): Promise<number | null> {
+  options.beforeProcess?.();
+  const result = await runShellCommand(evaluatorCommandLine(options.evaluator.argv), {
+    cwd: options.cwd,
+    timeoutMs: options.timeoutMs,
+    envOnly: true,
+    env: restrictedEnvironment(options.contract),
+    logPath: null,
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.containment ? { containment: { writableRoots: [options.cwd], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
+  });
+  if (!result.ok) return null;
+  return readEvaluatorReading({ cwd: options.cwd, output: options.evaluator.output, stdout: result.stdoutTail });
+}
+
 function median(values: number[]): number {
   const sorted = [...values].sort((a, b) => a - b);
   const middle = Math.floor(sorted.length / 2);
@@ -79,14 +171,26 @@ function median(values: number[]): number {
  *
  * The campaign proved its own instrument moved. This check takes a fresh copy of
  * the resulting working tree, runs the declared correctness commands, measures the
- * same workload again, and requires the change to clear the useful gain against
- * the baseline that was recorded before any candidate ran. A failure here stops
- * the run: the applied state no longer agrees with the measurement that promoted
- * it.
+ * same outcome again through the same instrument, and requires the change to clear
+ * the useful gain against the baseline that was recorded before any candidate ran.
+ * A duration metric measures the declared workload's wall clock; a score metric
+ * measures the declared evaluator, never wall time. A failure here stops the run:
+ * the applied state no longer agrees with the measurement that promoted it.
  */
 export async function verifyPostApply(expectation: PostApplyExpectation): Promise<PostApplyResult> {
   const projectDir = path.resolve(expectation.projectDir);
   const contract = expectation.contract;
+  const kind = expectation.kind ?? "command-duration";
+  const throughEvaluator = kind !== "command-duration";
+  if (throughEvaluator && !expectation.evaluator) {
+    return {
+      passed: false,
+      gain: null,
+      reason: `the "${kind}" metric kind requires the declared evaluator; wall time would measure a different outcome`,
+      detail: "evaluator missing",
+    };
+  }
+  const readingCount = Math.max(1, Math.round(expectation.readings ?? (throughEvaluator ? 1 : 3)));
   const scratch = path.join(expectation.workRoot, `post-apply-${crypto.randomUUID()}`);
   const measure = async (cwd: string): Promise<number | null> => {
     if (expectation.measureImpl) return expectation.measureImpl(expectation.argv, cwd);
@@ -97,6 +201,19 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
       timeoutMs: expectation.timeoutMs,
       ...(expectation.beforeProcess ? { beforeProcess: expectation.beforeProcess } : {}),
       ...(expectation.signal ? { signal: expectation.signal } : {}),
+      ...(expectation.containment ? { containment: expectation.containment } : {}),
+    });
+  };
+  const evaluate = async (cwd: string): Promise<number | null> => {
+    if (expectation.evaluateImpl) return expectation.evaluateImpl(expectation.evaluator!, cwd);
+    return measureEvaluatorReading({
+      evaluator: expectation.evaluator!,
+      cwd,
+      contract,
+      timeoutMs: expectation.timeoutMs,
+      ...(expectation.beforeProcess ? { beforeProcess: expectation.beforeProcess } : {}),
+      ...(expectation.signal ? { signal: expectation.signal } : {}),
+      ...(expectation.containment ? { containment: expectation.containment } : {}),
     });
   };
 
@@ -114,6 +231,7 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
         env: restrictedEnvironment(contract),
         logPath: null,
         ...(expectation.signal ? { signal: expectation.signal } : {}),
+        ...(expectation.containment ? { containment: { writableRoots: [scratch], ...(expectation.containment.readonlyRoots ? { readonlyRoots: expectation.containment.readonlyRoots } : {}) } } : {}),
       });
       if (!result.ok) {
         const detail = (result.spawnError ?? result.stderrTail.trim().split(/\r?\n/, 1)[0]) || `exit ${result.code}`;
@@ -122,13 +240,15 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
     }
 
     const readings: number[] = [];
-    for (let index = 0; index < 3; index += 1) {
-      const reading = await measure(scratch);
+    for (let index = 0; index < readingCount; index += 1) {
+      const reading = throughEvaluator ? await evaluate(scratch) : await measure(scratch);
       if (reading === null) {
         return {
           passed: false, gain: null,
-          reason: `the declared workload "${expectation.argv.join(" ")}" did not complete on the applied state`,
-          detail: "workload did not complete",
+          reason: throughEvaluator
+            ? `the declared evaluator "${expectation.evaluator!.argv.join(" ")}" did not produce a valid score on the applied state`
+            : `the declared workload "${expectation.argv.join(" ")}" did not complete on the applied state`,
+          detail: throughEvaluator ? "evaluator did not produce a score" : "workload did not complete",
         };
       }
       readings.push(reading);
@@ -144,7 +264,9 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
       gain,
       reason: passed ? null
         : `the applied state improved by ${round(gain)} ${expectation.unit}, short of the useful gain ${round(threshold)} ${expectation.unit}`,
-      detail: `${expectation.gates.length} gate(s) passed; workload ${round(before)} -> ${round(after)} ${expectation.unit} (gain ${round(gain)})`,
+      detail: throughEvaluator
+        ? `${expectation.gates.length} gate(s) passed; evaluator ${round(before)} -> ${round(after)} ${expectation.unit} (gain ${round(gain)})`
+        : `${expectation.gates.length} gate(s) passed; workload ${round(before)} -> ${round(after)} ${expectation.unit} (gain ${round(gain)})`,
     };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });

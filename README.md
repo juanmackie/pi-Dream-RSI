@@ -74,11 +74,19 @@ A campaign needs a numeric score and a correctness result. Its scorer must be fi
 
 Every start checks the evaluator and unchanged-target gates before an agent runs. An optional `action: "check"` measures fresh copies without creating a campaign. Five baseline readings estimate noise and the smallest detectable effect. Checks report direction, resolved gain units, projected confirmation cost, and optional known-better control-patch evidence.
 
+The check is fail-fast. After each reading it compares the observed reading time and the remaining deadline and caps against one verified promotion's floor, and stops before the gates when the remaining readings cannot fund a promotion. Each reading is saved as it completes: duration, exit code, score or fail class and error, the last 2000 characters of stdout and stderr, and a per-reading log path. The status check section and its report file are the campaign's measurement evidence. A project score file is not evidence: each candidate copy deletes the configured score path before scoring, so a leftover `eval/score.json` is never read back as a result.
+
+Resume keeps its remaining budget and deadline and reuses the readings already saved. It does not pay for them again, and a saved invalid reading fails the resume immediately instead of retrying it. A limit or deadline that runs out before a qualified baseline makes the campaign `failed` with an evaluator-preflight reason, not `complete`.
+
+Start also refuses, before creating a campaign directory or calling the scorer, caps that cannot fund one verified promotion. A promotion needs 7 agent starts (1 probe, 5 live attempts, 1 review), five baseline readings, one paired confirmation (2 runs when deterministic; 5 + 2 × pairs, at least 21, when noisy), one evaluator process per gate, and one more paired verification when a control patch is supplied. Until two readings are observed the check uses the deterministic floor; two valid scores that differ switch it to the noisy floor. Readings seeded by a loop qualification under the same instrument identity count toward the five and are not paid again. The refusal names the floor and recommended caps; raise them rather than retrying the same values. The deadline is not refused at start because no reading has been observed yet: it is estimated from the fastest observed reading once two readings exist, and checked at resume. `max_deadline_minutes` (1..720) on `dream_rsi_improve` start sets the campaign deadline.
+
 Set `task.higher_is_better` explicitly. Use a number for absolute `minimum_gain`, or `"5%"` for a relative gain. Percentages require positive raw metric values. Omission tests for positive improvement above zero. Deterministic confirmation uses one exact pair; noisy confirmation alternates before/after order in ABBA blocks and can stop for futility. Live scores rank noisy candidates; confirmation decides whether they improve.
 
-The shipped [command evaluator](evaluators/measure.mjs) measures numeric stdout or elapsed time for any language. It discards warmups and writes the median, samples, and validity to `eval/score.json`. Pass `--mode=elapsed` or `--mode=stdout-number`, `--warmup=N`, `--repeats=N`, then `--` and the command with its arguments.
+For the loop, a run contract may declare its own score evaluator instead of measuring wall-clock duration: `outcome.evaluator` names `argv`, an `output` of `score-json` or `stdout-number`, and optional `inputs`. The declared evaluator is ranked first, its code and inputs are pinned verifier inputs, and the independent post-apply check measures through the same evaluator. Duration levers are rejected unless the outcome is time-like or the contract supplies a proxy justification. The declaration is part of the contract identity, so changing it starts a non-comparable history.
 
-Status reports the loaded extension directory, campaign module, package version, process counts, and ledger health. The default evaluator timeout is 300,000 ms; `task.evaluator_timeout_ms` can change it. Reload the extension if its loaded directory or version differs from the checkout you expect.
+The shipped [command evaluator](evaluators/measure.mjs) measures numeric stdout or elapsed time for any language. It takes `--mode=elapsed|stdout-number`, `--output=<path>`, `--unit=<label>`, `--warmup=N`, `--repeats=N`, `--timeout=MS`, then `--`, then the command and its arguments. Defaults are elapsed time, 1 warmup, 3 repeats, 300,000 ms, unit `ms`, and `eval/score.json`; warmup is at least 0 and repeats are 1..100. It discards warmups and writes the median, samples, and validity to the output path. It has no help flag.
+
+Status reports the loaded extension directory, campaign module, package version, process counts, and ledger health, plus the campaign check section above. The default evaluator timeout is 300,000 ms; `task.evaluator_timeout_ms` can change it. Reload the extension if its loaded directory or version differs from the checkout you expect.
 
 ## Limits
 
@@ -94,6 +102,9 @@ Status reports the loaded extension directory, campaign module, package version,
 
 - The score must measure the outcome you care about. A weak proxy rewards its blind spots.
 - Noisy or slow evaluators consume budget and can hide real changes. Stabilize the evaluator before running a campaign.
+- A campaign whose caps cannot fund one verified promotion is refused at start: 7 agent starts and evaluator runs for five readings, one confirmation, and each gate. The refusal reports the floor and recommended caps; raise them instead of retrying the same values.
+- `max_deadline_minutes` on `dream_rsi_improve start` accepts 1..720; the campaign default is 60 minutes. The loop's whole-run `deadline_minutes` accepts 1..720.
+- A cap or deadline that runs out before a qualified baseline ends the campaign as a failed evaluator preflight. It is not a completed campaign and does not show that no improvement exists.
 - Parallel candidate runs need isolated workspaces and must not share mutable services.
 - Agent-generated code is untrusted. Gate it, review the diff, and keep the candidate away from secrets and production.
 - The campaign applies only in-scope files. It does not commit, open a pull request, or chain automatically to another lever.
@@ -102,7 +113,7 @@ Status reports the loaded extension directory, campaign module, package version,
 
 ## Experiment memory and self-improvement
 
-Campaigns append facts to `history/ledger.jsonl`: attempts, confirmation pairs, gates, reviews, applies, skips, and integrity events. A bounded digest of this project's history reaches later attempts. Status distinguishes timeouts, known no-edit attempts, duplicate patches, and applied wins.
+Campaigns append facts to `history/ledger.jsonl`: attempts, confirmation pairs, gates, reviews, applies, skips, and integrity events. A SHA-256 chain records event order, and `ledger.jsonl.head.json` plus `ledger.jsonl.head.required` detect edits and tail truncation when those checkpoint files remain intact. The checkpoint is stored with campaign state, so it is not an external witness against coordinated rewriting. A bounded digest of this project's history reaches later attempts. Status distinguishes timeouts, known no-edit attempts, duplicate patches, and applied wins.
 
 DreamBench evaluates the measurement engine with seeded synthetic instruments and exercises the controller with scripted agents. Scenarios cover noise, drift, boundary effects, wrong direction, no-ops, cheats, duplicate patches, and timed-out agents with valid edits. Results apply to the tested distributions and budgets, rather than every possible evaluator.
 

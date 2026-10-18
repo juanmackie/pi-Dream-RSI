@@ -168,16 +168,20 @@ test("each policy revision can read the replay feedback that guides it", async (
     await deployShippedPolicy(project);
     await runOneLiveCycle(project);
     project.task.agent = { ...project.task.agent, args: [project.script("developer-reads-feedback.mjs")] };
+    const progress = [];
     const dream = await runDreamPhase({
       dreamRoot: project.dreamRoot,
       projectDir: project.projectDir,
       task: project.task,
       iteration: 1,
+      onProgress: (snapshot) => progress.push(snapshot),
     });
     assert.equal(dream.ok, true, dream.error ?? "");
-    const lines = fs.readFileSync(path.join(project.dreamRoot, "feedback.log"), "utf8").trim().split("\n");
-    assert.equal(lines.length, 2, "one development call per revision after pi_0");
-    assert.ok(lines.every((line) => line === "sweep traces"), lines.join("; "));
+    const revisionOutputs = Object.values(progress.at(-1)?.attempts ?? {})
+      .map((attempt) => attempt.agent_tail.trim())
+      .filter(Boolean);
+    assert.equal(revisionOutputs.length, 2, "one development call per revision after pi_0");
+    assert.ok(revisionOutputs.every((line) => line === "sweep traces"), revisionOutputs.join("; "));
   } finally {
     project.cleanup();
   }

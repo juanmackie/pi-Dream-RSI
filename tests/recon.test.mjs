@@ -14,7 +14,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { contractIdentity, normalizeRunContract, validateRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import {
   buildReconInventory, discoverCommands, importGraph, reconProject, scriptCategory, scriptEntry,
 } from "../extensions/pi-dream-rsi/engine/recon.ts";
@@ -79,6 +79,37 @@ test("a lockfile changes the package-manager argv instead of assuming npm", () =
   assert.deepEqual(bench.argv, ["node", "bench.mjs"], "the direct body is used for measurement regardless of manager");
 });
 
+test("common JVM, .NET, Swift, Elixir, PHP, and Ruby manifests expose declared test and benchmark commands", () => {
+  const dir = project({
+    "pom.xml": "<project><modelVersion>4.0.0</modelVersion></project>\n",
+    "build.gradle.kts": "plugins { java }\n",
+    "gradlew.bat": "@echo off\n",
+    "App.csproj": "<Project />\n",
+    "Package.swift": "// swift-tools-version: 5.9\n",
+    "mix.exs": "defmodule Fixture.MixProject do end\n",
+    "composer.json": `${JSON.stringify({ scripts: { test: "phpunit", bench: "php bench.php", deploy: "php ship.php" } }, null, 2)}\n`,
+    Gemfile: "source 'https://rubygems.org'\n",
+    Rakefile: "task :test do\nend\ntask :bench do\nend\ntask :deploy do\nend\n",
+    "src/bench.php": "<?php echo 1;\n",
+    "src/app.swift": "func run() {}\n",
+    "src/App.cs": "class App {}\n",
+  });
+  const discovered = discoverCommands(dir, contract());
+  const byLabel = new Map(discovered.commands.map((command) => [command.label, command]));
+  assert.equal(byLabel.get("maven test")?.category, "test");
+  assert.deepEqual(byLabel.get("gradle test")?.argv, ["gradlew.bat", "test"]);
+  assert.equal(byLabel.get("dotnet test")?.source, "*.csproj or *.fsproj");
+  assert.equal(byLabel.get("swift test")?.category, "test");
+  assert.equal(byLabel.get("mix test")?.category, "test");
+  assert.equal(byLabel.get("composer test")?.category, "test");
+  assert.equal(byLabel.get("composer bench")?.category, "benchmark");
+  assert.deepEqual(byLabel.get("composer bench")?.argv, ["composer", "run-script", "bench"]);
+  assert.equal(byLabel.get("rake test")?.category, "test");
+  assert.equal(byLabel.get("rake bench")?.category, "benchmark");
+  assert.equal(byLabel.has("composer deploy"), false, "unrecognized scripts are never run as recon commands");
+  assert.equal(byLabel.has("rake deploy"), false, "unrecognized rake tasks are never run as recon commands");
+});
+
 test("a script that is more than a plain runner and file keeps its declared command", () => {
   const dir = project({
     "package.json": `${JSON.stringify({
@@ -109,6 +140,20 @@ test("a script that is more than a plain runner and file keeps its declared comm
   });
   const hookedBench = discoverCommands(hooked, contract()).commands.find((command) => command.label === "npm run bench");
   assert.deepEqual(hookedBench.argv, ["npm", "run", "bench"], "a lifecycle hook keeps the declared command");
+});
+
+test("a declared Go benchmark keeps its package path and attributes its local imports", () => {
+  const dir = project({
+    "package.json": `${JSON.stringify({ scripts: { bench: "go run ./cmd/bench" } }, null, 2)}\n`,
+    "go.mod": "module example.test/app\n",
+    "cmd/bench/main.go": "package main\nimport \"example.test/app/internal/work\"\nfunc main() { work.Run() }\n",
+    "internal/work/work.go": "package work\nfunc Run() {}\n",
+  });
+  const command = discoverCommands(dir, contract()).commands.find((entry) => entry.label === "npm run bench");
+  assert.ok(command);
+  assert.deepEqual(command.argv, ["go", "run", "./cmd/bench"], "the direct Go invocation omits package-manager startup");
+  assert.equal(command.entry, "cmd/bench/main.go");
+  assert.deepEqual(importGraph(dir, command.entry).files, ["cmd/bench/main.go", "internal/work/work.go"]);
 });
 
 function filesOf(root) {
@@ -147,6 +192,38 @@ test("the import graph follows local source and never enters dependencies or sec
   assert.ok(!walked.files.includes("src/unrelated.mjs"), "an unrelated module is not part of the measured workload");
   assert.ok(!walked.files.some((file) => file.includes("node_modules")), "a dependency branch ends the walk");
   assert.ok(!walked.files.some((file) => file.includes(".env")), "a secret-shaped path is never read");
+});
+
+test("the import graph follows Rust modules, Go module packages, and JVM imports within the repository", () => {
+  const rust = project({
+    "Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+    "src/lib.rs": "pub mod engine;\n",
+    "src/engine.rs": "mod parser;\npub fn run() { parser::parse(); }\n",
+    "src/engine/parser.rs": "pub fn parse() {}\n",
+    "vendor/ignored.rs": "pub fn ignored() {}\n",
+  });
+  assert.deepEqual(importGraph(rust, "src/lib.rs").files, ["src/engine.rs", "src/engine/parser.rs", "src/lib.rs"]);
+
+  const go = project({
+    "go.mod": "module example.test/service\n\ngo 1.22\n",
+    "cmd/server/main.go": "package main\nimport \"example.test/service/internal/core\"\nfunc main() { core.Run() }\n",
+    "internal/core/core.go": "package core\nfunc Run() {}\n",
+    "internal/core/helper.go": "package core\nfunc helper() {}\n",
+    "vendor/example.test/other/other.go": "package other\n",
+  });
+  assert.deepEqual(importGraph(go, "cmd/server/main.go").files, [
+    "cmd/server/main.go", "internal/core/core.go", "internal/core/helper.go",
+  ]);
+
+  const jvm = project({
+    "pom.xml": "<project />\n",
+    "src/main/java/org/example/Main.java": "package org.example;\nimport org.example.core.Worker;\nclass Main { Worker worker; }\n",
+    "src/main/java/org/example/core/Worker.java": "package org.example.core;\npublic class Worker {}\n",
+    "src/test/java/org/example/MainTest.java": "package org.example;\nclass MainTest {}\n",
+  });
+  assert.deepEqual(importGraph(jvm, "src/main/java/org/example/Main.java").files, [
+    "src/main/java/org/example/Main.java", "src/main/java/org/example/core/Worker.java",
+  ]);
 });
 
 test("a planted causal bottleneck is measured and becomes the scoped lever", async () => {
@@ -211,6 +288,165 @@ test("a project with no declared workload produces a named refusal, not an empty
   assert.equal(inventory.levers.length, 0);
   assert.ok(inventory.rejected.length > 0, "the refusal is a recorded rejection");
   assert.ok(inventory.diagnostics.some((line) => line.startsWith("blocker:")), "the diagnostic explains the stop");
+});
+
+// ---------------------------------------------------------------------------
+// W10: contract-declared score evaluator
+// ---------------------------------------------------------------------------
+
+function rawContract(overrides = {}) {
+  return {
+    version: 1,
+    outcome: { statement: "reduce benchmark duration", unit: "ms", higherIsBetter: false, minimumUsefulGain: "10%" },
+    preserved: { gates: [] },
+    scope: { roots: ["src"], protectedAssets: [] },
+    execution: { mode: "trusted-local", consent: true, envAllowlist: [], allowedCommandCategories: ["test", "benchmark"] },
+    models: { providers: ["fixture"] },
+    budgets: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 60, deadlineMs: 60_000, falseAcceptBudget: 0.01 },
+    ...overrides,
+  };
+}
+
+function evaluatorOutcome(overrides = {}) {
+  return {
+    statement: "raise the benchmark accuracy",
+    unit: "points",
+    higherIsBetter: true,
+    minimumUsefulGain: "10%",
+    evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] },
+    ...overrides,
+  };
+}
+
+function scoreContract(overrides = {}) {
+  return normalizeRunContract(rawContract({ outcome: evaluatorOutcome(), ...overrides }));
+}
+
+/** A declared workload plus a declared score evaluator that reads the editable code. */
+const SCORE_PROJECT = {
+  ...NODE_PROJECT,
+  "package.json": `${JSON.stringify({
+    name: "score-fixture", private: true, type: "module",
+    scripts: { test: "node test.mjs", bench: "node bench.mjs" },
+  }, null, 2)}\n`,
+  "bench.mjs": 'import { accuracy } from "./src/model.mjs";\nconsole.log(accuracy());\n',
+  "src/model.mjs": "export const accuracy = () => 0.62;\n",
+  "eval/score.mjs": 'import { accuracy } from "../src/model.mjs";\nconsole.log(JSON.stringify({ score: accuracy(), valid: true }));\n',
+};
+
+test("a declared outcome evaluator is validated, normalized, and changes the contract identity", () => {
+  const contract = scoreContract();
+  assert.deepEqual(contract.outcome.evaluator, {
+    argv: ["node", "eval/score.mjs"],
+    output: "score-json",
+    inputs: ["eval/score.mjs"],
+  }, "the evaluator is normalized onto the frozen outcome");
+
+  const identity = contractIdentity(contract);
+  assert.equal(contractIdentity(scoreContract()), identity, "the same evaluator keeps the same identity");
+  assert.notEqual(
+    contractIdentity(scoreContract({ outcome: evaluatorOutcome({ evaluator: { argv: ["node", "eval/score.mjs"], output: "stdout-number" } }) })),
+    identity,
+    "changing how the score is reported changes what a measurement means",
+  );
+  assert.notEqual(
+    contractIdentity(scoreContract({ outcome: evaluatorOutcome({ evaluator: { argv: ["node", "eval/other.mjs"], output: "score-json" } }) })),
+    identity,
+    "changing the evaluator changes the instrument identity",
+  );
+  assert.equal(contractIdentity(normalizeRunContract(rawContract())).length, 16);
+});
+
+test("an invalid evaluator declaration is refused with a specific reason", () => {
+  const errorsFor = (evaluator) => validateRunContract(rawContract({ outcome: evaluatorOutcome({ evaluator }) }));
+  assert.match(errorsFor({ argv: [], output: "score-json" }).join("; "), /outcome\.evaluator\.argv/);
+  assert.match(errorsFor({ argv: ["node", ""], output: "score-json" }).join("; "), /outcome\.evaluator\.argv/);
+  assert.match(errorsFor({ argv: ["node", "eval/score.mjs"], output: "elapsed" }).join("; "), /outcome\.evaluator\.output/);
+  assert.match(errorsFor({ argv: ["node", "eval/score.mjs"], output: "score-json", inputs: "eval/score.mjs" }).join("; "), /outcome\.evaluator\.inputs/);
+  assert.match(errorsFor({ argv: ["node", "eval/score.mjs"], output: "score-json", inputs: [""] }).join("; "), /outcome\.evaluator\.inputs/);
+  assert.match(errorsFor({ argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["../outside.mjs"] }).join("; "), /outcome\.evaluator\.inputs/);
+  assert.deepEqual(errorsFor({ argv: ["node", "eval/score.mjs"], output: "stdout-number", inputs: [] }), [], "an empty inputs list is acceptable");
+});
+
+test("a declared score evaluator becomes the primary lever, with the contract's direction and unit", async () => {
+  const dir = project(SCORE_PROJECT);
+  const runContract = scoreContract();
+  const recon = await reconProject({
+    projectDir: dir,
+    contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  const lever = inventory.levers[0];
+  assert.ok(lever, `expected a score lever, got ${JSON.stringify(inventory.rejected)}`);
+  assert.equal(lever.metricKind, "score", "the declared evaluator decides what is measured");
+  assert.equal(lever.sourceKind, "recon-command");
+  assert.match(lever.metric, /points/, "the unit comes from the approved outcome");
+  assert.match(lever.metric, /higher is better/, "the direction comes from the approved outcome");
+  assert.match(lever.goal, /raise the benchmark accuracy/);
+  assert.deepEqual(lever.command.argv, ["node", "eval/score.mjs"], "the lever measures the declared evaluator, never wall time");
+  assert.equal(lever.command.source, "contract.outcome.evaluator");
+  assert.deepEqual(lever.scopeFiles, ["src/model.mjs"], "scope is the code the declared workload exercises inside the approved root");
+  assert.ok(!lever.scopeFiles.includes("eval/score.mjs"), "pinned evaluator code is never candidate-editable");
+  assert.deepEqual(lever.gates, ["npm run test"], "declared test commands remain the correctness gates");
+  assert.ok(lever.reasons.some((reason) => /declared score evaluator/.test(reason)), "the lever explains the instrument");
+  assert.ok(lever.reasons.some((reason) => /pin/.test(reason)), "the lever reports that evaluator inputs are pinned");
+  assert.ok(
+    inventory.rejected.some((entry) => /wall-clock duration/.test(entry.reason) && /proxy/i.test(entry.reason)),
+    "a duration lever for a non-time outcome is rejected with the proxy reason, not silently dropped",
+  );
+});
+
+test("a non-time outcome cannot fall back to a wall-clock duration lever without a proxy justification", async () => {
+  const dir = project(NODE_PROJECT);
+  const nonTime = contract({ outcome: { statement: "raise the benchmark accuracy", unit: "points", higherIsBetter: true, minimumUsefulGain: "10%" } });
+  const recon = await reconProject({
+    projectDir: dir, contract: nonTime,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 900, timedOut: false, error: null }),
+  });
+  const refused = buildReconInventory({ contract: nonTime, recon });
+  assert.equal(refused.levers.length, 0, "wall time is not the declared outcome");
+  assert.match(refused.rejected[0].reason, /wall-clock duration/);
+  assert.match(refused.rejected[0].reason, /proxyJustification/);
+
+  const proxy = contract({ outcome: { statement: "raise the benchmark accuracy", unit: "points", higherIsBetter: true, minimumUsefulGain: "10%", proxyJustification: "wall-clock duration tracks the accuracy of the same model" } });
+  const proxied = buildReconInventory({ contract: proxy, recon });
+  assert.equal(proxied.levers[0]?.metricKind, "command-duration", "an explicit proxy justification permits the duration lever");
+
+  const timeLike = contract({ outcome: { statement: "reduce p95 latency", unit: "ms", higherIsBetter: false, minimumUsefulGain: "10%" } });
+  const timed = buildReconInventory({ contract: timeLike, recon });
+  assert.equal(timed.levers[0]?.metricKind, "command-duration", "a time-like unit needs no justification");
+});
+
+test("the score lever is ranked ahead of a duration lever that the same contract permits", async () => {
+  const dir = project(SCORE_PROJECT);
+  const runContract = scoreContract({
+    outcome: evaluatorOutcome({ proxyJustification: "wall-clock duration tracks the same model's accuracy" }),
+  });
+  const recon = await reconProject({
+    projectDir: dir,
+    contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  assert.equal(inventory.levers[0]?.metricKind, "score", "the declared outcome outranks a proxy");
+  assert.ok(inventory.levers.some((lever) => lever.metricKind === "command-duration"), "the justified proxy is still offered");
+});
+
+test("a score evaluator whose exercised code is all outside the approved scope is rejected with the reason", async () => {
+  const dir = project(SCORE_PROJECT);
+  const runContract = scoreContract({ scope: { roots: ["docs"], protectedAssets: [] } });
+  const recon = await reconProject({
+    projectDir: dir,
+    contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  assert.equal(inventory.levers.length, 0);
+  assert.ok(
+    inventory.rejected.some((entry) => /score evaluator/.test(entry.reason) && /approved editable scope/.test(entry.reason)),
+    `expected a scoped score rejection, got ${JSON.stringify(inventory.rejected)}`,
+  );
 });
 
 test("a python project's local imports are walked, and pytest becomes the gate", async () => {

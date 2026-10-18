@@ -35,6 +35,26 @@ const FINGERPRINT_LARGE_FILE = 4 * 1024 * 1024;
 
 export type MinimumGain = number | `${number}%`;
 
+/** How a declared score evaluator reports its number. */
+export const SCORE_EVALUATOR_OUTPUTS = ["score-json", "stdout-number"] as const;
+export type ScoreEvaluatorOutput = (typeof SCORE_EVALUATOR_OUTPUTS)[number];
+
+/**
+ * A declared way to measure the outcome as a number, as opposed to a duration.
+ *
+ * The argv is the operator-approved evaluator command. It and every declared
+ * input are pinned verifier inputs: a candidate may never edit them, because a
+ * candidate that can change the instrument can change what "improved" means.
+ */
+export interface RunContractScoreEvaluator {
+  /** Exact argv of the evaluator; measured verbatim, never rebuilt from a label. */
+  argv: string[];
+  /** Where the score comes from: `eval/score.json` or exactly one number on stdout. */
+  output: ScoreEvaluatorOutput;
+  /** Project-relative evaluator code or data files that must stay pinned. */
+  inputs?: string[];
+}
+
 export interface RunContractOutcome {
   /** What the project should measurably improve, in one sentence. */
   statement: string;
@@ -48,6 +68,12 @@ export interface RunContractOutcome {
    * one. Required for a proxy, omitted for the primary outcome.
    */
   proxyJustification?: string | null;
+  /**
+   * A declared score evaluator makes the outcome directly measurable. Without it
+   * the loop can only fall back to a wall-clock duration, which is a proxy and
+   * needs a time-like outcome or an explicit justification.
+   */
+  evaluator?: RunContractScoreEvaluator;
 }
 
 export interface RunContract {
@@ -156,6 +182,23 @@ export function validateRunContract(raw: unknown): string[] {
       && (typeof outcome.proxyJustification !== "string" || !outcome.proxyJustification.trim())) {
       errors.push("outcome.proxyJustification must be a non-empty string when present");
     }
+    if (outcome.evaluator !== undefined && outcome.evaluator !== null) {
+      const evaluator = outcome.evaluator;
+      if (!isRecord(evaluator)) {
+        errors.push("outcome.evaluator must be an object when present");
+      } else {
+        const argv = stringList(evaluator.argv);
+        if (argv === null || argv.length === 0) errors.push("outcome.evaluator.argv must be a non-empty array of non-empty strings");
+        if (typeof evaluator.output !== "string" || !SCORE_EVALUATOR_OUTPUTS.includes(evaluator.output as ScoreEvaluatorOutput)) {
+          errors.push('outcome.evaluator.output must be "score-json" or "stdout-number"');
+        }
+        if (evaluator.inputs !== undefined && evaluator.inputs !== null) {
+          const inputs = stringList(evaluator.inputs);
+          if (inputs === null) errors.push("outcome.evaluator.inputs must be an array of non-empty strings when present");
+          else if (inputs.some((input) => !safeRelative(input))) errors.push("outcome.evaluator.inputs must be project-relative paths");
+        }
+      }
+    }
   }
 
   const preserved = raw.preserved;
@@ -233,6 +276,13 @@ export function normalizeRunContract(raw: unknown): RunContract {
       higherIsBetter: value.outcome.higherIsBetter,
       minimumUsefulGain: value.outcome.minimumUsefulGain,
       ...(value.outcome.proxyJustification ? { proxyJustification: value.outcome.proxyJustification.trim() } : {}),
+      ...(value.outcome.evaluator ? {
+        evaluator: {
+          argv: [...value.outcome.evaluator.argv],
+          output: value.outcome.evaluator.output,
+          ...(value.outcome.evaluator.inputs ? { inputs: [...value.outcome.evaluator.inputs] } : {}),
+        },
+      } : {}),
     },
     preserved: { gates: [...value.preserved.gates] },
     scope: { roots: [...value.scope.roots], protectedAssets: [...value.scope.protectedAssets] },

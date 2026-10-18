@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import type { LeverAttempt, LeverProposal } from "./levers.ts";
+import type { LeverAttempt, LeverProposal, LeverSourceKind } from "./levers.ts";
 import { writeFileAtomic } from "./world.ts";
 
 /**
@@ -38,6 +38,8 @@ export interface ExperimentProvenance {
   baselineFingerprint?: string;
   /** The mechanism the candidate claimed to change. */
   mechanism?: string;
+  /** Closed-class origin of the measured lever, safe to aggregate across trajectories. */
+  strategyClass?: LeverSourceKind;
   /** Campaign this experiment continues, if any. */
   parentCampaign?: string;
 }
@@ -72,7 +74,12 @@ export function emptyMemory(): LoopMemory {
 
 const MEMORY_OUTCOMES: ReadonlySet<string> = new Set(["win", "no-win", "error", "rejected"]);
 
-const PROVENANCE_KEYS = ["contractId", "evaluatorId", "baselineFingerprint", "mechanism", "parentCampaign"] as const;
+const PROVENANCE_KEYS = ["contractId", "evaluatorId", "baselineFingerprint", "mechanism", "strategyClass", "parentCampaign"] as const;
+const STRATEGY_CLASSES = new Set([
+  "session-failure", "slow-command", "post-failure-edits", "session-tool-error", "repeated-tool-retry",
+  "aborted-session", "session-compaction", "session-model-change", "dream-improve", "git-hotspot",
+  "git-churn", "evaluator", "campaign-failure", "campaign-rejection", "campaign-health", "recon-command",
+]);
 
 function validProvenance(value: unknown): boolean {
   if (value === undefined) return true;
@@ -80,6 +87,7 @@ function validProvenance(value: unknown): boolean {
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (!PROVENANCE_KEYS.includes(key as (typeof PROVENANCE_KEYS)[number])) return false;
     if (typeof entry !== "string" || entry.length > 200) return false;
+    if (key === "strategyClass" && !STRATEGY_CLASSES.has(entry)) return false;
   }
   return true;
 }

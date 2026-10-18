@@ -28,6 +28,7 @@ import { ProgressRecorder, readProgress, type ProgressObserver } from "./progres
 import { readCheckpoint, saveCheckpoint, validateCheckpoint, freezePolicy, snapshotSeed, workspaceHash,
   type LiveCheckpoint, type PendingAttempt, type PreparedAttempt } from "./checkpoint.ts";
 import { normalizeTask, scoringFingerprint } from "./task.ts";
+import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
 import { classifyAgentTimeout } from "./timeout.ts";
 import {
   archiveAttempt,
@@ -63,6 +64,10 @@ export interface LiveEpisodeOptions {
   experimentDigest?: string;
   iteration: number;
   policyPath: string;
+  /** Generation-pinned discovery prompt; stored in the campaign snapshot for resume safety. */
+  promptTemplate?: string;
+  /** Generation-pinned research organization policy, appended to the discovery prompt. */
+  researchOrgPolicy?: string;
   policyName?: string | null;
   bakedBeta: number;
   grid: { branch_count: number; refine_count: number };
@@ -74,7 +79,11 @@ export interface LiveEpisodeOptions {
   signal?: AbortSignal;
   /** Durable budget reservations called immediately before actual child starts. */
   beforeAgentSpawn?: (key: string) => void;
+  /** Called once when a discovery process exits, including timeout and cancellation. */
+  onAgentComplete?: (result: CommandResult) => void;
   resolveAgent?: (savedAgent: AgentConfig) => AgentConfig | null;
+  /** OS containment for agent processes, rooted at each disposable attempt workspace. */
+  containment?: RepositoryCommandContainment;
   beforeEvaluatorSpawn?: (key: string) => void;
   /** Additional protected directories to keep out of full-workspace campaign snapshots. */
   workspaceExcludes?: string[];
@@ -104,6 +113,8 @@ export interface ScoreOutcome {
   valid: boolean;
   fail_class: string;
   error: string | null;
+  /** Direct evaluator process time when this outcome came from one command. */
+  processDurationMs?: number;
 }
 
 /**
@@ -278,7 +289,9 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
   const pruned = pruneWorkspaces(dreamRoot, task.work_retention, iteration);
   if (pruned.length > 0) log(`[live ${iteration}] pruned old workspaces: ${pruned.join(", ")}`);
 
-  const promptTemplate = cp?.prompt_template ?? loadPrompt("discovery-agent.md");
+  const discoveryTemplate = rawOptions.promptTemplate ?? loadPrompt("discovery-agent.md");
+  const researchOrgPolicy = rawOptions.researchOrgPolicy ?? loadPrompt("research-org.md");
+  const promptTemplate = cp?.prompt_template ?? `${discoveryTemplate}\n\n## Active research organization policy\n\n${researchOrgPolicy}`;
   // The discovery prompt tells every attempt to read `$baseline_dir`. On the first cycle there is no
   // baseline attempt yet, so say so where the agent will look instead of handing it a missing path.
   const baseline = baselineDir(dreamRoot);
@@ -458,6 +471,7 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       pending.stage = "agent"; pending.prepared = prepared; commit();
       progress.stage(prepared.cell, prepared.parentCell, prepared.round, "agent", pending.retry);
     }
+    const contained = workspaceContainment(options.containment, prepared.workspace);
     const agentRun = pending.agentRun ?? await runAgent({
       agent: task.agent,
       resolveAgent: options.resolveAgent,
@@ -467,7 +481,9 @@ async function runOwnedLiveEpisode(rawOptions: LiveEpisodeOptions, control: Abor
       logPath: prepared.logPath,
       protectedReadPaths: options.protectedReadPaths,
       signal,
+      ...(contained ? { containment: contained } : {}),
       beforeSpawn: () => options.beforeAgentSpawn?.(`live:${iteration}:${prepared.cell}:retry:${pending.retry}`),
+      onComplete: options.onAgentComplete,
       onOutput: (event) => progress.output(prepared.cell, false, event),
       onSpawn: (pid) => { pending.process = childOwnership(pid); commit(); },
     });

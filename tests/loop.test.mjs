@@ -5,7 +5,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
+import { campaignSeedReadings, patchPaths, runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
+import { getAgentContainmentSupport } from "../extensions/pi-dream-rsi/engine/containment.ts";
+import { CampaignInfeasibleError, campaignVerifierIdentity, promotionFloor } from "../extensions/pi-dream-rsi/engine/campaign.ts";
+import { projectFingerprint } from "../extensions/pi-dream-rsi/engine/intake.ts";
 
 const NOW = new Date("2026-10-16T00:00:00.000Z");
 
@@ -86,6 +89,59 @@ function stubCampaign({ outcome = "win", stateKind = "complete", stopReason = "s
 function baseLimits(overrides = {}) {
   return { maxCampaigns: 1, maxAgentStarts: 1000, maxEvaluatorRuns: 1000, deadlineMs: 60_000, ...overrides };
 }
+
+test("requested containment refuses before recon when the host backend is unavailable", async () => {
+  const fixture = fixtureProject();
+  let reconStarted = false;
+  try {
+    await assert.rejects(runLoop({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      containment: {},
+      containmentSupportImpl: async () => ({
+        available: false,
+        backend: null,
+        reason: "fixture has no OS container",
+      }),
+      collectSignalsImpl: async () => {
+        reconStarted = true;
+        return { weaknesses: [], diagnostics: [] };
+      },
+    }), /unavailable before recon: fixture has no OS container/);
+    assert.equal(reconStarted, false);
+    assert.equal(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi")), false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test("the real agent-runtime canary refuses this host before creating loop state", async (t) => {
+  const support = await getAgentContainmentSupport();
+  if (support.available) {
+    t.skip("this host can launch the Node runtime inside its process container");
+    return;
+  }
+  const fixture = fixtureProject();
+  let reconStarted = false;
+  try {
+    await assert.rejects(runLoop({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      containment: {},
+      containmentSupportImpl: async () => support,
+      collectSignalsImpl: async () => {
+        reconStarted = true;
+        return { weaknesses: [], diagnostics: [] };
+      },
+    }), /unavailable before recon/);
+    assert.equal(reconStarted, false);
+    assert.equal(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi")), false);
+  } finally {
+    fs.rmSync(fixture.dir, { recursive: true, force: true });
+  }
+});
 
 test("loop chains a discovered-scope command lever through synthesis, campaign, and durable accounting", async () => {
   const fixture = fixtureProject();
@@ -1119,5 +1175,165 @@ test("negative or fractional budget counters fail closed instead of inflating th
         JSON.stringify(tamper),
       );
     }
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("patchPaths lists every project-relative path a unified diff touches", () => {
+  const diff = [
+    "diff --git a/src/a.ts b/src/a.ts",
+    "--- a/src/a.ts",
+    "+++ b/src/a.ts",
+    "@@ -1 +1 @@",
+    "-old",
+    "+new",
+    "diff --git a/src/old.ts b/src/new.ts",
+    "similarity index 100%",
+    "rename from src/old.ts",
+    "rename to src/new.ts",
+    "diff --git a/src/added.ts b/src/added.ts",
+    "new file mode 100644",
+    "--- /dev/null",
+    "+++ b/src/added.ts",
+    "diff --git a/src/gone.ts b/src/gone.ts",
+    "deleted file mode 100644",
+    "--- a/src/gone.ts",
+    "+++ /dev/null",
+  ].join("\n");
+  assert.deepEqual(patchPaths(diff), ["src/a.ts", "src/added.ts", "src/gone.ts", "src/new.ts", "src/old.ts"]);
+  assert.deepEqual(patchPaths(""), [], "an empty patch touches no path");
+  assert.deepEqual(patchPaths("this is not a diff\n"), [], "prose is not parsed as a patch");
+  assert.deepEqual(
+    patchPaths("--- a/src/parser.ts\t2026-01-01 00:00:00\n+++ b/src/parser.ts\t2026-01-01 00:00:00\n"),
+    ["src/parser.ts"],
+    "a plain unified diff with timestamps still names its path",
+  );
+});
+
+test("a known-better control patch is not passed to a lever whose scope it escapes", async () => {
+  const fixture = fixtureProject();
+  try {
+    const controlPatchPath = path.join(fixture.projectDir, "escaped-control.patch");
+    fs.writeFileSync(controlPatchPath,
+      "diff --git a/src/unsafe.ts b/src/unsafe.ts\n--- a/src/unsafe.ts\n+++ b/src/unsafe.ts\n@@ -1 +1,2 @@\n seed\n+more\n");
+    const stub = stubCampaign();
+    const result = await runLoop({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      controlPatchPath,
+      runCampaignImpl: stub.impl,
+      now: () => NOW,
+    });
+    assert.equal(stub.calls.length, 0, "no campaign receives a control patch that touches paths outside the lever's scope");
+    assert.equal(result.stopReason, "no verifiable lever");
+    assert.ok(result.records.length >= 1, "the refuse-to-screen path records each lever");
+    assert.ok(result.records.every((record) => record.outcome === "rejected"));
+    assert.ok(
+      result.records.every((record) => /control patch/.test(record.stopReason ?? "") && /src\/unsafe\.ts/.test(record.stopReason ?? "")),
+      "each lever records the exact path it cannot cover",
+    );
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a campaign that refuses infeasible caps is charged no spend and the loop continues", async () => {
+  const fixture = fixtureProject();
+  try {
+    const floor = promotionFloor({ readings: 5, deterministic: true, evaluatorTimeoutMs: 60_000 });
+    const stub = stubCampaign();
+    const seen = [];
+    const impl = async (options) => {
+      seen.push(options);
+      if (seen.length <= 2) {
+        throw new CampaignInfeasibleError(
+          "insufficient caps for a verified promotion",
+          floor,
+          { evaluatorRuns: floor.evaluatorRuns, agentStarts: floor.agentStarts, deadlineMs: 60 * 60 * 1000 },
+        );
+      }
+      return stub.impl(options);
+    };
+    const result = await runLoop({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      controlPatchPath: fixture.controlPatchPath,
+      runCampaignImpl: impl,
+      now: () => NOW,
+    });
+
+    assert.equal(seen.length, 3, "each infeasible refusal moved on to the next lever instead of halting the run");
+    assert.equal(new Set(seen.map((options) => options.goal)).size, 3, "the refusals screened different levers");
+    assert.equal(stub.calls.length, 1, "the third lever finally started its campaign");
+    assert.equal(result.stopReason, "budget", "the run only stops once its campaign allowance is spent");
+
+    const rejected = result.records.filter((record) => record.outcome === "rejected");
+    assert.equal(rejected.length, 2);
+    for (const record of rejected) {
+      assert.equal(record.evaluatorRuns, 0, "a refusal taken before any reading costs no evaluator run");
+      assert.equal(record.agentStarts, 0, "a refusal taken before any agent costs no agent start");
+      assert.equal(record.campaignRoot, null);
+      assert.match(record.stopReason, /^campaign infeasible: /);
+    }
+    assert.ok(
+      result.memory.notes.some((note) => /infeasible/.test(note) && /evaluator runs 7/.test(note) && /recommended/.test(note)),
+      "the note names the floor and the recommended caps",
+    );
+    const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
+    assert.deepEqual(
+      { campaigns: budget.campaigns, agent: budget.agent_starts, evaluators: budget.evaluator_runs },
+      { campaigns: 1, agent: 5, evaluators: 9 },
+      "only the real campaign is charged; the refusals cost nothing",
+    );
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("qualification baseline readings seed the campaign only while the approved fingerprint matches", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-seed-"));
+  try {
+    fs.writeFileSync(path.join(dir, "a.js"), "export const a = 1;\n");
+    const task = {
+      name: "seed", workspace: ".", eval_program: "solution.py", score_program: "node score.mjs",
+      score_path: "eval/score.json", higher_is_better: false,
+    };
+    const evaluationContract = {
+      id: "0123456789abcdef", outcome: "reduce benchmark duration", unit: "ms", higherIsBetter: false,
+      minimumUsefulGain: "10%", metricKind: "command-duration", argv: ["node", "bench.mjs"], gates: [],
+      assets: [], baseline: [120, 122, 118], sensitivity: 40, confirmationPerspective: "fresh copy",
+    };
+    const approvedFingerprint = projectFingerprint(dir);
+    const seeds = campaignSeedReadings({
+      projectDir: dir, approvedFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
+    });
+    assert.ok(seeds, "a qualified instrument on the approved tree seeds the campaign check");
+    assert.equal(seeds.identity, campaignVerifierIdentity(dir, task, ["score.mjs"], []));
+    assert.deepEqual(seeds.runs.map((run) => run.score), [-120, -122, -118],
+      "every baseline reading is reused in the campaign's normalized score semantics (lower is better is negated)");
+    assert.ok(seeds.runs.every((run) => run.durationMs === 0 && run.code === null && run.valid === true
+      && run.failClass === "ok" && run.error === null && run.logPath === null
+      && run.stdoutTail === "seeded from loop qualification"), "seeded readings carry no invented process evidence");
+
+    fs.writeFileSync(path.join(dir, "a.js"), "export const a = 2;\n");
+    assert.equal(campaignSeedReadings({
+      projectDir: dir, approvedFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
+    }), null, "an edited tree invalidates the frozen baseline");
+    assert.equal(campaignSeedReadings({
+      projectDir: dir, approvedFingerprint: projectFingerprint(dir), task, verifierInputs: ["score.mjs"], gates: [],
+    }), null, "no qualified instrument means no seeded readings");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a campaign inherits a one-hour deadline when the run has more time", async () => {
+  const fixture = fixtureProject();
+  try {
+    const stub = stubCampaign();
+    await runLoop({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits({ deadlineMs: 2 * 60 * 60 * 1000 }),
+      controlPatchPath: fixture.controlPatchPath,
+      runCampaignImpl: stub.impl,
+      now: () => NOW,
+    });
+    assert.equal(stub.calls[0].limits.deadlineMs, 60 * 60 * 1000, "the campaign default deadline is one hour");
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });

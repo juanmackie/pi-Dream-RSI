@@ -17,6 +17,7 @@ import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand, type CommandResult } from "../agent/runner.ts";
 import { interpretEvaluation, readScoreFile, type ScoreOutcome } from "./live.ts";
+import type { RepositoryCommandContainment } from "./containment.ts";
 import type { TaskConfig } from "./task.ts";
 
 /** One file an apply copies from the candidate workspace (`from`) over the user's workspace (`to`). */
@@ -90,6 +91,7 @@ export async function scoreSeedCopy(options: {
   evaluatorKey?: string;
   exclude?: string[];
   onCommand?: (command: CommandResult) => void;
+  containment?: RepositoryCommandContainment;
 }): Promise<ScoreOutcome> {
   const { dreamRoot, projectDir, task, scratch } = options;
   const seed = path.resolve(projectDir, task.workspace);
@@ -111,10 +113,11 @@ export async function scoreSeedCopy(options: {
       timeoutMs: task.evaluator_timeout_ms,
       logPath: options.logPath ?? null,
       signal: options.signal,
+      ...(options.containment ? { containment: { writableRoots: [scratch], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
       beforeSpawn: () => options.beforeEvaluatorSpawn?.(options.evaluatorKey ?? "apply-score"),
     });
     options.onCommand?.(command);
-    return interpretEvaluation(task, command, readScoreFile(scratch, task));
+    return { ...interpretEvaluation(task, command, readScoreFile(scratch, task)), processDurationMs: command.durationMs };
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }

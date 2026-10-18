@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { Dashboard } from "./dashboard.ts";
-import { campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignCheckReport, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
+import { CAMPAIGN_DEADLINE_MAX_MS, DEFAULT_CAMPAIGN_LIMITS, campaignRuntimeDiagnostics, checkCampaignEvaluator, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign, type CampaignCheckReport, type CampaignLimits, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { resolveWithinRoot } from "./engine/apply.ts";
 import { runLoop, type LoopLimits } from "./engine/loop.ts";
 import { phaseIsActive } from "./engine/ownership.ts";
@@ -75,7 +75,8 @@ const improveParams = {
     max_cycles: { type: "integer", minimum: 1, maximum: 5, description: "Optional lower cycle cap (campaign default 5). Use this to honor a request such as 'run 2 cycles'." },
     max_agent_starts: { type: "integer", minimum: 1, maximum: 36, description: "Optional lower spawned-agent cap (campaign default 36)." },
     max_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Optional lower evaluator-run cap (campaign default 100)." },
-    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units, as a number, or a percentage such as '3%'. Omit it to use the preflight-resolved threshold." },
+    max_deadline_minutes: { type: "integer", minimum: 1, maximum: CAMPAIGN_DEADLINE_MAX_MS / 60_000, description: "Optional campaign wall-clock budget in minutes (campaign default 60). Use this to honor a request such as 'finish within 30 minutes'." },
+    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units, as a number, or a percentage such as '3%'. Omit it to test for a positive improvement above zero with a confirmation sized from the measured noise." },
     gates: { type: "array", items: { type: "string" }, description: "Optional correctness commands, such as the project's test command. Their inputs belong in verifier_inputs." },
     control_patch: { type: "string", description: "Optional fixed control candidate patch, relative to project_dir." },
   },
@@ -110,7 +111,7 @@ const loopParams = {
     campaign_evaluator_runs: { type: "integer", minimum: 1, maximum: 100, description: "Evaluator-run cap for each chained campaign. Default 48." },
     contract: { type: "object", description: "Approved run contract for cold-start operation: outcome, unit, direction, minimum useful gain, preserved gates, editable scope, trusted-local consent, allowed command categories, approved providers, and durable budgets. Without it the loop keeps the legacy signal-driven path." },
     control_patch: { type: "string", description: "Known-better control patch used to calibrate synthesized metrics. Without it, a contract run qualifies the instrument from independent evidence; a legacy run records the lever as rejected." },
-    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units or a percentage such as '3%'. Omit it to use the preflight-resolved threshold." },
+    minimum_gain: { type: ["number", "string"], description: "Optional minimum score gain in the metric's units or a percentage such as '3%'. Omit it to test for a positive improvement above zero with a confirmation sized from the measured noise." },
     agent_command: { type: "string", description: "Agent CLI executable for chained campaigns." },
     agent_args: { type: "array", items: { type: "string" }, description: "Arguments passed to the agent CLI." },
     agent_timeout_ms: { type: "number", description: "Maximum time allowed for one agent call." },
@@ -195,7 +196,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       "For dream_rsi_improve, start/resume is enabled only after an explicit improve request has activated Dream-RSI mode; status and stop remain controllable while mode is off.",
       "For dream_rsi_improve, use status, stop and resume against the active campaign. Resume uses its frozen goal, task, scope and verifier inputs.",
       "For dream_rsi_improve, start always performs evaluator, gate, noise, and detectability preflight before any agent call; use action=check when a separate diagnosis is requested.",
-      "For dream_rsi_improve, omit minimum_gain to use the preflight-resolved practical threshold derived from baseline noise and minimum detectable effect. Set an explicit absolute score delta or percent only when justified. Every gate input must be declared in verifier_inputs.",
+      "For dream_rsi_improve, omit minimum_gain to test for a positive improvement above zero; the campaign sizes the paired confirmation from the measured noise and reports both the noise and the instrument's resolution. Set an explicit absolute score delta or percent only when justified. Every gate input must be declared in verifier_inputs.",
+      "For dream_rsi_improve, pass max_deadline_minutes when the user names a wall-clock limit; the campaign default is 60 minutes and the ceiling is 720.",
       "For dream_rsi_improve, every candidate must pass its metric and gates, then receive an accepting adversarial review before apply. Review agent starts count against the saved agent budget.",
       "For dream_rsi_improve, resolve the active session model and thinking level at each agent call; use the campaign record only when no session value is available.",
       "For dream_rsi_improve, the campaign applies at most one in-scope candidate per cycle, only after its verifier measures a strict improvement. Report the final stop reason and call budget.",
@@ -205,7 +207,14 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       const baseRoot = dreamRoot(ctx);
       const action = typeof params.action === "string" ? params.action : "";
       if ((action === "start" || action === "resume" || action === "check") && !stateFor(ctx).mode) {
-        return { content: [{ type: "text", text: "Start, resume or check requires an explicit improvement request. Use /dream-rsi improve <what you want> first." }], details: { ok: false } };
+        const confirmed = await confirmCampaignIntent(ctx, action, campaignIntent(action, params, ctx, baseRoot));
+        if (confirmed === null) {
+          return { content: [{ type: "text", text: "Start, resume or check requires an explicit improvement request. Use /dream-rsi improve <what you want> first." }], details: { ok: false } };
+        }
+        if (!confirmed) {
+          return { content: [{ type: "text", text: campaignCanceled(action) }], details: { ok: false, cancelled: true } };
+        }
+        setMode(ctx, true);
       }
       if (action === "status") {
         const campaign = readCampaignStatus(baseRoot);
@@ -429,7 +438,14 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: "action must be start or status." }], details: { ok: false } };
       }
       if (!stateFor(ctx).mode) {
-        return { content: [{ type: "text", text: "Starting the loop requires an explicit improvement request. Use /dream-rsi loop <what you want> first." }], details: { ok: false } };
+        const confirmed = await confirmCampaignIntent(ctx, "loop", campaignIntent("loop", params, ctx, dreamRoot(ctx)));
+        if (confirmed === null) {
+          return { content: [{ type: "text", text: "Starting the loop requires an explicit improvement request. Use /dream-rsi loop <what you want> first." }], details: { ok: false } };
+        }
+        if (!confirmed) {
+          return { content: [{ type: "text", text: campaignCanceled("loop") }], details: { ok: false, cancelled: true } };
+        }
+        setMode(ctx, true);
       }
       const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
       if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
@@ -894,6 +910,7 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
     `  calls: ${campaign.agentStarts}/${campaign.limits.maxAgentStarts} agent starts, ${campaign.evaluatorRuns}/${campaign.limits.maxEvaluatorRuns} evaluator runs`,
     `  effective evaluator timeout: ${campaign.effectiveEvaluatorTimeoutMs}ms`,
     `  deadline: ${campaign.deadlineAt}`,
+    ...(campaign.check ? renderCampaignCheckStatus(campaign.check) : []),
     renderCampaignRuntime(runtime),
   ];
   if (campaign.health) lines.push(
@@ -907,6 +924,23 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
   if ("stopReason" in campaign && campaign.stopReason) lines.push(`  stop reason: ${campaign.stopReason}`);
   for (const rejection of campaign.rejections.slice(-3)) lines.push(`  rejected ${rejection.cell} (${rejection.stage}): ${rejection.reasons.join("; ")}`);
   return lines.join("\n");
+}
+
+/**
+ * Render the evaluator preflight evidence persisted with a campaign. The check may be
+ * partial (readings persisted after an abort) or complete, so both `reportPath` and the
+ * diagnoses list are optional here.
+ */
+function renderCampaignCheckStatus(check: NonNullable<CampaignStatus["check"]>): string[] {
+  const lines = [`  evaluator check: ${check.qualified ? "qualified" : "unqualified"}; ${check.runs.length} reading${check.runs.length === 1 ? "" : "s"}`];
+  check.runs.forEach((run, index) => {
+    const log = run.logPath === null ? "; seeded" : run.logPath ? `; log ${run.logPath}` : "";
+    const result = run.valid ? `score ${run.score}` : `${run.failClass}${run.error ? `: ${run.error}` : ""}`;
+    lines.push(`    reading ${index + 1}: ${Math.ceil(run.durationMs / 1000)}s, exit ${run.code ?? "unknown"}, ${result}${log}`);
+  });
+  for (const diagnosis of check.diagnoses) lines.push(`    diagnosis: ${diagnosis}`);
+  if (check.reportPath) lines.push(`    report: ${check.reportPath}`);
+  return lines;
 }
 
 function renderCampaignCheckReport(report: CampaignCheckReport): string {
@@ -945,13 +979,13 @@ function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void)
   };
 }
 
-function parseCampaignLimits(params: Record<string, unknown>): { limits?: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number }; error?: string } {
+function parseCampaignLimits(params: Record<string, unknown>): { limits?: Partial<CampaignLimits>; error?: string } {
   const fields = [
     ["max_cycles", "maxCycles", 5],
     ["max_agent_starts", "maxAgentStarts", 36],
     ["max_evaluator_runs", "maxEvaluatorRuns", 100],
   ] as const;
-  const limits: { maxCycles?: number; maxAgentStarts?: number; maxEvaluatorRuns?: number } = {};
+  const limits: Partial<CampaignLimits> = {};
   for (const [input, output, maximum] of fields) {
     const value = params[input];
     if (value === undefined) continue;
@@ -959,6 +993,13 @@ function parseCampaignLimits(params: Record<string, unknown>): { limits?: { maxC
       return { error: `${input} must be an integer from 1 to ${maximum}` };
     }
     limits[output] = value;
+  }
+  const deadlineMinutes = params.max_deadline_minutes;
+  if (deadlineMinutes !== undefined) {
+    if (typeof deadlineMinutes !== "number" || !Number.isInteger(deadlineMinutes) || deadlineMinutes < 1 || deadlineMinutes > CAMPAIGN_DEADLINE_MAX_MS / 60_000) {
+      return { error: `max_deadline_minutes must be an integer from 1 to ${CAMPAIGN_DEADLINE_MAX_MS / 60_000}` };
+    }
+    limits.deadlineMs = deadlineMinutes * 60_000;
   }
   return { ...(Object.keys(limits).length > 0 ? { limits } : {}) };
 }
@@ -1001,6 +1042,120 @@ function parseLoopLimits(params: Record<string, unknown>): { value?: { limits: L
   };
 }
 
+type CampaignGuardKind = "start" | "resume" | "check" | "loop";
+
+interface CampaignIntent {
+  goal: string;
+  target: string;
+  /** Budget caps the run will draw from. */
+  caps: string;
+  /** Wall-clock bound the dialog promises. */
+  projected: string;
+}
+
+const CAMPAIGN_CONFIRM_TITLES: Record<CampaignGuardKind, string> = {
+  start: "Start the Dream-RSI improvement campaign?",
+  resume: "Resume the Dream-RSI campaign?",
+  check: "Run the Dream-RSI evaluator check?",
+  loop: "Start the Dream-RSI unattended loop?",
+};
+
+function campaignGuardLabel(kind: CampaignGuardKind): string {
+  return kind === "loop" ? "Loop start" : kind === "start" ? "Campaign start" : kind === "resume" ? "Campaign resume" : "Evaluator check";
+}
+
+/** Read an integer parameter, falling back to the shipped default when absent or malformed. */
+function integerOrDefault(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : fallback;
+}
+
+/**
+ * Describe what a guarded action is about to do, so an interactive host can show the
+ * goal, target, caps and projected wall time before enabling Dream-RSI mode.
+ */
+function campaignIntent(kind: CampaignGuardKind, params: Record<string, unknown>, ctx: ExtensionContext, baseRoot: string): CampaignIntent {
+  const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd) ?? ctx.cwd;
+  const scope = readStringArray(params.scope, "scope").values;
+  const target = scope?.length ? `${projectDir} [${scope.join(", ")}]` : projectDir;
+  if (kind === "loop") {
+    const focus = typeof params.focus === "string" && params.focus.trim() ? params.focus.trim() : "unattended multi-lever improvement";
+    const campaigns = integerOrDefault(params.max_campaigns, 6);
+    const agents = integerOrDefault(params.max_agent_starts, 72);
+    const evaluators = integerOrDefault(params.max_evaluator_runs, 200);
+    const minutes = integerOrDefault(params.deadline_minutes, 120);
+    return {
+      goal: focus,
+      target,
+      caps: `${campaigns} campaigns, ${agents} agent starts, ${evaluators} evaluator runs, ${minutes} min deadline`,
+      projected: `up to ${minutes} min (the run deadline)`,
+    };
+  }
+  if (kind === "resume") {
+    const campaign = readCampaignStatus(baseRoot);
+    if (campaign) {
+      const remaining = Math.max(1, Math.ceil((Date.parse(campaign.deadlineAt) - Date.now()) / 60_000));
+      return {
+        goal: campaign.goal,
+        target: `${campaign.projectDir}${campaign.scope.length ? ` [${campaign.scope.join(", ")}]` : ""}`,
+        caps: `${campaign.limits.maxCycles} cycles, ${campaign.limits.maxAgentStarts} agent starts, ${campaign.limits.maxEvaluatorRuns} evaluator runs, ${Math.ceil(campaign.limits.deadlineMs / 60_000)} min deadline`,
+        projected: `up to ${remaining} min remaining`,
+      };
+    }
+    const savedGoal = typeof params.goal === "string" && params.goal.trim()
+      ? params.goal.trim()
+      : isRecord(params.lever) && typeof params.lever.goal === "string" ? params.lever.goal : "the campaign saved for this project";
+    return { goal: savedGoal, target, caps: "the saved campaign's limits", projected: "the saved campaign's remaining deadline" };
+  }
+  const goal = typeof params.goal === "string" && params.goal.trim()
+    ? params.goal.trim()
+    : isRecord(params.lever) && typeof params.lever.goal === "string"
+      ? params.lever.goal
+      : kind === "check" ? "check the evaluator on the unchanged target" : "(goal not provided)";
+  if (kind === "check") {
+    const parsed = parseCampaignTask(params.task, ctx);
+    const evaluatorTimeoutMs = parsed.task?.evaluator_timeout_ms ?? defaultTask().evaluator_timeout_ms;
+    const gates = readStringArray(params.gates, "gates").values?.length ?? 0;
+    const readings = 5;
+    return {
+      goal,
+      target,
+      caps: `${readings} evaluator readings${gates ? `, ${gates} gate(s)` : ""}`,
+      projected: `up to ${Math.ceil((readings * evaluatorTimeoutMs) / 60_000)} min at the configured evaluator timeout`,
+    };
+  }
+  const cycles = integerOrDefault(params.max_cycles, DEFAULT_CAMPAIGN_LIMITS.maxCycles);
+  const agents = integerOrDefault(params.max_agent_starts, DEFAULT_CAMPAIGN_LIMITS.maxAgentStarts);
+  const evaluators = integerOrDefault(params.max_evaluator_runs, DEFAULT_CAMPAIGN_LIMITS.maxEvaluatorRuns);
+  const minutes = integerOrDefault(params.max_deadline_minutes, Math.ceil(DEFAULT_CAMPAIGN_LIMITS.deadlineMs / 60_000));
+  return {
+    goal,
+    target,
+    caps: `${cycles} cycles, ${agents} agent starts, ${evaluators} evaluator runs, ${minutes} min deadline`,
+    projected: `up to ${minutes} min (the campaign deadline)`,
+  };
+}
+
+function formatCampaignIntent(intent: CampaignIntent): string {
+  return [
+    `Goal: ${intent.goal}`,
+    `Target: ${intent.target}`,
+    `Caps: ${intent.caps}`,
+    `Projected time: ${intent.projected}`,
+    "",
+    "Confirming enables Dream-RSI mode for this session and spends the campaign budget.",
+  ].join("\n");
+}
+
+/** Returns null when the host has no dialogs, so the caller keeps its headless refusal. */
+async function confirmCampaignIntent(ctx: ExtensionContext, kind: CampaignGuardKind, intent: CampaignIntent): Promise<boolean | null> {
+  if (!ctx.hasUI) return null;
+  return (await ctx.ui.confirm(CAMPAIGN_CONFIRM_TITLES[kind], formatCampaignIntent(intent))) === true;
+}
+
+function campaignCanceled(kind: CampaignGuardKind): string {
+  return `${campaignGuardLabel(kind)} canceled: no confirmation was given, so nothing ran and no budget was spent. Use /dream-rsi improve <what you want> first.`;
+}
+
 function parseCampaignMinimumGain(value: unknown): { minimumGain?: number | string; error?: string } {
   if (value === undefined) return {};
   if (typeof value === "number" && Number.isFinite(value) && value >= 0) return { minimumGain: value };
@@ -1012,7 +1167,7 @@ function parseCampaignMinimumGain(value: unknown): { minimumGain?: number | stri
 
 function validatePublicIntake(value: unknown, ctx: ExtensionContext): string[] {
   if (!isRecord(value)) return ["intake file must contain a JSON object"];
-  const allowed = new Set(["goal", "project_dir", "task", "lever", "scope", "verifier_inputs", "max_cycles", "max_agent_starts", "max_evaluator_runs", "minimum_gain", "gates", "control_patch"]);
+  const allowed = new Set(["goal", "project_dir", "task", "lever", "scope", "verifier_inputs", "max_cycles", "max_agent_starts", "max_evaluator_runs", "max_deadline_minutes", "minimum_gain", "gates", "control_patch"]);
   const errors = Object.keys(value).filter((key) => !allowed.has(key)).map((key) => `unknown intake field: ${key}`);
   const lever = parseAssessedLever(value.lever);
   if (lever.error) errors.push(lever.error);
@@ -1027,6 +1182,9 @@ function validatePublicIntake(value: unknown, ctx: ExtensionContext): string[] {
   }
   for (const field of ["max_cycles", "max_agent_starts", "max_evaluator_runs"] as const) {
     if (value[field] !== undefined && (typeof value[field] !== "number" || !Number.isSafeInteger(value[field]) || value[field] < 1)) errors.push(`${field} must be a positive integer`);
+  }
+  if (value.max_deadline_minutes !== undefined && (typeof value.max_deadline_minutes !== "number" || !Number.isSafeInteger(value.max_deadline_minutes) || value.max_deadline_minutes < 1 || value.max_deadline_minutes > CAMPAIGN_DEADLINE_MAX_MS / 60_000)) {
+    errors.push(`max_deadline_minutes must be an integer from 1 to ${CAMPAIGN_DEADLINE_MAX_MS / 60_000}`);
   }
   if (value.minimum_gain !== undefined) {
     const gain = parseCampaignMinimumGain(value.minimum_gain);

@@ -104,6 +104,154 @@ test("duration evaluator reports median wall-clock, detects a faster variant, an
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });
 
+function writeScoreEvaluator(projectDir, body) {
+  const target = path.join(projectDir, "eval", "score.mjs");
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, body);
+  return target;
+}
+
+function scoreLever(overrides = {}) {
+  return lever({
+    metricKind: "score",
+    sourceKind: "recon-command",
+    metric: "raise benchmark accuracy (points, higher is better)",
+    evidence: [{ source: "evaluator", ref: "contract.outcome.evaluator", count: 1 }],
+    ...overrides,
+  });
+}
+
+function scoreSpec(overrides = {}) {
+  return {
+    argv: ["node", "eval/score.mjs"],
+    output: "score-json",
+    inputs: ["eval/score.mjs"],
+    unit: "points",
+    higherIsBetter: true,
+    ...overrides,
+  };
+}
+
+const SCORE_JSON_WRITER = (score) => `import * as fs from "node:fs";
+fs.mkdirSync("eval", { recursive: true });
+fs.writeFileSync("eval/score.json", JSON.stringify({ score: ${score}, raw_score: ${score}, valid: true, fail_class: "ok", error: null }));
+`;
+
+test("the score metric template runs the declared evaluator and reads eval/score.json", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, SCORE_JSON_WRITER("0.75"));
+    const plan = await synthesizeMetric({
+      projectDir,
+      lever: scoreLever(),
+      scoreEvaluator: scoreSpec(),
+      controlPatchPath: writeControlPatch(projectDir),
+    });
+    assert.equal(plan.ready, true, plan.rejections.join("; "));
+    assert.equal(plan.metricKind, "score", "the declared score evaluator selects the score template");
+    assert.equal(plan.unit, "points", "the unit comes from the approved outcome, not a synthesized default");
+    assert.equal(plan.higherIsBetter, true);
+    assert.equal(plan.direction, "maximize");
+    assert.deepEqual(plan.argv, ["node", "eval/score.mjs"], "the declared evaluator argv is measured verbatim");
+    assert.deepEqual(plan.evaluatorInputs, ["eval/score.mjs"], "evaluator code is pinned as a verifier input");
+    assert.equal(plan.evaluatorOutput, "score-json");
+    assert.ok(plan.sampleTimeoutMs >= 30_000);
+    assert.ok(plan.notes.some((note) => /score evaluator/.test(note)), "the plan explains the score instrument");
+
+    const reading = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(reading.valid, true, reading.error ?? "");
+    assert.equal(reading.score, 0.75, "the score is the declared evaluator's number, not wall time");
+    assert.equal(reading.mode, "score");
+    assert.deepEqual(reading.samples, [0.75], "one repeat and no warmup for a score metric");
+
+    writeScoreEvaluator(projectDir, SCORE_JSON_WRITER("0.5"));
+    const changed = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(changed.valid, true);
+    assert.equal(changed.score, 0.5, "the same instrument observes a different score without re-synthesis");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("the score metric template reads a single number on stdout and fails closed on anything else", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, `console.log("0.8125");\n`);
+    const plan = await synthesizeMetric({
+      projectDir,
+      lever: scoreLever(),
+      scoreEvaluator: scoreSpec({ output: "stdout-number", higherIsBetter: false, unit: "error rate" }),
+      controlPatchPath: writeControlPatch(projectDir),
+    });
+    assert.equal(plan.ready, true, plan.rejections.join("; "));
+    assert.equal(plan.direction, "minimize", "the direction comes from the approved outcome");
+    assert.equal(plan.evaluatorOutput, "stdout-number");
+
+    const reading = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(reading.valid, true, reading.error ?? "");
+    assert.equal(reading.score, 0.8125, "a single numeric stdout is the score");
+    assert.equal(reading.unit, "error rate");
+
+    writeScoreEvaluator(projectDir, `console.log("not a number");\n`);
+    const malformed = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(malformed.valid, false, "text on stdout is not a score");
+    assert.equal(malformed.fail_class, "invalid_output");
+
+    writeScoreEvaluator(projectDir, `console.log("0.5");\nconsole.log("0.6");\n`);
+    const ambiguous = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(ambiguous.valid, false, "the declared contract is one number, not a series");
+    assert.equal(ambiguous.fail_class, "invalid_output");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("a declared evaluator that fails or reports itself invalid cannot produce a score", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, `process.exit(2);\n`);
+    const plan = await synthesizeMetric({
+      projectDir,
+      lever: scoreLever(),
+      scoreEvaluator: scoreSpec(),
+      controlPatchPath: writeControlPatch(projectDir),
+    });
+    assert.equal(plan.ready, true, plan.rejections.join("; "));
+
+    const failed = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(failed.valid, false, "a crashing evaluator is not a zero score");
+    assert.equal(failed.fail_class, "evaluator_error");
+
+    writeScoreEvaluator(projectDir, `import * as fs from "node:fs";
+fs.mkdirSync("eval", { recursive: true });
+fs.writeFileSync("eval/score.json", JSON.stringify({ score: 0, valid: false, fail_class: "invalid_output", error: "model did not run" }));
+`);
+    const refused = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(refused.valid, false, "the evaluator's own validity verdict is honoured");
+    assert.match(refused.error ?? "", /model did not run/);
+
+    writeScoreEvaluator(projectDir, `import * as fs from "node:fs";\nfs.writeFileSync("eval/score.json", "{not json");\n`);
+    const unreadable = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(unreadable.valid, false);
+    assert.equal(unreadable.fail_class, "invalid_output");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("a score lever without the contract's declared evaluator is refused, not guessed", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    const plan = await synthesizeMetric({
+      projectDir,
+      lever: scoreLever(),
+      controlPatchPath: writeControlPatch(projectDir),
+    });
+    assert.equal(plan.ready, false);
+    assert.equal(plan.metricKind, "score");
+    assert.match(plan.rejections.join("; "), /score metric kind requires the contract's declared outcome\.evaluator/);
+    assert.equal(plan.evaluatorPath, "", "no evaluator is written when the score instrument is undefined");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("runner resolution follows standard lockfile evidence and nothing else", () => {
   const projectDir = tempDir();
   try {

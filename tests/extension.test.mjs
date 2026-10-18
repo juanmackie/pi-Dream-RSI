@@ -92,6 +92,36 @@ test("campaign intake validates a direct target and lower-only call caps without
   } finally { project.cleanup(); }
 });
 
+test("campaign start validates max_deadline_minutes inside the one-to-720 minute range", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    await harness.handlers.get("input")({ type: "input", source: "interactive", text: "Use Dream-RSI to improve the fixture benchmark" }, context);
+    const improve = harness.tools.get("dream_rsi_improve");
+    const start = {
+      action: "start",
+      goal: "Increase the fixture score while preserving validity",
+      project_dir: project.projectDir,
+      task: {
+        name: "deadline fixture",
+        workspace: "seed",
+        eval_program: "solution.py",
+        score_program: project.task.score_program,
+        higher_is_better: true,
+        agent_command: "node",
+        agent_args: [project.script("agent-ok.mjs")],
+      },
+      verifier_inputs: ["score-ok.mjs"],
+    };
+    for (const value of [0, 721, 1.5, "30"]) {
+      const result = await improve.execute(`deadline-${String(value)}`, { ...start, max_deadline_minutes: value }, undefined, undefined, context);
+      assert.match(result.content[0].text, /max_deadline_minutes must be an integer from 1 to 720/, `max_deadline_minutes=${String(value)} is rejected`);
+      assert.equal(result.details.ok, false);
+    }
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false, "an invalid deadline request starts no campaign");
+  } finally { project.cleanup(); }
+});
+
 test("command completion exposes only campaign verbs", async () => {
   const project = makeProject();
   try {
@@ -173,6 +203,87 @@ test("only explicit Dream-RSI improve intent enables campaign mode from ordinary
     const allowed = await tool.execute("allowed", { action: "start" }, undefined, undefined, context);
     assert.match(allowed.content[0].text, /requires a concrete measurable goal/);
     assert.equal(fs.existsSync(project.dreamRoot), false, "enabling mode creates no task or campaign state");
+  } finally { project.cleanup(); }
+});
+
+test("interactive campaign start asks for confirmation with goal, target, caps and projected time", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    const improve = harness.tools.get("dream_rsi_improve");
+    const start = {
+      action: "start",
+      goal: "Reduce fixture latency without losing validity",
+      project_dir: project.projectDir,
+      max_cycles: 2,
+      max_agent_starts: 18,
+      max_evaluator_runs: 48,
+      max_deadline_minutes: 30,
+    };
+    harness.uiAnswers.confirm.push(false);
+    const declined = await improve.execute("confirm-declined", start, undefined, undefined, context);
+    assert.equal(declined.details.cancelled, true);
+    assert.match(declined.content[0].text, /canceled: no confirmation was given/i);
+    assert.equal(harness.uiPrompts.length, 1);
+    assert.equal(harness.uiPrompts[0].kind, "confirm");
+    assert.match(harness.uiPrompts[0].title, /Start the Dream-RSI improvement campaign\?/);
+    const dialog = harness.uiPrompts[0].message;
+    assert.match(dialog, /Goal: Reduce fixture latency without losing validity/);
+    assert.ok(dialog.includes(`Target: ${project.projectDir}`), "the dialog names the campaign target");
+    assert.match(dialog, /Caps: 2 cycles, 18 agent starts, 48 evaluator runs, 30 min deadline/);
+    assert.match(dialog, /Projected time: up to 30 min/);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false, "a declined request starts no campaign");
+    // A declined dialog does not enable mode: the next attempt asks again.
+    harness.uiAnswers.confirm.push(false);
+    await improve.execute("confirm-declined-again", start, undefined, undefined, context);
+    assert.equal(harness.uiPrompts.length, 2);
+  } finally { project.cleanup(); }
+});
+
+test("interactive resume and check require confirmation before enabling campaign mode", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    const improve = harness.tools.get("dream_rsi_improve");
+    for (const action of ["resume", "check"]) {
+      harness.uiAnswers.confirm.push(false);
+      const result = await improve.execute(`confirm-${action}`, { action, project_dir: project.projectDir }, undefined, undefined, context);
+      assert.equal(result.details.cancelled, true, `${action} cancels without confirmation`);
+      assert.match(result.content[0].text, /canceled: no confirmation was given/i);
+    }
+    assert.equal(harness.uiPrompts.length, 2);
+    for (const prompt of harness.uiPrompts) {
+      assert.equal(prompt.kind, "confirm");
+      assert.match(prompt.message, /Goal: /);
+      assert.match(prompt.message, /Target: /);
+      assert.match(prompt.message, /Caps: /);
+      assert.match(prompt.message, /Projected time: /);
+    }
+    assert.match(harness.uiPrompts[0].title, /Resume the Dream-RSI campaign\?/);
+    assert.match(harness.uiPrompts[1].title, /Run the Dream-RSI evaluator check\?/);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false);
+  } finally { project.cleanup(); }
+});
+
+test("confirming the start dialog enables campaign mode and continues past the guard", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    const improve = harness.tools.get("dream_rsi_improve");
+    harness.uiAnswers.confirm.push(true);
+    const continued = await improve.execute("confirm-accepted", { action: "start", goal: "Reduce fixture latency", project_dir: project.projectDir }, undefined, undefined, context);
+    assert.equal(harness.uiPrompts.length, 1);
+    assert.doesNotMatch(continued.content[0].text, /requires an explicit improvement request/);
+    assert.match(continued.content[0].text, /Campaign task is invalid/);
+    assert.ok(harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data.active === true), "a confirmed start enables Dream-RSI mode");
+    // Mode stays enabled: a later start does not ask again.
+    const later = await improve.execute("after-confirmed-start", { action: "start" }, undefined, undefined, context);
+    assert.equal(harness.uiPrompts.length, 1);
+    assert.match(later.content[0].text, /requires a concrete measurable goal/);
   } finally { project.cleanup(); }
 });
 
@@ -279,6 +390,36 @@ test("loop command routes to the unattended loop and enables it", async () => {
   } finally { project.cleanup(); }
 });
 
+test("interactive loop start confirms the run before enabling the loop", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    const loop = harness.tools.get("dream_rsi_loop");
+    const start = { action: "start", focus: "make the parser faster", max_campaigns: 2, max_agent_starts: 10, max_evaluator_runs: 20, deadline_minutes: 15 };
+    harness.uiAnswers.confirm.push(false);
+    const declined = await loop.execute("loop-confirm-declined", start, undefined, undefined, context);
+    assert.equal(declined.details.cancelled, true);
+    assert.match(declined.content[0].text, /canceled: no confirmation was given/i);
+    assert.equal(harness.uiPrompts.length, 1);
+    assert.match(harness.uiPrompts[0].title, /Start the Dream-RSI unattended loop\?/);
+    const dialog = harness.uiPrompts[0].message;
+    assert.match(dialog, /Goal: make the parser faster/);
+    assert.match(dialog, /Caps: 2 campaigns, 10 agent starts, 20 evaluator runs, 15 min deadline/);
+    assert.match(dialog, /Projected time: up to 15 min/);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "a declined loop start creates no loop state");
+    harness.uiAnswers.confirm.push(true);
+    const badTarget = path.join(project.projectDir, "missing-dir");
+    const accepted = await loop.execute("loop-confirm-accepted", { action: "start", focus: "make the parser faster", project_dir: badTarget }, undefined, undefined, context);
+    assert.match(accepted.content[0].text, /project_dir must name an existing local project directory/);
+    assert.ok(harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data.active === true), "a confirmed loop start enables Dream-RSI mode");
+    // Mode stays enabled: a later loop start does not ask again.
+    const later = await loop.execute("loop-after-confirm", { action: "start", project_dir: badTarget }, undefined, undefined, context);
+    assert.equal(harness.uiPrompts.length, 2);
+    assert.match(later.content[0].text, /project_dir must name an existing local project directory/);
+  } finally { project.cleanup(); }
+});
+
 test("headless help and retired manual verbs report without activating model work", async () => {
   const project = makeProject();
   try {
@@ -366,7 +507,15 @@ test("tool parameter schemas stay validatable and strict", async () => {
       }
     }
     const improve = harness.tools.get("dream_rsi_improve");
-    assert.match(improve.parameters.properties.minimum_gain.description, /omit.*preflight-resolved threshold/i);
+    assert.match(improve.parameters.properties.minimum_gain.description, /positive improvement above zero.*measured noise/i);
+    assert.doesNotMatch(improve.parameters.properties.minimum_gain.description, /preflight-resolved/i);
+    assert.doesNotMatch(improve.promptGuidelines.join(" "), /preflight-resolved/i);
+    assert.equal(improve.parameters.properties.max_deadline_minutes.type, "integer");
+    assert.equal(improve.parameters.properties.max_deadline_minutes.minimum, 1);
+    assert.equal(improve.parameters.properties.max_deadline_minutes.maximum, 720);
+    assert.match(improve.parameters.properties.max_deadline_minutes.description, /minutes/i);
+    assert.match(improve.promptGuidelines.join(" "), /max_deadline_minutes/);
+    assert.match(improve.promptGuidelines.join(" "), /positive improvement above zero.*measured noise/i);
     assert.match(improve.promptGuidelines.join(" "), /review.*agent budget/i);
     assert.match(improve.promptGuidelines.join(" "), /active session model.*each agent call/i);
     assert.match(improve.description, /check.*before start/i);

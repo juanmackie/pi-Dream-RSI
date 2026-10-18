@@ -13,7 +13,7 @@ import type { SignalEvidence, SignalWeakness } from "./signals.ts";
  * project and any language stack.
  */
 
-export type LeverMetricKind = "command-duration" | "command-success" | "suite-failures" | "unmeasurable";
+export type LeverMetricKind = "command-duration" | "command-success" | "suite-failures" | "score" | "unmeasurable";
 
 /**
  * Where a lever came from. `recon-command` is cold-start discovery: a declared

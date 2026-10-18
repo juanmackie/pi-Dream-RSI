@@ -496,29 +496,41 @@ test("a control patch that cannot beat the baseline is rejected at preflight wit
     const run = await executeFixture(spec, dir, {
       limits: { maxCampaigns: 2, plateauK: 3 },
       campaignDefaults: { maxCycles: 1 },
-      controlPatchText: (cloneDir) => {
-        // A control that applies cleanly but cannot improve the measured outcome.
-        fs.writeFileSync(path.join(cloneDir, "control-note.md"), "no measured effect\n");
-        git(["add", "-N", "control-note.md"], cloneDir);
-        const patch = git(["diff", "--no-color", "--", "control-note.md"], cloneDir);
-        git(["reset", "-q"], cloneDir);
-        fs.rmSync(path.join(cloneDir, "control-note.md"));
-        return patch;
+      controlPatchText: () => {
+        // W12: a supplied control patch is only used for a lever whose scope covers
+        // every patched path. This control edits src/parser.js, the file the fixture's
+        // session edits scope the levers to, so it stays in scope. It applies cleanly
+        // but leaves NEEDS_FIX in place, so the measured outcome cannot improve: the
+        // control is useless without being out of scope.
+        return [
+          "diff --git a/src/parser.js b/src/parser.js",
+          "--- a/src/parser.js",
+          "+++ b/src/parser.js",
+          "@@ -2,0 +3 @@",
+          "+// control: no measured effect",
+          "",
+        ].join("\n");
       },
     });
     assert.equal(run.result.wins, 0, "a useless control patch cannot produce a verified win");
     assert.equal(run.result.campaigns, 2, "each screened lever ran a campaign that failed at preflight");
     assert.equal(run.result.stopReason, "budget", "the run stops on its campaign budget, not on the first preflight rejection");
     assert.equal(run.result.agentStarts, 0, "a preflight failure happens before any agent work");
+    assert.ok(
+      !run.result.memory.notes.some((note) => /known-better control patch touches/.test(note)),
+      "the in-scope control patch passes the loop's W12 scope guard instead of rejecting the lever",
+    );
     const rejected = run.result.records.filter((record) => record.outcome === "rejected");
     assert.equal(rejected.length, 2, JSON.stringify(run.result.records.map((record) => ({ outcome: record.outcome, stopReason: record.stopReason }))));
-    for (const record of rejected) {
-      assert.match(record.stopReason ?? "", /evaluator preflight failed/, "every rejection names the preflight failure");
-      assert.ok(record.campaignRoot, "the rejected campaign keeps its root for evidence");
-      const ledger = readLedger(record.campaignRoot);
+    for (const rejection of rejected) {
+      assert.match(rejection.stopReason ?? "", /evaluator preflight failed/, "every rejection names the preflight failure");
+      assert.ok(rejection.campaignRoot, "the rejected campaign keeps its root for evidence");
+      const record = JSON.parse(fs.readFileSync(path.join(rejection.campaignRoot, "campaign.json"), "utf8"));
+      assert.equal(record.checkReport.control.validated, false, "the in-scope control did not beat the baseline");
+      const ledger = readLedger(rejection.campaignRoot);
       assert.ok(ledger.some((entry) => entry.kind === "integrity" && entry.outcome === "control-rejected"),
         "the campaign ledger records the control-patch rejection");
-      assert.equal(readApplied(record.campaignRoot).length, 0, "nothing is applied");
+      assert.equal(readApplied(rejection.campaignRoot).length, 0, "nothing is applied");
     }
     assert.ok(run.result.memory.notes.some((note) => /rejected during preflight/.test(note)), "the loop memory records the preflight rejection");
     assert.notEqual(runSpecCommand(spec, run.cloneDir).status, 0, "the fixture still fails: nothing was applied");

@@ -61,11 +61,26 @@ test("integrated campaigns enforce win, gate, review, no-op, direction, timeout,
       scope: ["solution.py"],
       verifierInputs: [project.script("score-ok.mjs"), ...(scenario.gate ? [project.script("gate-no-cheat.mjs")] : [])],
       gates: scenario.gate ? [`node "${project.script("gate-no-cheat.mjs")}"`] : [],
+      mechanism: "paired-hill-climb",
+      parentCampaignId: "prior-campaign",
       limits: { maxCycles: 1, maxAgentStarts: 18, maxEvaluatorRuns: 80, deadlineMs: 90_000, plateauCycles: 1, maxCandidatesPerCycle: 3 },
     });
     const appliedFile = path.join(result.campaignRoot, "history", "applied.jsonl");
     const applied = fs.existsSync(appliedFile) ? fs.readFileSync(appliedFile, "utf8").trim().split(/\r?\n/).filter(Boolean) : [];
     assert.equal(applied.length > 0, scenario.applied, JSON.stringify(result.rejections));
+    const ledger = fs.readFileSync(path.join(result.campaignRoot, "history", "ledger.jsonl"), "utf8")
+      .trim().split(/\r?\n/).map((line) => JSON.parse(line));
+    if (scenario.applied && scenario.scenario === "truewin") {
+      const apply = ledger.find((entry) => entry.kind === "apply" && entry.outcome === "success");
+      assert.ok(apply, "the promoted event is present in the experiment ledger");
+      assert.match(apply.provenance.contractId, /^[a-f0-9]{64}$/);
+      assert.match(apply.provenance.instrumentId, /^[a-f0-9]{64}$/);
+      assert.match(apply.provenance.baselineFingerprint, /^[a-f0-9]{64}$/);
+      assert.equal(apply.provenance.mechanism, "paired-hill-climb");
+      assert.equal(apply.provenance.parentCampaignId, "prior-campaign");
+      const parents = new Set(apply.parentEntryIds.map((id) => ledger.find((entry) => entry.entryId === id)?.kind));
+      assert.ok(parents.has("confirm") && parents.has("review"), "promotion depends on its measurement and reviewer evidence");
+    }
     assert.ok(result.agentStarts <= 18);
     assert.ok(result.evaluatorRuns <= 80);
     if (scenario.gate) assert.ok(result.rejections.some((entry) => entry.stage === "gate"));
@@ -176,13 +191,14 @@ test("unpatched workspace drift after pending-apply persistence prevents promoti
     fs.writeFileSync(script, `import { createRequire } from "node:module";
 const require_ = createRequire(import.meta.url);
 const cjsFs = require_("node:fs");
+const { syncBuiltinESMExports } = require_("node:module");
 const path = require_("node:path");
 const config = JSON.parse(cjsFs.readFileSync(process.argv[2], "utf8"));
 let fired = false;
 const realWrite = cjsFs.writeFileSync;
 cjsFs.writeFileSync = (file, data, ...args) => {
   const result = realWrite(file, data, ...args);
-  if (!fired && typeof data === "string" && path.basename(file).startsWith("campaign.json.tmp-")) {
+  if (!fired && typeof file === "string" && typeof data === "string" && path.basename(file).startsWith("campaign.json.tmp-")) {
     try {
       if (JSON.parse(data).pendingApply) {
         fired = true;
@@ -192,6 +208,7 @@ cjsFs.writeFileSync = (file, data, ...args) => {
   }
   return result;
 };
+syncBuiltinESMExports();
 const { runCampaign } = await import(config.campaignUrl);
 const result = await runCampaign(config.options);
 realWrite(config.resultFile, JSON.stringify({ fired, state: result.state, rejections: result.rejections, campaignRoot: result.campaignRoot }));
@@ -215,7 +232,7 @@ realWrite(config.resultFile, JSON.stringify({ fired, state: result.state, reject
     });
     assert.equal(exit.code, 0, `boundary child exited ${exit.code}: ${exit.stderr.slice(-1200)}`);
     const result = JSON.parse(fs.readFileSync(resultFile, "utf8"));
-    assert.equal(result.fired, true, "the unpatched dependency changed after pendingApply was persisted");
+    assert.equal(result.fired, true, `the unpatched dependency changed after pendingApply was persisted: ${JSON.stringify(result)}`);
     assert.equal(fs.existsSync(path.join(result.campaignRoot, "history", "applied.jsonl")), false,
       "the late workspace drift prevents a recorded apply");
     assert.ok(result.rejections.some((entry) => entry.stage === "apply"
