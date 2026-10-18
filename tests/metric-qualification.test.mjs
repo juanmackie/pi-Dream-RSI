@@ -15,10 +15,9 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { absoluteGain, normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { buildReconInventory, reconProject } from "../extensions/pi-dream-rsi/engine/recon.ts";
-import { getAgentContainmentSupport } from "../extensions/pi-dream-rsi/engine/containment.ts";
-import { qualifyInstrument, resolveGainThreshold, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
+import { qualifyInstrument, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
 
 /** Deterministic busy work, so the measured span is the project's work. */
 const WORK = `export function work(ms) {
@@ -166,9 +165,9 @@ async function qualifyOnce(projectDir, runContract, overrides = {}) {
 }
 
 test("a threshold of a fixed percentage resolves against the measured baseline", () => {
-  assert.equal(resolveGainThreshold(25, 1000), 25);
-  assert.equal(resolveGainThreshold("20%", 500), 100);
-  assert.equal(resolveGainThreshold("2.5%", 1000), 25);
+  assert.equal(absoluteGain(25, 1000), 25);
+  assert.equal(absoluteGain("20%", 500), 100);
+  assert.equal(absoluteGain("2.5%", 1000), 25);
 });
 
 test("an instrument is qualified without any supplied winning patch", async () => {
@@ -185,16 +184,47 @@ test("an instrument is qualified without any supplied winning patch", async () =
   assert.deepEqual([...plan.rejections], [], "the missing-control refusal is cleared by qualification");
 
   const named = report.checks.map((check) => check.name);
-  for (const required of ["workload", "baseline", "stability", "direction", "sensitivity", "missing-workload", "oracle", "mutation", "budget-fit"]) {
+  for (const required of ["workload", "baseline", "stability", "direction", "sensitivity", "missing-workload", "oracle", "budget-fit"]) {
     assert.ok(named.includes(required), `qualification must report the ${required} check`);
   }
   const sensitivity = report.checks.find((check) => check.name === "sensitivity");
   assert.equal(sensitivity.passed, true, sensitivity.detail);
-  const mutation = report.checks.find((check) => check.name === "mutation");
-  assert.equal(mutation.passed, true, mutation.detail);
-  assert.match(mutation.detail, /killed 2\/2 deterministic/);
+  assert.equal(named.includes("mutation"), false, "qualification does not run mutation testing");
   assert.ok(plan.evaluationContract.baseline.length >= 2, "the contract records its baseline readings");
   assert.ok(plan.evaluationContract.sensitivity > 0, "the contract records the measured response to the degraded control");
+});
+
+test("a deterministic failing suite qualifies when inert code causes additional test failures", async () => {
+  const projectDir = project({
+    "package.json": `${JSON.stringify({ name: "suite-failure-qualify", private: true, type: "module", scripts: { "test:broken": "node broken.mjs", "test:smoke": "node smoke.mjs" } }, null, 2)}\n`,
+    "broken.mjs": `import * as work from "./src/work.mjs";\nimport { spawnSync } from "node:child_process";\nconst result = spawnSync(process.execPath, ["--test", "broken.test.mjs"], { encoding: "utf8" });\nprocess.stdout.write(result.stdout ?? "");\nprocess.stderr.write(result.stderr ?? "");\nprocess.exit(result.status ?? 1);\n`,
+    "broken.test.mjs": `import test from "node:test";\nimport assert from "node:assert/strict";\nimport * as work from "./src/work.mjs";\ntest("existing deterministic failure", () => assert.equal(work.work(), 2));\ntest("editable export exists", () => assert.equal(typeof work.work, "function"));\n`,
+    "smoke.mjs": 'import { work } from "./src/work.mjs";\nif (work() !== 1) process.exit(1);\n',
+    "src/work.mjs": "export const work = () => 1;\n",
+  });
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir, contract: runContract,
+    probeImpl: async (command) => command.label === "npm run test:broken"
+      ? { label: command.label, ok: false, durationMs: 20, timedOut: false, error: "one assertion failed", exitCode: 1, spawnFailed: false }
+      : { label: command.label, ok: true, durationMs: 20, timedOut: false, error: null, exitCode: 0, spawnFailed: false },
+  });
+  const lever = buildReconInventory({ contract: runContract, recon }).levers.find((candidate) => candidate.metricKind === "suite-failures");
+  assert.ok(lever);
+  const plan = await synthesizeMetric({
+    projectDir, loopRoot: path.join(projectDir, ".dream-rsi", "loop"), lever,
+    ...(lever.command ? { command: lever.command } : {}),
+    qualification: {
+      contract: runContract, workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
+      outcome: runContract.outcome.statement, minimumUsefulGain: runContract.outcome.minimumUsefulGain,
+    },
+  });
+  const sensitivity = plan.qualification?.checks.find((check) => check.name === "sensitivity");
+  const baseline = plan.qualification?.checks.find((check) => check.name === "baseline");
+  assert.equal(plan.ready, true, JSON.stringify(plan.rejections));
+  assert.match(baseline?.detail ?? "", /median 3/);
+  assert.equal(sensitivity?.passed, true, sensitivity?.detail);
+  assert.match(sensitivity?.detail ?? "", /failure control moved the score/);
 });
 
 test("measurement refuses an insufficient evaluator allowance before spending", async () => {
@@ -212,19 +242,6 @@ test("measurement refuses an insufficient evaluator allowance before spending", 
   assert.equal(report.checks[0].name, "budget-fit");
   assert.match(report.checks[0].detail, /before spending evaluator runs/);
   assert.match(report.checks[0].detail, /only 10 evaluator run\(s\) remain/);
-});
-
-const agentContainmentSupport = await getAgentContainmentSupport();
-
-test("metric qualification runs its evaluator and correctness gates in contained copies", {
-  skip: agentContainmentSupport.available ? false : agentContainmentSupport.reason,
-}, async () => {
-  const projectDir = nodeProject();
-  const readonlyRoots = [path.dirname(process.execPath), process.env.SystemRoot].filter(Boolean);
-  const { plan, report } = await qualify(projectDir, contract(), { containment: { readonlyRoots } });
-
-  assert.equal(report.passed, true, `contained qualification should pass: ${JSON.stringify(report.rejections)}`);
-  assert.equal(plan.ready, true);
 });
 
 test("an instrument that cannot resolve the useful gain is refused, not accommodated", async () => {
@@ -275,58 +292,6 @@ test("a workload that does not complete on the unchanged target is refused immed
   assert.match(workload.detail, /did not produce a valid reading/);
   assert.equal(plan.ready, false);
   assert.ok(report.checks.length < 8, "qualification stops at the first failing prerequisite instead of running the rest");
-});
-
-test("a provided known-better control patch still takes the supplied-control path", async () => {
-  const projectDir = nodeProject();
-  const runContract = contract();
-  const recon = await reconProject({
-    projectDir, contract: runContract,
-    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 120, timedOut: false, error: null }),
-  });
-  const lever = buildReconInventory({ contract: runContract, recon }).levers[0];
-  const controlPatchPath = path.join(projectDir, "control.patch");
-  fs.writeFileSync(controlPatchPath, "diff --git a/src/work.mjs b/src/work.mjs\n");
-
-  const plan = await synthesizeMetric({
-    projectDir,
-    loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
-    lever,
-    ...(lever.command ? { command: lever.command } : {}),
-    controlPatchPath,
-    qualification: {
-      contract: runContract,
-      workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
-      outcome: runContract.outcome.statement,
-      minimumUsefulGain: runContract.outcome.minimumUsefulGain,
-    },
-  });
-
-  assert.equal(plan.ready, true);
-  assert.equal(plan.controlPatchPath, controlPatchPath);
-  assert.equal(plan.qualification, undefined, "a supplied control is validated by the campaign preflight, not by this path");
-});
-
-test("an empty control patch is still refused even when qualification is available", async () => {
-  const projectDir = nodeProject();
-  const runContract = contract();
-  const recon = await reconProject({
-    projectDir, contract: runContract,
-    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 120, timedOut: false, error: null }),
-  });
-  const lever = buildReconInventory({ contract: runContract, recon }).levers[0];
-  const controlPatchPath = path.join(projectDir, "control.patch");
-  fs.writeFileSync(controlPatchPath, "   \n");
-
-  const plan = await synthesizeMetric({
-    projectDir,
-    loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
-    lever,
-    ...(lever.command ? { command: lever.command } : {}),
-    controlPatchPath,
-  });
-  assert.equal(plan.ready, false);
-  assert.match(plan.rejections.join("; "), /control patch file is empty/);
 });
 
 // ---------------------------------------------------------------------------

@@ -4,13 +4,10 @@ import * as fs from "node:fs";
 import fsMutable from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { promisify } from "node:util";
-import { execFile } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 
 import { collectSignals, discoverSessionProjects } from "../extensions/pi-dream-rsi/engine/signals.ts";
 
-const execFileAsync = promisify(execFile);
 const NOW = new Date("2026-10-15T00:00:00.000Z");
 
 function tempDir() {
@@ -113,8 +110,6 @@ test("session mining reports structural tool, retry, stop, compaction, model and
     calls.push(toolEntry(id, "custom_tool", { payload: secret }, NOW.getTime() + index * 20));
     calls.push(toolResult(id, "custom_tool", secret, NOW.getTime() + index * 20 + 10, { isError: true }));
   }
-  const dream = toolEntry("dream", "dream_rsi_improve", { focus: secret }, NOW.getTime() + 100);
-  calls.push(dream, toolResult("dream", "dream_rsi_improve", secret, NOW.getTime() + 110));
   calls.push({ type: "compaction", summary: secret });
   calls.push({ type: "message", message: { role: "assistant", model: "provider/a", stopReason: "aborted", content: [] } });
   calls.push({ type: "message", message: { role: "assistant", model: "provider/b", stopReason: "length", content: [] } });
@@ -122,7 +117,7 @@ test("session mining reports structural tool, retry, stop, compaction, model and
   try {
     const result = await collectSignals({ projectDir, sessionDir, now: NOW });
     const serialized = JSON.stringify(result);
-    for (const kind of ["session-tool-error", "repeated-tool-retry", "aborted-session", "session-compaction", "session-model-change", "dream-improve"])
+    for (const kind of ["session-tool-error", "repeated-tool-retry", "aborted-session", "session-compaction", "session-model-change"])
       assert.ok(result.weaknesses.some((item) => item.kind === kind), `${kind} signal is present`);
     assert.doesNotMatch(serialized, /PRIVATE-ARGS-should-never-escape/);
     assert.match(serialized, /at least three times/);
@@ -286,101 +281,6 @@ test("post-failure edits begin after the failure result, not a parallel tool cal
   }
 });
 
-test("git signals use the injected 90-day cutoff, classify subjects, and omit raw subjects and unsafe paths", async () => {
-  const projectDir = tempDir();
-  const runGit = async (...args) => execFileAsync("git", args, { cwd: projectDir, windowsHide: true });
-  try {
-    await runGit("init");
-    await runGit("config", "user.email", "fixture@example.invalid");
-    await runGit("config", "user.name", "Fixture");
-    const commit = async (subject, file, daysAgo) => {
-      fs.mkdirSync(path.dirname(path.join(projectDir, file)), { recursive: true });
-      fs.writeFileSync(path.join(projectDir, file), subject);
-      await runGit("add", "--", file);
-      const date = new Date(NOW.getTime() - daysAgo * 86_400_000).toISOString();
-      await execFileAsync("git", ["commit", "-m", subject], {
-        cwd: projectDir,
-        windowsHide: true,
-        env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
-      });
-    };
-    await commit("fix outside window", "src/old.ts", 100);
-    await commit("revert sk-live-private-commit-subject", "src/private-token-sk-live-private.ts", 30);
-    await commit("fix parser timeout", "src/parser.ts", 20);
-
-    const result = await collectSignals({ projectDir, includeLogs: false, focus: "parser timeout", now: NOW });
-    const serialized = JSON.stringify(result);
-    assert.match(serialized, /fix|timeout/);
-    assert.doesNotMatch(serialized, /sk-live-private-commit-subject|src\/private-token-sk-live-private\.ts|fix outside window/);
-    assert.ok(result.weaknesses.length <= 10);
-  } finally {
-    fs.rmSync(projectDir, { recursive: true, force: true });
-  }
-});
-
-test("missing git is reported as unavailable and focus ranks matching evidence", async () => {
-  const projectDir = tempDir();
-  const oldPath = process.env.PATH;
-  fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ scripts: { test: "node test.mjs", "bench:fast": "node bench.mjs", "deploy-secret": "node deploy.mjs" } }));
-  try {
-    process.env.PATH = "";
-    const result = await collectSignals({ projectDir, includeLogs: false, focus: "performance", now: NOW });
-    assert.ok(result.diagnostics.some((item) => /git/i.test(item)));
-    const serialized = JSON.stringify(result);
-    assert.doesNotMatch(serialized, /deploy-secret|node deploy\.mjs/);
-    assert.ok(result.weaknesses.length <= 10);
-  } finally {
-    if (oldPath === undefined) delete process.env.PATH;
-    else process.env.PATH = oldPath;
-    fs.rmSync(projectDir, { recursive: true, force: true });
-  }
-});
-
-test("focus ranks evidence matches without exposing the matching source text", async () => {
-  const projectDir = tempDir();
-  const initGit = (...args) => execFileAsync("git", args, { cwd: projectDir, windowsHide: true });
-  try {
-    await initGit("init");
-    await initGit("config", "user.email", "fixture@example.invalid");
-    await initGit("config", "user.name", "Fixture");
-    fs.mkdirSync(path.join(projectDir, "src"));
-    fs.writeFileSync(path.join(projectDir, "src", "parser.ts"), "parser");
-    await initGit("add", "--", "src/parser.ts");
-    const date = NOW.toISOString();
-    await execFileAsync("git", ["commit", "-m", "fix parser timeout PRIVATE-SUBJECT-TEXT"], {
-      cwd: projectDir,
-      windowsHide: true,
-      env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
-    });
-    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ scripts: { test: "node test.mjs" } }));
-    const result = await collectSignals({ projectDir, includeLogs: false, focus: "timeout parser", now: NOW });
-    assert.equal(result.weaknesses[0]?.kind, "git-hotspot");
-    assert.doesNotMatch(JSON.stringify(result), /PRIVATE-SUBJECT-TEXT/);
-  } finally {
-    fs.rmSync(projectDir, { recursive: true, force: true });
-  }
-});
-
-test("campaign history emits fixed categories instead of stored free text", async () => {
-  const projectDir = tempDir();
-  const campaignDir = path.join(projectDir, ".dream-rsi", "campaigns", "one");
-  fs.mkdirSync(path.join(campaignDir, "history"), { recursive: true });
-  fs.writeFileSync(path.join(campaignDir, "campaign.json"), JSON.stringify({
-    state: { kind: "failed", reason: "PRIVATE-CAMPAIGN-REASON sk-private-campaign-token" },
-  }));
-  fs.writeFileSync(path.join(campaignDir, "history", "rejections.jsonl"), JSON.stringify({
-    stage: "review", reasons: ["PRIVATE-REJECTION-REASON sk-private-rejection-token"],
-  }) + "\n");
-  try {
-    const result = await collectSignals({ projectDir, includeLogs: false, now: NOW });
-    const serialized = JSON.stringify(result);
-    assert.doesNotMatch(serialized, /PRIVATE-CAMPAIGN-REASON|PRIVATE-REJECTION-REASON|sk-private-/);
-    assert.ok(result.weaknesses.length <= 10);
-  } finally {
-    fs.rmSync(projectDir, { recursive: true, force: true });
-  }
-});
-
 test("crowded signal collections retain recurring session failures ahead of readiness hints", async () => {
   const projectDir = tempDir();
   const sessionDir = path.join(projectDir, "sessions");
@@ -389,18 +289,6 @@ test("crowded signal collections retain recurring session failures ahead of read
     toolResult("failure", "bash", "failure", NOW.getTime() + 10, { isError: true }),
   ]);
   fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ scripts: { test: "node test.mjs", bench: "node bench.mjs", perf: "node perf.mjs" } }));
-  const campaigns = path.join(projectDir, ".dream-rsi", "campaigns");
-  const cases = ["timeout", "evaluator", "gate", "review", "agent", "baseline", "other"];
-  for (const [index, reason] of cases.entries()) {
-    const folder = path.join(campaigns, `campaign-${index}`);
-    fs.mkdirSync(folder, { recursive: true });
-    fs.writeFileSync(path.join(folder, "campaign.json"), JSON.stringify({
-      state: { kind: "failed", reason },
-    }));
-  }
-  const rejectDir = path.join(campaigns, "campaign-0", "history");
-  fs.mkdirSync(rejectDir, { recursive: true });
-  fs.writeFileSync(path.join(rejectDir, "rejections.jsonl"), ["metric", "gate", "review", "custom"].map((stage) => JSON.stringify({ stage })).join("\n"));
   try {
     const result = await collectSignals({ projectDir, sessionDir, now: NOW });
     assert.ok(result.weaknesses.some((item) => item.kind === "session-failure" && item.evidence.some((evidence) => evidence.ref === "npm test")));

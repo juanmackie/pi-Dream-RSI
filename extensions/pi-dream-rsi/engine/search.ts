@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { LeverAttempt, LeverProposal, LeverSourceKind } from "./levers.ts";
-import { writeFileAtomic } from "./world.ts";
+import { writeFileAtomic } from "./fsutil.ts";
 
 /**
  * Search strategy state for the unattended loop: durable cross-campaign memory,
@@ -77,8 +77,7 @@ const MEMORY_OUTCOMES: ReadonlySet<string> = new Set(["win", "no-win", "error", 
 const PROVENANCE_KEYS = ["contractId", "evaluatorId", "baselineFingerprint", "mechanism", "strategyClass", "parentCampaign"] as const;
 const STRATEGY_CLASSES = new Set([
   "session-failure", "slow-command", "post-failure-edits", "session-tool-error", "repeated-tool-retry",
-  "aborted-session", "session-compaction", "session-model-change", "dream-improve", "git-hotspot",
-  "git-churn", "evaluator", "campaign-failure", "campaign-rejection", "campaign-health", "recon-command",
+  "aborted-session", "session-compaction", "session-model-change", "evaluator", "recon-command",
 ]);
 
 function validProvenance(value: unknown): boolean {
@@ -287,26 +286,4 @@ export function mementoNotes(memory: LoopMemory, maxChars = 1200): string {
     lines.push(`- ${record.at}: ${record.leverId} ${record.outcome}${record.stopReason ? ` (${record.stopReason})` : ""}`);
   }
   return lines.join("\n").slice(0, Math.max(0, maxChars));
-}
-
-export interface PlateauState {
-  plateaued: boolean;
-  consecutiveNoWin: number;
-  leverId: string | null;
-}
-
-/** Consecutive campaign outcomes without a verified win at the tail of the history. */
-export function plateauState(memory: LoopMemory, k = 3): PlateauState {
-  let count = 0;
-  let leverId: string | null = null;
-  let mixed = false;
-  for (let index = memory.outcomes.length - 1; index >= 0; index -= 1) {
-    const record = memory.outcomes[index];
-    if (record.outcome === "win") break;
-    if (record.outcome === "rejected") continue; // screening outcomes are not search results
-    count += 1;
-    if (leverId === null) leverId = record.leverId;
-    else if (leverId !== record.leverId) mixed = true;
-  }
-  return { plateaued: count >= Math.max(1, Math.round(k)), consecutiveNoWin: count, leverId: mixed ? null : leverId };
 }

@@ -1,19 +1,16 @@
 {
   "name": "pi-dream-rsi",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
-  "description": "Dream-RSI for pi: project self-assessment, bounded verifier-driven code improvement, and recursive exploration-policy optimization.",
+  "description": "Dream-RSI assessment and bounded autonomous improvement loop for pi",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
     "dream-rsi",
-    "discovery-tree",
-    "replay-simulator",
-    "policy-improvement",
+    "autonomous-improvement",
     "coding-agent",
     "self-evaluation",
-    "code-improvement",
     "benchmark-optimization"
   ],
   "license": "MIT",
@@ -51,7 +48,6 @@
     "evaluators",
     "eval/bench.mjs",
     "eval/scenarios.json",
-    "eval/tournament",
     "docs",
     "README.md",
     "LICENSE",
@@ -60,10 +56,7 @@
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit",
-    "bench": "node eval/bench.mjs --seeds 20000",
-    "tournament:prereg": "node eval/tournament/preregistration.mjs",
-    "tournament:results": "node eval/tournament/results.mjs",
-    "tournament:run": "node eval/tournament/runner.mjs",
+    "bench": "node eval/bench.mjs",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "devDependencies": {
@@ -71,8 +64,5 @@
     "@earendil-works/pi-tui": "^0.87.1",
     "@types/node": "^22.10.0",
     "typescript": "^5.9.0"
-  },
-  "optionalDependencies": {
-    "@microsoft/mxc-sdk": "1.0.1"
   }
 }

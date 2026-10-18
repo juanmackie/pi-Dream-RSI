@@ -15,7 +15,7 @@ test("ledger appends sanitized, linked v1 facts and summarizes cross-campaign he
     appendLedgerRecord(file, { kind: "agent_start", campaignId: "c1", stage: "attempt", outcome: "reserved" }, new Date("2026-10-15T23:59:00Z"));
     appendLedgerRecord(file, { kind: "attempt", campaignId: "c1", stage: "attempt", agent: "agent-a", outcome: "timeout", ...fingerprint, editCount: 0, verifierRead: true,
       facts: { mode: "live", direction: "north", private: "sk-live-do-not-store" } }, new Date("2026-10-16T00:00:00Z"));
-    appendLedgerRecord(file, { kind: "agent_result", campaignId: "c1", stage: "attempt", agentRole: "discovery", outcome: "failed",
+    appendLedgerRecord(file, { kind: "agent_result", campaignId: "c1", stage: "attempt", agentRole: "experiment", outcome: "failed",
       usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 4 }, agentDurationMs: 12_000 }, new Date("2026-10-16T00:00:30Z"));
     appendLedgerRecord(file, { kind: "confirm", campaignId: "c1", stage: "confirm", agent: "agent-a", outcome: "success", ...fingerprint, evaluatorRunCount: 2, evaluatorDurationMs: 800 }, new Date("2026-10-16T00:01:00Z"));
     const { entries, diagnostics } = readLedger(file);
@@ -62,66 +62,7 @@ test("ledger detects edits in a chained record and refuses further appends", () 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test("ledger head checkpoint detects valid tail truncation and refuses to append", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-tail-"));
-  const file = path.join(dir, "ledger.jsonl");
-  try {
-    appendLedgerRecord(file, { kind: "attempt", outcome: "first" });
-    appendLedgerRecord(file, { kind: "confirm", outcome: "second" });
-    appendLedgerRecord(file, { kind: "apply", outcome: "third" });
-    const lines = fs.readFileSync(file, "utf8").trim().split(/\r?\n/);
-    fs.writeFileSync(file, `${lines.slice(0, 2).join("\n")}\n`);
-
-    const result = readLedger(file);
-    assert.equal(result.entries.length, 0, "a valid shortened prefix is not accepted as complete history");
-    assert.match(result.diagnostics.join(" "), /head checkpoint/);
-    assert.throws(() => appendLedgerRecord(file, { kind: "apply", outcome: "forged-tail" }), /head checkpoint/);
-
-    fs.rmSync(`${file}.head.json`);
-    assert.equal(readLedger(file).entries.length, 0, "the required marker prevents silently downgrading to an unanchored legacy ledger");
-    assert.match(readLedger(file).diagnostics.join(" "), /checkpoint is missing/);
-    assert.throws(() => appendLedgerRecord(file, { kind: "apply", outcome: "forged-tail" }), /checkpoint is missing/);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("ledger append recovers one complete record written before a checkpoint update", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-recover-head-"));
-  const file = path.join(dir, "ledger.jsonl");
-  const headFile = `${file}.head.json`;
-  try {
-    appendLedgerRecord(file, { kind: "attempt", outcome: "first" });
-    const oldHead = fs.readFileSync(headFile, "utf8");
-    appendLedgerRecord(file, { kind: "confirm", outcome: "second" });
-    fs.writeFileSync(headFile, oldHead, "utf8");
-
-    assert.match(readLedger(file).diagnostics.join(" "), /head checkpoint/);
-    appendLedgerRecord(file, { kind: "apply", outcome: "third" });
-    const recovered = readLedger(file);
-    assert.equal(recovered.entries.length, 3);
-    assert.deepEqual(recovered.entries.map((entry) => entry.outcome), ["first", "second", "third"]);
-    assert.deepEqual(recovered.diagnostics, []);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("first chained record anchors a legacy prefix and detects edits to that prefix", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-legacy-"));
-  const file = path.join(dir, "ledger.jsonl");
-  try {
-    const legacy = `${JSON.stringify({ v: 1, t: "2026-10-15T00:00:00Z", entryId: "legacy", kind: "attempt", outcome: "timeout" })}\n`;
-    fs.writeFileSync(file, legacy);
-    appendLedgerRecord(file, { kind: "confirm", outcome: "success" }, new Date("2026-10-16T00:01:00Z"));
-    const verified = readLedger(file);
-    assert.equal(verified.entries.length, 2);
-    assert.deepEqual(verified.diagnostics, []);
-
-    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace('"outcome":"timeout"', '"outcome":"forged"'));
-    const tampered = readLedger(file);
-    assert.equal(tampered.entries.length, 0, "the invalid chain also invalidates its unanchored legacy prefix");
-    assert.match(tampered.diagnostics.join(" "), /hash chain verification failed/);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("ledger migrates legacy tails and recovers a complete newline-free append", () => {
+test("ledger appends to legacy tails and CRLF records", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-no-newline-"));
   const file = path.join(dir, "history", "ledger.jsonl");
   try {
@@ -130,14 +71,9 @@ test("ledger migrates legacy tails and recovers a complete newline-free append",
     appendLedgerRecord(file, { kind: "confirm", outcome: "success" });
     assert.equal(readLedger(file).entries.length, 2);
 
-    const checkpointBeforeApply = fs.readFileSync(`${file}.head.json`, "utf8");
     appendLedgerRecord(file, { kind: "apply", outcome: "success" });
-    fs.writeFileSync(file, fs.readFileSync(file, "utf8").trimEnd());
-    fs.writeFileSync(`${file}.head.json`, checkpointBeforeApply, "utf8");
-    assert.match(readLedger(file).diagnostics.join(" "), /head checkpoint/);
-    appendLedgerRecord(file, { kind: "attempt", outcome: "recovered" });
     const result = readLedger(file);
-    assert.equal(result.entries.length, 4);
+    assert.equal(result.entries.length, 3);
     assert.deepEqual(result.diagnostics, []);
 
     const crlfFile = path.join(dir, "crlf", "ledger.jsonl");
@@ -165,25 +101,6 @@ test("ledger hashing includes prototype-named fields and rejects non-finite JSON
     const nonFinite = readLedger(file);
     assert.equal(nonFinite.entries.length, 0);
     assert.match(nonFinite.diagnostics.join(" "), /unsupported data/);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("concurrent processes serialize ledger appends without forking the hash chain", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-concurrent-"));
-  const file = path.join(dir, "history", "ledger.jsonl");
-  const importUrl = new URL("../extensions/pi-dream-rsi/engine/ledger.ts", import.meta.url).href;
-  const source = `const { appendLedgerRecord } = await import(${JSON.stringify(importUrl)}); appendLedgerRecord(process.argv[1], { kind: "attempt", title: process.argv[2] });`;
-  try {
-    await Promise.all(Array.from({ length: 8 }, (_, index) => new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ["--input-type=module", "-e", source, file, `writer-${index}`], { cwd: process.cwd() });
-      let stderr = "";
-      child.stderr.setEncoding("utf8").on("data", (chunk) => { stderr += chunk; });
-      child.once("error", reject);
-      child.once("close", (code) => code === 0 ? resolve(undefined) : reject(new Error(stderr || `writer exited ${code}`)));
-    })));
-    const result = readLedger(file);
-    assert.equal(result.entries.length, 8);
-    assert.deepEqual(result.diagnostics, []);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -219,41 +136,5 @@ test("ledger accepts a complete ledger at capacity and refuses further appends",
     const overflow = readLedger(file);
     assert.equal(overflow.entries.length, 0);
     assert.match(overflow.diagnostics.join(" "), /entry limit reached/);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("ledger provenance is typed and experiment parents must precede their child", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-ledger-dag-"));
-  const file = path.join(dir, "ledger.jsonl");
-  try {
-    const attempt = appendLedgerRecord(file, { kind: "attempt", campaignId: "campaign-a", facts: { iteration: 1, cell: "b0a0" } });
-    const confirm = appendLedgerRecord(file, {
-      kind: "confirm",
-      campaignId: "campaign-a",
-      facts: { iteration: 1, cell: "b0a0" },
-      parentEntryIds: [attempt.entryId],
-      provenance: {
-        contractId: "a".repeat(64),
-        instrumentId: "b".repeat(64),
-        baselineFingerprint: "c".repeat(64),
-        mechanism: "paired-hill-climb",
-        parentCampaignId: "campaign-previous",
-      },
-    });
-    const result = readLedger(file);
-    assert.equal(result.entries.length, 2);
-    assert.deepEqual(result.diagnostics, []);
-    assert.deepEqual(result.entries[1].parentEntryIds, [attempt.entryId]);
-    assert.equal(result.entries[1].provenance?.instrumentId, "b".repeat(64));
-    assert.throws(() => appendLedgerRecord(file, { kind: "review", parentEntryIds: ["deadbeef"] }), /missing or forward parent/);
-
-    const lines = fs.readFileSync(file, "utf8").trim().split(/\r?\n/);
-    const child = JSON.parse(lines[1]);
-    child.parentEntryIds = [];
-    lines[1] = JSON.stringify(child);
-    fs.writeFileSync(file, `${lines.join("\n")}\n`);
-    const altered = readLedger(file);
-    assert.equal(altered.entries.length, 0);
-    assert.match(altered.diagnostics.join(" "), /hash chain verification failed/);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

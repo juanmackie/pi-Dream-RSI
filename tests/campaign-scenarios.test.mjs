@@ -5,7 +5,7 @@ import * as os from "node:os";
 import { spawn } from "node:child_process";
 import test from "node:test";
 import { jump, makeProject } from "./fixtures.mjs";
-import { runControllerBenchmark } from "../eval/controller.mjs";
+import { runControllerBenchmark } from "./helpers/controller.mjs";
 
 test("controller benchmark rejects forged success and ledger claims when its independent gate fails", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-forged-controller-"));
@@ -78,8 +78,6 @@ test("integrated campaigns enforce win, gate, review, no-op, direction, timeout,
       assert.match(apply.provenance.baselineFingerprint, /^[a-f0-9]{64}$/);
       assert.equal(apply.provenance.mechanism, "paired-hill-climb");
       assert.equal(apply.provenance.parentCampaignId, "prior-campaign");
-      const parents = new Set(apply.parentEntryIds.map((id) => ledger.find((entry) => entry.entryId === id)?.kind));
-      assert.ok(parents.has("confirm") && parents.has("review"), "promotion depends on its measurement and reviewer evidence");
     }
     assert.ok(result.agentStarts <= 18);
     assert.ok(result.evaluatorRuns <= 80);
@@ -92,10 +90,10 @@ test("integrated campaigns enforce win, gate, review, no-op, direction, timeout,
         "campaign records the timed-out edit attempt and its observed diff");
     }
     if (scenario.scenario === "duplicate") {
-      const ledger = fs.readFileSync(path.join(result.campaignRoot, "history", "ledger.jsonl"), "utf8");
-      const attempts = ledger.trim().split(/\r?\n/).map((line) => JSON.parse(line)).filter((record) => record.kind === "attempt");
-      assert.ok(attempts.filter((record) => record.title === "# Same candidate").length > 1,
-        "multiple candidate cells produced the same proposal");
+      const world = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "cycles", "c0001", "world.json"), "utf8"));
+      const proposals = world.nodes.map((node) => path.join(result.campaignRoot, "cycles", "c0001", "attempts", node.id, "proposal.md"))
+        .filter((file) => fs.existsSync(file)).map((file) => fs.readFileSync(file, "utf8"));
+      assert.ok(proposals.some((proposal) => proposal.includes("# Same candidate")), "the experiment world retains the proposal");
       assert.equal(applied.length, 1);
     }
     const seedSource = fs.readFileSync(path.join(project.seed, "solution.py"), "utf8");

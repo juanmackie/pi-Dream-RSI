@@ -234,7 +234,7 @@ test("a planted causal bottleneck is measured and becomes the scoped lever", asy
     contract: runContract,
     probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: command.category === "benchmark" ? 1200 : 40, timedOut: false, error: null }),
   });
-  assert.equal(recon.probes.length, 1, "the benchmark is the measured workload; the test command is a gate");
+  assert.equal(recon.probes.length, 2, "recon probes one measured workload and the test gate");
   assert.equal(recon.commands.filter((command) => command.category === "test").length, 1);
 
   const inventory = buildReconInventory({ contract: runContract, recon });
@@ -249,6 +249,23 @@ test("a planted causal bottleneck is measured and becomes the scoped lever", asy
   assert.deepEqual(lever.command.argv, ["node", "bench.mjs"]);
   assert.deepEqual(lever.command.source, "package.json#scripts.bench", "the lever still cites the manifest declaration");
   assert.ok(lever.reasons.some((reason) => /measured: .*1200 ms/.test(reason)), "the lever cites its own measurement");
+});
+
+test("matching usage signals rank the measured lever and remain visible as evidence", async () => {
+  const dir = project(NODE_PROJECT);
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: command.category === "benchmark" ? 1200 : 40, timedOut: false, error: null }),
+  });
+  const baseline = buildReconInventory({ contract: runContract, recon }).levers[0];
+  const ranked = buildReconInventory({ contract: runContract, recon, signals: [{
+    kind: "slow-command", summary: "Repeated benchmark failures", suggestedMetric: "duration",
+    evidence: [{ source: "session", ref: "npm run bench", count: 5 }],
+  }] }).levers[0];
+  assert.equal(ranked.score, baseline.score * 2);
+  assert.ok(ranked.evidence.some((item) => item.source === "session" && item.ref === "slow-command:npm run bench" && item.count === 5));
+  assert.ok(ranked.reasons.some((reason) => /ranking multiplier 2\.00/.test(reason)));
 });
 
 test("a workload whose measured code is all outside the approved scope is rejected with the reason", async () => {
@@ -277,6 +294,63 @@ test("a failing or absent workload is reported as a blocker, never guessed aroun
   const inventory = buildReconInventory({ contract: runContract, recon: failing });
   assert.equal(inventory.levers.length, 0);
   assert.ok(inventory.rejected.some((entry) => /could not be measured/.test(entry.reason)));
+});
+
+test("a test that fails on the unchanged tree becomes a scoped suite-failures lever", async () => {
+  const dir = project({
+    ...NODE_PROJECT,
+    "package.json": `${JSON.stringify({ name: "failing-suite", private: true, type: "module", scripts: { test: "node test.mjs", bench: "node bench.mjs" } }, null, 2)}\n`,
+  });
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract,
+    probeImpl: async (command) => command.category === "test"
+      ? { label: command.label, ok: false, durationMs: 20, timedOut: false, error: "assertion failed", exitCode: 1, spawnFailed: false }
+      : { label: command.label, ok: true, durationMs: 1200, timedOut: false, error: null, exitCode: 0, spawnFailed: false },
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  const lever = inventory.levers.find((candidate) => candidate.metricKind === "suite-failures");
+  assert.ok(lever, "an ordinary nonzero test exit is actionable evidence");
+  assert.deepEqual(lever.scopeFiles, ["src/hot.mjs", "src/lib/util.mjs"]);
+  assert.deepEqual(lever.command.argv, ["node", "test.mjs"]);
+  assert.deepEqual(lever.gates, []);
+  assert.equal(inventory.levers.some((candidate) => candidate.metricKind === "command-duration"), true);
+});
+
+test("failing tests do not become correctness gates when a separate passing test exists", async () => {
+  const dir = project({
+    "package.json": `${JSON.stringify({ name: "test-gates", private: true, type: "module", scripts: { "test:broken": "node broken.mjs", "test:smoke": "node smoke.mjs" } }, null, 2)}\n`,
+    "broken.mjs": 'import { work } from "./src/work.mjs";\nwork();\n',
+    "smoke.mjs": 'import { work } from "./src/work.mjs";\nwork();\n',
+    "src/work.mjs": "export const work = () => 1;\n",
+  });
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract,
+    probeImpl: async (command) => command.label === "npm run test:broken"
+      ? { label: command.label, ok: false, durationMs: 20, timedOut: false, error: "assertion failed", exitCode: 1, spawnFailed: false }
+      : { label: command.label, ok: true, durationMs: 20, timedOut: false, error: null, exitCode: 0, spawnFailed: false },
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  const lever = inventory.levers.find((candidate) => candidate.metricKind === "suite-failures");
+  assert.ok(lever);
+  assert.deepEqual(lever.gates, ["npm run test:smoke"]);
+});
+
+test("test timeouts and launch failures do not become failure-count levers", async () => {
+  const dir = project(NODE_PROJECT);
+  const runContract = contract();
+  for (const failedProbe of [
+    { label: "npm run test", ok: false, durationMs: null, timedOut: true, error: "timeout", exitCode: null, spawnFailed: false },
+    { label: "npm run test", ok: false, durationMs: null, timedOut: false, error: "ENOENT", exitCode: null, spawnFailed: true },
+  ]) {
+    const recon = await reconProject({
+      projectDir: dir, contract: runContract,
+      probeImpl: async (command) => command.category === "test" ? failedProbe :
+        { label: command.label, ok: true, durationMs: 1200, timedOut: false, error: null, exitCode: 0, spawnFailed: false },
+    });
+    assert.equal(buildReconInventory({ contract: runContract, recon }).levers.some((candidate) => candidate.metricKind === "suite-failures"), false);
+  }
 });
 
 test("a project with no declared workload produces a named refusal, not an empty inventory", async () => {

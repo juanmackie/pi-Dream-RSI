@@ -2,7 +2,13 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
-import { readJson, type PhaseOwner } from "./world.ts";
+import { readJson } from "./fsutil.ts";
+
+export interface PhaseOwner {
+  session_id: string;
+  pid: number;
+  claimed_at: string;
+}
 export function pidIsAlive(pid: number): boolean {
   try { if (!Number.isInteger(pid) || pid <= 0) return false; process.kill(pid, 0); return true; }
   catch (e) { return (e as NodeJS.ErrnoException).code === "EPERM"; }

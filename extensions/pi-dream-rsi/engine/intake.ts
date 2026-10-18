@@ -35,6 +35,19 @@ const FINGERPRINT_LARGE_FILE = 4 * 1024 * 1024;
 
 export type MinimumGain = number | `${number}%`;
 
+/** Resolve an approved absolute or percentage gain against one measured baseline. */
+export function absoluteGain(minimumGain: number | string, baseline: number): number {
+  if (typeof minimumGain === "number") {
+    if (!Number.isFinite(minimumGain) || minimumGain < 0) throw new Error("minimum gain must be a finite non-negative number");
+    return minimumGain;
+  }
+  const match = /^(\d+(?:\.\d+)?)%$/.exec(minimumGain);
+  if (!match) throw new Error("minimum gain must be a number or percentage such as 5%");
+  const percent = Number(match[1]);
+  if (!Number.isFinite(percent) || percent < 0 || percent >= 100) throw new Error("minimum gain percentage must be in [0%, 100%)");
+  return Math.abs(baseline) * percent / 100;
+}
+
 /** How a declared score evaluator reports its number. */
 export const SCORE_EVALUATOR_OUTPUTS = ["score-json", "stdout-number"] as const;
 export type ScoreEvaluatorOutput = (typeof SCORE_EVALUATOR_OUTPUTS)[number];
@@ -90,15 +103,11 @@ export interface RunContract {
     protectedAssets: string[];
   };
   execution: {
-    mode: "trusted-local";
     /** Explicit acceptance that discovered repository code runs on this host. */
     consent: boolean;
     /** Environment variables passed to probes and instruments; everything else is withheld. */
     envAllowlist: string[];
     allowedCommandCategories: CommandCategory[];
-  };
-  models: {
-    providers: string[];
   };
   budgets: {
     maxCampaigns: number;
@@ -107,8 +116,6 @@ export interface RunContract {
     deadlineMs: number;
     /** Loop-level rare-event allowance for promotions, allocated across the whole run. */
     falseAcceptBudget: number;
-    /** Reserved sub-allowance for bounded optimizer (self-improvement) trials. */
-    optimizerTrials?: number;
   };
   /** Candidate agent; null resolves the active session model at call time. */
   agent?: AgentConfig | null;
@@ -219,7 +226,6 @@ export function validateRunContract(raw: unknown): string[] {
   const execution = raw.execution;
   if (!isRecord(execution)) errors.push("execution must be an object");
   else {
-    if (execution.mode !== "trusted-local") errors.push('execution.mode must be "trusted-local"');
     if (typeof execution.consent !== "boolean") errors.push("execution.consent must be explicitly true or false");
     if (stringList(execution.envAllowlist) === null) errors.push("execution.envAllowlist must be an array of non-empty variable names");
     const categories = stringList(execution.allowedCommandCategories);
@@ -229,10 +235,6 @@ export function validateRunContract(raw: unknown): string[] {
       if (unknown.length > 0) errors.push(`execution.allowedCommandCategories has unknown categories: ${unknown.join(", ")}`);
     }
   }
-
-  const models = raw.models;
-  if (!isRecord(models)) errors.push("models must be an object");
-  else if (stringList(models.providers) === null || (models.providers as string[]).length === 0) errors.push("models.providers must be a non-empty array of provider names");
 
   const budgets = raw.budgets;
   if (!isRecord(budgets)) errors.push("budgets must be an object");
@@ -244,9 +246,6 @@ export function validateRunContract(raw: unknown): string[] {
     if (typeof budgets.falseAcceptBudget !== "number" || !Number.isFinite(budgets.falseAcceptBudget)
       || budgets.falseAcceptBudget <= 0 || budgets.falseAcceptBudget >= 0.5) {
       errors.push("budgets.falseAcceptBudget must be a finite number greater than 0 and below 0.5");
-    }
-    if (budgets.optimizerTrials !== undefined && !positiveInteger(budgets.optimizerTrials)) {
-      errors.push("budgets.optimizerTrials must be a positive integer when present");
     }
   }
 
@@ -287,19 +286,16 @@ export function normalizeRunContract(raw: unknown): RunContract {
     preserved: { gates: [...value.preserved.gates] },
     scope: { roots: [...value.scope.roots], protectedAssets: [...value.scope.protectedAssets] },
     execution: {
-      mode: "trusted-local",
       consent: value.execution.consent,
       envAllowlist: [...value.execution.envAllowlist],
       allowedCommandCategories: [...value.execution.allowedCommandCategories],
     },
-    models: { providers: [...value.models.providers] },
     budgets: {
       maxCampaigns: value.budgets.maxCampaigns,
       maxAgentStarts: value.budgets.maxAgentStarts,
       maxEvaluatorRuns: value.budgets.maxEvaluatorRuns,
       deadlineMs: value.budgets.deadlineMs,
       falseAcceptBudget: value.budgets.falseAcceptBudget,
-      ...(value.budgets.optimizerTrials === undefined ? {} : { optimizerTrials: value.budgets.optimizerTrials }),
     },
     ...(value.agent ? { agent: { ...value.agent, args: [...value.agent.args] } } : {}),
   };
@@ -355,9 +351,6 @@ export function approveRunContract(projectDir: string, contract: RunContract): A
   if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
     throw new ContractNotApprovedError(`project directory does not exist: ${projectDir}`);
   }
-  if (contract.execution.mode !== "trusted-local") {
-    throw new ContractNotApprovedError(`unsupported execution mode: ${contract.execution.mode}`);
-  }
   if (!contract.execution.consent) {
     throw new ContractNotApprovedError(
       "trusted-local execution was not approved for this repository; discovered commands run on this host with host access, so the operator must approve that risk once before any probe runs",
@@ -399,14 +392,6 @@ const RUNTIME_ENV_BASELINE = process.platform === "win32"
   ? ["PATH", "PATHEXT", "SystemRoot", "SystemDrive", "windir", "ComSpec", "TEMP", "TMP", "NUMBER_OF_PROCESSORS", "OS", "PROCESSOR_ARCHITECTURE"]
   : ["PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "TZ"];
 
-/** True when `relative` stays inside one of the contract's editable roots. */
-export function withinApprovedScope(contract: RunContract, relative: string): boolean {
-  const candidate = relative.replace(/\\/g, "/");
-  const roots = contract.scope.roots.map((root) => root.replace(/\\/g, "/")).filter((root) => root !== "" && root !== ".");
-  if (roots.length === 0) return true;
-  return roots.some((root) => candidate === root || candidate.startsWith(`${root}/`));
-}
-
 /** True when `relative` names a protected asset or lives inside one. */
 export function isProtectedAsset(contract: RunContract, relative: string): boolean {
   const candidate = relative.replace(/\\/g, "/");
@@ -428,7 +413,6 @@ export function contractIdentity(contract: RunContract): string {
     gates: contract.preserved.gates,
     scope: contract.scope,
     categories: contract.execution.allowedCommandCategories,
-    providers: contract.models.providers,
     budgets: {
       maxCampaigns: contract.budgets.maxCampaigns,
       maxAgentStarts: contract.budgets.maxAgentStarts,

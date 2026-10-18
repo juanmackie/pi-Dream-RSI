@@ -1,10 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { writeFileAtomic } from "./world.ts";
 
 export type LedgerKind = "agent_start" | "agent_result" | "attempt" | "confirm" | "gate" | "review" | "apply" | "skip" | "integrity" | "dream" | "check";
-export type LedgerAgentRole = "probe" | "discovery" | "review" | "development";
+export type LedgerAgentRole = "experiment" | "review";
 export interface LedgerEntry {
   v: 1;
   t: string;
@@ -32,8 +31,6 @@ export interface LedgerEntry {
   previousHash?: string;
   /** SHA-256 of this record's canonical JSON plus `previousHash`. */
   recordHash?: string;
-  /** Earlier events this experiment depends on; every id must already exist in this ledger. */
-  parentEntryIds?: string[];
   /** Immutable identities needed to compare this event with other experiments. */
   provenance?: LedgerProvenance;
 }
@@ -52,8 +49,6 @@ const SAFE_KEY = /^[a-z][a-zA-Z0-9_]{0,39}$/;
 const HASH = /^[a-f0-9]{64}$/;
 const MAX_FILE_BYTES = 8 * 1024 * 1024;
 const MAX_ENTRIES = 2000;
-const LOCK_WAIT_MS = 30_000;
-const MAX_PARENT_ENTRY_IDS = 128;
 
 function safeText(value: unknown, max = 120): string | undefined {
   if (typeof value !== "string") return undefined;
@@ -78,7 +73,7 @@ function sanitize(value: unknown): LedgerRecord {
   if (stage && STAGES.has(stage)) result.stage = stage;
   const agent = safeText(record.agent, 40);
   if (agent) result.agent = agent;
-  if (record.agentRole === "probe" || record.agentRole === "discovery" || record.agentRole === "review" || record.agentRole === "development") result.agentRole = record.agentRole;
+  if (record.agentRole === "experiment" || record.agentRole === "review") result.agentRole = record.agentRole;
   const outcome = safeText(record.outcome, 40);
   if (outcome) result.outcome = outcome;
   if (typeof record.patchHash === "string" && HASH.test(record.patchHash)) result.patchHash = record.patchHash;
@@ -116,14 +111,6 @@ function sanitize(value: unknown): LedgerRecord {
       } else if (value === null || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value))) facts[key] = value;
     }
     if (Object.keys(facts).length) result.facts = facts;
-  }
-  if (record.parentEntryIds !== undefined) {
-    if (!Array.isArray(record.parentEntryIds) || record.parentEntryIds.length > MAX_PARENT_ENTRY_IDS
-      || record.parentEntryIds.some((id) => typeof id !== "string" || !/^[a-f0-9-]{1,64}$/i.test(id))) {
-      throw new Error("invalid ledger parent entry ids");
-    }
-    result.parentEntryIds = [...new Set(record.parentEntryIds as string[])];
-    if (result.parentEntryIds.length !== record.parentEntryIds.length) throw new Error("duplicate ledger parent entry id");
   }
   if (record.provenance !== undefined) {
     if (!isRecord(record.provenance)) throw new Error("invalid ledger provenance");
@@ -165,77 +152,21 @@ function chainPayload(entry: Omit<LedgerEntry, "previousHash" | "recordHash">): 
 
 export function appendLedgerRecord(file: string, record: LedgerRecord, now = new Date()): LedgerEntry {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const lock = acquireLedgerLock(file);
-  try {
-    const prior = readLedgerContent(file);
-    if (prior.diagnostics.length > 0) throw new Error(`cannot append to an invalid experiment ledger: ${prior.diagnostics.join("; ")}`);
-    if (prior.fileHash === null) throw new Error("cannot append to an unreadable experiment ledger");
-    const anchor = readLedgerAnchor(file);
-    if (anchor.error) throw new Error(`cannot append to an invalid experiment ledger head: ${anchor.error}`);
-    if (!anchor.value && hasLedgerAnchorRequirement(file)) throw new Error("cannot append to an experiment ledger whose head checkpoint is missing");
-    if (!anchor.value) {
-      writeLedgerAnchor(file, prior);
-      requireLedgerAnchor(file);
-    }
-    if (anchor.value && !ledgerMatchesAnchor(prior, anchor.value)) {
-      if (!isSingleAppendAhead(file, prior, anchor.value)) throw new Error("cannot append to an experiment ledger whose head checkpoint does not match its contents");
-      writeLedgerAnchor(file, prior);
-    }
-    if (prior.entries.length >= MAX_ENTRIES) throw new Error("cannot append to an experiment ledger at its entry limit");
-    const priorIds = new Set(prior.entries.map((entry) => entry.entryId));
-    const cleanRecord = sanitize(record);
-    if (cleanRecord.parentEntryIds?.some((id) => !priorIds.has(id))) throw new Error("cannot append an experiment with missing or forward parent entries");
-    const last = prior.entries.at(-1);
-    const previousHash = last?.recordHash ?? prior.appendPreviousHash;
-    const base = { v: 1 as const, t: now.toISOString(), entryId: randomUUID(), ...cleanRecord };
-    const recordHash = sha256(`${previousHash}\n${chainPayload(base)}`);
-    const entry: LedgerEntry = { ...base, previousHash, recordHash };
-    fs.appendFileSync(file, `${prior.needsSeparator ? "\n" : ""}${JSON.stringify(entry)}\n`, { encoding: "utf8", flag: "a" });
-    writeLedgerAnchor(file, readLedgerContent(file));
-    requireLedgerAnchor(file);
-    return entry;
-  } finally {
-    releaseLedgerLock(lock);
-  }
-}
-
-interface LedgerLock { file: string; fd: number; token: string; }
-
-function acquireLedgerLock(file: string): LedgerLock {
-  const lockFile = `${file}.lock`;
-  const token = `${process.pid}:${randomUUID()}`;
-  const deadline = Date.now() + LOCK_WAIT_MS;
-  while (true) {
-    try {
-      const fd = fs.openSync(lockFile, "wx", 0o600);
-      try { fs.writeFileSync(fd, token, "utf8"); }
-      catch (error) { fs.closeSync(fd); fs.unlinkSync(lockFile); throw error; }
-      return { file: lockFile, fd, token };
-    } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
-      if (Date.now() >= deadline) {
-        throw new Error(`timed out waiting for experiment ledger lock ${lockFile}; if its owner process is gone, remove the stale lock before resuming`);
-      }
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
-}
-
-function releaseLedgerLock(lock: LedgerLock): void {
-  fs.closeSync(lock.fd);
-  try {
-    if (fs.readFileSync(lock.file, "utf8") === lock.token) fs.unlinkSync(lock.file);
-  } catch (error) {
-    if (!isMissingFile(error)) throw error;
-  }
+  const prior = readLedgerContent(file);
+  if (prior.diagnostics.length > 0) throw new Error(`cannot append to an invalid experiment ledger: ${prior.diagnostics.join("; ")}`);
+  if (prior.fileHash === null) throw new Error("cannot append to an unreadable experiment ledger");
+  if (prior.entries.length >= MAX_ENTRIES) throw new Error("cannot append to an experiment ledger at its entry limit");
+  const last = prior.entries.at(-1);
+  const previousHash = last?.recordHash ?? prior.appendPreviousHash;
+  const base = { v: 1 as const, t: now.toISOString(), entryId: randomUUID(), ...sanitize(record) };
+  const recordHash = sha256(`${previousHash}\n${chainPayload(base)}`);
+  const entry: LedgerEntry = { ...base, previousHash, recordHash };
+  fs.appendFileSync(file, `${prior.needsSeparator ? "\n" : ""}${JSON.stringify(entry)}\n`, { encoding: "utf8", flag: "a" });
+  return entry;
 }
 
 function isMissingFile(error: unknown): boolean {
   return error instanceof Error && "code" in error && error.code === "ENOENT";
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  return error instanceof Error && "code" in error && error.code === "EEXIST";
 }
 
 export interface LedgerReadResult {
@@ -246,111 +177,8 @@ export interface LedgerReadResult {
   appendPreviousHash: string;
   needsSeparator: boolean;
 }
-interface LedgerAnchor {
-  v: 1;
-  byteLength: number;
-  fileHash: string;
-  entryCount: number;
-  lastEntryId: string | null;
-  recordHash: string | null;
-}
-interface LedgerAnchorRead { value: LedgerAnchor | null; error: string | null; }
-
-function ledgerAnchorFile(file: string): string { return `${file}.head.json`; }
-function ledgerAnchorRequiredFile(file: string): string { return `${file}.head.required`; }
-
-function hasLedgerAnchorRequirement(file: string): boolean {
-  try {
-    fs.lstatSync(ledgerAnchorRequiredFile(file));
-    return true;
-  } catch (error) {
-    if (isMissingFile(error)) return false;
-    return true;
-  }
-}
-
-function requireLedgerAnchor(file: string): void {
-  const requiredFile = ledgerAnchorRequiredFile(file);
-  try {
-    const fd = fs.openSync(requiredFile, "wx", 0o600);
-    try { fs.writeFileSync(fd, "v1\n", "utf8"); fs.fsyncSync(fd); }
-    finally { fs.closeSync(fd); }
-  } catch (error) {
-    if (!isAlreadyExists(error)) throw error;
-  }
-}
-
-function readLedgerAnchor(file: string): LedgerAnchorRead {
-  let raw: string;
-  try { raw = fs.readFileSync(ledgerAnchorFile(file), "utf8"); }
-  catch (error) {
-    if (isMissingFile(error)) return { value: null, error: null };
-    return { value: null, error: "checkpoint could not be read" };
-  }
-  try {
-    const value: unknown = JSON.parse(raw);
-    if (!isRecord(value) || value.v !== 1
-      || typeof value.byteLength !== "number" || !Number.isSafeInteger(value.byteLength) || value.byteLength < 0
-      || typeof value.fileHash !== "string" || !HASH.test(value.fileHash)
-      || typeof value.entryCount !== "number" || !Number.isSafeInteger(value.entryCount) || value.entryCount < 0
-      || !(value.lastEntryId === null || typeof value.lastEntryId === "string")
-      || !(value.recordHash === null || (typeof value.recordHash === "string" && HASH.test(value.recordHash)))) {
-      return { value: null, error: "checkpoint has an invalid shape" };
-    }
-    return { value: value as unknown as LedgerAnchor, error: null };
-  } catch { return { value: null, error: "checkpoint is malformed" }; }
-}
-
-function ledgerMatchesAnchor(result: LedgerReadResult, anchor: LedgerAnchor): boolean {
-  const last = result.entries.at(-1);
-  return result.fileHash === anchor.fileHash
-    && result.byteLength === anchor.byteLength
-    && result.entries.length === anchor.entryCount
-    && (last?.entryId ?? null) === anchor.lastEntryId
-    && (last?.recordHash ?? null) === anchor.recordHash;
-}
-
-function isSingleAppendAhead(file: string, result: LedgerReadResult, anchor: LedgerAnchor): boolean {
-  if (result.entries.length !== anchor.entryCount + 1) return false;
-  let bytes: Buffer;
-  try { bytes = fs.readFileSync(file); } catch { return false; }
-  if (bytes.length < anchor.byteLength) return false;
-  const prefix = bytes.subarray(0, anchor.byteLength);
-  if (sha256(prefix) !== anchor.fileHash) return false;
-  const appended = result.entries[anchor.entryCount];
-  const expectedPreviousHash = anchor.recordHash
-    ?? sha256(prefix.length > 0 && prefix[prefix.length - 1] !== 0x0a ? Buffer.concat([prefix, Buffer.from("\n")]) : prefix);
-  return appended?.previousHash === expectedPreviousHash
-    && appended.recordHash !== undefined
-    && result.byteLength > anchor.byteLength;
-}
-
-function writeLedgerAnchor(file: string, result: LedgerReadResult): void {
-  if (result.fileHash === null || result.diagnostics.length > 0) throw new Error("cannot checkpoint an invalid experiment ledger");
-  const last = result.entries.at(-1);
-  const anchor: LedgerAnchor = {
-    v: 1,
-    byteLength: result.byteLength,
-    fileHash: result.fileHash,
-    entryCount: result.entries.length,
-    lastEntryId: last?.entryId ?? null,
-    recordHash: last?.recordHash ?? null,
-  };
-  writeFileAtomic(ledgerAnchorFile(file), `${JSON.stringify(anchor)}\n`, true);
-}
-
 export function readLedger(file: string): LedgerReadResult {
-  const result = readLedgerContent(file);
-  if (result.diagnostics.length > 0) return result;
-  const anchor = readLedgerAnchor(file);
-  if (anchor.error) return { ...result, entries: [], diagnostics: [anchor.error] };
-  if (!anchor.value && hasLedgerAnchorRequirement(file)) {
-    return { ...result, entries: [], diagnostics: ["ledger append-only head checkpoint is missing"] };
-  }
-  if (anchor.value && !ledgerMatchesAnchor(result, anchor.value)) {
-    return { ...result, entries: [], diagnostics: ["ledger contents do not match the append-only head checkpoint"] };
-  }
-  return result;
+  return readLedgerContent(file);
 }
 
 function readLedgerContent(file: string): LedgerReadResult {
@@ -383,7 +211,6 @@ function readLedgerContent(file: string): LedgerReadResult {
       if (item.v !== 1 || typeof item.t !== "string" || typeof item.entryId !== "string" || !isLedgerKind(item.kind)) throw new Error();
       if (priorEntryIds.has(item.entryId)) throw new Error();
       const clean = sanitize(item);
-      if (clean.parentEntryIds?.some((id) => !priorEntryIds.has(id))) throw new Error();
       const hasPrevious = Object.hasOwn(item, "previousHash");
       const hasRecordHash = Object.hasOwn(item, "recordHash");
       if (hasPrevious !== hasRecordHash) throw new Error();

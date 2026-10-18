@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth, matchesKey, Key } from "@earendil-works/pi-tui";
 import { progressIterations, progressSummary, readProgress, type ProgressSnapshot } from "./engine/progress.ts";
-import { attemptDir, roundDir } from "./engine/world.ts";
 
 const clean = (s: string): string => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f]/g, " ");
 type RowKind = "title" | "section" | "row" | "selected" | "ok" | "warn" | "error" | "muted";
@@ -14,6 +13,8 @@ interface CampaignDisplayMetadata {
   phase?: string;
   iteration?: number;
   completedCycles: number[];
+  searchConfig?: { batchSize: number; exploreShare: number; refineTop: number; maxRounds: number; patience: number };
+  adoptedAt?: string;
 }
 
 function rowKind(text: string): RowKind {
@@ -31,19 +32,34 @@ function campaignDisplayMetadata(root: string, fallbackCycle: number, cycleCount
   let phase: string | undefined;
   let iteration: number | undefined;
   let completedCycles: number[] = [];
+  let searchConfig: CampaignDisplayMetadata["searchConfig"];
+  let adoptedAt: string | undefined;
   try {
     const value: unknown = JSON.parse(fs.readFileSync(path.join(root, "campaign.json"), "utf8"));
     if (typeof value === "object" && value !== null) {
-      const record = value as { id?: unknown; limits?: { maxCycles?: unknown }; state?: { kind?: unknown; phase?: unknown; iteration?: unknown }; completedCycles?: unknown };
+      const record = value as { id?: unknown; limits?: { maxCycles?: unknown }; state?: { kind?: unknown; phase?: unknown; iteration?: unknown }; completedCycles?: unknown; searchConfig?: CampaignDisplayMetadata["searchConfig"] };
       if (typeof record.id === "string" && record.id.length > 0) id = record.id;
       if (typeof record.limits?.maxCycles === "number" && Number.isFinite(record.limits.maxCycles) && record.limits.maxCycles > 0) maxCycles = Math.floor(record.limits.maxCycles);
       if (typeof record.state?.phase === "string") phase = record.state.phase;
       else if (typeof record.state?.kind === "string") phase = record.state.kind;
       if (typeof record.state?.iteration === "number" && Number.isFinite(record.state.iteration)) iteration = record.state.iteration;
       if (Array.isArray(record.completedCycles)) completedCycles = record.completedCycles.filter((cycle): cycle is number => typeof cycle === "number" && Number.isFinite(cycle));
+      if (record.searchConfig && Number.isFinite(record.searchConfig.batchSize) && Number.isFinite(record.searchConfig.exploreShare)
+        && Number.isFinite(record.searchConfig.refineTop) && Number.isFinite(record.searchConfig.maxRounds)
+        && Number.isFinite(record.searchConfig.patience)) searchConfig = record.searchConfig;
+      if (searchConfig) {
+        const dreamsFile = path.join(path.dirname(root), "..", "loop", "dreams.jsonl");
+        try {
+          const lines = fs.readFileSync(dreamsFile, "utf8").trim().split(/\r?\n/).slice(-100);
+          for (const line of lines.reverse()) {
+            const dream = JSON.parse(line) as { at?: unknown; adopted?: unknown };
+            if (typeof dream.at === "string" && JSON.stringify(dream.adopted) === JSON.stringify(searchConfig)) { adoptedAt = dream.at; break; }
+          }
+        } catch { /* No adoption record means this campaign uses the incumbent config. */ }
+      }
     }
   } catch { /* A missing campaign record falls back to the observed progress. */ }
-  return { id: id.slice(0, 8), maxCycles, phase, iteration: iteration ?? fallbackCycle, completedCycles };
+  return { id: id.slice(0, 8), maxCycles, phase, iteration: iteration ?? fallbackCycle, completedCycles, searchConfig, adoptedAt };
 }
 
 function selectedRejections(root: string, iteration: number, cell: string): { stage: string; reasons: string[] }[] {
@@ -86,7 +102,6 @@ export class DashboardView {
   private page: { text: string; start: number } | null = null;
   private snapshot: ProgressSnapshot | null = null;
   private signature = "";
-  private preferredPhase: "live" | "dream" | undefined;
   private root: string;
   constructor(root: string, iteration?: number) {
     this.root = root;
@@ -95,38 +110,29 @@ export class DashboardView {
     this.refresh();
   }
   refresh(): boolean {
-    const live = readProgress(this.root, this.iteration);
-    const dream = readProgress(this.root, this.iteration, "dream");
-    this.snapshot = this.preferredPhase === "dream" ? (dream ?? live) : this.preferredPhase === "live" ? (live ?? dream) :
-      dream && (!live || dream.status === "running") ? dream : live;
+    this.snapshot = readProgress(this.root, this.iteration);
     const signature = JSON.stringify(this.snapshot);
     const changed = signature !== this.signature; this.signature = signature;
     return changed;
   }
   private cells(): string[] {
-    return [...new Set([...(this.snapshot?.tree?.cells.map((n) => n.meta.cell_id) ?? []), ...Object.keys(this.snapshot?.attempts ?? {})])];
+    return Object.keys(this.snapshot?.attempts ?? {});
   }
   handleInput(data: string): void {
     const cycles = progressIterations(this.root); const index = cycles.indexOf(this.iteration);
     if (matchesKey(data, Key.left) || matchesKey(data, Key.right)) {
       const next = matchesKey(data, Key.left) ? index + 1 : index - 1;
       this.iteration = cycles[Math.max(0, Math.min(cycles.length - 1, next))] ?? this.iteration;
-      this.nodeIndex = 0; this.page = null; this.preferredPhase = undefined; this.refresh();
+      this.nodeIndex = 0; this.page = null; this.refresh();
     } else if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       this.nodeIndex = Math.max(0, Math.min(this.cells().length - 1, this.nodeIndex + (matchesKey(data, Key.up) ? -1 : 1))); this.page = null;
-    } else if (matchesKey(data, "d")) {
-      this.preferredPhase = this.snapshot?.phase === "dream" ? "live" : "dream";
-      this.nodeIndex = 0; this.page = null; this.refresh();
     } else if (matchesKey(data, Key.tab)) { this.pane = (this.pane + 1) % 3; this.page = null; }
     else if (matchesKey(data, Key.pageUp)) { this.page = readLogPage(this.logFile(), this.page?.start); }
     else if (matchesKey(data, Key.pageDown)) this.page = null;
   }
   private logFile(): string {
     const cell = this.cells()[this.nodeIndex] ?? "";
-    if (this.snapshot?.phase === "dream" && cell.startsWith("revision-")) {
-      return path.join(roundDir(this.root, this.iteration, "dream"), `development_r${Number(cell.split("-")[1]) - 1}_agent.log`);
-    }
-    return path.join(attemptDir(this.root, this.iteration, cell), this.pane === 2 ? "eval.log" : "agent.log");
+    return path.join(this.root, "cycles", `c${String(this.iteration).padStart(4, "0")}`, "attempts", cell, this.pane === 2 ? "eval.log" : "agent.log");
   }
   invalidate(): void {}
   private rows(): DashboardRow[] {
@@ -134,49 +140,27 @@ export class DashboardView {
     if (!s) return [{ kind: "muted", text: "Dream-RSI: no recorded progress. Esc closes." }];
     const cells = this.cells(); const selected = cells[this.nodeIndex]; const attempt = s.attempts[selected];
     const rows: DashboardRow[] = [
-      { kind: "title", text: `Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ node  d live/dream  Tab pane  PgUp older  PgDn tail  Esc close` },
+      { kind: "title", text: `Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ attempt  Tab pane  PgUp older  PgDn tail  Esc close` },
       ...progressSummary(s).split("\n").map((text) => ({ kind: rowKind(text), text })),
       { kind: "row", text: "" },
     ];
     const start = Math.max(0, this.nodeIndex - 5);
     for (const cell of cells.slice(start, start + 10)) {
-      const a = s.attempts[cell]; const node = s.tree?.cells.find((n) => n.meta.cell_id === cell) as
-        | { meta?: { parent_id?: string | null }; score?: number | null; fail_class?: string; timeout_assessment?: { raw_score?: unknown } }
-        | undefined;
-      // Ordinary score stays ordinary; diagnostic values render separately as partial_score.
-      const ordinary = a?.score ?? node?.score ?? "n/a";
-      const rawPartial = (node?.timeout_assessment as { raw_score?: unknown } | undefined)?.raw_score;
-      const partialNote =
-        typeof rawPartial === "number" && Number.isFinite(rawPartial)
-          ? ` partial_score=${Math.round(rawPartial * 10000) / 10000}`
-          : "";
-      // Show timeout diagnostics explicitly; other fail classes keep the concise stage view.
-      const fail = (node as { fail_class?: string } | undefined)?.fail_class;
-      const failNote = fail === "timeout_scored" || fail === "timeout" ? ` ${fail}` : "";
-      const text = `${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? (node as { meta?: { parent_id?: string | null } } | undefined)?.meta?.parent_id ?? "root"}  ${a?.stage ?? "unopened"}${failNote}  score=${ordinary}${partialNote}${a?.retry ? ` retry=${a.retry}` : ""}`;
+      const a = s.attempts[cell];
+      const timeout = a?.timedOut ? " [timedOut]" : "";
+      const text = `${cell === selected ? ">" : " "} ${cell} ← ${a?.parent ?? "root"} ${a?.kind ?? "branch"} r${a?.round ?? "?"} ${a?.stage ?? "unopened"} score=${a?.score ?? "n/a"}${timeout}${a?.retry ? ` retry=${a.retry}` : ""}`;
       rows.push({ kind: cell === selected ? "selected" : rowKind(text), text, tree: true });
     }
     if (attempt) {
-      const elapsed = attempt.stage === "agent" || attempt.stage === "evaluation" || attempt.stage === "preparing" ? Date.now() : attempt.updated_at;
-      const selectedNode = s.tree?.cells.find((n) => n.meta.cell_id === selected) as
-        | { error?: string | null; fail_class?: string; timeout_assessment?: { fail_class?: string; error?: string | null } }
-        | undefined;
-      // Preserve the failed stage and agent timeout explanation; show evaluator
-      // failures separately when the diagnostic assessment is unresolved.
-      const evalFailure =
-        selectedNode?.timeout_assessment && selectedNode.fail_class === "timeout"
-          ? ` | assessment ${selectedNode.timeout_assessment.fail_class}${selectedNode.timeout_assessment.error ? `: ${selectedNode.timeout_assessment.error}` : ""}`
-          : "";
-      rows.push({ kind: "row", text: "" }, { kind: rowKind(attempt.error ?? evalFailure), text: `${selected}: round ${attempt.round} | elapsed ${Math.max(0, Math.round((elapsed - attempt.started_at) / 1000))}s | ${attempt.error ?? ""}${evalFailure}` });
+      rows.push({ kind: "row", text: "" }, { kind: rowKind(attempt.error ?? ""), text: `${selected}: round ${attempt.round} | ${attempt.error ?? ""}` });
     }
     if (this.pane === 0) {
-      const tools = attempt?.tools.length ? attempt.tools.slice(-8) : ["(no tool activity)"];
-      rows.push({ kind: "row", text: "" }, { kind: "section", text: "Tool activity" }, ...tools.map((text) => ({ kind: rowKind(text), text, log: true })));
+      rows.push({ kind: "row", text: "" }, { kind: "section", text: "Attempt" }, { kind: rowKind(attempt?.stage ?? ""), text: attempt ? `${attempt.kind} from ${attempt.parent}: ${attempt.stage}` : "(no attempt selected)" });
     }
     else {
       rows.push({ kind: "row", text: "" }, { kind: "section", text: `${this.pane === 1 ? "Agent" : "Evaluator"} log ${this.page ? "(older page)" : "(tail)"}` });
-      const tail = this.page?.text ?? (this.pane === 1 ? attempt?.agent_tail : attempt?.eval_tail);
-      rows.push(...(tail || readLogPage(this.logFile()).text).split("\n").slice(-14).map((text) => ({ kind: rowKind(text), text, log: true })));
+      const tail = this.page?.text ?? readLogPage(this.logFile()).text;
+      rows.push(...tail.split("\n").slice(-14).map((text) => ({ kind: rowKind(text), text, log: true })));
     }
     rows.push(...selectedRejections(this.root, this.iteration, selected).flatMap(({ stage, reasons }) => [
       { kind: "section" as const, text: `Rejection · ${stage}` },
@@ -195,11 +179,13 @@ export class DashboardView {
     const metadata = campaignDisplayMetadata(this.root, this.iteration || cycleCount || 1, cycleCount);
     const currentCycle = metadata.iteration ?? this.iteration ?? 1;
     const currentPhase = metadata.phase ?? this.snapshot?.phase ?? "ready";
-    const title = `Dream-RSI · ${metadata.id} · cycle ${currentCycle}/${metadata.maxCycles} · ${currentPhase}`;
+    const config = metadata.searchConfig ? ` · search b${metadata.searchConfig.batchSize}/e${metadata.searchConfig.exploreShare}/r${metadata.searchConfig.refineTop}×${metadata.searchConfig.maxRounds}/p${metadata.searchConfig.patience}` : "";
+    const adopted = metadata.adoptedAt ? ` · adopted ${metadata.adoptedAt.slice(0, 10)}` : "";
+    const title = `Dream-RSI · ${metadata.id} · cycle ${currentCycle}/${metadata.maxCycles} · ${currentPhase}${config}${adopted}`;
     const currentRows = this.rows();
     const body = this.snapshot ? currentRows.slice(1) : currentRows;
     if (!this.snapshot) body[0] = { kind: "muted", text: "No recorded progress. Esc closes." };
-    const footer: DashboardRow = { kind: "muted", text: "←/→ cycle · ↑/↓ node · d phase · Tab pane · PgUp/PgDn logs · Esc close" };
+    const footer: DashboardRow = { kind: "muted", text: "←/→ cycle · ↑/↓ attempt · Tab pane · PgUp/PgDn logs · Esc close" };
     const cap = Math.max(1, Math.floor(maxRows));
     const height = Math.min(cap, Math.max(body.length + 3, 20));
     if (height < 3) {

@@ -18,7 +18,7 @@ function lever(overrides) {
     sourceKind: "session-failure",
     goal: "Make the command pass.",
     mechanism: "test fixture",
-    metric: "failures (lower is better)",
+    metric: '"npm test" failure count (failures, lower is better)',
     metricKind: "command-success",
     scopeFiles: [],
     gates: [],
@@ -36,12 +36,6 @@ function runEvaluator(projectDir, evaluatorPath) {
   return JSON.parse(fs.readFileSync(path.join(projectDir, "eval", "score.json"), "utf8"));
 }
 
-function writeControlPatch(projectDir) {
-  const file = path.join(projectDir, "control.patch");
-  fs.writeFileSync(file, "diff --git a/FIXED b/FIXED\nnew file mode 100644\n--- /dev/null\n+++ b/FIXED\n@@ -0,0 +1 @@\n+1\n");
-  return file;
-}
-
 test("failure-count evaluator measures the real command, with and without the fix as controls", async () => {
   const projectDir = tempDir();
   try {
@@ -51,7 +45,6 @@ test("failure-count evaluator measures the real command, with and without the fi
     const plan = await synthesizeMetric({
       projectDir,
       lever: lever({ estimator: undefined, estimates: { expectedGain: 0.5, costSeconds: 30, confidence: 0.5, readiness: 0.9 } }),
-      controlPatchPath: writeControlPatch(projectDir),
       commandOverrides: { "npm test": [process.execPath, check] },
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
@@ -82,7 +75,6 @@ test("duration evaluator reports median wall-clock, detects a faster variant, an
     const plan = await synthesizeMetric({
       projectDir,
       lever: lever({ metricKind: "command-duration", metric: "duration (ms, lower is better)", estimates: { expectedGain: 1, costSeconds: 1, confidence: 0.5, readiness: 0.9 } }),
-      controlPatchPath: writeControlPatch(projectDir),
       commandOverrides: { "npm test": [process.execPath, slow] },
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
@@ -146,7 +138,6 @@ test("the score metric template runs the declared evaluator and reads eval/score
       projectDir,
       lever: scoreLever(),
       scoreEvaluator: scoreSpec(),
-      controlPatchPath: writeControlPatch(projectDir),
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
     assert.equal(plan.metricKind, "score", "the declared score evaluator selects the score template");
@@ -181,7 +172,6 @@ test("the score metric template reads a single number on stdout and fails closed
       projectDir,
       lever: scoreLever(),
       scoreEvaluator: scoreSpec({ output: "stdout-number", higherIsBetter: false, unit: "error rate" }),
-      controlPatchPath: writeControlPatch(projectDir),
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
     assert.equal(plan.direction, "minimize", "the direction comes from the approved outcome");
@@ -213,7 +203,6 @@ test("a declared evaluator that fails or reports itself invalid cannot produce a
       projectDir,
       lever: scoreLever(),
       scoreEvaluator: scoreSpec(),
-      controlPatchPath: writeControlPatch(projectDir),
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
 
@@ -243,7 +232,6 @@ test("a score lever without the contract's declared evaluator is refused, not gu
     const plan = await synthesizeMetric({
       projectDir,
       lever: scoreLever(),
-      controlPatchPath: writeControlPatch(projectDir),
     });
     assert.equal(plan.ready, false);
     assert.equal(plan.metricKind, "score");
@@ -271,24 +259,10 @@ test("runner resolution follows standard lockfile evidence and nothing else", ()
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });
 
-test("missing, absent, or empty control patches reject the lever, and unmeasurable levers never synthesize", async () => {
+test("unmeasurable levers never synthesize an evaluator", async () => {
   const projectDir = tempDir();
   try {
     fs.writeFileSync(path.join(projectDir, "package.json"), "{}");
-    const noControl = await synthesizeMetric({ projectDir, lever: lever({}) });
-    assert.equal(noControl.ready, false);
-    assert.ok(noControl.rejections.some((line) => /no known-better control patch/.test(line)));
-
-    const missingControl = await synthesizeMetric({ projectDir, lever: lever({}), controlPatchPath: "nowhere.patch" });
-    assert.equal(missingControl.ready, false);
-    assert.ok(missingControl.rejections.some((line) => /not found/.test(line)));
-
-    const emptyControl = path.join(projectDir, "empty.patch");
-    fs.writeFileSync(emptyControl, "\n");
-    const empty = await synthesizeMetric({ projectDir, lever: lever({}), controlPatchPath: emptyControl });
-    assert.equal(empty.ready, false);
-    assert.ok(empty.rejections.some((line) => /empty/.test(line)));
-
     const unmeasurable = await synthesizeMetric({ projectDir, lever: lever({ metricKind: "unmeasurable" }) });
     assert.equal(unmeasurable.ready, false);
     assert.ok(unmeasurable.rejections.some((line) => /no measurable metric kind/.test(line)));
@@ -309,7 +283,6 @@ test("the generated evaluator spawns the real platform runner resolved from the 
         evidence: [{ source: "session", ref: "src/parser.ts", count: 2 }],
         gates: ["npm test"],
       }),
-      controlPatchPath: writeControlPatch(projectDir),
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
     assert.deepEqual(plan.argv, ["npm", "test"], "the canonical head resolves to the platform runner without overrides");
@@ -339,7 +312,6 @@ test("suite levers take their command from the declared gate, not from file scop
         evidence: [{ source: "session", ref: "src/parser.ts", count: 2 }],
         gates: ["npm test"],
       }),
-      controlPatchPath: writeControlPatch(projectDir),
       commandOverrides: { "npm test": [process.execPath, check] },
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));
@@ -357,7 +329,6 @@ test("the Windows shim path refuses arguments the command interpreter could rein
     const plan = await synthesizeMetric({
       projectDir,
       lever: lever({}),
-      controlPatchPath: writeControlPatch(projectDir),
       commandOverrides: { "npm test": ["npm", "test", "&", "node", "marker.mjs"] },
     });
     assert.equal(plan.ready, true, plan.rejections.join("; "));

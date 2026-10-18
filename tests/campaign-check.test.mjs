@@ -94,7 +94,7 @@ test("promotion floors expose the same minimums the campaign enforces", async ()
   const campaign = await jump("engine/campaign.ts");
   const exact = campaign.promotionFloor({ readings: 5, gates: 0, deterministic: true, evaluatorTimeoutMs: 200_000 });
   assert.equal(exact.evaluatorRuns, 7, "5 readings + one exact 2-run confirmation");
-  assert.equal(exact.agentStarts, 7, "probe + five live attempts + review");
+  assert.equal(exact.agentStarts, 3, "two first-round experiment attempts + review");
   assert.equal(exact.durationMs, 7 * 200_000);
   const noisy = campaign.promotionFloor({ readings: 5, gates: 2, deterministic: false, evaluatorTimeoutMs: 200_000 });
   assert.equal(noisy.evaluatorRuns, 28, "5 readings + 2 gates + a 21-run noisy confirmation");

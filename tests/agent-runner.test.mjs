@@ -7,7 +7,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { EXT, jump } from "./fixtures.mjs";
 
-const { DiscoveryTree } = await jump("engine/tree.ts");
 const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
 const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
 const { OutputDecoder } = await jump("agent/output.ts");
@@ -258,73 +257,13 @@ test("a missing agent CLI reports the command and the fix instead of a bare ENOE
   assert.match(result.spawnError, /agent\.command/);
 });
 
-test("an npm-installed package runs its worker from the project, not from node_modules", async () => {
-  // Node refuses to strip TypeScript types under node_modules, and that is exactly where npm puts the
-  // package. The worker entry must therefore be mirrored into the project before it is spawned.
-  const { runPolicyChecked } = await jump("policy/runner.ts");
-  const { ensurePolicyRuntime, deployPolicy, ensureWorkerRuntime } = await jump("engine/world.ts");
-  const { EXT } = await import("./fixtures.mjs");
-  const path = await import("node:path");
-
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-npmlayout-"));
-  try {
-    // A faithful npm layout: the extension inside node_modules/pi-dream-rsi/extensions/pi-dream-rsi.
-    const installRoot = path.join(dir, "consumer", "node_modules", "pi-dream-rsi");
-    fs.mkdirSync(installRoot, { recursive: true });
-    for (const entry of ["extensions", "prompts", "skills", "package.json"]) {
-      fs.cpSync(path.join(EXT, "..", "..", entry), path.join(installRoot, entry), { recursive: true });
-    }
-    const installedExt = path.join(installRoot, "extensions", "pi-dream-rsi");
-
-    // Deploy that copy's policy into a fresh project fixture.
-    const dreamRoot = path.join(dir, "consumer", ".dream-rsi");
-    fs.mkdirSync(path.join(dir, "consumer", "seed"), { recursive: true });
-    ensurePolicyRuntime(dreamRoot, path.join(installedExt, "policy"));
-    deployPolicy(dreamRoot, fs.readFileSync(path.join(installedExt, "policy", "method.ts"), "utf8"));
-
-    // Spawning the package copy directly is what used to happen, and it throws.
-    const { Worker } = await import("node:worker_threads");
-    const spawnPackageWorker = () =>
-      new Promise((_resolve, reject) => {
-        const worker = new Worker(path.join(installedExt, "worker", "policy-worker.ts"), {
-          execArgv: process.features?.typescript ? [] : ["--experimental-strip-types"],
-          workerData: { policyPath: path.join(dreamRoot, "policy", "method.ts"), mode: "grid", maxParallelism: 1, config: {} },
-        });
-        worker.on("error", reject);
-        worker.on("exit", () => _resolve(undefined));
-      });
-    await assert.rejects(spawnPackageWorker(), /node_modules/);
-
-    // Mirrored into the project, the same policy runs.
-    const mirrored = ensureWorkerRuntime(dreamRoot, installedExt);
-    assert.ok(mirrored && fs.existsSync(mirrored), "the worker is mirrored into the project");
-    assert.ok(mirrored.includes(`${path.sep}.dream-rsi${path.sep}runtime${path.sep}`));
-    for (const relative of ["worker/policy-worker.ts", "engine/tree.ts", "engine/replay.ts", "policy/host.ts", "policy/api.ts"]) {
-      assert.ok(fs.existsSync(path.join(dreamRoot, "runtime", relative)), `${relative} came along`);
-    }
-
-    const tree = new DiscoveryTree({ baselineScore: 0, branchCount: 1, refineCount: 1 });
-    tree.addBranchSlot(0);
-    const run = await runPolicyChecked({
-      policyPath: path.join(dreamRoot, "policy", "method.ts"),
-      mode: "replay",
-      maxParallelism: 1,
-      world: tree,
-      maxRounds: 2,
-      verifyDeterminism: true,
-    });
-    assert.equal(run.ok, true, run.error ?? "");
-    assert.equal(run.deterministic, true, "and the mirrored worker is deterministic");
-    assert.ok(!mirrored.includes("node_modules"), "never spawns from node_modules");
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-});
-
 test("the scoring fingerprint follows the contract, not the budgets", () => {
   const base = normalizeTask({ name: "t", workspace: "seed", eval_program: "prog.py", score_program: "node s.mjs", higher_is_better: true });
-  const budgetOnly = normalizeTask({ ...base, workers: 8, k1: 2, revisions: 5, default_beta: 0.2, max_loops: 4 });
-  assert.equal(scoringFingerprint(base), scoringFingerprint(budgetOnly), "budgets never invalidate recorded scores");
+  const migrated = normalizeTask({ ...base, workers: 8, k1: 2, revisions: 5, default_beta: 0.2, max_loops: 4 });
+  assert.equal(scoringFingerprint(base), scoringFingerprint(migrated), "legacy fields do not invalidate recorded scores");
+  for (const field of ["workers", "max_loops", "k1", "k2", "revisions", "beta1", "beta2", "beta_grid", "default_beta", "work_retention"]) {
+    assert.equal(field in migrated, false, field);
+  }
   assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, higher_is_better: false })));
   assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, score_program: "node other.mjs" })));
   assert.notEqual(scoringFingerprint(base), scoringFingerprint(normalizeTask({ ...base, workspace: "seed2" })));

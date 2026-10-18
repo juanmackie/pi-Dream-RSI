@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import test from "node:test";
 
-import { jump, makeProject, mockPi, REPO } from "./fixtures.mjs";
+import { jump, makeProject, mockPi } from "./fixtures.mjs";
+
+const { failPausedV2Campaign, pruneCampaignWork } = await jump("engine/campaign.ts");
 
 const waitFor = async (predicate, timeoutMs = 5000) => {
   const started = Date.now();
@@ -14,6 +15,53 @@ const waitFor = async (predicate, timeoutMs = 5000) => {
   }
   throw new Error("timed out waiting for campaign fixture state");
 };
+
+test("a paused 2.x campaign is marked failed with the 3.0 restart path", () => {
+  const project = makeProject();
+  try {
+    const id = "aaaaaaaaaaaaaaaa";
+    const campaignRoot = path.join(project.dreamRoot, "campaigns", id);
+    fs.mkdirSync(campaignRoot, { recursive: true });
+    fs.writeFileSync(path.join(project.dreamRoot, "campaigns", "active.json"), JSON.stringify({ id }));
+    const recordPath = path.join(campaignRoot, "campaign.json");
+    fs.writeFileSync(recordPath, JSON.stringify({ version: 1, id, state: { kind: "paused", phase: "live", iteration: "iter1" }, engine: "live" }));
+
+    const reason = failPausedV2Campaign(project.dreamRoot);
+    const migrated = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+    assert.equal(migrated.state.kind, "failed");
+    assert.match(reason, /2\.x.*cannot resume in 3\.0/);
+    assert.match(migrated.state.reason, /start a new \/dream-rsi loop/);
+  } finally { fs.rmSync(project.dir, { recursive: true, force: true }); }
+});
+
+test("campaign retention prunes only workspaces older than the two newest terminal campaigns", () => {
+  const project = makeProject();
+  try {
+    for (let index = 1; index <= 4; index += 1) {
+      const root = path.join(project.dreamRoot, "campaigns", `retention-${index}`);
+      const cycle = path.join(root, "cycles", "c0001");
+      fs.mkdirSync(path.join(cycle, "work"), { recursive: true });
+      fs.mkdirSync(path.join(cycle, "seed"), { recursive: true });
+      fs.writeFileSync(path.join(cycle, "world.json"), "{}\n");
+      fs.writeFileSync(path.join(root, "campaign.json"), JSON.stringify({ version: 1, startedAt: `2026-10-0${index}T00:00:00.000Z`, state: { kind: "complete", reason: "done" } }));
+    }
+    const pausedRoot = path.join(project.dreamRoot, "campaigns", "paused");
+    const pausedCycle = path.join(pausedRoot, "cycles", "c0001");
+    fs.mkdirSync(path.join(pausedCycle, "work"), { recursive: true });
+    fs.writeFileSync(path.join(pausedRoot, "campaign.json"), JSON.stringify({ version: 1, startedAt: "2026-10-09T00:00:00.000Z", state: { kind: "paused", phase: "experiment", iteration: 1 } }));
+
+    pruneCampaignWork(project.dreamRoot);
+    for (let index = 1; index <= 2; index += 1) {
+      const cycle = path.join(project.dreamRoot, "campaigns", `retention-${index}`, "cycles", "c0001");
+      assert.equal(fs.existsSync(path.join(cycle, "work")), false);
+      assert.equal(fs.existsSync(path.join(cycle, "seed")), false);
+      assert.equal(fs.existsSync(path.join(cycle, "world.json")), true);
+    }
+    for (const name of ["retention-3", "retention-4", "paused"]) {
+      assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns", name, "cycles", "c0001", "work")), true);
+    }
+  } finally { project.cleanup(); }
+});
 
 function campaignOptions(project, task = project.task, limits = {}) {
   return {
@@ -45,71 +93,38 @@ test("start refuses caps that cannot fund one promotion before any scorer call",
         gates: [`node "${gateA}"`, `node "${gateB}"`],
       }),
       (error) => error instanceof campaign.CampaignInfeasibleError
-        && /4 agent start\(s\) remain but a promotion needs 7/.test(error.message)
         && /8 evaluator run\(s\) remain but 9 are needed/.test(error.message)
-        && /Recommended caps: max_evaluator_runs >= 28, max_agent_starts >= 7/.test(error.message),
+        && /Recommended caps: max_evaluator_runs >= 28, max_agent_starts >= 3/.test(error.message),
     );
     assert.equal(fs.existsSync(counter), false, "no evaluator reading is paid for");
     assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false, "no campaign directory is created");
   } finally { project.cleanup(); }
 });
 
-test("campaign pays for the baseline first and reserves the probe before spawn", async () => {
+test("campaign pays for the baseline first and reserves the first experiment attempt before spawn", async () => {
   const project = makeProject();
   try {
     const campaign = await jump("engine/campaign.ts");
     const reserved = [];
     const result = await campaign.runCampaign({
       ...campaignOptions(project, project.task, { maxCycles: 1 }),
-      beforeAgentSpawn: (key) => { reserved.push(key); throw new Error("cheap stop at the campaign probe"); },
+      beforeAgentSpawn: (key) => { reserved.push(key); throw new Error("cheap stop at the first experiment attempt"); },
     });
-    assert.deepEqual(reserved, ["campaign-probe"], "only the probe is reserved before the test stops the run");
+    assert.deepEqual(reserved, ["experiment-1-n1"], "the first saved attempt is reserved before the test stops the run");
     assert.equal(result.agentStarts, 1);
     assert.equal(result.evaluatorRuns, 5, "the baseline is paid before the probe");
     assert.equal(result.state.kind, "failed");
-    assert.match(result.stopReason, /cheap stop at the campaign probe/);
+    assert.match(result.stopReason, /cheap stop at the first experiment attempt/);
     assert.ok(result.check?.qualified, "the status exposes the qualified check");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "cycles", "c0001", "world.json"), "utf8")).nodes[0].id, "n1");
 
     const ledgerFile = path.join(result.campaignRoot, "history", "ledger.jsonl");
     const lines = fs.readFileSync(ledgerFile, "utf8").trim().split(/\r?\n/);
     assert.ok(lines.length > 1, "the fixture records campaign events before the probe stops");
-    fs.writeFileSync(ledgerFile, `${lines.slice(0, -1).join("\n")}\n`);
-    assert.throws(() => campaign.readCampaignStatus(project.dreamRoot), /experiment ledger integrity check failed.*head checkpoint/);
-  } finally { project.cleanup(); }
-});
-
-test("a verified optimizer generation is snapshotted and seeds the campaign runtime", async () => {
-  const project = makeProject();
-  try {
-    const [campaign, generation] = await Promise.all([jump("engine/campaign.ts"), jump("engine/generation.ts")]);
-    const relativeFiles = {
-      "extensions/pi-dream-rsi/policy/method.ts": `${fs.readFileSync(path.join(REPO, "extensions/pi-dream-rsi/policy/method.ts"), "utf8")}\n// generation-policy-marker\n`,
-      "prompts/discovery-agent.md": "generation discovery policy\n",
-      "prompts/policy-improvement.md": "generation improvement policy\n",
-      "prompts/research-org.md": "generation research organization policy\n",
-    };
-    const artifacts = Object.entries(relativeFiles).map(([artifactPath, content]) => ({
-      path: artifactPath,
-      sha256: createHash("sha256").update(content).digest("hex"),
-    }));
-    const optimizerGeneration = {
-      id: generation.generationId(artifacts),
-      label: "test generation",
-      artifacts,
-      files: relativeFiles,
-    };
-    const result = await campaign.runCampaign({
-      ...campaignOptions(project, project.task, { maxCycles: 1 }),
-      optimizerGeneration,
-      beforeAgentSpawn: () => { throw new Error("stop after checking campaign initialization"); },
-    });
-    const record = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign.json"), "utf8"));
-    assert.equal(record.optimizerGenerationId, optimizerGeneration.id);
-    assert.deepEqual(record.optimizerGenerationArtifacts, Object.fromEntries(artifacts.map(({ path: artifactPath, sha256 }) => [artifactPath, sha256])));
-    assert.equal(fs.readFileSync(path.join(result.campaignRoot, "optimizer-generation", "prompts", "discovery-agent.md"), "utf8"), relativeFiles["prompts/discovery-agent.md"]);
-    assert.equal(fs.readFileSync(path.join(result.campaignRoot, "optimizer-generation", "prompts", "policy-improvement.md"), "utf8"), relativeFiles["prompts/policy-improvement.md"]);
-    assert.equal(fs.readFileSync(path.join(result.campaignRoot, "optimizer-generation", "prompts", "research-org.md"), "utf8"), relativeFiles["prompts/research-org.md"]);
-    assert.match(fs.readFileSync(path.join(result.campaignRoot, "policy", "method.ts"), "utf8"), /generation-policy-marker/);
+    const tampered = JSON.parse(lines[0]);
+    tampered.facts = { ...(tampered.facts ?? {}), edited: true };
+    fs.writeFileSync(ledgerFile, `${[JSON.stringify(tampered), ...lines.slice(1)].join("\n")}\n`);
+    assert.throws(() => campaign.readCampaignStatus(project.dreamRoot), /experiment ledger integrity check failed.*hash chain/);
   } finally { project.cleanup(); }
 });
 
@@ -406,12 +421,12 @@ test("accepted review applies the measured patch, not an edited review copy", as
     const applied = fs.readFileSync(path.join(project.seed, "solution.py"), "utf8");
     assert.equal(applied, fs.readFileSync(measuredPatch, "utf8"), "apply uses the exact bytes whose score was verified");
     const ledger = JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign-processes.json"), "utf8"));
-    assert.ok(ledger.agent_starts >= 4, "probe, phase agents and review starts are reserved");
+    assert.ok(ledger.agent_starts >= 3, "experiment attempts and review starts are reserved");
     const resourceEntries = fs.readFileSync(path.join(result.campaignRoot, "history", "ledger.jsonl"), "utf8")
       .trim().split(/\r?\n/).map((line) => JSON.parse(line));
     assert.equal(resourceEntries.filter((entry) => entry.kind === "agent_start").length, ledger.agent_starts, "each reserved agent start is recorded in the append-only ledger");
     assert.ok(resourceEntries.some((entry) => entry.kind === "agent_result" && entry.agentDurationMs > 0 && entry.usage), "campaign ledger records each agent process time and token usage");
-    assert.ok(["probe", "discovery", "review"].every((role) => resourceEntries.some((entry) => entry.kind === "agent_result" && entry.agentRole === role)), "probe, discovery, and review resource records are captured");
+    assert.ok(["experiment", "review"].every((role) => resourceEntries.some((entry) => entry.kind === "agent_result" && entry.agentRole === role)), "experiment and review resource records are captured");
     assert.ok(resourceEntries.some((entry) => ["confirm", "gate", "check"].includes(entry.kind) && entry.evaluatorDurationMs > 0), "campaign ledger records measured evaluator process time");
   } finally { project.cleanup(); }
 });
@@ -442,12 +457,11 @@ test("campaign deadline aborts an in-flight child instead of waiting for its age
     const options = campaignOptions(project, task, { maxCycles: 1, deadlineMs: 15_000 });
     const started = Date.now();
     const resultPromise = campaign.runCampaign(options);
-    let probeWorkspace;
     await waitFor(() => {
       const status = campaign.readCampaignStatus(project.dreamRoot);
       if (!status) return false;
-      probeWorkspace = path.join(status.campaignRoot, "probe-workspace");
-      return fs.existsSync(path.join(probeWorkspace, "started.marker"));
+      return status.state.phase === "experiment"
+        && fs.existsSync(path.join(status.campaignRoot, "cycles", "c0001", "work", "n1", "started.marker"));
     }, 20_000);
     const result = await resultPromise;
     assert.ok(Date.now() - started < 30_000, "deadline should terminate the child before its 60s timeout");
@@ -465,10 +479,11 @@ test("stop pauses durably and explicit resume consumes the same agent-start budg
     const agent = path.join(project.projectDir, "pause-until-resume.mjs");
     fs.writeFileSync(agent, `import { existsSync, writeFileSync } from "node:fs";\nconst gate = ${JSON.stringify(gate)};\nwriteFileSync("started.marker", "yes");\nprocess.stdin.on("data", () => {});\nprocess.stdin.on("end", () => { const poll = setInterval(() => { if (existsSync(gate)) { clearInterval(poll); process.exit(0); } }, 20); });\n`);
     const task = { ...project.task, agent: { ...project.task.agent, args: [agent] }, agent_timeout_ms: 30_000 };
-    const run = campaign.runCampaign(campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 7 }));
+    const run = campaign.runCampaign(campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 3 }));
     await waitFor(() => {
       const status = campaign.readCampaignStatus(project.dreamRoot);
-      return status?.state.kind === "running" && status.state.phase === "probe" && fs.existsSync(path.join(status.campaignRoot, "probe-workspace", "started.marker"));
+      return status?.state.kind === "running" && status.state.phase === "experiment"
+        && fs.existsSync(path.join(status.campaignRoot, "cycles", "c0001", "work", "n1", "started.marker"));
     });
     await assert.rejects(campaign.resumeCampaign({ baseRoot: project.dreamRoot, projectDir: project.projectDir }), /campaign is already running/);
     const stopped = campaign.stopCampaign(project.dreamRoot);
@@ -479,7 +494,7 @@ test("stop pauses durably and explicit resume consumes the same agent-start budg
 
     const recordPath = path.join(paused.campaignRoot, "campaign.json");
     const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-    record.state = { kind: "running", phase: "probe", iteration: null };
+    record.state = { kind: "running", phase: "experiment", iteration: 1 };
     delete record.gates;
     delete record.minimumGainSource;
     delete record.baselineScores;
@@ -499,14 +514,14 @@ test("stop pauses durably and explicit resume consumes the same agent-start budg
     context.cwd = project.projectDir;
     await harness.handlers.get("session_start")({}, context);
     await harness.commands.get("dream-rsi").handler("resume", context);
-    assert.equal(harness.sentMessages.at(-1).content, "/skill:dream-rsi-improve resume", "the command routes stale running records through the guarded resume path");
+    assert.match(harness.sentMessages.at(-1).content, /dream_rsi_loop with action=resume/, "the command routes stale running records through the v3 loop tool");
 
     fs.writeFileSync(gate, "resume\n");
     const resumed = await campaign.resumeCampaign({ baseRoot: project.dreamRoot, projectDir: project.projectDir });
-    assert.ok(resumed.agentStarts >= 2, "the resumed probe is charged to the same durable budget");
+    assert.ok(resumed.agentStarts >= 2, "the resumed experiment attempt is charged to the same durable budget");
     assert.ok(resumed.agentStarts <= resumed.limits.maxAgentStarts);
     assert.equal(resumed.state.kind, "complete");
-    assert.match(resumed.stopReason, /cycle limit reached|agent start limit reached/);
+    assert.match(resumed.stopReason, /cycle limit reached|agent start limit reached|experiment allowance exhausted/);
     const ledger = JSON.parse(fs.readFileSync(path.join(resumed.campaignRoot, "campaign-processes.json"), "utf8"));
     assert.equal(ledger.agent_starts, resumed.agentStarts, "the durable ledger is the authority, not an in-memory counter");
   } finally { project.cleanup(); }
@@ -704,7 +719,7 @@ test("extra instrument files are hashed into the campaign identity", async () =>
     assert.equal(JSON.parse(fs.readFileSync(path.join(result.campaignRoot, "campaign.json"), "utf8")).identityInputs.length, 1);
     const recordPath = path.join(result.campaignRoot, "campaign.json");
     const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
-    record.state = { kind: "paused", phase: "probe", iteration: null, reason: "test resume" };
+    record.state = { kind: "paused", phase: "experiment", iteration: 1, reason: "test resume" };
     fs.writeFileSync(recordPath, JSON.stringify(record, null, 2));
     const callsBeforeResume = Number(fs.existsSync(counter) ? fs.readFileSync(counter, "utf8").length : 0);
     fs.writeFileSync(instrument, "export const version = 2;\n");

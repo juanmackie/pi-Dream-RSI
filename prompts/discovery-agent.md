@@ -5,7 +5,9 @@ supports it. After implementation, update the proposal with what changed and its
 
 $candidate_brief
 
-$campaign_digest
+$parent_summary
+
+Recent recorded attempts are in `$history_dir`. Inspect the most relevant proposals and evidence before choosing a mechanism.
 
 Attempt budget: $attempt_budget
 Writable files: $scope_files

@@ -1,3 +1,11 @@
+## 3.0.0
+
+Breaking release. Dream-RSI now exposes read-only assessment and one autonomous loop.
+
+- Removed `dream_rsi_improve`, `/dream-rsi improve`, `/dream-rsi start`, control patches, optimizer trials, plateau restarts, mutation diagnostics, and the dashboard live/dream toggle.
+- Removed the Mind2Web scorer, policy self-campaign, tier2 and assess real-model harnesses, tournament, MXC containment, and signed receipts.
+- Replaced the policy runtime with a bounded hill climb over recorded experiment worlds and deterministic replay of search configs. Resume restarts an interrupted attempt.
+- 2.x paused campaigns cannot resume. Stored v1 loop contracts are normalized when read.
 # Changelog
 
 ## Unreleased

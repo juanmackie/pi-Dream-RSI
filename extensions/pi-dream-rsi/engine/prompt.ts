@@ -1,9 +1,7 @@
 /**
  * Prompt loading and variable substitution.
  *
- * The paper's prompts are shipped verbatim in `prompts/`; the runtime fills the variables it owns
- * (`$node_dir`, `$eval_program`, `$history_dir`, `$baseline_dir`, `$problem_file`, `{method_file}`,
- * `{history_dir}`, `{trace_pool}`).
+ * Agent prompts are shipped in `prompts/`; the runtime fills their named placeholders.
  */
 
 import * as fs from "node:fs";

@@ -5,10 +5,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
-import type { RepositoryCommandContainment } from "./containment.ts";
 import { restrictedEnvironment, type RunContract } from "./intake.ts";
 import type { LeverMetricKind } from "./levers.ts";
-import { resolveGainThreshold } from "./metrics.ts";
+import { absoluteGain } from "./intake.ts";
 
 /** Where a score-json evaluator reports its number, relative to the checked copy. */
 export const SCORE_READING_PATH = "eval/score.json";
@@ -54,7 +53,6 @@ export interface PostApplyExpectation {
   /** Called immediately before each process starts, for durable accounting. */
   beforeProcess?: () => void;
   signal?: AbortSignal;
-  containment?: RepositoryCommandContainment;
   /** Test seam replacing the measurement process. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
   /** Test seam replacing the evaluator process. */
@@ -73,7 +71,6 @@ export async function measureWorkload(options: {
   timeoutMs: number;
   beforeProcess?: () => void;
   signal?: AbortSignal;
-  containment?: RepositoryCommandContainment;
 }): Promise<number | null> {
   options.beforeProcess?.();
   const started = performance.now();
@@ -84,7 +81,6 @@ export async function measureWorkload(options: {
     env: restrictedEnvironment(options.contract as RunContract),
     logPath: null,
     ...(options.signal ? { signal: options.signal } : {}),
-    ...(options.containment ? { containment: { writableRoots: [options.cwd], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
   });
   if (!result.ok) return null;
   return performance.now() - started;
@@ -142,7 +138,6 @@ export interface EvaluatorMeasurementOptions {
   timeoutMs: number;
   beforeProcess?: () => void;
   signal?: AbortSignal;
-  containment?: RepositoryCommandContainment;
 }
 
 export async function measureEvaluatorReading(options: EvaluatorMeasurementOptions): Promise<number | null> {
@@ -154,7 +149,6 @@ export async function measureEvaluatorReading(options: EvaluatorMeasurementOptio
     env: restrictedEnvironment(options.contract),
     logPath: null,
     ...(options.signal ? { signal: options.signal } : {}),
-    ...(options.containment ? { containment: { writableRoots: [options.cwd], ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}) } } : {}),
   });
   if (!result.ok) return null;
   return readEvaluatorReading({ cwd: options.cwd, output: options.evaluator.output, stdout: result.stdoutTail });
@@ -201,7 +195,6 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
       timeoutMs: expectation.timeoutMs,
       ...(expectation.beforeProcess ? { beforeProcess: expectation.beforeProcess } : {}),
       ...(expectation.signal ? { signal: expectation.signal } : {}),
-      ...(expectation.containment ? { containment: expectation.containment } : {}),
     });
   };
   const evaluate = async (cwd: string): Promise<number | null> => {
@@ -213,7 +206,6 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
       timeoutMs: expectation.timeoutMs,
       ...(expectation.beforeProcess ? { beforeProcess: expectation.beforeProcess } : {}),
       ...(expectation.signal ? { signal: expectation.signal } : {}),
-      ...(expectation.containment ? { containment: expectation.containment } : {}),
     });
   };
 
@@ -231,7 +223,6 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
         env: restrictedEnvironment(contract),
         logPath: null,
         ...(expectation.signal ? { signal: expectation.signal } : {}),
-        ...(expectation.containment ? { containment: { writableRoots: [scratch], ...(expectation.containment.readonlyRoots ? { readonlyRoots: expectation.containment.readonlyRoots } : {}) } } : {}),
       });
       if (!result.ok) {
         const detail = (result.spawnError ?? result.stderrTail.trim().split(/\r?\n/, 1)[0]) || `exit ${result.code}`;
@@ -256,7 +247,7 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
     const after = median(readings);
     const before = median(expectation.baseline);
     const gain = expectation.higherIsBetter ? after - before : before - after;
-    const threshold = resolveGainThreshold(expectation.minimumUsefulGain, before);
+    const threshold = absoluteGain(expectation.minimumUsefulGain, before);
     const passed = gain >= threshold && gain > 0;
     const round = (value: number): number => Math.round(value * 1000) / 1000;
     return {

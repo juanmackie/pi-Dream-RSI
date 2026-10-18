@@ -11,7 +11,6 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { OutputDecoder, type AgentOutputEvidence, type OutputEvent } from "./output.ts";
-import { runContainedCommand } from "../engine/containment.ts";
 
 import { THINKING_LEVELS, type AgentConfig } from "../engine/task.ts";
 
@@ -69,8 +68,6 @@ export interface RunOptions {
   protectedReadPaths?: string[];
   /** Store decoded, bounded presentation text and tool names instead of raw JSONL. */
   compactAgentLog?: boolean;
-  /** Use an OS process container, with only these explicit project paths visible. */
-  containment?: { writableRoots: string[]; readonlyRoots?: string[] };
   /** Persist process-level accounting after output decoding and duration measurement. */
   onComplete?: (result: CommandResult) => void;
 }
@@ -201,7 +198,6 @@ async function collect(
     let settled = false;
     let timedOut = false;
     let aborted = false;
-    let containedCommandRunning = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let grace: ReturnType<typeof setTimeout> | undefined;
 
@@ -257,7 +253,7 @@ async function collect(
       if (settled) return;
       aborted = true;
       if (child) killTree(child);
-      if (!containedCommandRunning && !grace) grace = setTimeout(() => finish({ aborted: true }), 2000);
+      if (!grace) grace = setTimeout(() => finish({ aborted: true }), 2000);
     };
 
     try {
@@ -272,64 +268,6 @@ async function collect(
       const argv = options.shell
         ? [`${commandText}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
-      if (options.containment) {
-        if (options.signal?.aborted) {
-          finish({ aborted: true });
-          return;
-        }
-        options.beforeSpawn?.();
-        containedCommandRunning = true;
-        const commandLine = options.shell
-          ? commandText + (args.length ? ` ${args.map(quoteForShell).join(" ")}` : "")
-          : [commandText, ...args].map(quoteForShell).join(" ");
-        const containedEnv: Record<string, string> = {};
-        for (const [key, value] of Object.entries(env)) if (typeof value === "string") containedEnv[key] = value;
-        const streamOutput = Boolean(options.onOutput || options.compactAgentLog);
-        void runContainedCommand({
-          command: commandLine,
-          cwd: options.cwd,
-          timeoutMs: options.timeoutMs,
-          writableRoots: options.containment.writableRoots,
-          ...(options.containment.readonlyRoots ? { readonlyRoots: options.containment.readonlyRoots } : {}),
-          env: containedEnv,
-          ...(options.stdin !== undefined ? { stdin: options.stdin } : {}),
-          ...(options.signal ? { signal: options.signal } : {}),
-          ...(options.onSpawn ? { onSpawn: options.onSpawn } : {}),
-          ...((options.onOutput || options.compactAgentLog) ? {
-            onOutput: (stream: "stdout" | "stderr", text: string) => {
-              sawOutput = true;
-              if (stream === "stdout") stdoutTail = append(stdoutTail, text);
-              else stderrTail = append(stderrTail, text);
-              decoder.feed(stream, text);
-              if (logStream?.writable) logStream.write(text);
-            },
-          } : {}),
-        }).then((result) => {
-          if (!streamOutput) {
-            if (result.stdoutTail) {
-              sawOutput = true;
-              stdoutTail = append(stdoutTail, result.stdoutTail);
-              decoder.feed("stdout", result.stdoutTail);
-              if (logStream?.writable) logStream.write(result.stdoutTail);
-            }
-            if (result.stderrTail) {
-              sawOutput = true;
-              stderrTail = append(stderrTail, result.stderrTail);
-              decoder.feed("stderr", result.stderrTail);
-              if (logStream?.writable) logStream.write(result.stderrTail);
-            }
-          }
-          finish({
-            ok: result.ok && !aborted,
-            code: result.code,
-            signal: null,
-            timedOut: result.timedOut,
-            aborted,
-            spawnError: result.spawnError,
-          });
-        }).catch((error) => finish({ spawnError: error instanceof Error ? error.message : String(error) }));
-        return;
-      }
       options.beforeSpawn?.();
       child = spawn(argv[0] as string, argv[1] as string[], {
         cwd: options.cwd,

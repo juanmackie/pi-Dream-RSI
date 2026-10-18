@@ -14,17 +14,16 @@
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import * as crypto from "node:crypto";
 
-import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
-import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
+import { runShellCommand } from "../agent/runner.ts";
 import {
   restrictedEnvironment, type CommandCategory, type RunContract, type RunContractScoreEvaluator,
 } from "./intake.ts";
 import type { LeverAttempt, LeverInventory, LeverProposal } from "./levers.ts";
-import { leverId } from "./levers.ts";
+import { attemptDemotion, leverId } from "./levers.ts";
+import { pathWithin } from "./scope.ts";
+import type { SignalsResult } from "./signals.ts";
 
 const MAX_SCANNED_FILES = 2000;
 const MAX_GRAPH_FILES = 200;
@@ -108,6 +107,9 @@ export interface ProbeReading {
   durationMs: number | null;
   timedOut: boolean;
   error: string | null;
+  /** Present when the process launched; distinguishes a test failure from a missing runner. */
+  exitCode?: number | null;
+  spawnFailed?: boolean;
 }
 
 export interface ReconResult {
@@ -136,7 +138,6 @@ export interface ReconOptions {
   maxProbes?: number;
   probeTimeoutMs?: number;
   /** Run repository workloads from disposable, OS-contained copies. */
-  containment?: RepositoryCommandContainment;
   signal?: AbortSignal;
   onProgress?: (message: string) => void;
   /** Test seam replacing the probe process. */
@@ -220,6 +221,13 @@ export function scriptEntry(script: string, projectDir: string): string | null {
       const next = tokens[index + 1];
       if (!next) continue;
       const candidate = unquote(next);
+      if (/^bun$/i.test(token) && candidate === "test" && tokens[index + 2]) {
+        const testFile = unquote(tokens[index + 2]);
+        const absoluteTestFile = path.resolve(projectDir, testFile);
+        if (isInside(projectDir, absoluteTestFile) && fs.existsSync(absoluteTestFile) && fs.statSync(absoluteTestFile).isFile()) {
+          return relativeOf(projectDir, absoluteTestFile);
+        }
+      }
       if (candidate.startsWith("-")) continue;
       const absolute = path.resolve(projectDir, candidate);
       if (!isInside(projectDir, absolute)) continue;
@@ -529,27 +537,18 @@ export function importGraph(projectDir: string, entry: string): { files: string[
 export async function probeCommand(options: ReconOptions, command: DiscoveredCommand): Promise<ProbeReading> {
   options.beforeProbe?.(command);
   const commandLine = command.argv.map((part) => (/[\s"]/.test(part) ? `"${part.replace(/"/g, '""')}"` : part)).join(" ");
-  const scratch = options.containment ? path.join(os.tmpdir(), `dream-rsi-recon-${crypto.randomUUID()}`) : null;
-  try {
-    if (scratch) await copyWorkspace(options.projectDir, scratch, {
-      exclude: [path.join(options.projectDir, ".git"), path.join(options.projectDir, ".dream-rsi")],
-    });
-    const result = await runShellCommand(commandLine, {
-      cwd: scratch ?? options.projectDir,
+  const result = await runShellCommand(commandLine, {
+      cwd: options.projectDir,
       timeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
       envOnly: true,
       env: restrictedEnvironment(options.contract),
       logPath: null,
-      ...(scratch ? { containment: workspaceContainment(options.containment, scratch) } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
     });
-    const durationMs = result.durationMs;
-    const timedOut = result.timedOut;
-    const error = result.spawnError ?? (timedOut ? "probe timed out" : result.ok ? null : (result.stderrTail.trim().split(/\r?\n/, 1)[0] || `exit ${result.code}`));
-    return { label: command.label, ok: result.ok, durationMs, timedOut, error };
-  } finally {
-    if (scratch) fs.rmSync(scratch, { recursive: true, force: true });
-  }
+  const durationMs = result.durationMs;
+  const timedOut = result.timedOut;
+  const error = result.spawnError ?? (timedOut ? "probe timed out" : result.ok ? null : (result.stderrTail.trim().split(/\r?\n/, 1)[0] || `exit ${result.code}`));
+  return { label: command.label, ok: result.ok, durationMs, timedOut, error, exitCode: result.code, spawnFailed: result.spawnError !== null };
 }
 
 /**
@@ -565,36 +564,52 @@ export async function reconProject(options: ReconOptions): Promise<ReconResult> 
   const progress = options.onProgress ?? (() => {});
 
   const measurable = discovered.commands.filter((command) => command.category === "benchmark" || command.category === "custom");
+  const tests = discovered.commands.filter((command) => command.category === "test");
   for (const command of discovered.commands) {
     if (!measurable.includes(command)) notes.push(`"${command.label}" is a ${command.category} command; it is available as a gate, not as the measured outcome.`);
   }
-  if (measurable.length === 0) {
-    blockers.push("no benchmark or custom workload is declared, so no duration or throughput can be measured");
-  }
-
   const limit = Math.max(1, options.maxProbes ?? 3);
+  // Keep one measured workload for duration levers, then spend the remaining
+  // bounded probes checking declared tests. A failing test is useful evidence;
+  // timeout or spawn failure is not.
+  const firstMeasuredCount = Math.min(1, measurable.length, limit);
+  const testProbes = tests.slice(0, Math.max(0, limit - firstMeasuredCount));
+  const additionalMeasuredCount = Math.max(0, limit - firstMeasuredCount - testProbes.length);
+  const probeCommands = [
+    ...measurable.slice(0, firstMeasuredCount),
+    ...testProbes,
+    ...measurable.slice(firstMeasuredCount, firstMeasuredCount + additionalMeasuredCount),
+  ];
   const probes: ProbeReading[] = [];
-  for (const command of measurable.slice(0, limit)) {
+  for (const command of probeCommands) {
     if (options.signal?.aborted) break;
     progress(`recon: probing "${command.label}"`);
     const reading = options.probeImpl
       ? await options.probeImpl(command)
       : await probeCommand(options, command);
     probes.push(reading);
-    if (!reading.ok) blockers.push(`the declared workload "${command.label}" did not complete: ${reading.error ?? "unknown failure"}`);
+    if (!reading.ok && command.category !== "test") blockers.push(`the declared workload "${command.label}" did not complete: ${reading.error ?? "unknown failure"}`);
+    if (!reading.ok && command.category === "test") notes.push(`test command "${command.label}" failed during recon${reading.exitCode !== undefined ? ` with exit ${reading.exitCode}` : ""}; it becomes a failure lever only when the process launched and exited normally.`);
   }
+
+  const hasMeasuredProbe = probeCommands.some((command) => measurable.includes(command) && probes.some((probe) => probe.label === command.label));
+  const hasFailingTest = tests.some((command) => {
+    const probe = probes.find((item) => item.label === command.label);
+    return probe !== undefined && !probe.ok && !probe.timedOut && probe.spawnFailed !== true && probe.exitCode !== null && probe.exitCode !== undefined;
+  });
+  if (measurable.length === 0 && !hasFailingTest) blockers.push("no benchmark or custom workload is declared, so no duration or throughput can be measured");
 
   const graph = new Set<string>();
   const graphs: Record<string, string[]> = {};
   let truncated = false;
-  for (const command of measurable.slice(0, limit)) {
+  for (const command of probeCommands) {
     if (!command.entry) continue;
     const walked = importGraph(projectDir, command.entry);
     truncated = truncated || walked.truncated;
     graphs[command.label] = walked.files;
-    for (const file of walked.files) graph.add(file);
+    if (measurable.includes(command)) for (const file of walked.files) graph.add(file);
   }
-  if (measurable.length > 0 && graph.size === 0) {
+  if (hasMeasuredProbe && graph.size === 0) {
     blockers.push("the declared workload does not name a local entry file, so its patch scope cannot be attributed to measured code");
   }
   if (truncated) notes.push(`the import graph reached the ${MAX_GRAPH_FILES}-file cap; later candidates may be incomplete.`);
@@ -606,6 +621,7 @@ export interface ReconInventoryOptions {
   contract: RunContract;
   recon: ReconResult;
   attempts?: LeverAttempt[];
+  signals?: SignalsResult["weaknesses"];
 }
 
 /** Words that make a wall-clock duration an honest measure of the approved outcome. */
@@ -667,18 +683,25 @@ function scoreEvaluatorLever(options: {
   const id = leverId("recon-command", ["contract.outcome.evaluator", evaluator.output, ...evaluator.argv]);
   // Scope is the union of the measured workloads' import graphs: the evaluator may
   // run more than one declared entry, but every proposed file must be exercised.
-  const graph = [...new Set(Object.values(options.recon.graphs).flat())].sort();
-  const inScope = graph.filter((file) => within(contract, file)
+  const graph = [...new Set(options.recon.commands
+    .filter((command) => command.category === "benchmark" || command.category === "custom")
+    .flatMap((command) => options.recon.graphs[command.label] ?? []))].sort();
+  // A user-declared editable root is explicit attribution evidence when the
+  // evaluator is a standalone score program with no imported workload graph.
+  const attributable = graph.length > 0
+    ? graph
+    : contract.scope.roots.length > 0 ? options.recon.files.map((file) => file.path) : [];
+  const inScope = attributable.filter((file) => pathWithin(file, contract.scope.roots)
     && !protectedAsset(contract, file)
     && !pinnedEvaluatorFile(evaluator, file));
-  const outOfScope = graph.filter((file) => !inScope.includes(file));
+  const outOfScope = attributable.filter((file) => !inScope.includes(file));
   if (inScope.length === 0) {
     return {
       reason: `the declared score evaluator ${evaluator.argv.join(" ")} is measurable but no file it exercises is inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"}), so no patch can be attributed to it`,
     };
   }
   const attempt = options.attempt;
-  const demotion = attempt ? (attempt.outcome === "win" ? 0.15 : attempt.outcome === "no-win" ? 0.5 : attempt.outcome === "rejected" ? 0.35 : 0.6) : 1;
+  const demotion = attemptDemotion(attempt?.outcome);
   const measuredDurations = options.recon.probes
     .filter((probe) => probe.ok && probe.durationMs !== null)
     .map((probe) => probe.durationMs as number);
@@ -732,7 +755,8 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   const levers: LeverProposal[] = [];
   const rejected: LeverInventory["rejected"] = [];
   const diagnostics: string[] = [...recon.notes];
-  const gates = recon.commands.filter((command) => command.category === "test").map((command) => command.label);
+  const passingTests = recon.commands.filter((command) => command.category === "test" && recon.probes.some((probe) => probe.label === command.label && probe.ok));
+  const gates = passingTests.map((command) => command.label);
   if (gates.length > 0) diagnostics.push(`Declared test gates: ${gates.join(", ")}.`);
 
   // A declared score evaluator is the primary instrument: it says what the number
@@ -752,11 +776,53 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
     .map((command) => ({ command, probe: recon.probes.find((probe) => probe.label === command.label) ?? null }))
     .filter((entry) => entry.probe !== null);
 
+  for (const command of recon.commands.filter((item) => item.category === "test")) {
+    const probe = recon.probes.find((item) => item.label === command.label);
+    if (!probe || probe.ok || probe.timedOut || probe.spawnFailed === true || probe.exitCode === null || probe.exitCode === undefined) continue;
+    const id = leverId("recon-command", [command.label, command.source, "suite-failures"]);
+    const workloadGraph = recon.graphs[command.label] ?? [];
+    const inScope = workloadGraph.filter((file) => pathWithin(file, contract.scope.roots) && !protectedAsset(contract, file));
+    if (inScope.length === 0) {
+      rejected.push({ id, sourceKind: "recon-command", readiness: 0.25,
+        reason: `"${command.label}" exits with ${probe.exitCode}, but its test entry imports no file inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"})` });
+      continue;
+    }
+    const attempt = attemptByLever.get(id);
+    const demotion = attemptDemotion(attempt?.outcome);
+    const signalMatches = (options.signals ?? []).filter((signal) => signal.evidence.some((item) =>
+      item.ref.toLowerCase().includes(command.label.toLowerCase()) || inScope.some((file) => file.toLowerCase() === item.ref.toLowerCase())));
+    const signalCount = signalMatches.reduce((sum, signal) => sum + signal.evidence.reduce((total, item) => total + item.count, 0), 0);
+    const signalMultiplier = 1 + Math.min(1, signalCount / 5);
+    const costSeconds = Math.max(5, Math.min(600, (probe.durationMs ?? 30_000) / 1000));
+    const readiness = gates.length > 0 ? 0.9 : 0.5;
+    levers.push({
+      id, sourceKind: "recon-command",
+      goal: `Reduce the number of failures reported by "${command.label}" without weakening its assertions.`,
+      mechanism: `fix the code exercised by the failing test command "${command.label}"`,
+      metric: `"${command.label}" failure count (failures, lower is better)`,
+      metricKind: "suite-failures",
+      scopeFiles: inScope.slice(0, 8),
+      gates: [...gates],
+      estimates: { expectedGain: Math.min(1, Math.max(0.1, Math.abs(probe.exitCode))), costSeconds, confidence: 0.6, readiness },
+      score: demotion * signalMultiplier * (Math.min(1, Math.max(0.1, Math.abs(probe.exitCode))) * readiness) / Math.pow(costSeconds, 0.25),
+      evidence: [{ source: "evaluator", ref: command.source, count: Math.max(1, Math.abs(probe.exitCode)) },
+        ...signalMatches.flatMap((signal) => signal.evidence.map((item) => ({ ...item, ref: `${signal.kind}:${item.ref}` })))],
+      reasons: [
+        `failed on the unchanged tree with exit ${probe.exitCode}${probe.error ? `: ${probe.error}` : ""}`,
+        `scope: ${inScope.length} file(s) reached from the test entry ${command.entry ?? "unknown"}`,
+        gates.length > 0 ? `passing correctness gate(s): ${gates.join(", ")}` : "no passing independent test gate was found; metric qualification may refuse this lever",
+        attempt ? `history: prior outcome ${attempt.outcome} for this lever; score adjusted.` : "history: no prior outcome for this lever",
+        ...(signalCount > 0 ? [`usage signals: ${signalCount} matching event(s), ranking multiplier ${signalMultiplier.toFixed(2)}`] : []),
+      ],
+      command: { argv: [...command.argv], shim: command.shim, source: command.source, entry: command.entry },
+    });
+  }
+
   for (const { command, probe } of measured) {
     const id = leverId("recon-command", [command.label, command.source]);
     // Scope comes from this workload's own imports, not from every measured workload.
     const workloadGraph = recon.graphs[command.label] ?? [];
-    const inScope = workloadGraph.filter((file) => within(contract, file) && !protectedAsset(contract, file));
+    const inScope = workloadGraph.filter((file) => pathWithin(file, contract.scope.roots) && !protectedAsset(contract, file));
     const outOfScope = workloadGraph.filter((file) => !inScope.includes(file));
     if (!probe!.ok || probe!.durationMs === null) {
       rejected.push({ id, sourceKind: "recon-command", reason: `"${command.label}" could not be measured: ${probe!.error ?? "no duration"}`, readiness: 0.2 });
@@ -780,13 +846,19 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
       continue;
     }
     const attempt = attemptByLever.get(id);
-    const demotion = attempt ? (attempt.outcome === "win" ? 0.15 : attempt.outcome === "no-win" ? 0.5 : attempt.outcome === "rejected" ? 0.35 : 0.6) : 1;
+    const demotion = attemptDemotion(attempt?.outcome);
     // Uncalibrated prior: a slower measured workload has more attributable headroom,
     // with the same saturating shape the signal inventory uses.
     const expectedGain = Math.min(1, probe!.durationMs / 30_000);
     const costSeconds = Math.max(5, Math.min(600, probe!.durationMs / 1000));
     const readiness = gates.length > 0 ? 0.9 : 0.75;
-    const score = demotion * (expectedGain * readiness) / Math.pow(costSeconds, 0.25);
+    const matchingSignals = (options.signals ?? []).filter((signal) => signal.evidence.some((item) =>
+      item.ref.toLowerCase().includes(command.label.toLowerCase())
+      || command.label.toLowerCase().includes(item.ref.toLowerCase())
+      || inScope.some((file) => file.toLowerCase() === item.ref.toLowerCase())));
+    const signalCount = matchingSignals.reduce((sum, signal) => sum + signal.evidence.reduce((total, item) => total + item.count, 0), 0);
+    const signalMultiplier = 1 + Math.min(1, signalCount / 5);
+    const score = demotion * signalMultiplier * (expectedGain * readiness) / Math.pow(costSeconds, 0.25);
     levers.push({
       id,
       sourceKind: "recon-command",
@@ -798,12 +870,13 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
       gates: [...gates],
       estimates: { expectedGain, costSeconds, confidence: 0.6, readiness },
       score,
-      evidence: [{ source: "evaluator", ref: command.source, count: 1 }],
+      evidence: [{ source: "evaluator", ref: command.source, count: 1 }, ...matchingSignals.flatMap((signal) => signal.evidence.map((item) => ({ ...item, ref: `${signal.kind}:${item.ref}` })))],
       reasons: [
         `measured: "${command.label}" completed in ${Math.round(probe!.durationMs)} ms (${command.source})`,
         `scope: ${inScope.length} file(s) reached from the measured workload's entry ${command.entry ?? "unknown"}; ${outOfScope.length} measured file(s) excluded by the approved scope`,
         gates.length > 0 ? `gate: ${gates.join(", ")}` : "no declared test gate; correctness must be established by the metric's own oracle",
         attempt ? `history: prior outcome ${attempt.outcome} for this lever; score adjusted.` : "history: no prior outcome for this lever",
+        ...(signalCount > 0 ? [`usage signals: ${signalCount} matching event(s), ranking multiplier ${signalMultiplier.toFixed(2)}`] : []),
       ],
       command: { argv: [...command.argv], shim: command.shim, source: command.source, entry: command.entry },
     });
@@ -811,7 +884,7 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
 
   for (const blocker of recon.blockers) {
     diagnostics.push(`blocker: ${blocker}`);
-    // A blocker is a named refusal, not an unexplained empty inventory: it carries
+    // A blocker is a named refusal, not an unexplained lack of eligible levers: it carries
     // its own id and reason so status, memory and reporting can explain the stop.
     rejected.push({ id: leverId("recon-command", [blocker]), sourceKind: "recon-command", reason: blocker, readiness: 0 });
   }
@@ -820,13 +893,6 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   // The declared outcome outranks every proxy, regardless of the uncalibrated prior.
   if (scoreLever) levers.unshift(scoreLever);
   return { levers, rejected, diagnostics };
-}
-
-function within(contract: RunContract, relative: string): boolean {
-  const roots = contract.scope.roots.map((root) => root.replace(/\\/g, "/")).filter((root) => root !== "" && root !== ".");
-  if (roots.length === 0) return true;
-  const candidate = relative.replace(/\\/g, "/");
-  return roots.some((root) => candidate === root || candidate.startsWith(`${root}/`));
 }
 
 function protectedAsset(contract: RunContract, relative: string): boolean {

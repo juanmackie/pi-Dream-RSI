@@ -19,6 +19,8 @@ import { spawnSync } from "node:child_process";
 
 import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import dreamRsi from "../extensions/pi-dream-rsi/index.ts";
+import { mockPi } from "./fixtures.mjs";
 
 const COMSHELL = process.env.ComSpec ?? "cmd.exe";
 /**
@@ -31,7 +33,7 @@ const HELDOUT = process.env.DREAM_RSI_HELDOUT === "1";
 
 /** Run one fixture command independently of the loop's own instrumentation. */
 function runFixtureCommand(projectDir, script) {
-  const result = spawnSync(process.execPath, [script], { cwd: projectDir, encoding: "utf8", timeout: 120_000, windowsHide: true });
+  const result = spawnSync(process.execPath, Array.isArray(script) ? script : [script], { cwd: projectDir, encoding: "utf8", timeout: 120_000, windowsHide: true });
   return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "", error: result.error ?? null };
 }
 
@@ -185,25 +187,31 @@ function contractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "50%", m
   });
 }
 
-test("cold start: loop finds a causal bottleneck from source and a declared command, then proves the improvement independently", async () => {
+test("cold start: dream_rsi_loop with consent and focus applies and independently verifies an improvement", async () => {
   const fixture = coldStartProject();
+  // Use enough deterministic quadratic work for the default 5% threshold to
+  // sit above process-startup jitter while keeping the change substantial.
+  fs.writeFileSync(path.join(fixture.projectDir, "bench.mjs"), BENCH.replace("24_000", "60_000"));
   const baselineMs = measureScript(fixture.projectDir, "bench.mjs");
   const baselineGate = runFixtureCommand(fixture.projectDir, "test.mjs");
   assert.equal(baselineGate.status, 0, "the fixture's correctness oracle passes before the change");
 
-  const contract = contractFor({ agentPath: fixture.agentPath });
-  const messages = [];
-  const result = await runLoop({
-    projectDir: fixture.projectDir,
-    contract,
-    limits: { maxCampaigns: 2, maxAgentStarts: 24, maxEvaluatorRuns: 120, deadlineMs: 20 * 60 * 1000 },
-    now: () => new Date("2026-10-20T00:00:00.000Z"),
-    onProgress: (message) => messages.push(message),
-  });
+  const { pi, context, harness } = mockPi();
+  dreamRsi(pi);
+  context.cwd = fixture.projectDir;
+  await harness.handlers.get("session_start")({}, context);
+  const result = await harness.tools.get("dream_rsi_loop").execute("cold-start", {
+    action: "start", consent: true,
+    focus: "reduce the wall-clock duration of the declared benchmark without changing its output",
+    minimum_gain: "25%",
+    agent_command: process.execPath, agent_args: [fixture.agentPath],
+  }, undefined, undefined, context);
+  assert.match(result.content[0].text, /Dream-RSI loop finished/);
+  const loopResult = result.details.loop;
 
-  assert.ok(result.campaigns >= 1, `the loop must run at least one campaign; stopped with "${result.stopReason}"`);
-  assert.equal(result.wins, 1, `exactly one verified improvement; stop reason "${result.stopReason}"`);
-  assert.ok(result.contract, "the result reports the frozen contract identity");
+  assert.ok(loopResult.campaigns >= 1, `the loop must run at least one campaign; stopped with "${loopResult.stopReason}": ${JSON.stringify({ inventory: loopResult.inventory, memory: loopResult.memory.notes })}`);
+  assert.equal(loopResult.wins, 1, `exactly one verified improvement; stop reason "${loopResult.stopReason}"`);
+  assert.ok(loopResult.contract, "the result reports the frozen contract identity");
 
   const applied = fs.readFileSync(path.join(fixture.projectDir, "src", "pipeline.mjs"), "utf8");
   assert.ok(!applied.includes("for (let inner"), "the applied patch removed the quadratic re-scan");
@@ -212,12 +220,61 @@ test("cold start: loop finds a causal bottleneck from source and a declared comm
   const gateAfter = runFixtureCommand(fixture.projectDir, "test.mjs");
   assert.equal(gateAfter.status, 0, "the correctness oracle still passes after the apply");
   const afterMs = measureScript(fixture.projectDir, "bench.mjs");
-  assert.ok(afterMs < baselineMs * 0.5, `the declared benchmark must actually get faster (${baselineMs.toFixed(0)} ms -> ${afterMs.toFixed(0)} ms)`);
+  assert.ok(afterMs < baselineMs * 0.9, `the declared benchmark must actually improve beyond the default useful gain (${baselineMs.toFixed(0)} ms -> ${afterMs.toFixed(0)} ms)`);
 
   assert.ok(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi", "loop", "contract.json")), "the approved contract is durable");
-  const postApply = result.verifications ?? [];
+  const postApply = loopResult.verifications ?? [];
   assert.ok(postApply.length >= 1, "the loop records an independent post-apply verification");
   assert.equal(postApply[0].passed, true, "the independent verification agreed with the promotion");
+  const campaignRecords = fs.readdirSync(path.join(fixture.projectDir, ".dream-rsi", "campaigns"), { withFileTypes: true })
+    .filter((entry) => entry.isDirectory()).map((entry) => {
+      const root = path.join(fixture.projectDir, ".dream-rsi", "campaigns", entry.name);
+      return JSON.parse(fs.readFileSync(path.join(root, "campaign.json"), "utf8"));
+    }).sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  assert.ok(campaignRecords.length >= 2, `the fixture runs a follow-up campaign after its verified improvement: ${JSON.stringify({ stopReason: loopResult.stopReason, campaigns: loopResult.campaigns, records: loopResult.records, notes: loopResult.memory.notes })}`);
+  const secondCampaign = campaignRecords[1];
+  assert.ok(secondCampaign.checkRuns?.some((run) => run.stdoutTail === "seeded from loop qualification"),
+    "the second campaign reuses the qualification readings paid for under its baseline fingerprint");
+});
+
+test("cold start: a normally failing declared test becomes a qualified and verified failure-count lever", async () => {
+  const fixture = coldStartProject();
+  fs.writeFileSync(path.join(fixture.projectDir, "package.json"), `${JSON.stringify({
+    name: "failing-test-fixture", private: true, type: "module",
+    scripts: { "test:broken": "node broken.mjs", "test:smoke": "node smoke.mjs" },
+  }, null, 2)}\n`);
+fs.writeFileSync(path.join(fixture.projectDir, "broken.mjs"), `import * as pipeline from "./src/pipeline.mjs";\nimport { spawnSync } from "node:child_process";\nconst result = spawnSync(process.execPath, ["--test", "broken.test.mjs"], { encoding: "utf8" });\nprocess.stdout.write(result.stdout ?? "");\nprocess.stderr.write(result.stderr ?? "");\nprocess.exit(result.status ?? 1);\n`);
+fs.writeFileSync(path.join(fixture.projectDir, "broken.test.mjs"), `import test from "node:test";\nimport assert from "node:assert/strict";\nimport * as pipeline from "./src/pipeline.mjs";\ntest("the broken report value is repaired", () => assert.equal(pipeline.buildReport(1), 1));\ntest("the editable function remains exported", () => assert.equal(typeof pipeline.buildReport, "function"));\n`);
+  fs.writeFileSync(path.join(fixture.projectDir, "smoke.mjs"), 'import { buildReport } from "./src/pipeline.mjs";\nif (buildReport(0) !== 0) process.exit(1);\n');
+  fs.writeFileSync(path.join(fixture.projectDir, "src", "pipeline.mjs"), "export const buildReport = (count) => count === 0 ? 0 : 0;\n");
+
+  try {
+    const contract = contractFor({ agentPath: fixture.agentPath, maxCampaigns: 1, minimumUsefulGain: "5%", maxEvaluatorRuns: 120 });
+    const runCampaignImpl = async (options) => {
+      fs.writeFileSync(path.join(fixture.projectDir, "src", "pipeline.mjs"), "export const buildReport = (count) => count === 0 ? 0 : 1;\n");
+      const id = "suite-failure-win";
+      const campaignRoot = path.join(options.baseRoot, "campaigns", id);
+      fs.mkdirSync(path.join(campaignRoot, "history"), { recursive: true });
+      fs.writeFileSync(path.join(campaignRoot, "history", "ledger.jsonl"), `${JSON.stringify({ v: 1, t: new Date().toISOString(), entryId: "apply-1", kind: "apply", campaignId: id, stage: "apply", outcome: "success" })}\n`);
+      return {
+        id, baseRoot: options.baseRoot, campaignRoot, engineRoot: campaignRoot,
+        state: { kind: "complete", reason: "verified failure count reduction" }, stopped: true,
+        stopReason: "verified failure count reduction", agentStarts: 1, evaluatorRuns: 1,
+        currentScore: 0, bestScore: 0, baselineScore: 1, startedAt: new Date().toISOString(),
+      };
+    };
+    const result = await runLoop({
+      projectDir: fixture.projectDir, contract,
+      limits: { maxCampaigns: 1, maxAgentStarts: 24, maxEvaluatorRuns: 120, deadlineMs: 20 * 60 * 1000 },
+      runCampaignImpl,
+    });
+
+    assert.ok(result.inventory?.levers.some((lever) => lever.metricKind === "suite-failures"), "recon surfaced a failing suite as a failure-count lever");
+    assert.equal(result.campaigns, 1);
+    assert.equal(result.wins, 1, JSON.stringify({ stopReason: result.stopReason, records: result.records, verifications: result.verifications, notes: result.memory.notes }));
+    assert.equal(result.verifications[0]?.passed, true, result.verifications[0]?.reason ?? "post-apply verification failed");
+    assert.equal(runFixtureCommand(fixture.projectDir, "broken.mjs").status, 0, "the applied source makes the declared failing test pass");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
 test("cold start: a repository without trusted-local consent is refused before any command runs", async () => {

@@ -15,7 +15,7 @@ export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhig
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 export interface AgentConfig {
-  /** Executable to spawn for one attempt (one generation-evaluation request). */
+  /** Executable to spawn for one experiment attempt. */
   command: string;
   /** Arguments; `{model}` and `{thinking}` are substituted when present. */
   args: string[];
@@ -54,29 +54,6 @@ export interface TaskConfig {
   error_field: string;
   /** False when the evaluator reports a cost (smaller is better); scores are normalized to "larger is better". */
   higher_is_better: boolean;
-  /** W — attempts that may run in parallel. */
-  workers: number;
-  /**
-   * Cap on how many online episodes may run at once (parallel worlds).
-   * Real fan-out is `loops x workers` agent processes, so keep it near what the provider allows.
-   */
-  max_loops: number;
-  /** K1 — online decision rounds per live episode. */
-  k1: number;
-  /** K2 — replay decision rounds per policy-world evaluation. */
-  k2: number;
-  /** M — policy revisions per offline phase. */
-  revisions: number;
-  /**
-   * Numeric reward shaping for Eq. 1 (the paper states the form, not the values). Absolute score
-   * units per probe: scale to the metric (scores in [0, 1] want ~0.001, scores near 100 keep 0.01).
-   */
-  beta1: number;
-  beta2: number;
-  /** Beta grid swept during offline evaluation. */
-  beta_grid: number[];
-  /** Default beta baked into a freshly seeded policy. */
-  default_beta: number;
   agent_timeout_ms: number;
   evaluator_timeout_ms: number;
   agent: AgentConfig;
@@ -85,8 +62,6 @@ export interface TaskConfig {
    * Empty by default: a candidate may genuinely need everything in the seed workspace to run.
    */
   copy_exclude: string[];
-  /** How many recent iteration directories under `work/` to keep; older candidates are pruned. */
-  work_retention: number;
 }
 
 export function defaultTask(name = "task"): TaskConfig {
@@ -102,19 +77,9 @@ export function defaultTask(name = "task"): TaskConfig {
     fail_class_field: "fail_class",
     error_field: "error",
     higher_is_better: true,
-    workers: 4,
-    max_loops: 2,
-    k1: 6,
-    k2: 8,
-    revisions: 3,
-    beta1: 0.01,
-    beta2: 0.01,
-    beta_grid: [0, 0.2, 0.4, 0.6, 0.8, 1],
-    default_beta: 0.6,
     agent_timeout_ms: 30 * 60 * 1000,
     evaluator_timeout_ms: 300_000,
     copy_exclude: [],
-    work_retention: 20,
     agent: {
       command: "pi",
       // Attempts are self-contained: instructions come from the prompt, history is read through tools —
@@ -148,13 +113,6 @@ export function validateTask(raw: unknown): string[] {
     if (typeof t[key] !== "string" || (t[key] as string).trim() === "") errors.push(`${key} must be a non-empty string`);
   }
   const numbers: [keyof TaskConfig, number, number][] = [
-    ["workers", 1, 256],
-    ["max_loops", 1, 8],
-    ["k1", 1, 10_000],
-    ["k2", 0, 10_000],
-    ["revisions", 0, 100],
-    ["beta1", 0, 1e6],
-    ["beta2", 0, 1e6],
   ];
   for (const key of ["agent_timeout_ms", "evaluator_timeout_ms"] as const) {
     if (!Number.isSafeInteger(t[key]) || (t[key] ?? 0) < 1 || (t[key] ?? 0) > 2_147_483_647) errors.push(`${key} must be an integer from 1 through 2147483647 milliseconds`);
@@ -165,22 +123,9 @@ export function validateTask(raw: unknown): string[] {
       errors.push(`${key} must be a number in [${min}, ${max}]`);
     }
   }
-  if (!Array.isArray(t.beta_grid) || t.beta_grid.length === 0) {
-    errors.push("beta_grid must be a non-empty array");
-  } else if (t.beta_grid.some((b) => typeof b !== "number" || !Number.isFinite(b) || b < 0 || b > 1)) {
-    errors.push("beta_grid values must be numbers in [0, 1]");
-  }
-  if (typeof t.default_beta !== "number" || t.default_beta < 0 || t.default_beta > 1) {
-    errors.push("default_beta must be a number in [0, 1]");
-  }
   if (t.copy_exclude !== undefined) {
     if (!Array.isArray(t.copy_exclude) || t.copy_exclude.some((entry) => typeof entry !== "string" || entry.trim() === "")) {
       errors.push("copy_exclude must be an array of non-empty workspace-relative paths");
-    }
-  }
-  if (t.work_retention !== undefined) {
-    if (typeof t.work_retention !== "number" || !Number.isFinite(t.work_retention) || t.work_retention < 1 || t.work_retention > 10_000) {
-      errors.push("work_retention must be a number in [1, 10000]");
     }
   }
   const agent = t.agent as Partial<AgentConfig> | undefined;
@@ -278,9 +223,11 @@ export function programFingerprint(projectDir: string, task: TaskConfig): string
  */
 export function normalizeTask(raw: Partial<TaskConfig>): TaskConfig {
   const base = defaultTask(typeof raw?.name === "string" && raw.name ? raw.name : "task");
+  const removedFields = new Set(["workers", "max_loops", "k1", "k2", "revisions", "beta1", "beta2", "beta_grid", "default_beta", "work_retention"]);
+  const currentFields = Object.fromEntries(Object.entries(raw ?? {}).filter(([key]) => !removedFields.has(key)));
   const merged: TaskConfig = {
     ...base,
-    ...raw,
+    ...currentFields,
     agent: { ...base.agent, ...(raw?.agent ?? {}) },
   };
   const errors = validateTask(merged);

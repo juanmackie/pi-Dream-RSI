@@ -1,31 +1,35 @@
-/** Durable, bounded improve-target controller. */
+/** Durable, bounded campaign engine used by the autonomous loop. */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { copyWorkspace, runAgent, runShellCommand, type CommandResult } from "../agent/runner.ts";
-import { BUNDLED_POLICY_DIR, EXTENSION_DIR, PACKAGE_DIR } from "../layout.ts";
-import { assertGuardRailsIntact, generationId, type ActiveGeneration } from "./generation.ts";
-import { runLiveEpisode } from "./live.ts";
-import { runDreamPhase } from "./dream.ts";
-import { CampaignBudget, CampaignLimitError } from "./campaign-budget.ts";
+import { runAgent, type CommandResult } from "../agent/runner.ts";
+import { EXTENSION_DIR, PACKAGE_DIR } from "../layout.ts";
+import { defaultSearchConfig, experimentSeed, experimentWorkspace, experimentWorldPath, runExperiment, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
+import { CampaignBudget, CampaignLimitError } from "./budget.ts";
 import { buildCandidatePatch, patchConflicts, verifyCandidatePatch, applyCandidatePatch, reconcileCandidatePatch, runCampaignGate, workspaceDigest, WorkspaceDriftDuringApplyError, type CandidatePatch } from "./campaign-patch.ts";
-import { scoreSeedCopy } from "./apply.ts";
-import { findCandidate, type Candidate } from "./improvements.ts";
+import { scoreSeedCopy } from "./score.ts";
+import { absoluteGain } from "./intake.ts";
 import { normalizeTask, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
-import { ensureDreamIgnore, ensurePolicyRuntime, liveMethodPath, nodeWorkspace, readManifest, readJson, writeFileAtomic, writeJson } from "./world.ts";
-import { readTree } from "./world.ts";
-import { allocator, acquirePhase, phaseIsActive, pidIsAlive } from "./ownership.ts";
-import { checkpointPath } from "./checkpoint.ts";
-import { tracePoolDir, writeCurrentManifest, attemptDir, deployedBetaPath, type LiveCycleManifest } from "./world.ts";
+import { readJson, writeFileAtomic, writeJson } from "./fsutil.ts";
+import { allocator, acquirePhase, phaseIsActive } from "./ownership.ts";
 import type { ProgressObserver } from "./progress.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { parseThreshold, resolveThreshold, planTest } from "./measure.ts";
-import { appendLedgerRecord, readLedger, ledgerDigest, ledgerHealth, type LedgerAgentRole, type LedgerEntry, type LedgerRecord } from "./ledger.ts";
-import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
+import { appendLedgerRecord, readLedger, ledgerHealth, type LedgerAgentRole, type LedgerEntry, type LedgerRecord } from "./ledger.ts";
 
 export type CampaignAgentResolver = (savedAgent: AgentConfig) => AgentConfig | null;
+
+interface Candidate {
+  iteration: number;
+  cell: string;
+  score: number;
+  raw_score: number | null;
+  fail_class: string;
+  workspace: string | null;
+  program: string | null;
+}
 
 export interface CampaignLimits {
   maxCycles: number;
@@ -84,8 +88,8 @@ export const DEFAULT_CAMPAIGN_LIMITS: CampaignLimits = {
   deadlineMs: 60 * 60 * 1000,
 };
 
-/** Agent starts one verified promotion needs: 1 probe + 5 live attempts + 1 review. */
-export const PROMOTION_AGENT_STARTS = 7;
+/** The default two experiment attempts plus the candidate review. */
+export const PROMOTION_AGENT_STARTS = defaultSearchConfig.batchSize + 1;
 /** Minimum pairs in a noisy paired confirmation, matching the campaign's plan floor. */
 export const PROMOTION_MIN_CONFIRMATION_PAIRS = 8;
 
@@ -98,8 +102,6 @@ export interface PromotionFloorInput {
   deterministic: boolean;
   /** Pairs in a noisy confirmation; defaults to the campaign minimum of 8. */
   pairs?: number;
-  /** A declared control patch runs its own paired verification during the check. */
-  control?: boolean;
   /** Observed worst one-reading wall time; omitted before the first reading completes. */
   readingMs?: number;
   /** Declared evaluator timeout, used for processes that have not been observed. */
@@ -110,14 +112,9 @@ export interface PromotionFloorInput {
 
 /**
  * Minimum budget one verified promotion requires, derived from the shipped engine:
- * 5 evaluator readings (checkCampaignEvaluator), 1 process per declared gate, a paired
- * confirmation that is 2 processes when exact (campaign-patch verifyCandidatePatch:
- * baselineRuns 0 + one before/after pair, measure.ts:104-125) and 5 + 2*maxPairs when
- * noisy, and an agent phase of 1 probe + 5 live attempts + 1 review
- * (policy/method.ts selectBatch over workers=2/k1=3 refuses to promote without an
- * improvement, recovery and review; policy/api.ts:123 gives the pruning patience;
- * campaign.ts promoteCandidates keeps one confirmation per candidate inside the
- * remaining evaluator and time budget).
+ * baseline readings, one process per declared gate, paired confirmation readings,
+ * candidate attempts, and an independent review. These minimums match the current
+ * experiment and promotion phases so infeasible campaigns stop before spending.
  *
  * `durationMs` is evaluator wall time only; the campaign has always been sized by the
  * evaluator, and the agent allowance is reported separately as `agentMs`. Once one
@@ -133,16 +130,14 @@ export function promotionFloor(input: PromotionFloorInput): PromotionFloor {
   const gates = Math.max(0, Math.trunc(input.gates ?? 0));
   const pairs = Math.max(4, Math.min(64, Math.trunc(input.pairs ?? PROMOTION_MIN_CONFIRMATION_PAIRS)));
   const confirmationRuns = input.deterministic ? 2 : 5 + 2 * pairs;
-  // A control patch is validated with the same paired procedure before any candidate runs.
-  const controlRuns = input.control ? confirmationRuns : 0;
   const observed = typeof input.readingMs === "number" && Number.isFinite(input.readingMs) && input.readingMs > 0 ? input.readingMs : null;
   const readingMs = observed ?? input.evaluatorTimeoutMs;
-  const durationMs = Math.ceil((readings + gates + confirmationRuns + controlRuns) * readingMs);
+  const durationMs = Math.ceil((readings + gates + confirmationRuns) * readingMs);
   const agentMs = typeof input.agentTimeoutMs === "number" && Number.isFinite(input.agentTimeoutMs) && input.agentTimeoutMs > 0
     ? PROMOTION_AGENT_STARTS * input.agentTimeoutMs
     : null;
   return {
-    evaluatorRuns: readings + gates + confirmationRuns + controlRuns,
+    evaluatorRuns: readings + gates + confirmationRuns,
     agentStarts: PROMOTION_AGENT_STARTS,
     durationMs,
     readings,
@@ -167,7 +162,7 @@ export class CampaignInfeasibleError extends Error {
   }
 }
 
-type RunningPhase = "probe" | "baseline" | "live" | "dream" | "promote";
+type RunningPhase = "baseline" | "experiment" | "promote";
 type CampaignState =
   | { kind: "running"; phase: RunningPhase; iteration: number | null }
   | { kind: "paused"; phase: RunningPhase; iteration: number | null; reason: string }
@@ -187,15 +182,13 @@ export interface CampaignRecord {
   verifierInputs: string[];
   verifierIdentity: string;
   taskFingerprint: string;
+  searchConfig: SearchConfig;
   mechanism?: string;
   parentCampaignId?: string;
-  optimizerGenerationId?: string;
-  optimizerGenerationArtifacts?: Record<string, string>;
   minimumGain: number;
   requestedMinimumGain?: number | string;
   /** Per-promotion false-accept allowance assigned by the caller (see MeasurementPlan). */
   confirmationAlpha?: number;
-  controlPatch?: string;
   /** Optional extra file/directory contents that define the scoring instrument. */
   identityInputs?: string[];
   checkReport?: CampaignCheckReport;
@@ -206,6 +199,8 @@ export interface CampaignRecord {
   minimumGainSource?: "explicit" | "calibrated";
   baselineScores?: number[];
   gates?: string[];
+  /** Permit a known-failing baseline gate; candidate gates still have to pass before promotion. */
+  allowFailingBaselineGates?: boolean;
   limits: CampaignLimits;
   startedAt: string;
   deadlineAt: string;
@@ -228,6 +223,7 @@ export interface CampaignStatus {
   targetRoot: string;
   scope: string[];
   goal: string;
+  searchConfig: SearchConfig;
   state: CampaignState;
   limits: CampaignLimits;
   agentStarts: number;
@@ -264,11 +260,13 @@ export interface CampaignOptions {
   baseRoot: string;
   projectDir: string;
   task: TaskConfig;
+  searchConfig?: SearchConfig;
   goal: string;
   scope?: string[];
   verifierInputs?: string[];
   minimumGain?: number | string;
-  controlPatch?: string;
+  /** Preserve failed baseline gates as required candidate gates instead of rejecting preflight. */
+  allowFailingBaselineGates?: boolean;
   gates?: string[];
   /** Loop qualification readings to reuse when their identity matches this campaign's verifier. */
   seedReadings?: CampaignSeedReadings;
@@ -293,10 +291,6 @@ export interface CampaignOptions {
   /** Research decision and predecessor that selected this campaign. */
   mechanism?: string;
   parentCampaignId?: string;
-  /** Verified policy generation loaded by a fresh loop process. */
-  optimizerGeneration?: ActiveGeneration;
-  /** Opt-in OS containment for repository-owned evaluator and gate commands. */
-  containment?: RepositoryCommandContainment;
 }
 
 export interface CampaignCheckRun {
@@ -336,7 +330,6 @@ export interface CampaignCheckReport {
   resolution_rel: number | null;
   threshold_resolved: number;
   confirmationCostMs: number;
-  control: { validated: boolean; gain: number | null; reason: string };
   /** True only when every planned reading ran valid and every gate passed. */
   qualified: boolean;
   /** Readings this check planned to take (5 for a campaign preflight). */
@@ -351,6 +344,8 @@ export interface CampaignCheckOptions {
   task: TaskConfig;
   verifierInputs?: string[];
   gates?: string[];
+  /** Preserve failed baseline gates as required candidate gates instead of rejecting preflight. */
+  allowFailingBaselineGates?: boolean;
   runs?: number;
   /** Readings already paid for by an interrupted check; the check continues after them. */
   priorRuns?: CampaignCheckRun[];
@@ -362,11 +357,9 @@ export interface CampaignCheckOptions {
   identityInputs?: string[];
   maxEvaluatorRuns?: number;
   minimumGain?: number | string;
-  controlPatch?: string;
   maxCycles?: number;
   deadlineMs?: number;
   beforeEvaluatorSpawn?: (key: string) => void;
-  containment?: RepositoryCommandContainment;
   signal?: AbortSignal;
 }
 
@@ -379,6 +372,7 @@ export interface CampaignSeedReadings {
 export interface CampaignResumeOptions {
   baseRoot: string;
   projectDir: string;
+  allowFailingBaselineGates?: boolean;
   sessionId?: string;
   signal?: AbortSignal;
   resolveAgent?: CampaignAgentResolver;
@@ -388,7 +382,6 @@ export interface CampaignResumeOptions {
   onPhaseProgress?: ProgressObserver;
   onUpdate?: (status: CampaignStatus) => void;
   log?: (message: string) => void;
-  containment?: RepositoryCommandContainment;
 }
 
 const stateFile = (root: string): string => path.join(root, "campaign.json");
@@ -451,7 +444,7 @@ function statusOf(record: CampaignRecord): CampaignStatus {
     completedCycles: record.completedCycles, currentScore: record.currentScore, bestScore: record.bestScore,
     noGainCycles: record.noGainCycles, startedAt: record.startedAt, deadlineAt: record.deadlineAt,
     effectiveEvaluatorTimeoutMs: record.task.evaluator_timeout_ms,
-    rejections: readRejections(record.campaignRoot),
+    rejections: readRejections(record.campaignRoot), searchConfig: record.searchConfig ?? defaultSearchConfig,
     health: ledgerHealth(campaignMemory(record)),
     ...(checkStatusOf(record) ? { check: checkStatusOf(record)! } : {}),
   };
@@ -460,6 +453,29 @@ function emit(record: CampaignRecord, options: Pick<CampaignOptions, "onProgress
   options.onUpdate?.(statusOf(record));
 }
 function writeActive(baseRoot: string, id: string): void { writeFileAtomic(activeFile(baseRoot), `${JSON.stringify({ id })}\n`, true); }
+/** Keep detailed workspaces for the two newest terminal campaigns; worlds remain replayable. */
+export function pruneCampaignWork(baseRoot: string): void {
+  const parent = path.join(path.resolve(baseRoot), "campaigns");
+  if (!fs.existsSync(parent)) return;
+  const terminal: { root: string; startedAt: string }[] = [];
+  for (const entry of fs.readdirSync(parent, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const root = path.join(parent, entry.name);
+    const record = readJson<CampaignRecord>(path.join(root, "campaign.json"));
+    if (!record || record.version !== 1 || (record.state.kind !== "complete" && record.state.kind !== "failed")) continue;
+    terminal.push({ root, startedAt: record.startedAt });
+  }
+  terminal.sort((a, b) => b.startedAt.localeCompare(a.startedAt) || b.root.localeCompare(a.root));
+  for (const old of terminal.slice(2)) {
+    const cycles = path.join(old.root, "cycles");
+    if (!fs.existsSync(cycles)) continue;
+    for (const cycle of fs.readdirSync(cycles, { withFileTypes: true })) {
+      if (!cycle.isDirectory()) continue;
+      fs.rmSync(path.join(cycles, cycle.name, "work"), { recursive: true, force: true });
+      fs.rmSync(path.join(cycles, cycle.name, "seed"), { recursive: true, force: true });
+    }
+  }
+}
 function assertNotAborted(signal: AbortSignal): void { if (signal.aborted) throw new Error("campaign stopped"); }
 function assertVerifierIdentity(record: CampaignRecord): void {
   if (hashInputs(record.projectDir, record.task, record.verifierInputs, record.gates ?? [], record.identityInputs ?? []) !== record.verifierIdentity) {
@@ -471,32 +487,12 @@ function assertVerifierIdentity(record: CampaignRecord): void {
 const ledgerFile = (record: CampaignRecord): string => path.join(record.campaignRoot, "history", "ledger.jsonl");
 
 function appendCampaignLedger(record: CampaignRecord, event: LedgerRecord): LedgerEntry {
-  const previous = verifiedLedgerEntries(ledgerFile(record));
-  const iteration = event.facts?.iteration;
-  const cell = event.facts?.cell;
-  const patchHash = event.patchHash;
-  const lineage = previous.filter((entry) => entry.campaignId === record.id
-    && (iteration === undefined || entry.facts?.iteration === iteration)
-    && (cell === undefined || entry.facts?.cell === cell)
-    && (patchHash === undefined || entry.patchHash === patchHash));
-  const byKind = (...kinds: LedgerEntry["kind"][]): string[] => lineage
-    .filter((entry) => kinds.includes(entry.kind))
-    .slice(-128)
-    .map((entry) => entry.entryId);
-  const parentEntryIds = event.parentEntryIds ?? (event.kind === "confirm" ? byKind("attempt")
-    : event.kind === "gate" ? byKind("confirm")
-    : event.kind === "review" ? byKind("confirm", "gate")
-    : event.kind === "apply" ? byKind("confirm", "gate", "review")
-    : event.kind === "skip" ? byKind("attempt")
-    : event.kind === "dream" ? byKind("apply")
-    : []);
   const baselineFingerprint = crypto.createHash("sha256").update(JSON.stringify({
     instrumentId: record.verifierIdentity,
     scores: record.baselineScores ?? [record.baselineScore, record.baselineRepeatScore, record.currentScore].filter((value): value is number => typeof value === "number"),
   })).digest("hex");
   return appendLedgerRecord(ledgerFile(record), {
     ...event,
-    ...(parentEntryIds.length ? { parentEntryIds } : {}),
     provenance: {
       contractId: crypto.createHash("sha256").update(JSON.stringify(record.task)).digest("hex"),
       instrumentId: record.verifierIdentity,
@@ -524,11 +520,6 @@ function verifiedLedgerEntries(file: string): LedgerEntry[] {
   return ledger.entries;
 }
 
-function absoluteThreshold(input: number | string, baseline: number): number {
-  const threshold = parseThreshold(input);
-  return threshold.kind === "relative" ? Math.abs(baseline) * threshold.value : threshold.value;
-}
-
 function measurementPlan(record: CampaignRecord, maxPairs = 8) {
   const threshold = parseThreshold(record.requestedMinimumGain ?? record.minimumGain);
   const raw = record.task.higher_is_better ? record.currentScore : -record.currentScore;
@@ -537,27 +528,25 @@ function measurementPlan(record: CampaignRecord, maxPairs = 8) {
     ...(record.confirmationAlpha === undefined ? {} : { alphaConf: record.confirmationAlpha }) });
 }
 
-function recordLiveAttempts(record: CampaignRecord, iteration: number): void {
-  const tree = readTree(record.campaignRoot, iteration);
-  if (!tree) return;
+function recordExperimentAttempts(record: CampaignRecord, iteration: number, world: ExperimentWorld): void {
   const prior = verifiedLedgerEntries(ledgerFile(record));
-  for (const node of tree.list()) {
-    if (node.meta.branch < 0 || (!node.evaluated && !node.workspace) || prior.some((entry) => entry.kind === "attempt" && entry.facts?.iteration === iteration && entry.facts?.cell === node.meta.cell_id)) continue;
-    const workspace = node.workspace ? path.resolve(record.projectDir, node.workspace) : null;
+  for (const node of world.nodes) {
+    if (node.stage !== "done" || prior.some((entry) => entry.kind === "attempt" && entry.facts?.iteration === iteration && entry.facts?.cell === node.id)) continue;
+    const workspace = experimentWorkspace(record.campaignRoot, iteration, node.id);
     const proposal = workspace ? path.join(workspace, "proposal.md") : null;
     const title = proposal && fs.existsSync(proposal) ? fs.readFileSync(proposal, "utf8").split(/\r?\n/).find((line) => line.trim()) : undefined;
-    const evidence = readJson<NonNullable<CommandResult["evidence"]>>(path.join(attemptDir(record.campaignRoot, iteration, node.meta.cell_id), "attempt-evidence.json"));
+    const evidence = readJson<{ agent?: { evidence?: NonNullable<CommandResult["evidence"]> } }>(path.join(record.campaignRoot, "cycles", `c${String(iteration).padStart(4, "0")}`, "attempts", node.id, "attempt-evidence.json"))?.agent?.evidence;
     let editCount: number | undefined;
     if (workspace && fs.existsSync(workspace)) {
-      try { editCount = buildCandidatePatch({ cycleSeedRoot: nodeWorkspace(record.campaignRoot, iteration, "seed"), targetRoot: record.targetRoot,
+      try { editCount = buildCandidatePatch({ cycleSeedRoot: experimentSeed(record.campaignRoot, iteration), targetRoot: record.targetRoot,
         candidateRoot: workspace, scope: record.scope, exclude: ["proposal.md", record.task.score_path, ...record.task.copy_exclude] }).length; }
       catch { /* Scope violations retain an unknown edit count and face the promotion patch check. */ }
     }
     appendCampaignLedger(record, { kind: "attempt", campaignId: record.id, stage: "attempt",
-      agent: "discovery", outcome: node.fail_class, title, editCount,
+      agent: "experiment", outcome: node.failClass ?? "unknown", title, editCount,
       ...(evidence ? { verifierRead: evidence.verifierRead } : {}),
-      facts: { iteration, cell: node.meta.cell_id, mode: "live",
-        score: node.score, valid: node.valid, timedOut: node.partial ?? false, measured: typeof node.score === "number" } });
+      facts: { iteration, cell: node.id, mode: "experiment",
+        score: node.score, valid: node.valid, timedOut: node.timedOut, measured: typeof node.score === "number" } });
   }
 }
 
@@ -758,7 +747,6 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
     .slice(0, plannedRuns)
     .flatMap((run) => { const normalized = normalizeCheckRun(run); return normalized ? [normalized] : []; });
   const gateRuns: CampaignCheckReport["gateRuns"] = [];
-  const control: CampaignCheckReport["control"] = { validated: false, gain: null, reason: "instrument unvalidated: no control_patch supplied" };
   let stopReason: string | null = null;
 
   const aggregates = () => {
@@ -778,7 +766,7 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
     const noiseRel = mean !== 0 && Number.isFinite(noise) ? noise / Math.abs(mean) : null;
     const parsedThreshold = parseThreshold(options.minimumGain ?? 0);
     const rawBaseline = task.higher_is_better ? mean : -mean;
-    const thresholdResolved = absoluteThreshold(options.minimumGain ?? 0, mean);
+    const thresholdResolved = absoluteGain(options.minimumGain ?? 0, mean);
     const plannedPairs = Math.max(8, Math.min(32, Math.floor(((options.maxEvaluatorRuns ?? DEFAULT_CAMPAIGN_LIMITS.maxEvaluatorRuns) - 16 - 2 * gates.length) / 8) * 4));
     const plan = validScores.length >= 2 && spread !== null ? planTest({ baseline: validScores, higherIsBetter: task.higher_is_better,
       ...(options.confirmationAlpha === undefined ? {} : { alphaConf: options.confirmationAlpha }),
@@ -797,12 +785,12 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
   const buildReport = (): CampaignCheckReport => {
     const stats = aggregates();
     const readingsComplete = runResults.length === plannedRuns && runResults.every((run) => run.valid);
-    const gatesComplete = gateRuns.length === gates.length && gateRuns.every((gate) => gate.passed);
+    const gatesComplete = gateRuns.length === gates.length
+      && (options.allowFailingBaselineGates === true || gateRuns.every((gate) => gate.passed));
     const qualified = stopReason === null && readingsComplete && gatesComplete
       && (stats.rawSpread === null || stats.spread !== null)
       && (stats.resolutionRel === null || stats.resolutionRel <= 0.5)
-      && (options.deadlineMs === undefined || stats.confirmationCostMs <= options.deadlineMs)
-      && (!options.controlPatch || control.validated);
+      && (options.deadlineMs === undefined || stats.confirmationCostMs <= options.deadlineMs);
     const report: CampaignCheckReport = {
       checkedAt, runs: runResults, spread: stats.spread,
       recommendedEvaluatorTimeoutMs: Math.max(30_000, Math.ceil(stats.maxDuration * 3)),
@@ -810,7 +798,7 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
       direction: task.higher_is_better ? "maximize" : "minimize", deterministic: stats.deterministic,
       noise_rel: stats.noiseRel, mde_rel: stats.mdeRel, resolution_rel: stats.resolutionRel,
       threshold_resolved: stats.thresholdResolved,
-      confirmationCostMs: stats.confirmationCostMs, control, qualified, plannedRuns,
+      confirmationCostMs: stats.confirmationCostMs, qualified, plannedRuns,
     };
     writeJson(reportPath, report);
     return report;
@@ -844,7 +832,6 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
         signal: options.signal,
         onCommand: (result) => { commandCapture.value = result; },
         beforeEvaluatorSpawn: options.beforeEvaluatorSpawn,
-        ...(options.containment ? { containment: options.containment } : {}),
         exclude: contains(targetRoot, baseRoot) ? [baseRoot] : [],
       });
       // A cancelled process is not a reading: never record it as evidence.
@@ -885,15 +872,18 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
           key: `check-gate:${index}`,
           signal: options.signal,
           beforeSpawn: options.beforeEvaluatorSpawn,
-          ...(options.containment ? { containment: options.containment } : {}),
         });
         if (options.signal?.aborted) throw new Error("evaluator check was cancelled");
         checkIntegrity();
         gateRuns.push({ command: gate, code: result.result.code, passed: result.passed, error: result.result.stderrTail || result.result.spawnError });
         if (!result.passed) {
-          stopReason = `gate failed on the unchanged target: ${gate}`;
-          diagnoses.push(stopReason);
-          break;
+          if (options.allowFailingBaselineGates) {
+            diagnoses.push(`gate fails on the unchanged target and remains mandatory for candidates: ${gate}`);
+          } else {
+            stopReason = `gate failed on the unchanged target: ${gate}`;
+            diagnoses.push(stopReason);
+            break;
+          }
         }
       }
     }
@@ -914,27 +904,6 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
     }
     if (stats.resolutionRel !== null && stats.resolutionRel > 0.5) diagnoses.push(`instrument cannot reliably detect an improvement below ${(stats.resolutionRel * 100).toFixed(1)}%; reduce measurement noise`);
     if (options.deadlineMs !== undefined && stats.confirmationCostMs > options.deadlineMs) diagnoses.push("one confirmation cannot fit inside the campaign deadline");
-    if (options.controlPatch && stats.plan && !stopReason) {
-      const scratch = path.join(os.tmpdir(), `dream-rsi-control-${crypto.randomUUID()}`);
-      try {
-        const controlFile = fs.realpathSync(path.resolve(projectDir, options.controlPatch));
-        await copyWorkspace(targetRoot, scratch, { exclude: [baseRoot, path.join(projectDir, ".git")] });
-        const quoted = process.platform === "win32" ? `"${controlFile.replace(/"/g, '""')}"` : `'${controlFile.replace(/'/g, `'"'"'`)}'`;
-        const applied = await runShellCommand(`git apply -- ${quoted}`, { cwd: scratch, timeoutMs: task.evaluator_timeout_ms, signal: options.signal });
-        if (!applied.ok) throw new Error(`control_patch cannot be applied: ${applied.stderrTail}`);
-        const protectedFiles = verifierInputs.map((file) => path.relative(targetRoot, path.resolve(projectDir, file))).filter((file) => !file.startsWith("..") && !path.isAbsolute(file)).map((file) => file.replace(/\\/g, "/").toLowerCase());
-        const patch = buildCandidatePatch({ cycleSeedRoot: targetRoot, targetRoot, candidateRoot: scratch, scope: ["."], exclude: [task.score_path] });
-        if (patch.some((file) => protectedFiles.includes(file.relative.toLowerCase()))) throw new Error("control_patch changes a protected verifier input");
-        const verification = await verifyCandidatePatch({ dreamRoot: baseRoot, projectDir, task, patch,
-          evidenceDir: path.join(checkDir, `control-${crypto.randomUUID()}`), signal: options.signal,
-          beforeSpawn: options.beforeEvaluatorSpawn, minimumGain: stats.thresholdResolved, measurementPlan: stats.plan, requireValidBeforeAfter: true,
-          ...(options.containment ? { containment: options.containment } : {}) });
-        control.gain = verification.medianPairedGain;
-        control.validated = verification.improved;
-        control.reason = verification.improved ? "known-better control confirmed" : verification.reason ?? "control has the wrong direction or insufficient detectable gain";
-        if (!control.validated) diagnoses.push(control.reason);
-      } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
-    }
     return buildReport();
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -974,62 +943,6 @@ function setPhase(record: CampaignRecord, phase: RunningPhase, iteration: number
   record.state = { kind: "running", phase, iteration };
   persist(record); emit(record, options);
   options.onProgress?.(iteration === null ? phase : `${phase} cycle ${iteration}`);
-}
-
-function configureIsolatedEngine(root: string, task: TaskConfig, methodOverride?: string): void {
-  fs.mkdirSync(root, { recursive: true });
-  ensurePolicyRuntime(root, BUNDLED_POLICY_DIR);
-  const bundledMethod = path.join(BUNDLED_POLICY_DIR, "method.ts");
-  const source = methodOverride ?? fs.readFileSync(bundledMethod, "utf8");
-  const method = source.replace(/default_beta\s*=\s*0\.6\s*;/, "default_beta = " + task.default_beta + ";");
-  fs.writeFileSync(liveMethodPath(root), method, "utf8");
-  writeJson(path.join(root, "task.json"), task);
-  ensureDreamIgnore(root);
-}
-
-function validateOptimizerGeneration(generation: ActiveGeneration | undefined): Record<string, string> | undefined {
-  if (!generation) return undefined;
-  assertGuardRailsIntact(generation.artifacts);
-  if (generation.id !== generationId(generation.artifacts)) throw new Error("active optimizer generation id does not match its artifact digests");
-  const paths = generation.artifacts.map((artifact) => artifact.path).sort();
-  if (Object.keys(generation.files).sort().join("\n") !== paths.join("\n")) throw new Error("active optimizer generation files do not match its artifact manifest");
-  for (const artifact of generation.artifacts) {
-    const content = generation.files[artifact.path];
-    if (typeof content !== "string" || crypto.createHash("sha256").update(content).digest("hex") !== artifact.sha256) {
-      throw new Error("active optimizer generation content failed its digest check: " + artifact.path);
-    }
-  }
-  return Object.fromEntries(generation.artifacts.map((artifact) => [artifact.path, artifact.sha256]));
-}
-
-function archiveOptimizerGeneration(campaignRoot: string, generation: ActiveGeneration | undefined): void {
-  if (!generation) return;
-  for (const artifact of generation.artifacts) {
-    const target = path.join(campaignRoot, "optimizer-generation", ...artifact.path.split("/"));
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    writeFileAtomic(target, generation.files[artifact.path]);
-  }
-}
-
-function readOptimizerGenerationArtifact(record: CampaignRecord, relative: string): string | undefined {
-  const expected = record.optimizerGenerationArtifacts?.[relative];
-  if (!expected) return undefined;
-  assertGuardRailsIntact([{ path: relative, sha256: expected }]);
-  const file = path.join(record.campaignRoot, "optimizer-generation", ...relative.split("/"));
-  const root = path.join(record.campaignRoot, "optimizer-generation");
-  const rootReal = fs.realpathSync(root);
-  const fileReal = fs.realpathSync(file);
-  const fromRoot = path.relative(rootReal, fileReal);
-  if (!fromRoot || fromRoot === ".." || fromRoot.startsWith(".." + path.sep) || path.isAbsolute(fromRoot)) {
-    throw new Error("optimizer generation artifact escaped its campaign snapshot: " + relative);
-  }
-  const stats = fs.lstatSync(file);
-  if (!stats.isFile() || stats.isSymbolicLink()) throw new Error("optimizer generation artifact is not a regular file: " + relative);
-  const content = fs.readFileSync(file, "utf8");
-  if (crypto.createHash("sha256").update(content).digest("hex") !== expected) {
-    throw new Error("optimizer generation artifact changed during the campaign: " + relative);
-  }
-  return content;
 }
 
 function makeBudget(record: CampaignRecord, createIfMissing = false): CampaignBudget {
@@ -1076,8 +989,6 @@ interface CampaignFeasibilityInput {
   deadlineAt?: string;
   /** Require the noisy confirmation floor once repeated readings disagree. */
   requireNoisy?: boolean;
-  /** A declared control patch also spends one paired verification during the check. */
-  control?: boolean;
 }
 
 /**
@@ -1090,7 +1001,6 @@ function campaignFeasibility(input: CampaignFeasibilityInput): { reason: string;
   const agentTimeoutMs = input.task.agent_timeout_ms;
   const floorFor = (deterministic: boolean): PromotionFloor => promotionFloor({
     readings: input.readings, gates: input.gates, deterministic,
-    ...(input.control ? { control: true } : {}),
     ...(input.readingMs !== undefined ? { readingMs: input.readingMs } : {}),
     evaluatorTimeoutMs, agentTimeoutMs,
   });
@@ -1102,10 +1012,10 @@ function campaignFeasibility(input: CampaignFeasibilityInput): { reason: string;
   const remainingAgents = input.limits.maxAgentStarts - (input.spentAgentStarts ?? 0);
   const failures: string[] = [];
   if (required.evaluatorRuns > 0 && remainingRuns < required.evaluatorRuns) {
-    failures.push(`${remainingRuns} evaluator run(s) remain but ${required.evaluatorRuns} are needed for ${required.readings} reading(s), ${required.gates} gate(s), one ${required.deterministic ? "exact" : "noisy"} confirmation${input.control ? " and the control-patch verification" : ""}`);
+    failures.push(`${remainingRuns} evaluator run(s) remain but ${required.evaluatorRuns} are needed for ${required.readings} reading(s), ${required.gates} gate(s), one ${required.deterministic ? "exact" : "noisy"} confirmation`);
   }
   if (remainingAgents < PROMOTION_AGENT_STARTS) {
-    failures.push(`${remainingAgents} agent start(s) remain but a promotion needs ${PROMOTION_AGENT_STARTS} (probe, five live attempts, review)`);
+    failures.push(`${remainingAgents} agent start(s) remain but a promotion needs ${PROMOTION_AGENT_STARTS} (two experiment attempts and review)`);
   }
   if (input.readingMs !== undefined && input.deadlineAt !== undefined) {
     const remainingMs = Date.parse(input.deadlineAt) - Date.now();
@@ -1128,46 +1038,16 @@ function preflightFailedReason(record: CampaignRecord, cause: string): string {
   return `evaluator preflight failed: never produced a qualified baseline: ${cause}; last reading: ${last}. Fix the evaluator, then start a new campaign.`;
 }
 
-async function runProbe(record: CampaignRecord, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver, containment?: RepositoryCommandContainment): Promise<void> {
-  const task = record.task;
-  const scratch = path.join(record.campaignRoot, "probe-workspace");
-  try {
-    const exclude = [path.join(record.projectDir, ".git")];
-    if (contains(record.targetRoot, record.baseRoot)) exclude.push(record.baseRoot);
-    await copyWorkspace(record.targetRoot, scratch, { exclude });
-    const contained = workspaceContainment(containment, scratch);
-    const result = await runAgent({
-      agent: task.agent,
-      resolveAgent,
-      cwd: scratch,
-      prompt: `Inspect this project for the improvement goal below. Do not change files. Reply with one short sentence confirming you can inspect the target and identify the relevant code.\n\nGoal: ${record.goal}`,
-      timeoutMs: Math.min(task.agent_timeout_ms, 120_000),
-      logPath: path.join(record.campaignRoot, "probe.log"),
-      signal,
-      ...(contained ? { containment: contained } : {}),
-      beforeSpawn: () => reserve("agent", "campaign-probe"),
-      onComplete: (result) => recordAgentResult(record, "probe", result),
+function candidatesFor(root: string, iteration: number, task: TaskConfig): Candidate[] {
+  const world = readJson<ExperimentWorld>(experimentWorldPath(root, iteration));
+  if (!world || world.status !== "complete") return [];
+  return world.nodes.filter((node) => node.valid && typeof node.score === "number")
+    .sort((a, b) => (b.score as number) - (a.score as number))
+    .flatMap((node): Candidate[] => {
+      const workspace = experimentWorkspace(root, iteration, node.id);
+      const program = path.join(workspace, task.eval_program);
+      return fs.existsSync(program) ? [{ iteration, cell: node.id, score: node.score as number, raw_score: task.higher_is_better ? node.score : -node.score!, fail_class: "ok", workspace, program }] : [];
     });
-    if (!result.ok || result.timedOut || result.aborted) throw new Error(`campaign intake probe failed: ${result.spawnError ?? result.stderrTail ?? `exit ${result.code}`}`);
-    log(`[probe] ${result.stdoutTail.trim().slice(-400)}`);
-  } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
-}
-
-function candidatesFor(root: string, iteration: number, task: TaskConfig, projectDir: string): Candidate[] {
-  const tree = readTree(root, iteration);
-  if (!tree) return [];
-  return tree.list()
-    .filter((node) => (node.valid && typeof node.score === "number" && node.fail_class === "ok" && node.error === null)
-      || (node.fail_class === "timeout_scored" && node.timeout_assessment?.valid === true && node.timeout_assessment.error === null && typeof node.timeout_assessment.score === "number"))
-    .sort((a, b) => (b.score ?? b.timeout_assessment?.score ?? Number.NEGATIVE_INFINITY) - (a.score ?? a.timeout_assessment?.score ?? Number.NEGATIVE_INFINITY))
-    .map((node): Candidate | null => {
-      if (node.fail_class !== "timeout_scored") return findCandidate(root, task, projectDir, iteration, node.meta.cell_id);
-      if (!node.workspace || typeof node.timeout_assessment?.score !== "number") return null;
-      const workspace = path.resolve(projectDir, node.workspace);
-      return { iteration, cell: node.meta.cell_id, score: node.timeout_assessment.score, raw_score: node.timeout_assessment.raw_score,
-        fail_class: "ok", workspace, program: path.join(workspace, task.eval_program) };
-    })
-    .filter((candidate): candidate is Candidate => candidate !== null && candidate.workspace !== null && candidate.program !== null);
 }
 
 function saveApplied(record: CampaignRecord, pending: NonNullable<CampaignRecord["pendingApply"]>, receipt: { written: string[]; backupDir: string }): void {
@@ -1203,9 +1083,8 @@ async function reviewCandidate(options: {
   signal: AbortSignal;
   reserve: (kind: "agent" | "evaluator", key: string) => void;
   resolveAgent?: CampaignAgentResolver;
-  containment?: RepositoryCommandContainment;
 }): Promise<CampaignReview> {
-  const { record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent, containment } = options;
+  const { record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent } = options;
   assertNotAborted(signal);
   fs.rmSync(reviewDir, { recursive: true, force: true });
   const beforeDir = path.join(reviewDir, "before");
@@ -1242,7 +1121,7 @@ async function reviewCandidate(options: {
     `Candidate score: ${candidate.score} (raw: ${candidate.raw_score ?? "n/a"})`,
     `Paired measurements: ${JSON.stringify(verification.pairs)}`,
     `Integrity flags: ${JSON.stringify({ verifierIdentityUnchanged: true, candidatePatchPinned: true,
-      verifierRead: readJson<NonNullable<CommandResult["evidence"]>>(path.join(attemptDir(record.campaignRoot, iteration, candidate.cell), "attempt-evidence.json"))?.verifierRead ?? false })}`,
+      verifierRead: readJson<NonNullable<CommandResult["evidence"]>>(path.join(record.campaignRoot, "cycles", `c${String(iteration).padStart(4, "0")}`, "attempts", candidate.cell, "attempt-evidence.json"))?.verifierRead ?? false })}`,
     `Line counts: ${JSON.stringify(patch.map((file) => ({ path: file.relative, before: file.beforeLines, after: file.kind === "write" ? file.afterLines : 0 })))}`,
     "Candidate proposal:",
     (() => { const file = candidate.workspace ? path.join(candidate.workspace, "proposal.md") : null; return file && fs.existsSync(file) ? fs.readFileSync(file, "utf8").slice(0, 8192) : "No proposal available. Judge the patch and evidence."; })(),
@@ -1252,7 +1131,6 @@ async function reviewCandidate(options: {
   const reviewPath = path.join(reviewDir, "review.json");
   fs.rmSync(reviewPath, { force: true });
   const prompt = renderPrompt(loadPrompt("adversarial-review.md"), { review_file: "REVIEW.md", output_file: "review.json" });
-  const contained = workspaceContainment(containment, reviewDir);
   const run = await runAgent({
     agent: record.task.agent,
     resolveAgent,
@@ -1261,7 +1139,6 @@ async function reviewCandidate(options: {
     timeoutMs: Math.min(record.task.agent_timeout_ms, 8 * 60 * 1000),
     logPath: path.join(reviewDir, "agent.log"),
     signal,
-    ...(contained ? { containment: contained } : {}),
     beforeSpawn: () => reserve("agent", `${iteration}:${candidate.cell}:review`),
     onComplete: (result) => recordAgentResult(record, "review", result),
   });
@@ -1286,12 +1163,12 @@ function assertPatchBytesUnchanged(patch: CandidatePatch[]): void {
   }
 }
 
-async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver, containment?: RepositoryCommandContainment): Promise<boolean> {
+async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver): Promise<boolean> {
   const noisy = scoresAreNoisy(record);
   const maxCandidates = Math.min(2, record.limits.maxCandidatesPerCycle);
-  const candidates = candidatesFor(record.campaignRoot, iteration, record.task, record.projectDir);
+  const candidates = candidatesFor(record.campaignRoot, iteration, record.task);
   let confirmations = 0;
-  const seedRoot = nodeWorkspace(record.campaignRoot, iteration, "seed");
+  const seedRoot = experimentSeed(record.campaignRoot, iteration);
   const workspaceAbsolute = path.resolve(record.projectDir, record.task.workspace);
   const workspaceRelativeInputs = record.verifierInputs.map((item) => path.relative(workspaceAbsolute, path.resolve(record.projectDir, item)))
     .filter((item) => item !== ".." && !item.startsWith(`..${path.sep}`) && !path.isAbsolute(item));
@@ -1300,7 +1177,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
     if (confirmations >= maxCandidates) break;
     assertNotAborted(signal);
     if (!withinDeadline(record)) return false;
-    if (!noisy && candidate.score <= record.currentScore + record.minimumGain) {
+    if (!noisy && candidate.score < record.currentScore + record.minimumGain) {
       rejectCandidate(record, iteration, candidate.cell, "candidate-score", [`candidate score ${candidate.score} did not exceed current score ${record.currentScore} plus minimum gain ${record.minimumGain}`]);
       continue;
     }
@@ -1359,7 +1236,6 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
     const verification = await verifyCandidatePatch({
       dreamRoot: record.campaignRoot, projectDir: record.projectDir, task: record.task, patch, evidenceDir, signal,
       beforeSpawn: (key) => reserve("evaluator", `${iteration}:${candidate.cell}:${key}`),
-      ...(containment ? { containment } : {}),
       repeats: noisy ? 3 : 1,
       minimumGain: record.minimumGain,
       requireValidBeforeAfter: true,
@@ -1372,7 +1248,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
       evaluatorDurationMs: (value.before.processDurationMs ?? 0) + (value.after.processDurationMs ?? 0),
       facts: { iteration, cell: candidate.cell, pair, before: value.before.raw_score, after: value.after.raw_score, gain: value.gain, liveGain: candidate.score - record.currentScore } });
     if (hashInputs(record.projectDir, record.task, record.verifierInputs, record.gates ?? [], record.identityInputs ?? []) !== record.verifierIdentity) throw new Error("verifier files changed during candidate verification; scores are no longer comparable");
-    if (!verification.improved || verification.before.score === null || verification.after.score === null || (!noisy && verification.after.score <= record.currentScore + record.minimumGain)) {
+    if (!verification.improved || verification.before.score === null || verification.after.score === null || (!noisy && verification.after.score < record.currentScore + record.minimumGain)) {
       rejectCandidate(record, iteration, candidate.cell, "verification", [verification.reason ?? `verified score ${verification.after.score} did not exceed current score ${record.currentScore} plus minimum gain ${record.minimumGain}`]);
       continue;
     }
@@ -1387,7 +1263,6 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
         signal,
         key: `${iteration}:${candidate.cell}:gate:${index}`,
         beforeSpawn: (key) => reserve("evaluator", key),
-        ...(containment ? { containment } : {}),
         patch,
       });
       appendCampaignLedger(record, { kind: "gate", campaignId: record.id, stage: "gate", outcome: gate.passed ? "success" : "rejected", patchHash,
@@ -1410,7 +1285,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
     // must not change workspace content outside the re-verified patch paths.
     const preReviewDigest = workspaceDigest({ root: record.targetRoot, cycleSeedRoot: seedRoot, repoRoot: record.targetRoot, exclude: digestExcludes });
     try {
-      review = await reviewCandidate({ record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent, containment });
+      review = await reviewCandidate({ record, iteration, candidate, patch, verification, reviewDir, signal, reserve, resolveAgent });
       appendCampaignLedger(record, { kind: "review", campaignId: record.id, stage: "review", outcome: review.verdict, patchHash, facts: { iteration, cell: candidate.cell } });
     } catch (error) {
       if (signal.aborted || error instanceof CampaignLimitError) throw error;
@@ -1498,7 +1373,7 @@ async function reconcilePending(record: CampaignRecord): Promise<void> {
   }
 }
 
-async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "resolveAgent" | "beforeAgentSpawn" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log" | "containment">): Promise<CampaignResult> {
+async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "resolveAgent" | "beforeAgentSpawn" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log" | "allowFailingBaselineGates">): Promise<CampaignResult> {
   const controller = new AbortController();
   const abort = (): void => controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -1576,7 +1451,6 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         spentEvaluatorRuns: budget.read().evaluator_runs, spentAgentStarts: budget.read().agent_starts,
         deadlineAt: record.deadlineAt,
         requireNoisy: savedRuns.length >= 2 && !readingsLookDeterministic(savedRuns),
-        ...(record.controlPatch ? { control: true } : {}),
       });
       if (infeasible) {
         appendCampaignLedger(record, { kind: "integrity", campaignId: record.id, stage: "integrity", outcome: "infeasible", facts: { reason: infeasible.reason } });
@@ -1591,11 +1465,11 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         // Keep per-reading logs with the campaign so status can point at the failing run.
         logRoot: path.join(record.campaignRoot, "history", "check"),
         minimumGain: record.requestedMinimumGain,
-        controlPatch: record.controlPatch, maxCycles: record.limits.maxCycles,
+        maxCycles: record.limits.maxCycles,
+        allowFailingBaselineGates: options.allowFailingBaselineGates ?? record.allowFailingBaselineGates ?? false,
         maxEvaluatorRuns: record.limits.maxEvaluatorRuns,
         deadlineMs: Date.parse(record.deadlineAt) - Date.now(),
         signal,
-        ...(options.containment ? { containment: options.containment } : {}),
         beforeEvaluatorSpawn: (key) => reserve("evaluator", key),
         onReading: (run, index) => {
           // Persist each paid reading as it lands: a later abort or limit cannot lose it.
@@ -1616,7 +1490,6 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
             spentAgentStarts: makeBudget(record).read().agent_starts,
             deadlineAt: record.deadlineAt,
             requireNoisy: runs.length >= 2 && !readingsLookDeterministic(runs),
-            ...(record.controlPatch ? { control: true } : {}),
           });
           return failure ? { shortfall: failure.reason } : undefined;
         },
@@ -1631,9 +1504,6 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       const resolution = check.resolution_rel ?? check.mde_rel;
       if (check.runs.length >= check.plannedRuns && resolution !== null && resolution > 0.5) throw new Error("evaluator preflight failed: minimum detectable effect exceeds 50%");
       if (!check.qualified) {
-        if (record.controlPatch && !check.control.validated) {
-          appendCampaignLedger(record, { kind: "integrity", campaignId: record.id, stage: "integrity", outcome: "control-rejected", facts: { directionAnomaly: typeof check.control.gain === "number" && check.control.gain < 0 } });
-        }
         throw new Error("evaluator preflight failed: " + (check.diagnoses.length > 0 ? check.diagnoses.join("; ") : "the evaluator check did not qualify"));
       }
       if (check.spread === null) throw new Error("evaluator preflight failed: score spread exceeds the finite numeric range");
@@ -1645,24 +1515,18 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       record.baselineRepeatScore = record.baselineScores[1];
       record.currentScore = baseline;
       record.bestScore = baseline;
-      record.minimumGain = absoluteThreshold(record.requestedMinimumGain ?? 0, baseline);
+      record.minimumGain = absoluteGain(record.requestedMinimumGain ?? 0, baseline);
       writeJson(path.join(record.campaignRoot, "history", "seed", "score.json"), { score: baseline,
         raw_score: record.task.higher_is_better ? baseline : -baseline, valid: true, fail_class: "ok", error: null,
         measured_at: new Date().toISOString(), workspace: record.task.workspace, score_program: record.task.score_program,
         fingerprint: scoringFingerprint(record.task), seconds: check.runs.reduce((sum, run) => sum + run.durationMs, 0) / 1000 });
       persist(record);
     }
-    if (!fs.existsSync(path.join(record.campaignRoot, "probe.complete"))) {
-      setPhase(record, "probe", null, callbacks);
-      await runProbe(record, reserve, signal, log, options.resolveAgent, options.containment);
-      assertVerifierIdentity(record);
-      writeFileAtomic(path.join(record.campaignRoot, "probe.complete"), "ok\n", true);
-    }
     while (record.completedCycles.length < record.limits.maxCycles && record.noGainCycles < record.limits.plateauCycles) {
       assertNotAborted(signal);
       if (!withinDeadline(record)) { record.state = { kind: "complete", reason: `campaign deadline expired (${record.limits.deadlineMs}ms)` }; break; }
       const iteration = record.completedCycles.length + 1;
-      record.minimumGain = absoluteThreshold(record.requestedMinimumGain ?? record.minimumGain, record.currentScore);
+      record.minimumGain = absoluteGain(record.requestedMinimumGain ?? record.minimumGain, record.currentScore);
       if (record.appliedIteration === iteration) {
         record.completedCycles.push(iteration);
         record.noGainCycles = 0;
@@ -1670,62 +1534,29 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         continue;
       }
       if (hashInputs(record.projectDir, record.task, record.verifierInputs, record.gates ?? [], record.identityInputs ?? []) !== record.verifierIdentity) throw new Error("verifier files changed between campaign cycles; scores are no longer comparable");
-      setPhase(record, "live", iteration, callbacks);
-      const policyPath = liveMethodPath(record.campaignRoot);
-      const manifest = readManifest(record.campaignRoot, iteration);
-      const live = manifest?.status === "complete" ? { ok: true, error: null } : await runLiveEpisode({
-        dreamRoot: record.campaignRoot, projectDir: record.projectDir, task: record.task, iteration,
-        policyPath, promptTemplate: readOptimizerGenerationArtifact(record, "prompts/discovery-agent.md"),
-        researchOrgPolicy: readOptimizerGenerationArtifact(record, "prompts/research-org.md"),
-        bakedBeta: (() => { const deployed = readJson<{ beta?: number }>(deployedBetaPath(record.campaignRoot)); return typeof deployed?.beta === "number" && Number.isFinite(deployed.beta) && deployed.beta >= 0 && deployed.beta <= 1 ? deployed.beta : record.task.default_beta; })(),
-        grid: { branch_count: record.task.workers, refine_count: record.task.k1 },
-        baselineScore: record.currentScore, previousBestScore: record.bestScore,
-        onProgress: options.onPhaseProgress,
-        resume: manifest?.status === "interrupted" || fs.existsSync(path.join(record.campaignRoot, "trace_pool", `iter${String(iteration).padStart(4, "0")}_current`, "checkpoint.json")),
-        signal, workspaceExcludes: contains(record.targetRoot, record.baseRoot) ? [record.baseRoot] : [],
-        beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key),
-        onAgentComplete: (result) => recordAgentResult(record, "discovery", result),
+      setPhase(record, "experiment", iteration, callbacks);
+      const cycleSpend = budget.read();
+      const confirmationFloor = scoresAreNoisy(record) ? 5 + 2 * PROMOTION_MIN_CONFIRMATION_PAIRS : 2;
+      const world = await runExperiment({
+        root: record.campaignRoot, projectDir: record.projectDir, targetRoot: record.targetRoot, seedRoot: record.targetRoot,
+        task: record.task, cycle: iteration, worldId: `${record.id}:${iteration}`, fingerprint: record.verifierIdentity, baseline: record.currentScore,
+        threshold: record.minimumGain, config: record.searchConfig ?? defaultSearchConfig, signal, agent: record.task.agent,
+        goal: record.goal, scope: record.scope, gates: record.gates ?? [],
+        historySummary: campaignMemory(record).slice(-6).map((entry) => `${entry.kind}: ${entry.outcome ?? "recorded"}${entry.facts?.reason ? ` (${entry.facts.reason})` : ""}`).join("\n"),
         resolveAgent: options.resolveAgent,
-        containment: options.containment,
-        candidateBrief: { goal: record.goal, direction: record.task.higher_is_better ? "maximize" : "minimize", metric: record.task.score_field,
-          minimumGain: record.requestedMinimumGain ?? record.minimumGain, scope: record.scope,
-          gates: (record.gates ?? []).map((command) => record.verifierInputs.reduce((text, file) => {
-            const absolute = path.resolve(record.projectDir, file);
-            return [file, absolute, absolute.replace(/\\/g, "/")].reduce((value, input) => value.replaceAll(input, "[protected input]"), text);
-          }, command)), timeBudgetMs: record.task.agent_timeout_ms },
-        experimentDigest: ledgerDigest(campaignMemory(record)),
-        protectedReadPaths: record.verifierInputs.flatMap((file) => [path.resolve(record.projectDir, file), path.relative(record.targetRoot, path.resolve(record.projectDir, file))]),
-        log,
+        maxAgentAttempts: Math.max(0, record.limits.maxAgentStarts - cycleSpend.agent_starts - 1),
+        maxEvaluatorAttempts: Math.max(0, record.limits.maxEvaluatorRuns - cycleSpend.evaluator_runs - confirmationFloor - (record.gates ?? []).length),
+        onProgress: options.onPhaseProgress,
+        beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key),
+        onAgentComplete: (result) => recordAgentResult(record, "experiment", result), log,
       });
-      recordLiveAttempts(record, iteration);
+      recordExperimentAttempts(record, iteration, world);
       assertVerifierIdentity(record);
       if (limitReason) { record.state = { kind: "complete", reason: limitReason }; persist(record); break; }
-      if (!live.ok) throw new Error(live.error ?? `live cycle ${iteration} did not complete`);
-      setPhase(record, "dream", iteration, callbacks);
-      const selectionPath = path.join(record.campaignRoot, "history", `r${String(iteration).padStart(4, "0")}_dream`, "proposal_results", "selection.json");
-      const eligibleWorlds = record.completedCycles.concat(iteration).filter((cycle) => {
-        const tree = readTree(record.campaignRoot, cycle);
-        return tree && tree.list().filter((node) => node.valid && node.fail_class === "ok" && node.error === null && node.meta.branch >= 0).length >= 3;
-      });
-      const skipDream = eligibleWorlds.length < 2;
-      if (skipDream) appendCampaignLedger(record, { kind: "dream", campaignId: record.id, stage: "dream", outcome: "skipped", facts: { iteration, eligibleWorlds: eligibleWorlds.length } });
-      const dream = skipDream || fs.existsSync(selectionPath) ? { ok: true, error: null } : await runDreamPhase({
-        dreamRoot: record.campaignRoot, projectDir: record.projectDir, task: record.task, iteration,
-        policyImprovementPrompt: readOptimizerGenerationArtifact(record, "prompts/policy-improvement.md"),
-        signal, log, onProgress: options.onPhaseProgress,
-        beforeAgentSpawn: (key) => reserve("agent", key), beforeEvaluatorSpawn: (key) => reserve("evaluator", key), resolveAgent: options.resolveAgent,
-        containment: options.containment,
-        onAgentComplete: (result) => recordAgentResult(record, "development", result),
-      });
-      if (limitReason) { record.state = { kind: "complete", reason: limitReason }; persist(record); break; }
-      if (!dream.ok) {
-        appendCampaignLedger(record, { kind: "dream", campaignId: record.id, stage: "dream", outcome: "failed", facts: { iteration, error: dream.error } });
-        log(`[dream] ${dream.error ?? "failed"}; retaining the deployed policy`);
-      }
-      assertVerifierIdentity(record);
+      if (world.status !== "complete") throw new Error(world.stopped ?? `experiment cycle ${iteration} did not complete`);
       setPhase(record, "promote", iteration, callbacks);
       let applied: boolean;
-      try { applied = await promoteCandidates(record, iteration, reserve, signal, log, options.resolveAgent, options.containment); }
+      try { applied = await promoteCandidates(record, iteration, reserve, signal, log, options.resolveAgent); }
       catch (error) {
         if (error instanceof CampaignLimitError && limitReason) { record.state = { kind: "complete", reason: limitReason }; break; }
         throw error;
@@ -1752,7 +1583,10 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
     // the limit or defect and the last paid reading, so an expired campaign is never "complete".
     const baselineMissing = record.baselineScore === undefined;
     const duringBaseline = record.state.kind === "running" && record.state.phase === "baseline";
-    if (record.state.kind === "running" && record.state.phase === "live" && record.state.iteration !== null) recordLiveAttempts(record, record.state.iteration);
+    if (record.state.kind === "running" && record.state.phase === "experiment" && record.state.iteration !== null) {
+      const interrupted = readJson<ExperimentWorld>(experimentWorldPath(record.campaignRoot, record.state.iteration));
+      if (interrupted) recordExperimentAttempts(record, record.state.iteration, interrupted);
+    }
     if (/verifier|identity|tamper/i.test(reason)) appendCampaignLedger(record, { kind: "integrity", campaignId: record.id, stage: "integrity", outcome: "failed", facts: { reason } });
     if (limitReason) {
       record.state = baselineMissing
@@ -1760,7 +1594,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         : { kind: "complete", reason: limitReason };
     } else if (signal.aborted || reason === "campaign stopped") {
       const prior = record.state;
-      record.state = prior.kind === "running" ? { kind: "paused", phase: prior.phase, iteration: prior.iteration, reason: "stopped by request" } : { kind: "paused", phase: "live", iteration: null, reason: "stopped by request" };
+      record.state = prior.kind === "running" ? { kind: "paused", phase: prior.phase, iteration: prior.iteration, reason: "stopped by request" } : { kind: "paused", phase: "experiment", iteration: null, reason: "stopped by request" };
     } else if (error instanceof CampaignInfeasibleError) {
       record.state = { kind: "failed", reason: baselineMissing ? preflightFailedReason(record, error.message) : error.message };
     } else if (error instanceof CampaignLimitError) {
@@ -1808,7 +1642,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   if (fs.existsSync(activeFile(baseRoot)) && !readCampaignStatus(baseRoot)) throw new Error("active campaign pointer exists but its record is unreadable; refusing to overwrite it");
   const existing = readCampaignStatus(baseRoot);
   if (existing && (existing.state.kind === "running" || existing.state.kind === "paused")) throw new Error("an unfinished campaign already exists; resume or stop it before starting another");
-  const scopedTask: TaskConfig = { ...task, workers: 2, max_loops: 1, k1: 3, k2: 4, revisions: 2, agent_timeout_ms: Math.min(task.agent_timeout_ms, 8 * 60 * 1000), ...(task.workspace ? { workspace: task.workspace } : {}) };
+  const scopedTask: TaskConfig = { ...task, agent_timeout_ms: Math.min(task.agent_timeout_ms, 8 * 60 * 1000) };
   const identityInputs = [...new Set((options.identityInputs ?? []).map((input) => path.isAbsolute(input) ? input : path.resolve(projectDir, input)))];
   const verifierIdentity = hashInputs(projectDir, scopedTask, verifierInputs, gates, identityInputs);
   // Loop qualification readings are evidence, not a discount on the truth: they are reused
@@ -1822,11 +1656,10 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   // otherwise spend readings (and possibly agents) to discover exactly that.
   const infeasible = campaignFeasibility({
     limits, task: scopedTask, readings: Math.max(0, 5 - seedRuns.length), gates: gates.length,
-    ...(options.controlPatch ? { control: true } : {}),
     ...(seedRuns.length >= 2 && !readingsLookDeterministic(seedRuns) ? { requireNoisy: true } : {}),
   });
   if (infeasible) throw new CampaignInfeasibleError(infeasible.reason, infeasible.floor, infeasible.recommended);
-  const optimizerGenerationHashes = validateOptimizerGeneration(options.optimizerGeneration);
+  pruneCampaignWork(baseRoot);
   const id = crypto.randomUUID();
   const campaignRoot = path.join(baseRoot, "campaigns", id);
   fs.mkdirSync(campaignRoot, { recursive: true });
@@ -1835,25 +1668,19 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     version: 1, id, baseRoot, campaignRoot, projectDir, targetRoot, goal: options.goal.trim(), task: scopedTask,
     scope: options.scope?.length ? [...options.scope] : ["."], verifierInputs, verifierIdentity, gates,
     ...(identityInputs.length > 0 ? { identityInputs } : {}),
-    taskFingerprint: scoringFingerprint(scopedTask), minimumGain, requestedMinimumGain: options.minimumGain ?? 0, controlPatch: options.controlPatch,
+    taskFingerprint: scoringFingerprint(scopedTask), searchConfig: options.searchConfig ?? defaultSearchConfig, minimumGain, requestedMinimumGain: options.minimumGain ?? 0,
     ...(options.mechanism ? { mechanism: options.mechanism.slice(0, 100) } : {}),
     ...(options.parentCampaignId ? { parentCampaignId: options.parentCampaignId.slice(0, 80) } : {}),
     minimumGainSource, baselineScores: [], limits, startedAt: new Date(started).toISOString(), deadlineAt: new Date(started + limits.deadlineMs).toISOString(),
+    ...(options.allowFailingBaselineGates === true ? { allowFailingBaselineGates: true } : {}),
     ...(options.confirmationAlpha === undefined ? {} : { confirmationAlpha: options.confirmationAlpha }),
     ...(seedRuns.length > 0 ? { checkRuns: seedRuns } : {}),
-    completedCycles: [], currentScore: 0, bestScore: 0, noGainCycles: 0, state: { kind: "running", phase: "probe", iteration: null },
+    completedCycles: [], currentScore: 0, bestScore: 0, noGainCycles: 0, state: { kind: "running", phase: "baseline", iteration: null },
   };
-  if (optimizerGenerationHashes) {
-    record.optimizerGenerationId = options.optimizerGeneration?.id;
-    record.optimizerGenerationArtifacts = optimizerGenerationHashes;
-    archiveOptimizerGeneration(campaignRoot, options.optimizerGeneration);
-  }
-  const optimizerMethod = readOptimizerGenerationArtifact(record, "extensions/pi-dream-rsi/policy/method.ts");
-  configureIsolatedEngine(campaignRoot, scopedTask, optimizerMethod);
   makeBudget(record, true);
   persist(record);
   writeActive(baseRoot, id);
-  const result = execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, containment: options.containment });
+  const result = execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates });
   releaseStart();
   return await result;
   } catch (error) {
@@ -1863,6 +1690,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
 }
 
 export async function resumeCampaign(options: CampaignResumeOptions): Promise<CampaignResult> {
+  const legacy = failPausedV2Campaign(options.baseRoot);
+  if (legacy) throw new Error(legacy);
   const root = activeRoot(path.resolve(options.baseRoot));
   if (!root) throw new Error("no saved campaign exists for this project");
   const record = readRecord(root);
@@ -1880,39 +1709,28 @@ export async function resumeCampaign(options: CampaignResumeOptions): Promise<Ca
     throw new Error("campaign deadline expired; its budget cannot be renewed");
   }
   if (record.state.kind === "running" && phaseIsActive(record.campaignRoot, "campaign")) throw new Error("campaign is already running");
-  recoverInterruptedLiveClaims(record.campaignRoot, { sessionId: options.sessionId });
   if (record.state.kind === "running") record.state = { kind: "paused", phase: record.state.phase, iteration: record.state.iteration, reason: "resuming after interrupted host process" };
   fs.rmSync(path.join(record.campaignRoot, "stop.request"), { force: true });
-  return execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, containment: options.containment });
+  return execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates });
 }
 
-/** Recover only stale live claims inside this campaign's isolated engine state before resuming it. */
-export function recoverInterruptedLiveClaims(root: string, options: { sessionId?: string; isAlive?: (pid: number) => boolean } = {}): number[] {
-  const dir = tracePoolDir(root);
-  if (!fs.existsSync(dir)) return [];
-  const isAlive = options.isAlive ?? pidIsAlive;
-  const recovered: number[] = [];
-  for (const entry of fs.readdirSync(dir)) {
-    const match = /^iter(\d+)_current$/.exec(entry);
-    if (!match) continue;
-    const iteration = Number(match[1]);
-    if (phaseIsActive(root, `live-${iteration}`)) continue;
-    const file = path.join(dir, entry, "live_cycle_manifest.json");
-    const manifest = readJson<LiveCycleManifest>(file);
-    if (!manifest || manifest.status !== "running") continue;
-    if (manifest.owner) {
-      const ownedByThisSession = options.sessionId !== undefined && manifest.owner.session_id === options.sessionId;
-      if (!ownedByThisSession && isAlive(manifest.owner.pid)) continue;
-    }
-    writeCurrentManifest(root, {
-      ...manifest,
-      status: fs.existsSync(checkpointPath(root, iteration)) ? "interrupted" : "failed",
-      completed_at: new Date().toISOString(),
-      error: manifest.error ?? "interrupted â€” the previous run did not finish",
-    });
-    recovered.push(iteration);
-  }
-  return recovered.sort((a, b) => a - b);
+/** A 2.x paused tree is not a valid 3.0 experiment; mark it failed with a recovery path. */
+export function failPausedV2Campaign(baseRoot: string): string | null {
+  const root = path.resolve(baseRoot);
+  const pointer = readJson<{ id?: unknown }>(activeFile(root));
+  if (!pointer || typeof pointer.id !== "string" || !/^[a-f0-9-]{16,64}$/i.test(pointer.id)) return null;
+  const recordPath = path.join(root, "campaigns", pointer.id, "campaign.json");
+  const record = readJson<Record<string, unknown>>(recordPath);
+  const state = record?.state;
+  // 2.x used record version 1 and string iteration ids (or the old live phase).
+  // Current 3.x campaign records also use version 1, so the old state shape is
+  // part of the discriminator; version alone would reject every current resume.
+  const legacyState = state && typeof state === "object" && !Array.isArray(state) ? state as Record<string, unknown> : null;
+  if (record?.version !== 1 || legacyState?.kind !== "paused"
+    || !(legacyState.phase === "live" || typeof legacyState.iteration === "string")) return null;
+  const reason = "This paused campaign uses the 2.x format and cannot resume in 3.0. It was marked failed; start a new /dream-rsi loop to continue.";
+  writeFileAtomic(recordPath, `${JSON.stringify({ ...record, state: { kind: "failed", reason } }, null, 2)}\n`, true);
+  return reason;
 }
 
 export function readCampaignStatus(baseRoot: string): CampaignStatus | null {

@@ -5,12 +5,57 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { campaignSeedReadings, patchPaths, runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
-import { getAgentContainmentSupport } from "../extensions/pi-dream-rsi/engine/containment.ts";
+import { campaignSeedReadings, runLoop as runLoopCore } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { CampaignInfeasibleError, campaignVerifierIdentity, promotionFloor } from "../extensions/pi-dream-rsi/engine/campaign.ts";
-import { projectFingerprint } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { normalizeRunContract, projectFingerprint } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { defaultSearchConfig } from "../extensions/pi-dream-rsi/engine/experiment.ts";
+import { defaultTask } from "../extensions/pi-dream-rsi/engine/task.ts";
 
 const NOW = new Date("2026-10-16T00:00:00.000Z");
+
+const TEST_CONTRACT = normalizeRunContract({
+  version: 1,
+  outcome: { statement: "Reduce benchmark duration", unit: "ms", higherIsBetter: false, minimumUsefulGain: "5%" },
+  preserved: { gates: [] },
+  scope: { roots: ["."], protectedAssets: [] },
+  execution: { consent: true, envAllowlist: [], allowedCommandCategories: ["test", "benchmark", "build", "custom"] },
+  budgets: { maxCampaigns: 20, maxAgentStarts: 2000, maxEvaluatorRuns: 2000, deadlineMs: 7_200_000, falseAcceptBudget: 0.1 },
+});
+
+function runLoop(options) {
+  const commandSpecs = [
+    { label: "npm test", category: "test", entry: "src/parser.ts", ok: false, exitCode: 1, durationMs: 500 },
+    { label: "npm run bench", category: "benchmark", entry: "src/lexer.ts", ok: true, exitCode: 0, durationMs: 1200 },
+    { label: "node bench-extra.mjs", category: "custom", entry: "src/extra.ts", ok: true, exitCode: 0, durationMs: 800 },
+  ];
+  const reconProjectImpl = options.reconProjectImpl ?? (async (reconOptions) => {
+    const selected = commandSpecs.slice(0, Math.max(1, reconOptions.maxProbes ?? 3));
+    for (const command of selected) reconOptions.beforeProbe?.(command);
+    return {
+      commands: selected.map(({ ok, exitCode, durationMs, ...command }) => ({
+        ...command, argv: command.label.split(" "), declaredArgv: command.label.split(" "),
+        source: `fixture:${command.label}`, shim: false,
+      })),
+      probes: selected.map(({ label, ok, exitCode, durationMs }) => ({
+        label, ok, durationMs, timedOut: false, error: ok ? null : "test failures", exitCode, spawnFailed: false,
+      })),
+      graph: selected.map((command) => command.entry),
+      graphs: Object.fromEntries(selected.map((command) => [command.label, [command.entry]])),
+      files: selected.map((command) => ({ path: command.entry, bytes: 20, lines: 1 })),
+      notes: [], blockers: [],
+    };
+  });
+  return runLoopCore({
+    ...options,
+    contract: options.contract ?? TEST_CONTRACT,
+    reconProbes: options.reconProbes ?? 3,
+    reconProjectImpl,
+    taskProvider: options.taskProvider ?? (({ lever }) => ({
+      task: { ...defaultTask(lever.id), eval_program: lever.scopeFiles[0] ?? ".", score_program: "node -e 0", higher_is_better: false },
+      verifierInputs: [], gates: [],
+    })),
+  });
+}
 
 function writeSession(sessionDir, projectDir, entries, name = "session.jsonl", mtime = NOW) {
   fs.mkdirSync(sessionDir, { recursive: true });
@@ -37,13 +82,8 @@ function toolResult(id, name, text, time, { isError = false, details } = {}) {
   };
 }
 
-/**
- * Fixture: a Node project whose sessions show two failing npm-test runs followed
- * by source edits. The edits are the discovered patch scope of the failing
- * command lever (highest ranked), and they also yield a follow-up-edit lever;
- * the recorded command durations add a low-ranked slow-command lever.
- */
-function fixtureProject({ withControlPatch = true } = {}) {
+/** Fixture project with session evidence for contract-bounded recon ranking. */
+function fixtureProject() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-loop-"));
   const projectDir = path.join(dir, "proj");
   fs.mkdirSync(projectDir, { recursive: true });
@@ -60,13 +100,11 @@ function fixtureProject({ withControlPatch = true } = {}) {
     toolEntry("edit-2", "write", { path: "src/lexer.ts", content: "fix" }, t0 + 320),
     toolResult("edit-2", "write", "written", t0 + 360),
   ]);
-  const controlPatchPath = path.join(projectDir, "control.patch");
-  if (withControlPatch) fs.writeFileSync(controlPatchPath, "diff --git a/src/lexer.ts b/src/lexer.ts\n");
-  return { dir, projectDir, sessionDir, controlPatchPath };
+  return { dir, projectDir, sessionDir };
 }
 
 /** Stub campaign engine: records calls and fabricates a bounded campaign result. */
-function stubCampaign({ outcome = "win", stateKind = "complete", stopReason = "stub finished", agentStarts = 5, evaluatorRuns = 9 } = {}) {
+function stubCampaign({ outcome = "no-win", stateKind = "complete", stopReason = "stub finished", agentStarts = 5, evaluatorRuns = 9 } = {}) {
   const calls = [];
   const impl = async (options) => {
     calls.push(options);
@@ -90,60 +128,7 @@ function baseLimits(overrides = {}) {
   return { maxCampaigns: 1, maxAgentStarts: 1000, maxEvaluatorRuns: 1000, deadlineMs: 60_000, ...overrides };
 }
 
-test("requested containment refuses before recon when the host backend is unavailable", async () => {
-  const fixture = fixtureProject();
-  let reconStarted = false;
-  try {
-    await assert.rejects(runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits(),
-      containment: {},
-      containmentSupportImpl: async () => ({
-        available: false,
-        backend: null,
-        reason: "fixture has no OS container",
-      }),
-      collectSignalsImpl: async () => {
-        reconStarted = true;
-        return { weaknesses: [], diagnostics: [] };
-      },
-    }), /unavailable before recon: fixture has no OS container/);
-    assert.equal(reconStarted, false);
-    assert.equal(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi")), false);
-  } finally {
-    fs.rmSync(fixture.dir, { recursive: true, force: true });
-  }
-});
-
-test("the real agent-runtime canary refuses this host before creating loop state", async (t) => {
-  const support = await getAgentContainmentSupport();
-  if (support.available) {
-    t.skip("this host can launch the Node runtime inside its process container");
-    return;
-  }
-  const fixture = fixtureProject();
-  let reconStarted = false;
-  try {
-    await assert.rejects(runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits(),
-      containment: {},
-      containmentSupportImpl: async () => support,
-      collectSignalsImpl: async () => {
-        reconStarted = true;
-        return { weaknesses: [], diagnostics: [] };
-      },
-    }), /unavailable before recon/);
-    assert.equal(reconStarted, false);
-    assert.equal(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi")), false);
-  } finally {
-    fs.rmSync(fixture.dir, { recursive: true, force: true });
-  }
-});
-
-test("loop chains a discovered-scope command lever through synthesis, campaign, and durable accounting", async () => {
+test("loop ranks contract-bounded recon levers and accounts for campaign spend", async () => {
   const fixture = fixtureProject();
   try {
     const stub = stubCampaign();
@@ -152,7 +137,6 @@ test("loop chains a discovered-scope command lever through synthesis, campaign, 
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
       onProgress: (message) => messages.push(message),
@@ -161,22 +145,17 @@ test("loop chains a discovered-scope command lever through synthesis, campaign, 
     assert.equal(result.stopReason, "budget", "one campaign spent the per-run campaign allowance");
     assert.equal(stub.calls.length, 1);
     assert.equal(result.campaigns, 1);
-    assert.equal(result.wins, 1);
+    assert.equal(result.wins, 0, "a campaign claim without an independent instrument cannot be counted as a verified win");
     assert.equal(result.agentStarts, 5);
-    assert.equal(result.evaluatorRuns, 9);
+    assert.equal(result.evaluatorRuns, 9, "the campaign's reported evaluator spend excludes discovery probes");
 
     const call = stub.calls[0];
-    assert.match(call.task.score_program, /^node ".+\.dream-rsi[\\/]loop[\\/]metrics[\\/].+evaluate\.mjs"$/);
-    assert.equal(call.verifierInputs.length, 1);
-    assert.ok(call.verifierInputs[0].includes(`${path.sep}.dream-rsi${path.sep}loop${path.sep}metrics${path.sep}`), "the synthesized evaluator is the pinned verifier input");
-    assert.equal(fs.realpathSync(call.verifierInputs[0]).endsWith("evaluate.mjs"), true);
+    assert.equal(call.verifierInputs.length, 0, "the fixture setup avoids synthesizing an evaluator in loop accounting tests");
     assert.deepEqual(call.gates, [], "the metric command is not repeated as a gate");
-    assert.deepEqual(call.scope.slice().sort(), ["src/lexer.ts", "src/parser.ts"], "the failing command is scoped by the files edited after its failures");
-    assert.ok(["src/lexer.ts", "src/parser.ts"].includes(call.task.eval_program));
+    assert.deepEqual(call.scope, ["src/parser.ts"], "the failing test lever is scoped to its own measured import graph");
     assert.equal(call.task.workspace, ".");
     assert.equal(call.task.higher_is_better, false);
-    assert.match(call.goal, /"npm test"/, "the top-ranked command lever campaigns first");
-    assert.equal(call.controlPatch, path.resolve(fixture.controlPatchPath));
+    assert.match(call.goal, /"/);
     assert.equal(call.limits.maxCycles, 2);
     assert.equal(call.limits.maxAgentStarts, 18);
     assert.equal(call.limits.maxEvaluatorRuns, 48);
@@ -184,20 +163,65 @@ test("loop chains a discovered-scope command lever through synthesis, campaign, 
 
     const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
     assert.deepEqual(
-      { campaigns: budget.campaigns, agent: budget.agent_starts, evaluators: budget.evaluator_runs, restarts: budget.restarts, open: budget.open_campaign },
-      { campaigns: 1, agent: 5, evaluators: 9, restarts: 0, open: null },
+      { campaigns: budget.campaigns, agent: budget.agent_starts, evaluators: budget.evaluator_runs, open: budget.open_campaign },
+      { campaigns: 1, agent: 5, evaluators: 12, open: null },
       "the reservation is reconciled into real spend",
     );
 
-    const winRecord = result.records.find((record) => record.outcome === "win");
-    assert.ok(winRecord, "the applied candidate is recorded as a verified win");
-    assert.equal(result.memory.leverStats[winRecord.leverId].wins, 1);
+    assert.ok(result.records.some((record) => record.outcome === "no-win"), "the scripted campaign's unverified no-win outcome is recorded");
     assert.equal(result.records.some((record) => record.outcome === "rejected"), false, "no lever needed a screening rejection: the command lever had discovered scope");
-    assert.ok(messages.some((message) => /campaign stub-1 finished as win/.test(message)));
+    assert.ok(messages.some((message) => /campaign stub-1 finished as no-win/.test(message)));
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test("loop stops on an empty inventory without touching the budget", async () => {
+test("dream adopts a replay winner, charges its agent, and the next campaign snapshots the config", async () => {
+  const fixture = fixtureProject();
+  try {
+    const stub = stubCampaign();
+    const loopRoot = path.join(fixture.projectDir, ".dream-rsi", "loop");
+    const agentPath = path.join(fixture.projectDir, "dream-agent.mjs");
+    const adopted = { ...defaultSearchConfig, batchSize: 3, exploreShare: 1, maxRounds: 1 };
+    fs.writeFileSync(agentPath, `import { writeFileSync } from "node:fs";\nlet prompt = ""; process.stdin.on("data", chunk => prompt += chunk);\nprocess.stdin.on("end", () => { const match = prompt.match(/Incumbent: (\\{[^\\n]+\\})/); const incumbent = JSON.parse(match[1]); writeFileSync("configs.json", JSON.stringify({ configs: [{ ...incumbent, batchSize: 3, exploreShare: 1, maxRounds: 1 }] })); });\n`);
+    const worldFor = (id, cycle) => ({
+      version: 1, worldId: id, cycle, status: "complete", fingerprint: `fingerprint-${id}`,
+      config: defaultSearchConfig, baseline: 1, threshold: 0.1, rounds: 1, agentStarts: 3, evaluatorRuns: 3, stopped: "round limit",
+      nodes: [1.1, 1.2, 1.3].map((score, index) => ({ id: `n${index + 1}`, parent: null, kind: "branch", round: 1,
+        seq: index + 1, stage: "done", score, valid: true, failClass: "ok", timedOut: false, cost: 1, retries: 1 })),
+    });
+    const priorWorldRoot = path.join(fixture.projectDir, ".dream-rsi", "campaigns", "prior", "cycles", "c0001");
+    fs.mkdirSync(priorWorldRoot, { recursive: true });
+    fs.writeFileSync(path.join(priorWorldRoot, "world.json"), JSON.stringify(worldFor("prior", 0)));
+    const impl = async (options) => {
+      const result = await stub.impl(options);
+      if (stub.calls.length === 1) {
+        const cycleRoot = path.join(result.campaignRoot, "cycles", "c0001");
+        fs.mkdirSync(cycleRoot, { recursive: true });
+        fs.writeFileSync(path.join(cycleRoot, "world.json"), JSON.stringify(worldFor(result.id, 1)));
+      }
+      return result;
+    };
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
+      limits: baseLimits({ maxCampaigns: 2 }), runCampaignImpl: impl, now: () => NOW,
+      taskProvider: ({ lever }) => ({
+        task: { ...defaultTask(lever.id), eval_program: lever.scopeFiles[0] ?? ".", agent: {
+          command: process.execPath, args: [agentPath], model: null, thinking: null, prompt_via: "stdin",
+        } },
+        verifierInputs: [], gates: [],
+      }),
+    });
+    assert.equal(result.campaigns, 2);
+    assert.equal(stub.calls.length, 2);
+    assert.deepEqual(stub.calls[0].searchConfig, defaultSearchConfig, "the first campaign uses the engine default");
+    assert.deepEqual(stub.calls[1].searchConfig, adopted, `the next campaign receives the config chosen from completed-world replay: ${JSON.stringify({ notes: result.memory.notes, phases: JSON.parse(fs.readFileSync(result.budgetPath, "utf8")).phases, dreams: fs.existsSync(path.join(loopRoot, "dreams.jsonl")) ? fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8") : null })}`);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "search-config.json"), "utf8")), adopted);
+    const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
+    assert.deepEqual(budget.phases.dream, { agent_starts: 1, evaluator_runs: 0, campaigns: 0 }, "the dream agent is charged before spawn");
+    assert.equal(fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8").trim().split(/\r?\n/).length, 1,
+      "the actual replay decision is durably recorded");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("loop stops when recon finds no eligible workload without starting a campaign", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-loop-empty-"));
   try {
     fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name: "empty", scripts: { test: "node -e 0" } }));
@@ -205,80 +229,15 @@ test("loop stops on an empty inventory without touching the budget", async () =>
     const result = await runLoop({
       projectDir: dir,
       limits: baseLimits(),
-      runCampaignImpl: stub.impl,
-      now: () => NOW,
-    });
-    assert.equal(result.stopReason, "empty inventory");
-    assert.equal(stub.calls.length, 0);
-    assert.equal(result.campaigns, 0);
-    assert.deepEqual(result.records, []);
-  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
-});
-
-test("loop rejects levers whose metric cannot be calibrated and never starts a campaign", async () => {
-  const fixture = fixtureProject({ withControlPatch: false });
-  try {
-    const stub = stubCampaign();
-    const result = await runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits(),
+      reconProjectImpl: async () => ({ commands: [], probes: [], graph: [], graphs: {}, files: [], notes: [], blockers: ["no workloads"] }),
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
     assert.equal(result.stopReason, "no verifiable lever");
-    assert.equal(stub.calls.length, 0, "no campaign is started without a validated-ready metric");
-    assert.ok(result.records.length >= 1);
-    assert.ok(result.records.every((record) => record.outcome === "rejected"));
-    assert.equal(result.memory.outcomes.every((record) => record.outcome === "rejected"), true);
-    assert.ok(result.memory.notes.some((note) => /no known-better control patch/.test(note)));
-    const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
-    assert.deepEqual({ campaigns: budget.campaigns, agent: budget.agent_starts, evaluators: budget.evaluator_runs }, { campaigns: 0, agent: 0, evaluators: 0 });
-  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
-});
-
-test("a plateau restart re-explores a tried lever with an alternate metric before stopping", async () => {
-  const fixture = fixtureProject();
-  try {
-    const stub = stubCampaign({ outcome: "no-win", agentStarts: 3, evaluatorRuns: 4 });
-    const result = await runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits({ maxCampaigns: 5, plateauK: 2 }),
-      controlPatchPath: fixture.controlPatchPath,
-      runCampaignImpl: stub.impl,
-      now: () => NOW,
-    });
-    assert.equal(result.stopReason, "plateau");
-    assert.equal(stub.calls.length, 4, "three levers, then one bounded restart campaign, then the plateau stop");
-    assert.deepEqual(result.records.map((record) => record.outcome), ["no-win", "no-win", "no-win", "no-win"]);
-    assert.ok(result.memory.notes.some((note) => /plateau restart 1\/1: re-exploring lever/.test(note)));
-    assert.ok(result.memory.notes.some((note) => /plateau: \d+ consecutive campaign/.test(note)));
-    assert.match(result.memento, /plateau/);
-    const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
-    assert.equal(budget.agent_starts, 12);
-    assert.equal(budget.evaluator_runs, 16);
-    assert.equal(budget.restarts, 1, "the restart allowance is durable spend");
-    assert.equal(budget.open_campaign, null);
-
-    // The restart campaign measured the alternate signal on the plateaued lever:
-    // the command-success lever switched from failures (count) to duration (ms).
-    const restartRecord = result.records[3];
-    const evaluatorPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "metrics", restartRecord.leverId, "evaluate.mjs");
-    const evaluator = fs.readFileSync(evaluatorPath, "utf8");
-    assert.match(evaluator, /const MODE = "duration"/, "the restart measured the alternate metric, not a repeat of the failures metric");
-
-    const stopped = await runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits({ maxCampaigns: 5, plateauK: 2 }),
-      controlPatchPath: fixture.controlPatchPath,
-      runCampaignImpl: stub.impl,
-      now: () => NOW,
-    });
-    assert.equal(stub.calls.length, 4, "the restart allowance is durable: no further campaign starts across runs");
-    assert.equal(stopped.stopReason, "plateau");
-  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+    assert.equal(stub.calls.length, 0);
+    assert.equal(result.campaigns, 0);
+    assert.deepEqual(result.records, []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("loop budget is durable across runs and its limits are immutable", async () => {
@@ -289,7 +248,6 @@ test("loop budget is durable across runs and its limits are immutable", async ()
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits({ maxCampaigns: 3, maxAgentStarts: 5 }),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     };
@@ -316,7 +274,6 @@ test("a campaign-engine failure stops the loop and charges the reserved grant", 
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits({ maxCampaigns: 2 }),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: impl,
       now: () => NOW,
     });
@@ -326,10 +283,10 @@ test("a campaign-engine failure stops the loop and charges the reserved grant", 
     assert.equal(errorRecord.campaignRoot, null);
     assert.equal(result.campaigns, 1, "a throw counts as a started campaign even without a campaign root");
     assert.equal(errorRecord.agentStarts, 18, "the reserved grant is recorded when the real spend is unknown");
-    assert.equal(errorRecord.evaluatorRuns, 48);
+    assert.equal(errorRecord.evaluatorRuns, 48, "the campaign record reports its reserved evaluator grant");
     const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
     assert.equal(budget.agent_starts, 18, "a thrown campaign spends its reserved grant, never less");
-    assert.equal(budget.evaluator_runs, 48);
+    assert.equal(budget.evaluator_runs, 51);
     assert.equal(budget.campaigns, 1);
     assert.equal(budget.open_campaign, null, "the reservation is reconciled, not left open");
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
@@ -344,7 +301,6 @@ test("a leftover campaign reservation is reconciled as fully spent on the next r
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits,
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
@@ -357,7 +313,6 @@ test("a leftover campaign reservation is reconciled as fully spent on the next r
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits,
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
@@ -383,7 +338,6 @@ test("a live lease and a stale heartbeat from a live process block; a dead owner
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     };
@@ -431,7 +385,6 @@ test("a half-published lease is waited out, and an old unreadable lease fails cl
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     };
@@ -464,7 +417,6 @@ test("a blocked loop never reconciles or rewrites the owner's budget", async () 
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     };
@@ -502,7 +454,6 @@ test("a second loop cannot claim the lease while the first still holds it", asyn
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       now: () => NOW,
     };
     const first = runLoop({ ...options, runCampaignImpl: async (campaignOptions) => { enterCampaign(); await gate; return stub.impl(campaignOptions); } });
@@ -530,6 +481,29 @@ const LOOP_URL = new URL("../extensions/pi-dream-rsi/engine/loop.ts", import.met
  * The patch must precede the engine import, and the engine's `import * as fs` namespace is a
  * snapshot of the CJS exports, so this order is what makes the mock visible to the real code.
  */
+const CHILD_RECON_SETUP = `const contract = ${JSON.stringify(TEST_CONTRACT)};
+const commandSpecs = [
+  { label: "npm test", category: "test", entry: "src/parser.ts", ok: false, exitCode: 1, durationMs: 500 },
+  { label: "npm run bench", category: "benchmark", entry: "src/lexer.ts", ok: true, exitCode: 0, durationMs: 1200 },
+  { label: "node bench-extra.mjs", category: "custom", entry: "src/extra.ts", ok: true, exitCode: 0, durationMs: 800 },
+];
+const reconProjectImpl = async (options) => {
+  const selected = commandSpecs.slice(0, Math.max(1, options.maxProbes ?? 3));
+  for (const command of selected) options.beforeProbe?.(command);
+  return {
+    commands: selected.map(({ ok, exitCode, durationMs, ...command }) => ({ ...command,
+      argv: command.label.split(" "), declaredArgv: command.label.split(" "), source: "fixture:" + command.label, shim: false })),
+    probes: selected.map(({ label, ok, exitCode, durationMs }) => ({ label, ok, durationMs, timedOut: false,
+      error: ok ? null : "test failures", exitCode, spawnFailed: false })),
+    graph: selected.map((command) => command.entry),
+    graphs: Object.fromEntries(selected.map((command) => [command.label, [command.entry]])),
+    files: selected.map((command) => ({ path: command.entry, bytes: 20, lines: 1 })), notes: [], blockers: [],
+  };
+};
+const taskProvider = ({ lever }) => ({ task: { name: "lease fixture", workspace: ".", eval_program: lever.scopeFiles[0] ?? ".",
+  score_program: "node -e 0", score_path: "eval/score.json", higher_is_better: false }, verifierInputs: [], gates: [] });
+`;
+
 const CHILD_SCRIPT = `import { createRequire } from "node:module";
 const require_ = createRequire(import.meta.url);
 const config = JSON.parse(require_("node:fs").readFileSync(process.argv[2], "utf8"));
@@ -587,6 +561,7 @@ if (config.mode === "rename-retry" || config.mode === "rename-fatal" || config.m
 const fs = await import("node:fs");
 const path = await import("node:path");
 const runLoop = config.loopUrl ? (await import(config.loopUrl)).runLoop : null;
+${CHILD_RECON_SETUP}
 const stub = (label) => {
   const calls = [];
   const impl = async (options) => {
@@ -605,7 +580,9 @@ const stub = (label) => {
 const options = {
   projectDir: config.projectDir,
   sessionDir: config.sessionDir,
-  controlPatchPath: config.controlPatchPath,
+  contract,
+  reconProjectImpl,
+  taskProvider,
   limits: { maxCampaigns: 1, maxAgentStarts: 1000, maxEvaluatorRuns: 1000, deadlineMs: 60_000 },
 };
 let report;
@@ -716,8 +693,10 @@ if (config.role === "A") {
   };
 }
 const { runLoop } = await import(config.loopUrl);
+${CHILD_RECON_SETUP}
 const result = await runLoop({
   projectDir: config.projectDir,
+  contract, reconProjectImpl, taskProvider,
   limits: { maxCampaigns: 2, maxAgentStarts: 100, maxEvaluatorRuns: 100, deadlineMs: 60_000 },
   ...(config.role === "O" ? { now: () => new Date(Date.now() - 60 * 60 * 1000) } : {}),
   collectSignalsImpl: async () => {
@@ -748,7 +727,7 @@ test("independent processes serialize campaigns under the loop lease", async () 
       const configFile = path.join(stateDir, `config-${round}.json`);
       fs.writeFileSync(configFile, JSON.stringify({
         mode: "race", loopUrl: LOOP_URL, projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
-        controlPatchPath: fixture.controlPatchPath, markerDir, resultDir, goFile: path.join(stateDir, `go-${round}`),
+        markerDir, resultDir, goFile: path.join(stateDir, `go-${round}`),
         holdMs: 4000,
       }));
       const contenders = Array.from({ length: 4 }, () => spawnContender(childFile, configFile));
@@ -791,7 +770,7 @@ test("stale lease reapers serialize before unlinking and cannot evict a newer ow
     const resumeFile = path.join(stateDir, "resume");
     const common = {
       loopUrl: LOOP_URL, projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
-      controlPatchPath: fixture.controlPatchPath, markerDir, resultDir, leasePath, holdMs: 4000, stopAfterOne: true,
+      markerDir, resultDir, leasePath, holdMs: 4000, stopAfterOne: true,
     };
     const configA = path.join(stateDir, "config-a.json");
     const configB = path.join(stateDir, "config-b.json");
@@ -907,14 +886,14 @@ test("the exclusive-create fallback holds single ownership when hard links are u
     const configFile = path.join(stateDir, "config.json");
     fs.writeFileSync(configFile, JSON.stringify({
       mode: "nohardlink", loopUrl: LOOP_URL, projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
-      controlPatchPath: fixture.controlPatchPath, markerDir, resultDir, holdMs: 1500,
+      markerDir, resultDir, holdMs: 1500,
     }));
     const exit = await spawnContender(childFile, configFile);
     assert.equal(exit.code, 0, `child exited ${exit.code}: ${exit.stderr.slice(-600)}`);
     const [result] = readResults(resultDir);
     assert.ok(result, "the child reported a result");
     assert.ok(result.linkCalls >= 1, "the fallback was exercised: hard linking threw for the real claim path");
-    assert.equal(result.firstStop, "budget", "the first loop proceeds through the exclusive-create fallback");
+    assert.match(result.firstStop, /^post-apply check failed/, "the lease fallback runs and refuses an unverified apply claim");
     assert.equal(result.firstCampaigns, 1);
     assert.equal(result.secondStop, "blocked", "the second loop stays blocked while the fallback lease is held");
     assert.equal(result.secondCampaigns, 0);
@@ -940,7 +919,7 @@ test("the exclusive-create fallback serializes simultaneous stale observations",
     const configFile = path.join(stateDir, "config.json");
     fs.writeFileSync(configFile, JSON.stringify({
       mode: "fallback-race", loopUrl: LOOP_URL, projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
-      controlPatchPath: fixture.controlPatchPath, markerDir, resultDir, readyDir, leasePath,
+      markerDir, resultDir, readyDir, leasePath,
       releaseFile: path.join(stateDir, "release"),
     }));
     const children = [spawnContender(childFile, configFile), spawnContender(childFile, configFile)];
@@ -970,7 +949,7 @@ test("atomic writes retry a transient rename refusal and still fail on a fatal o
     fs.mkdirSync(resultDir, { recursive: true });
     const childFile = path.join(stateDir, "loop-child.mjs");
     fs.writeFileSync(childFile, CHILD_SCRIPT);
-    const worldUrl = new URL("../extensions/pi-dream-rsi/engine/world.ts", import.meta.url).href;
+    const worldUrl = new URL("../extensions/pi-dream-rsi/engine/fsutil.ts", import.meta.url).href;
     const retryConfig = path.join(stateDir, "config-retry.json");
     fs.writeFileSync(retryConfig, JSON.stringify({ mode: "rename-retry", worldUrl, failFirst: 2, markerDir, resultDir }));
     const retryExit = await spawnContender(childFile, retryConfig);
@@ -1036,7 +1015,6 @@ test("an unfinished campaign blocks the loop before any new campaign", async () 
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
@@ -1057,7 +1035,6 @@ test("a stop request between campaigns cancels the loop and is consumed", async 
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
@@ -1077,17 +1054,18 @@ test("a task provider replaces synthesis, and its rejection is recorded verbatim
       score_path: "eval/score.json", higher_is_better: false,
     };
     const rejections = [];
+    let providerCalls = 0;
     const result = await runLoop({
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
       taskProvider: ({ lever }) => {
-        if (lever.sourceKind !== "post-failure-edits") return { reject: `provider said no to ${lever.sourceKind}` };
+        providerCalls += 1;
+        if (providerCalls === 1) return { reject: `provider said no to ${lever.metricKind}` };
         rejections.push(lever.id);
-        return { task: providedTask, verifierInputs: [path.join(fixture.projectDir, "external-evaluator.mjs")], gates: [], controlPatch: fixture.controlPatchPath };
+        return { task: providedTask, verifierInputs: [path.join(fixture.projectDir, "external-evaluator.mjs")], gates: [] };
       },
     });
     assert.equal(result.stopReason, "budget");
@@ -1099,7 +1077,7 @@ test("a task provider replaces synthesis, and its rejection is recorded verbatim
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test("a campaign that applied a verified patch and then failed stops the loop without losing the win", async () => {
+test("a campaign apply claim without an independent instrument stops as unverified", async () => {
   const fixture = fixtureProject();
   try {
     const stub = stubCampaign({ outcome: "win", stateKind: "failed", stopReason: "integrity check failed after apply", agentStarts: 6, evaluatorRuns: 11 });
@@ -1107,15 +1085,14 @@ test("a campaign that applied a verified patch and then failed stops the loop wi
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits({ maxCampaigns: 3 }),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
     assert.equal(stub.calls.length, 1, "a failed campaign stops the loop instead of starting another one");
-    assert.equal(result.stopReason, "campaign failed: integrity check failed after apply");
+    assert.match(result.stopReason, /^post-apply check failed/);
     assert.equal(result.campaigns, 1);
-    assert.equal(result.wins, 1, "the applied patch is still counted as a win");
-    assert.ok(result.records.some((record) => record.outcome === "win"), "the applied patch is recorded truthfully and not overwritten by the later failure");
+    assert.equal(result.wins, 0, "the apply claim is not promoted to a win without independent verification");
+    assert.ok(result.records.every((record) => record.outcome !== "win"));
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -1133,7 +1110,6 @@ test("a lever-level preflight rejection is a screening outcome, not a loop stop"
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits({ maxCampaigns: 5 }),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
@@ -1155,19 +1131,17 @@ test("negative or fractional budget counters fail closed instead of inflating th
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits,
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
     const valid = JSON.parse(fs.readFileSync(first.budgetPath, "utf8"));
-    for (const tamper of [{ campaigns: -5 }, { agent_starts: 1.5 }, { evaluator_runs: null }, { restarts: null }]) {
+    for (const tamper of [{ campaigns: -5 }, { agent_starts: 1.5 }, { evaluator_runs: null }]) {
       fs.writeFileSync(first.budgetPath, JSON.stringify({ ...valid, ...tamper }));
       await assert.rejects(
         () => runLoop({
           projectDir: fixture.projectDir,
           sessionDir: fixture.sessionDir,
           limits,
-          controlPatchPath: fixture.controlPatchPath,
           runCampaignImpl: stub.impl,
           now: () => NOW,
         }),
@@ -1175,63 +1149,6 @@ test("negative or fractional budget counters fail closed instead of inflating th
         JSON.stringify(tamper),
       );
     }
-  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
-});
-
-test("patchPaths lists every project-relative path a unified diff touches", () => {
-  const diff = [
-    "diff --git a/src/a.ts b/src/a.ts",
-    "--- a/src/a.ts",
-    "+++ b/src/a.ts",
-    "@@ -1 +1 @@",
-    "-old",
-    "+new",
-    "diff --git a/src/old.ts b/src/new.ts",
-    "similarity index 100%",
-    "rename from src/old.ts",
-    "rename to src/new.ts",
-    "diff --git a/src/added.ts b/src/added.ts",
-    "new file mode 100644",
-    "--- /dev/null",
-    "+++ b/src/added.ts",
-    "diff --git a/src/gone.ts b/src/gone.ts",
-    "deleted file mode 100644",
-    "--- a/src/gone.ts",
-    "+++ /dev/null",
-  ].join("\n");
-  assert.deepEqual(patchPaths(diff), ["src/a.ts", "src/added.ts", "src/gone.ts", "src/new.ts", "src/old.ts"]);
-  assert.deepEqual(patchPaths(""), [], "an empty patch touches no path");
-  assert.deepEqual(patchPaths("this is not a diff\n"), [], "prose is not parsed as a patch");
-  assert.deepEqual(
-    patchPaths("--- a/src/parser.ts\t2026-01-01 00:00:00\n+++ b/src/parser.ts\t2026-01-01 00:00:00\n"),
-    ["src/parser.ts"],
-    "a plain unified diff with timestamps still names its path",
-  );
-});
-
-test("a known-better control patch is not passed to a lever whose scope it escapes", async () => {
-  const fixture = fixtureProject();
-  try {
-    const controlPatchPath = path.join(fixture.projectDir, "escaped-control.patch");
-    fs.writeFileSync(controlPatchPath,
-      "diff --git a/src/unsafe.ts b/src/unsafe.ts\n--- a/src/unsafe.ts\n+++ b/src/unsafe.ts\n@@ -1 +1,2 @@\n seed\n+more\n");
-    const stub = stubCampaign();
-    const result = await runLoop({
-      projectDir: fixture.projectDir,
-      sessionDir: fixture.sessionDir,
-      limits: baseLimits(),
-      controlPatchPath,
-      runCampaignImpl: stub.impl,
-      now: () => NOW,
-    });
-    assert.equal(stub.calls.length, 0, "no campaign receives a control patch that touches paths outside the lever's scope");
-    assert.equal(result.stopReason, "no verifiable lever");
-    assert.ok(result.records.length >= 1, "the refuse-to-screen path records each lever");
-    assert.ok(result.records.every((record) => record.outcome === "rejected"));
-    assert.ok(
-      result.records.every((record) => /control patch/.test(record.stopReason ?? "") && /src\/unsafe\.ts/.test(record.stopReason ?? "")),
-      "each lever records the exact path it cannot cover",
-    );
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -1256,7 +1173,6 @@ test("a campaign that refuses infeasible caps is charged no spend and the loop c
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits(),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: impl,
       now: () => NOW,
     });
@@ -1281,13 +1197,13 @@ test("a campaign that refuses infeasible caps is charged no spend and the loop c
     const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
     assert.deepEqual(
       { campaigns: budget.campaigns, agent: budget.agent_starts, evaluators: budget.evaluator_runs },
-      { campaigns: 1, agent: 5, evaluators: 9 },
+      { campaigns: 1, agent: 5, evaluators: 12 },
       "only the real campaign is charged; the refusals cost nothing",
     );
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
-test("qualification baseline readings seed the campaign only while the approved fingerprint matches", () => {
+test("qualification baseline readings seed the campaign only while the qualification fingerprint matches", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-seed-"));
   try {
     fs.writeFileSync(path.join(dir, "a.js"), "export const a = 1;\n");
@@ -1300,9 +1216,9 @@ test("qualification baseline readings seed the campaign only while the approved 
       minimumUsefulGain: "10%", metricKind: "command-duration", argv: ["node", "bench.mjs"], gates: [],
       assets: [], baseline: [120, 122, 118], sensitivity: 40, confirmationPerspective: "fresh copy",
     };
-    const approvedFingerprint = projectFingerprint(dir);
+    const qualificationFingerprint = projectFingerprint(dir);
     const seeds = campaignSeedReadings({
-      projectDir: dir, approvedFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
+      projectDir: dir, qualificationFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
     });
     assert.ok(seeds, "a qualified instrument on the approved tree seeds the campaign check");
     assert.equal(seeds.identity, campaignVerifierIdentity(dir, task, ["score.mjs"], []));
@@ -1314,10 +1230,10 @@ test("qualification baseline readings seed the campaign only while the approved 
 
     fs.writeFileSync(path.join(dir, "a.js"), "export const a = 2;\n");
     assert.equal(campaignSeedReadings({
-      projectDir: dir, approvedFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
+      projectDir: dir, qualificationFingerprint, task, verifierInputs: ["score.mjs"], gates: [], evaluationContract,
     }), null, "an edited tree invalidates the frozen baseline");
     assert.equal(campaignSeedReadings({
-      projectDir: dir, approvedFingerprint: projectFingerprint(dir), task, verifierInputs: ["score.mjs"], gates: [],
+      projectDir: dir, qualificationFingerprint: projectFingerprint(dir), task, verifierInputs: ["score.mjs"], gates: [],
     }), null, "no qualified instrument means no seeded readings");
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1330,7 +1246,6 @@ test("a campaign inherits a one-hour deadline when the run has more time", async
       projectDir: fixture.projectDir,
       sessionDir: fixture.sessionDir,
       limits: baseLimits({ deadlineMs: 2 * 60 * 60 * 1000 }),
-      controlPatchPath: fixture.controlPatchPath,
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });

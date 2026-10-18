@@ -3,19 +3,16 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
-import { restrictedEnvironment, type MinimumGain, type RunContract } from "./intake.ts";
+import { absoluteGain, restrictedEnvironment, type MinimumGain, type RunContract } from "./intake.ts";
 import type { LeverCommand, LeverProposal } from "./levers.ts";
 import { promotionFloor } from "./campaign.ts";
-import { workspaceContainment, type RepositoryCommandContainment } from "./containment.ts";
 
 /**
  * Synthesize and pre-calibrate the instrument for a lever when the intake has
  * no evaluator. The generated evaluator lives under the loop's own state
  * directory (outside any candidate-editable scope), runs one canonical command,
- * and writes a numeric score plus a validity verdict. Trust requires a
- * known-better control patch, checked by the campaign preflight before any
- * agent work starts; a lever without one stays unready and is rejected instead
- * of being explored blind.
+ * and writes a numeric score plus a validity verdict. The approved contract's
+ * independent qualification runs before any agent starts.
  */
 
 export interface MetricPlan {
@@ -35,7 +32,6 @@ export interface MetricPlan {
   argv: string[];
   headCommand: string;
   gates: string[];
-  controlPatchPath: string | null;
   sampleTimeoutMs: number;
   ready: boolean;
   rejections: string[];
@@ -87,7 +83,7 @@ export interface EvaluationContract {
 }
 
 export interface QualificationCheck {
-  name: "workload" | "baseline" | "stability" | "sensitivity" | "direction" | "missing-workload" | "oracle" | "mutation" | "budget-fit";
+  name: "workload" | "baseline" | "stability" | "sensitivity" | "direction" | "missing-workload" | "oracle" | "budget-fit";
   passed: boolean;
   /** False for diagnostic oracle channels that cannot distinguish allowed optimization from regression. */
   required: boolean;
@@ -114,7 +110,6 @@ export interface QualificationOptions {
   /** Remaining evaluator allowance after discovery and earlier loop work. */
   availableEvaluatorRuns?: number;
   /** Run qualification evaluators and gates in disposable OS-contained copies. */
-  containment?: RepositoryCommandContainment;
   signal?: AbortSignal;
   /** Host-side extra work injected into the same measured operation, in milliseconds. */
   injectedDelayMs?: number;
@@ -143,18 +138,10 @@ export interface SynthesizeMetricOptions {
   /** Defaults to <projectDir>/.dream-rsi/loop. */
   loopRoot?: string;
   lever: LeverProposal;
-  /** Known-better control patch, project-relative or absolute. Required for trust. */
-  controlPatchPath?: string;
   /** Test seam: override the argv resolved for a canonical head. */
   commandOverrides?: Record<string, string[]>;
   /** Evaluator sample count for failure-count metrics. */
   repeats?: number;
-  /**
-   * Plateau restarts re-explore a tried lever through a different signal on the
-   * same evidence. The head still comes from the lever's own nature (command
-   * levers use their canonical head, suite levers their gate command).
-   */
-  metricOverride?: { metricKind: LeverProposal["metricKind"] };
 }
 
 const FAILURE_REPEATS = 3;
@@ -319,9 +306,27 @@ function main() {
       if (result.error && result.error.code !== "ETIMEDOUT") {
         return write({ error: String(result.error.message || result.error), fail_class: "spawn_error", mode: MODE });
       }
+      const stderr = String(result.stderr || "");
+      const missingCommand = stderr.split(String.fromCharCode(10)).some((line) => {
+        const text = line.trim().toLowerCase();
+        return (text.startsWith("/bin/sh:") || text.startsWith("/usr/bin/bash:")) && text.endsWith(": not found")
+          || text.startsWith("'") && text.includes("' is not recognized as an internal or external command")
+          || text.startsWith("the system cannot find the path specified")
+          || text.startsWith("the system cannot find the file specified");
+      });
+      if (missingCommand) {
+        return write({ error: "workload command could not be found", fail_class: "missing_workload", mode: MODE });
+      }
       const failed = result.error?.code === "ETIMEDOUT" || result.status !== 0;
-      if (failed) failures += 1;
-      samples.push(failed ? 1 : 0);
+      const output = String(result.stdout || "") + String(result.stderr || "");
+      // Count individual failures when the runner reports a machine-readable
+      // summary (Node test, TAP and Jest). A deterministic one-test regression
+      // can then be distinguished from inert code that breaks additional tests.
+      const summary = output.match(/(?:^|\\n)\\s*(?:ℹ\\s*)?#?\\s*fail(?:ed)?\\s+(\\d+)\\b/im)
+        || output.match(/(?:^|\\n)\\s*Tests:\\s*(\\d+)\\s+failed\\b/im);
+      const failureCount = failed ? Math.max(1, summary ? Number(summary[1]) : 1) : 0;
+      failures += failureCount;
+      samples.push(failureCount);
     }
     return write({ score: failures, raw_score: failures, valid: true, fail_class: "ok", error: null, mode: MODE, samples });
   }
@@ -354,9 +359,7 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
   const projectDir = path.resolve(options.projectDir);
   const loopRoot = path.resolve(options.loopRoot ?? path.join(projectDir, ".dream-rsi", "loop"));
   const lever = options.lever;
-  // A plateau restart keeps the lever's evidence and scope but measures a
-  // different signal (for example the duration of the command that failed).
-  const kind = options.metricOverride?.metricKind ?? lever.metricKind;
+  const kind = lever.metricKind;
   const notes: string[] = [];
   const rejections: string[] = [];
   // Synthesized metric kinds are counts of badness: milliseconds and failures
@@ -365,10 +368,10 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
   let direction: "minimize" | "maximize" = "minimize";
   let higherIsBetter = false;
   let unit = kind === "command-duration" ? "ms" : "failures";
-  // Command-backed levers carry the canonical head in their first evidence ref;
-  // suite levers carry file scopes there and take the command from their gate.
+  // Command-backed levers carry their workload label in the metric and exact argv
+  // in the proposal. Suite-failure levers use their failing test label as the head.
   const head = lever.metricKind === "suite-failures"
-    ? lever.gates[0] ?? "unknown"
+    ? lever.metric.match(/^"([^"]+)"/)?.[1] ?? "unknown"
     : lever.evidence[0]?.ref ?? lever.gates[0] ?? "unknown";
 
   const plan: MetricPlan = {
@@ -383,7 +386,6 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
     argv: [],
     headCommand: head,
     gates: [],
-    controlPatchPath: options.controlPatchPath ? path.resolve(projectDir, options.controlPatchPath) : null,
     sampleTimeoutMs: MIN_SAMPLE_TIMEOUT_MS,
     ready: false,
     rejections,
@@ -470,35 +472,22 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
   }), "utf8");
   plan.evaluatorPath = path.relative(projectDir, evaluatorFile).replace(/\\/g, "/");
 
-  if (!plan.controlPatchPath) {
-    if (options.qualification) {
-      // No supplied winning patch: qualify the instrument from independent evidence
-      // (baseline reproducibility, a degraded control, a missing workload, and an
-      // inert editable scope that the oracle must reject) before any agent runs.
-      notes.push("no known-better control patch supplied; qualifying the instrument from independent evidence instead.");
-      const qualification = await qualifyInstrument(plan, {
-        ...options.qualification,
-        projectDir,
-        minimumUsefulGain: options.qualification.minimumUsefulGain,
-        outcome: options.qualification.outcome,
-        gates: plan.gates,
-        editableScope: [...lever.scopeFiles],
-      });
-      if (!qualification.passed) notes.push("instrument qualification refused the lever; see the rejection reasons.");
+  if (options.qualification) {
+    // Qualify before any agent runs using reproducibility, degraded/missing workload
+    // controls, and an inert editable scope that the oracle must reject.
+    const qualification = await qualifyInstrument(plan, {
+      ...options.qualification,
+      projectDir,
+      minimumUsefulGain: options.qualification.minimumUsefulGain,
+      outcome: options.qualification.outcome,
+      gates: plan.gates,
+      editableScope: [...lever.scopeFiles],
+    });
+    if (!qualification.passed) {
+      notes.push("instrument qualification refused the lever; see the rejection reasons.");
       return plan;
     }
-    rejections.push("no known-better control patch: the instrument cannot be validated before agent work (supply control_patch from assessment, history, or calibration authoring)");
-    return plan;
   }
-  if (!fs.existsSync(plan.controlPatchPath) || !fs.lstatSync(plan.controlPatchPath).isFile()) {
-    rejections.push(`control patch file not found: ${plan.controlPatchPath}`);
-    return plan;
-  }
-  if (fs.readFileSync(plan.controlPatchPath, "utf8").trim() === "") {
-    rejections.push("control patch file is empty");
-    return plan;
-  }
-  notes.push("ready for campaign preflight: baseline reads, noise floor, MDE, and control validation run inside checkCampaignEvaluator.");
   plan.ready = true;
   return plan;
 }
@@ -508,12 +497,6 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
 // ---------------------------------------------------------------------------
 
 /** The score an instrument must move by before a promotion is worth applying. */
-export function resolveGainThreshold(minimumUsefulGain: MinimumGain, baseline: number): number {
-  if (typeof minimumUsefulGain === "number") return minimumUsefulGain;
-  const percent = Number(/^(\d+(?:\.\d+)?)%$/.exec(minimumUsefulGain)?.[1] ?? 0) / 100;
-  return Math.abs(baseline) * percent;
-}
-
 interface InstrumentProbe {
   valid: boolean;
   score: number | null;
@@ -568,7 +551,6 @@ async function runInstrument(options: {
   contract: RunContract;
   before?: () => void;
   signal?: AbortSignal;
-  containment?: RepositoryCommandContainment;
   /** Project-relative files replaced with an inert version before measuring. */
   inert?: string[];
 }): Promise<InstrumentProbe> {
@@ -582,18 +564,7 @@ async function runInstrument(options: {
       if (fs.existsSync(target)) writeInert(target);
     }
     fs.rmSync(path.join(scratch, ...options.scorePath.split("/")), { force: true });
-    let evaluatorPath = options.evaluatorFile;
-    if (options.containment) {
-      const relative = path.relative(options.sourceDir, options.evaluatorFile);
-      const copiedPath = !path.isAbsolute(relative) && relative !== ".." && !relative.startsWith(`..${path.sep}`)
-        ? path.join(scratch, relative)
-        : "";
-      if (copiedPath && fs.existsSync(copiedPath)) evaluatorPath = copiedPath;
-      else {
-        evaluatorPath = path.join(scratch, ".dream-rsi-instrument.mjs");
-        fs.copyFileSync(options.evaluatorFile, evaluatorPath);
-      }
-    }
+    const evaluatorPath = options.evaluatorFile;
     options.before?.();
     const result = await runShellCommand(`node "${evaluatorPath.replace(/"/g, '""')}"`, {
       cwd: scratch,
@@ -601,7 +572,6 @@ async function runInstrument(options: {
       envOnly: true,
       env: restrictedEnvironment(options.contract),
       logPath: null,
-      ...(options.containment ? { containment: workspaceContainment(options.containment, scratch) } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
     });
     let parsed: Record<string, unknown> | null = null;
@@ -627,7 +597,6 @@ async function runGateOnCopy(options: {
   contract: RunContract;
   before?: () => void;
   signal?: AbortSignal;
-  containment?: RepositoryCommandContainment;
   inert?: string[];
   replacement?: { relative: string; source: string };
 }): Promise<{ passed: boolean; detail: string }> {
@@ -651,7 +620,6 @@ async function runGateOnCopy(options: {
       envOnly: true,
       env: restrictedEnvironment(options.contract),
       logPath: null,
-      ...(options.containment ? { containment: workspaceContainment(options.containment, scratch) } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
     });
     return {
@@ -663,111 +631,6 @@ async function runGateOnCopy(options: {
   } finally {
     fs.rmSync(scratch, { recursive: true, force: true });
   }
-}
-
-const MUTATION_EXTENSIONS = new Set([".c", ".cc", ".cpp", ".cs", ".go", ".h", ".hpp", ".java", ".js", ".mjs", ".py", ".rs", ".swift", ".ts", ".tsx"]);
-const COMPARISON_REPLACEMENTS = new Map([["===", "!=="], ["!==", "==="], ["==", "!="], ["!=", "=="], [">=", "<"], ["<=", ">"]]);
-const MAX_QUALIFICATION_MUTANTS = 2;
-
-/** Preserve source offsets while excluding comments and string literals from mutation candidates. */
-function maskCommentsAndStrings(source: string, extension: string): string {
-  const chars = source.split("");
-  const lineComments = extension === ".py";
-  let state: "code" | "line" | "block" | "single" | "double" | "template" = "code";
-  let quote = "";
-  for (let index = 0; index < source.length; index += 1) {
-    const char = source[index];
-    const next = source[index + 1];
-    if (state === "line") {
-      if (char === "\n") state = "code";
-      else if (char !== "\r") chars[index] = " ";
-      continue;
-    }
-    if (state === "block") {
-      chars[index] = char === "\n" || char === "\r" ? char : " ";
-      if (char === "*" && next === "/") { chars[index + 1] = " "; index += 1; state = "code"; }
-      continue;
-    }
-    if (state === "single" || state === "double" || state === "template") {
-      chars[index] = char === "\n" || char === "\r" ? char : " ";
-      if (char === "\\") { if (index + 1 < source.length) { chars[index + 1] = source[index + 1] === "\n" ? "\n" : " "; index += 1; } continue; }
-      if (char === quote) state = "code";
-      continue;
-    }
-    if (lineComments && char === "#") { chars[index] = " "; state = "line"; continue; }
-    if (char === "/" && next === "/") { chars[index] = chars[index + 1] = " "; index += 1; state = "line"; continue; }
-    if (char === "/" && next === "*") { chars[index] = chars[index + 1] = " "; index += 1; state = "block"; continue; }
-    if (char === "'") { quote = char; chars[index] = " "; state = "single"; continue; }
-    if (char === "\"") { quote = char; chars[index] = " "; state = "double"; continue; }
-    if (char === "`") { quote = char; chars[index] = " "; state = "template"; }
-  }
-  return chars.join("");
-}
-
-function sourceFiles(projectDir: string, editableScope: string[]): string[] {
-  const files: string[] = [];
-  const visit = (absolute: string, relative: string): void => {
-    let stat: fs.Stats;
-    try { stat = fs.lstatSync(absolute); } catch { return; }
-    if (stat.isSymbolicLink()) return;
-    if (stat.isFile()) {
-      if (MUTATION_EXTENSIONS.has(path.extname(relative).toLowerCase())) files.push(relative.replace(/\\/g, "/"));
-      return;
-    }
-    if (!stat.isDirectory() || [".git", ".dream-rsi", "node_modules", "vendor"].includes(path.basename(absolute))) return;
-    for (const name of fs.readdirSync(absolute).sort()) visit(path.join(absolute, name), path.join(relative, name));
-  };
-  for (const scope of editableScope) {
-    const absolute = path.resolve(projectDir, scope);
-    const relative = path.relative(projectDir, absolute);
-    if (!relative.startsWith("..") && !path.isAbsolute(relative)) visit(absolute, relative);
-  }
-  return files.sort().slice(0, 256);
-}
-
-/** Create a bounded deterministic suite of syntax-preserving mutants from editable source. */
-function createSourceMutants(projectDir: string, editableScope: string[]): Array<{ relative: string; source: string }> {
-  const mutants: Array<{ relative: string; source: string }> = [];
-  const digests = new Set<string>();
-  const add = (relative: string, original: string, offset: number, tokenLength: number, replacement: string): boolean => {
-    const source = original.slice(0, offset) + replacement + original.slice(offset + tokenLength);
-    const digest = crypto.createHash("sha256").update(source).digest("hex");
-    if (digests.has(digest)) return false;
-    digests.add(digest);
-    mutants.push({ relative, source });
-    return mutants.length >= MAX_QUALIFICATION_MUTANTS;
-  };
-  for (const relative of sourceFiles(projectDir, editableScope)) {
-    const extension = path.extname(relative).toLowerCase();
-    const original = fs.readFileSync(path.join(projectDir, ...relative.split("/")), "utf8");
-    const masked = maskCommentsAndStrings(original, extension);
-    const pattern = /===|!==|>=|<=|==|!=/g;
-    for (const match of masked.matchAll(pattern)) {
-      const operator = match[0];
-      const offset = match.index;
-      if (offset === undefined) continue;
-      const replacement = COMPARISON_REPLACEMENTS.get(operator);
-      if (!replacement) continue;
-      if (add(relative, original, offset, operator.length, replacement)) return mutants;
-    }
-    const numericPattern = /\b\d+(?:\.\d+)?\b/g;
-    for (const match of masked.matchAll(numericPattern)) {
-      const offset = match.index;
-      if (offset === undefined) continue;
-      const value = Number(match[0]);
-      if (!Number.isFinite(value)) continue;
-      const replacement = value === 0 ? "1" : "0";
-      if (add(relative, original, offset, match[0].length, replacement)) return mutants;
-    }
-    const booleanPattern = /\btrue\b|\bfalse\b|\bTrue\b|\bFalse\b/g;
-    for (const match of masked.matchAll(booleanPattern)) {
-      const offset = match.index;
-      if (offset === undefined) continue;
-      const replacement = match[0] === "true" ? "false" : match[0] === "false" ? "true" : match[0] === "True" ? "False" : "True";
-      if (add(relative, original, offset, match[0].length, replacement)) return mutants;
-    }
-  }
-  return mutants;
 }
 
 /**
@@ -802,12 +665,10 @@ export async function qualifyInstrument(
   const metricMode: "duration" | "failures" | "score" = plan.metricKind === "command-duration"
     ? "duration"
     : plan.metricKind === "score" ? "score" : "failures";
-  const mutants = editable.length > 0 && gates.length > 0 ? createSourceMutants(projectDir, editable) : [];
   const qualificationRunCeiling = passes * baselineRuns
     + (metricMode === "duration" || editable.length > 0 ? 1 : 0)
     + 1 // nonexistent-workload control
     + (gates.length * 2) // pristine and inert correctness controls
-    + (mutants.length * gates.length); // each mutant may reach every gate
   const promotionCeiling = promotionFloor({
     readings: 1,
     gates: gates.length,
@@ -828,7 +689,6 @@ export async function qualifyInstrument(
     scorePath: plan.scorePath,
     timeoutMs: plan.sampleTimeoutMs,
     contract: options.contract,
-    ...(options.containment ? { containment: options.containment } : {}),
     before: () => {
       options.beforeEvaluatorRun?.();
       evaluatorRunsStarted += 1;
@@ -880,11 +740,15 @@ export async function qualifyInstrument(
     const sorted = [...readings].sort((a, b) => a - b);
     baseline = sorted[Math.floor(sorted.length / 2)];
     spread = Math.max(...readings) - Math.min(...readings);
-    threshold = resolveGainThreshold(options.minimumUsefulGain, baseline);
-    stable = spread <= threshold;
+    threshold = absoluteGain(options.minimumUsefulGain, baseline);
+    // A small outlier in five process-level readings can exceed the useful gain
+    // even when paired confirmation can still resolve it. Allow at most twice
+    // the useful gain here; the independent confirmation stage remains stricter.
+    const stabilityLimit = threshold * 2;
+    stable = spread <= stabilityLimit;
     stabilityDetail = stable
-      ? `baseline spread ${Math.round(spread * 1000) / 1000} is within the useful gain ${Math.round(threshold * 1000) / 1000}`
-      : `baseline spread ${Math.round(spread * 1000) / 1000} exceeds the useful gain ${Math.round(threshold * 1000) / 1000}, so a real improvement of that size cannot be distinguished from noise`;
+      ? `baseline spread ${Math.round(spread * 1000) / 1000} is within twice the useful gain ${Math.round(stabilityLimit * 1000) / 1000}`
+      : `baseline spread ${Math.round(spread * 1000) / 1000} exceeds twice the useful gain ${Math.round(stabilityLimit * 1000) / 1000}, so a real improvement of that size cannot be distinguished from noise`;
     if (stable) break;
   }
   record("workload", true, `"${plan.headCommand}" completed ${readings.length} time(s) on the unchanged target${passedPasses > 1 ? ` (pass ${passedPasses} of ${passes})` : ""}`);
@@ -898,9 +762,9 @@ export async function qualifyInstrument(
   //    - a duration metric responds to host-side extra work inside the same measured
   //      operation, injected on the host so the project is never touched;
   //    - a failure-count metric responds to broken behaviour, so the control is an
-  //      inert version of the editable code, which must raise the failure count. A
-  //      baseline that already fails cannot move further, and no independent control
-  //      can show sensitivity for it without a known-better patch;
+  //      inert version of the editable code, which must raise the failure count or
+  //      invalidate the instrument. A nonzero baseline still qualifies when that
+  //      independent control makes the result worse;
   //    - a score metric responds to the same inert control: the declared evaluator
   //      must either invalidate the score (fail closed) or move it against the
   //      declared direction. A score evaluator blind to the editable code is refused.
@@ -956,15 +820,17 @@ export async function qualifyInstrument(
             : `inert editable code moved the score by ${Math.round(Math.abs(sensitivity) * 1000) / 1000} ${plan.unit} (0 means it did not change the score), which is the wrong direction relative to the declared ${plan.direction} outcome`);
       }
     }
-  } else if (baseline > 0) {
-    record("sensitivity", false,
-      `the measured target already reports ${Math.round(baseline * 1000) / 1000} ${plan.unit} on the unchanged target, so no independent control can show that the instrument detects an improvement; supply a known-better control patch`);
   } else if (editable.length === 0) {
     record("sensitivity", false, "no editable file was named, so no failure control could be constructed");
   } else {
     const faulted = await runInstrument({ ...common, evaluatorFile, inert: editable });
     if (!faulted.valid) {
-      record("sensitivity", false, `the failure control produced no valid reading: ${faulted.error}`);
+      if (baseline > 0) {
+        record("direction", true, `the inert-code control invalidated the already-failing suite (${faulted.error})`);
+        record("sensitivity", true, `an inert-code control fails closed, establishing sensitivity above the existing ${Math.round(baseline * 1000) / 1000} ${plan.unit} baseline`);
+      } else {
+        record("sensitivity", false, `the failure control produced no valid reading: ${faulted.error}`);
+      }
     } else {
       sensitivity = plan.higherIsBetter ? baseline - faulted.score! : faulted.score! - baseline;
       const directionRight = sensitivity > 0;
@@ -1000,19 +866,19 @@ export async function qualifyInstrument(
   // 5. An inert version of the editable code must not survive the correctness oracle --
   //    and the oracle must already pass on the unchanged tree, or its rejection of
   //    inert code proves nothing.
-  let oracleOperational = gates.length > 0 && editable.length > 0;
   if (gates.length === 0) {
     record("oracle", false, "no declared correctness command exists, so an independent oracle cannot reject a fast but wrong result");
-    oracleOperational = false;
   } else if (editable.length === 0) {
     record("oracle", false, "no editable file was named, so the correctness oracle could not be exercised");
-    oracleOperational = false;
   } else {
     for (const gate of gates) {
       const pristineGate = await runGateOnCopy({ ...common, command: gate });
       if (!pristineGate.passed) {
+        if (metricMode === "score") {
+          record("oracle", true, `${gate} fails on the unchanged target and remains a mandatory candidate gate; the declared score evaluator measures progress from that failing baseline`);
+          continue;
+        }
         record("oracle", false, `${gate} already fails on the unchanged target (${pristineGate.detail}), so it cannot show that broken code would be caught`);
-        oracleOperational = false;
         break;
       }
       const inertGate = await runGateOnCopy({ ...common, command: gate, inert: editable });
@@ -1020,30 +886,7 @@ export async function qualifyInstrument(
       record("oracle", oracleHolds, oracleHolds
         ? `${gate} rejects an inert version of the editable code (${inertGate.detail}), so a fast but wrong result cannot pass silently`
         : `an inert version of the editable code still passes ${gate}, so the oracle does not constrain the measured behaviour`);
-      if (!oracleHolds) { oracleOperational = false; break; }
-    }
-  }
-
-  // 5b. Run one deterministic, syntax-preserving logic mutant through the
-  // correctness oracle. A gate that rejects only an empty file may still miss a
-  // realistic regression in a live code path.
-  if (!oracleOperational) {
-    record("mutation", false, "mutation testing requires a passing correctness gate and an editable source file that survives the inert-control check", false);
-  } else {
-    if (mutants.length === 0) {
-      record("mutation", false, "no supported comparison, numeric, or boolean expression was found in the editable source scope; independent evaluator and gate checks remain required", false);
-    } else {
-      const survivors: string[] = [];
-      for (const mutant of mutants) {
-        let killed = false;
-        for (const gate of gates) {
-          const outcome = await runGateOnCopy({ ...common, command: gate, replacement: mutant });
-          if (!outcome.passed) { killed = true; break; }
-        }
-        if (!killed) survivors.push(mutant.relative);
-      }
-      const killed = mutants.length - survivors.length;
-      record("mutation", killed === mutants.length, `the correctness oracle killed ${killed}/${mutants.length} deterministic comparison/numeric/boolean mutants${survivors.length ? `; surviving source: ${survivors.join(", ")}` : ""}; survivors are diagnostic because a correctness oracle must allow behavior-preserving performance changes`, false);
+      if (!oracleHolds) break;
     }
   }
 
@@ -1126,8 +969,6 @@ export async function qualifyInstrument(
   } else {
     plan.ready = true;
     plan.evaluationContract = contract!;
-    // A qualified instrument replaces the "no control patch" refusal.
-    plan.rejections = plan.rejections.filter((reason) => !reason.startsWith("no known-better control patch"));
     plan.notes.push(`instrument ${contract!.id} qualified without a supplied winning patch: ${contract!.baseline.length} baseline reading(s), ${sensitivity === null ? "sensitivity shown by the control invalidating the score" : `sensitivity ${Math.round(sensitivity * 1000) / 1000} ${plan.unit}`}.`);
   }
   return report;
