@@ -1,3 +1,9 @@
+# Changelog
+
+## Unreleased
+
+- Align the project docs and release guidance with the 3.0 lean loop, recorded-world replay, and canonical `main` workflow.
+
 ## 3.0.0
 
 Breaking release. Dream-RSI now exposes read-only assessment and one autonomous loop.
@@ -5,10 +11,11 @@ Breaking release. Dream-RSI now exposes read-only assessment and one autonomous 
 - Removed `dream_rsi_improve`, `/dream-rsi improve`, `/dream-rsi start`, control patches, optimizer trials, plateau restarts, mutation diagnostics, and the dashboard live/dream toggle.
 - Removed the Mind2Web scorer, policy self-campaign, tier2 and assess real-model harnesses, tournament, MXC containment, and signed receipts.
 - Replaced the policy runtime with a bounded hill climb over recorded experiment worlds and deterministic replay of search configs. Resume restarts an interrupted attempt.
-- 2.x paused campaigns cannot resume. Stored v1 loop contracts are normalized when read.
-# Changelog
+- 2.x paused campaigns are marked failed with the 3.0 restart path. Stored v1 loop contracts are normalized when read.
 
-## Unreleased
+## Pre-3.0 development (superseded by 3.0.0)
+
+The following notes describe interim 2.x development. They are retained as history; the 3.0.0 entry above defines the current product surface.
 
 - Hash-chain experiment ledger records to their predecessor, anchor the first linked record to any legacy prefix, serialize writers with an interprocess lock, reject malformed history, and refuse to append when verification fails. A missing external head means clean tail deletion and coordinated full-file rewrite remain undetected; a crashed writer can leave a stale lock requiring manual recovery.
 - Attach typed contract, instrument and baseline identities to campaign ledger events; link confirmations to attempts, gates and reviews to their evidence, and applies to the full preceding review path. Ledger records reject missing or forward parent references and are protected by the existing hash chain.
@@ -54,7 +61,7 @@ Breaking release. Dream-RSI now exposes read-only assessment and one autonomous 
 - Fingerprint the target workspace across verification, gates, review, and patch promotion. Recheck immediately before and after patch writes; reject and roll back when any candidate-visible, unpatched path changes. Exclude only the current transaction's checked, generated deletion tombstones from the promotion digest. Arbitrary external writers are not locked, so a final external change after the post-write check remains outside the atomicity guarantee.
 - Key loop start progress, `status`, and the advertised `stop` to the resolved project directory — the session retains the last loop target — so one session can inspect and stop loops that run in another project.
 
-This breaks the intake contract. Internal worker, round, revision, repeat, and guidance fields are not public campaign options. Start a new campaign after upgrading. Commit, push, merge, scheduling, and publication remain manual.
+The 2.x intake contract is not compatible with 3.0. Internal worker, round, revision, repeat, and guidance fields are not public campaign options. Start a new campaign after upgrading.
 
 ## 1.0.1
 

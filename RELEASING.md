@@ -7,7 +7,7 @@ stale publish is a stale pi.dev page.
 
 | Surface | What it is | How it gets the version |
 |---------|------------|-------------------------|
-| npm registry | Source of truth. `pi install npm:pi-dream-rsi` reads this; the package page renders the packaged README and metadata. | GitHub Actions publishes when `package.json`'s version changes on `main`; maintainers can use interactive 2FA when no publish job will run |
+| npm registry | Published-package source of truth. `pi install npm:pi-dream-rsi` reads this; the package page renders the packaged README and metadata. | GitHub Actions publishes when `package.json`'s version changes on `main`; maintainers can use interactive 2FA when no publish job will run |
 | [pi.dev/packages](https://pi.dev/packages/pi-dream-rsi) | Gallery of every npm package tagged `pi-package`. Derived, never edited by hand. | automatic, minutes after publish |
 | [GitHub repository](https://github.com/juanmackie/pi-Dream-RSI) | Source, issues and canonical README. | Merge the release commit to `main` |
 | git | Provenance for the tarball. | release commit + `v<version>` tag |
@@ -16,6 +16,10 @@ stale publish is a stale pi.dev page.
 
 This repo is installed in the author's pi as a local path, so dev edits are live after `/reload` and never
 require a publish. Publishing is for users, not for dogfooding — see [Development setup](#development-setup).
+
+## Canonical repository state
+
+`main` is the only persistent branch and `origin/main` is the shared source of truth. Keep local `main` fast-forwarded to `origin/main`. Short-lived branches may support review; after merge, remove their local and remote refs. Release commits and version tags must resolve to `main`.
 
 ## One-time npm setup
 
@@ -66,12 +70,17 @@ npm view "pi-dream-rsi@<version>" version
 #   For a new version only: npm version patch --no-git-tag-version
 #   ...edit README if install instructions changed...
 
-# 3. Commit the changes and push through a PR to main. A package version change triggers publishing;
+# 3. Commit the reviewed changes on a short-lived review branch and merge the PR to main. A package version change triggers publishing;
 #    changes to code/docs without a version bump do not.
-git add -A
+#   Stage reviewed paths explicitly; exclude local state and generated files.
 git commit -m "release v$(node -p "require('./package.json').version")"
 git push -u origin HEAD
 #   ...open and merge the PR into main...
+#   ...delete the merged local topic branch with git branch -d <actual-branch-name>...
+#   ...refresh main and remove stale remote-tracking refs...
+git switch main
+git pull --ff-only origin main
+git fetch --prune
 
 # 4. If the package version changed, wait for the publish workflow's final result. If no workflow ran because
 #    the version was unchanged, or it failed before publishing, use the interactive 2FA path above only after
@@ -98,7 +107,7 @@ curl -s -o /dev/null -w "%{http_code}\n" https://pi.dev/packages/pi-dream-rsi
   tarball for the same version is rejected by npm.
 - The README, skills, command help, and tool descriptions must agree on assessment, campaign intake, evaluator
   checks, calibrated baselines, paired verification, gates, review, apply, and campaign controls. They must
-  also explain that legacy manual data remains unused.
+  also explain the bounded loop, recorded-world replay, trusted-local consent, budgets, and current status/resume controls. Removed 2.x interfaces are historical only.
 - Linux and Windows CI must pass on the commit being released. On a scratch project, check assessment, campaign
   status, stop and resume, and the watch dashboard. Confirm that a rejected or unverified candidate is never
   applied and that the journal records an accepted patch.
@@ -107,10 +116,17 @@ curl -s -o /dev/null -w "%{http_code}\n" https://pi.dev/packages/pi-dream-rsi
 
 ## Development setup
 
+Start from the canonical branch and keep it aligned with the remote before editing:
+
+```bash
+git switch main
+git pull --ff-only origin main
+```
+
 Your pi must run your checkout, not the tarball — otherwise you cannot see your own edits.
 
 ```bash
-pi install "C:/Users/juanm/Documents/GitHub/pi Dream-RSI"   # dev: working tree, /reload picks up edits
+pi install "<path-to-repository>"                           # dev: working tree, /reload picks up edits
 pi install npm:pi-dream-rsi                                # users: unpinned, so `pi update --extensions` works
 ```
 

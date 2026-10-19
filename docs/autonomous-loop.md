@@ -10,10 +10,16 @@ Defaults are 6 campaigns, 72 agent starts, 200 evaluator runs, and 120 minutes. 
 
 The tool accepts a focus, optional evaluator and gates, editable scope, protected assets, command categories, environment allowlist, and budget caps. Without an evaluator, it can qualify a workload duration or test-failure count. With an evaluator, declare its unit and score direction.
 
+## Experiment and dream cycle
+
+Each campaign uses a bounded hill climb with a fixed, qualified metric. Attempts run in isolated workspaces; the campaign confirms candidate gains, runs correctness gates and adversarial review, then applies an accepted patch. The loop checks the applied result independently before it starts another campaign.
+
+Completed experiments are recorded as worlds. When enough eligible worlds exist, the dream step can ask an agent for bounded search-config proposals. Deterministic replay scores each proposal using only recorded branch and refinement attempts. The incumbent remains a candidate, and only a challenger with sufficient coverage and a clear score margin is adopted. Dream output is configuration data; it does not provide executable policy code.
+
 ## State and recovery
 
-Project state lives under `.dream-rsi/`. Campaign records and append-only attempt evidence are retained. Search-policy configs and dream decisions live under `.dream-rsi/loop/`. Each attempt starts a fresh agent process and receives prior notes and experiment history.
+Project state lives under `.dream-rsi/`. Campaign records and append-only attempt evidence are retained. Search configs and dream decisions live under `.dream-rsi/loop/`. Each attempt starts a fresh agent process and receives prior notes and experiment history.
 
-`status` reports progress and spend. `stop` pauses the active campaign. `resume` retries the interrupted attempt and continues the loop. If a 2.x campaign cannot be read, Dream-RSI reports that it cannot resume; v1 stored contracts are normalized when read.
+`status` reports progress and spend. `stop` pauses the active campaign. `resume` restarts the interrupted attempt and continues the loop without renewing durable budgets. A paused 2.x campaign is marked failed with the 3.0 restart path; stored v1 loop contracts are normalized when read.
 
 Applied changes remain in the working tree. Review the diff, then keep or revert it with Git.

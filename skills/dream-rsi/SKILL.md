@@ -7,6 +7,6 @@ description: Route Dream-RSI assessment, loop, and campaign status requests. Use
 
 Use [dream-rsi-assess](../dream-rsi-assess/SKILL.md) for read-only project assessment. Use [dream-rsi-loop](../dream-rsi-loop/SKILL.md) when the user asks Dream-RSI to improve a project autonomously.
 
-`/dream-rsi status`, `stop`, `resume`, and `watch` inspect or control the loop. `/dream-rsi improve` and `/dream-rsi start` were removed in 3.0; use `/dream-rsi loop`.
+Use `/dream-rsi status`, `watch`, `stop`, and `resume` to inspect or control a saved loop. Start improvement through `/dream-rsi loop`.
 
 Use `dream_rsi_signals` for bounded, read-only evidence. Pass the user's goal as `focus`. Set `include_logs` to false when requested. Report sanitized aggregates only.

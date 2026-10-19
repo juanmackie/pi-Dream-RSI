@@ -18,6 +18,8 @@ Start the autonomous loop with the goal and explicit trusted-local consent:
 
 The loop finds measurable levers, qualifies its metric, runs isolated experiments, and applies only changes that pass confirmation, correctness gates, review, and an independent post-apply check. The loop stops when it reaches its budget or cannot find a verifiable lever.
 
+Its dream step uses completed experiment worlds to compare bounded search configurations through deterministic replay. An agent may propose configuration data; the loop never executes agent-written code as its search policy.
+
 ## Consent and cost
 
 Consent means project code and declared commands run on this host with the host user's access. This is not containment for hostile repositories. Use the loop only on projects you would run by hand.
@@ -29,7 +31,6 @@ Default durable limits are 6 campaigns, 72 agent starts, 200 evaluator runs, and
 - `/dream-rsi assess [goal]` reads project signals and ranks improvement opportunities.
 - `/dream-rsi loop [goal]` starts the unattended loop.
 - `/dream-rsi status`, `watch`, `stop`, and `resume` inspect or control it.
-- `/dream-rsi improve` and `/dream-rsi start` were removed in 3.0. Use `/dream-rsi loop`.
 
 ## State and rollback
 
