@@ -97,9 +97,12 @@ test("promotion floors expose the same minimums the campaign enforces", async ()
   assert.equal(exact.agentStarts, 3, "two first-round experiment attempts + review");
   assert.equal(exact.durationMs, 7 * 200_000);
   const noisy = campaign.promotionFloor({ readings: 5, gates: 2, deterministic: false, evaluatorTimeoutMs: 200_000 });
-  assert.equal(noisy.evaluatorRuns, 28, "5 readings + 2 gates + a 21-run noisy confirmation");
-  assert.ok(noisy.durationMs >= 28 * 200_000);
-  assert.equal(noisy.confirmationRuns, 21);
+  assert.equal(noisy.evaluatorRuns, 16, "5 readings + 2 gates + a 9-run noisy confirmation");
+  assert.ok(noisy.durationMs >= 16 * 200_000);
+  assert.equal(noisy.confirmationRuns, 9);
+  const reused = campaign.promotionFloor({ readings: 5, gates: 2, deterministic: false, baselineReuse: true, expectedReadMs: 60_000, evaluatorTimeoutMs: 900_000 });
+  assert.equal(reused.confirmationRuns, 4, "qualified baseline reuse leaves only two paired observations in the first look");
+  assert.equal(reused.durationMs, 11 * 60_000, "admission uses expected duration, not process timeout");
 });
 
 

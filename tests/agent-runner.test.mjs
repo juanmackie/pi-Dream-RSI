@@ -8,7 +8,7 @@ import * as path from "node:path";
 import { EXT, jump } from "./fixtures.mjs";
 
 const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
-const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError } = await jump("agent/runner.ts");
+const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError, copyWorkspace } = await jump("agent/runner.ts");
 const { OutputDecoder } = await jump("agent/output.ts");
 
 test("pi JSON output decodes bounded usage and content-free tool evidence", () => {
@@ -24,6 +24,16 @@ test("pi JSON output decodes bounded usage and content-free tool evidence", () =
   assert.equal(events.filter((event) => event.edit).length, 1);
   assert.equal(events.filter((event) => event.read).length, 1);
   assert.doesNotMatch(JSON.stringify(events), /SECRET|verifier\/private|private\/file/);
+});
+
+test("copyWorkspace refuses a destination that would delete the source root", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-copy-guard-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const source = path.join(root, "project");
+  fs.mkdirSync(source);
+  fs.writeFileSync(path.join(source, "keep.txt"), "keep");
+  await assert.rejects(copyWorkspace(source, root), /destination cannot be the source root or one of its ancestors/);
+  assert.equal(fs.readFileSync(path.join(source, "keep.txt"), "utf8"), "keep");
 });
 
 test("verifier-read telemetry only matches explicitly protected paths", () => {

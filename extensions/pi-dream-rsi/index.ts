@@ -5,10 +5,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as crypto from "node:crypto";
 
 import { Dashboard } from "./dashboard.ts";
 import { campaignRuntimeDiagnostics, failPausedV2Campaign, readCampaignStatus, runCampaign, stopCampaign, type CampaignRuntimeDiagnostics, type CampaignStatus } from "./engine/campaign.ts";
 import { runLoop, type LoopLimits } from "./engine/loop.ts";
+import { copyWorkspace, runAgent } from "./agent/runner.ts";
+import { writeFileAtomic } from "./engine/fsutil.ts";
+import { pathProtected, pathWithin } from "./engine/scope.ts";
 import { phaseIsActive } from "./engine/ownership.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { mementoNotes, readMemory } from "./engine/search.ts";
@@ -31,7 +35,7 @@ const signalsParams = {
 const loopParams = {
   type: "object",
   properties: {
-    action: { type: "string", enum: ["start", "status", "stop", "resume"], description: "Start, inspect, stop or resume the unattended loop." },
+    action: { type: "string", enum: ["start", "status", "stop", "resume", "confirm"], description: "Start, inspect, stop, resume, or continue saved confirmation pairs." },
     project_dir: { type: "string", description: "Local project path; defaults to the current project." },
     consent: { type: "boolean", description: "Required for start: discovered repository code runs on this host with host access." },
     focus: { type: "string", description: "Improvement goal. Defaults to reducing declared workload wall-clock time without changing results." },
@@ -42,9 +46,13 @@ const loopParams = {
     proxy_justification: { type: "string", description: "Why a proxy metric represents the stated goal." },
     evaluator: { type: "object", properties: {
       argv: { type: "array", items: { type: "string" } },
-      output: { type: "string", enum: ["score-json", "stdout-number"] },
+      output: { type: "string", enum: ["score-json", "stdout-number", "stdout-json"] },
       inputs: { type: "array", items: { type: "string" } },
     }, required: ["argv", "output"], additionalProperties: false },
+    evaluator_bootstrap: { type: "object", properties: {
+      authorized: { type: "boolean", description: "Must be true to let an agent create a pinned workload in an isolated project copy." },
+      paths: { type: "array", items: { type: "string" }, description: "Exact project-relative files the bootstrap agent may create or update; every path must be in approved editable scope." },
+    }, required: ["authorized", "paths"], additionalProperties: false },
     scope_roots: { type: "array", items: { type: "string" }, description: "Editable project roots. Defaults to recon's discovered scope." },
     protected_assets: { type: "array", items: { type: "string" } },
     gates: { type: "array", items: { type: "string" }, description: "Correctness commands that must continue to pass." },
@@ -195,9 +203,20 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           } catch { lines.push("The stored run contract is unreadable; the next start fails closed."); }
           try { lines.push(mementoNotes(readMemory(memoryPath))); }
           catch { lines.push("Loop memory is unreadable; the next start fails closed."); }
+          const reportPath = path.join(loopRoot, "latest-report.json");
+          if (fs.existsSync(reportPath)) {
+            try {
+              const report = JSON.parse(fs.readFileSync(reportPath, "utf8")) as { version?: number; stopCode?: string; stopReason?: string; campaigns?: number; wins?: number; evaluatorRuns?: number; preflightEvaluatorRuns?: number; campaignEvaluatorRuns?: number; agentStarts?: number; preflight?: { status?: string; checks?: Array<{ name?: string; status?: string; reason?: string; remedy?: string }> } };
+              if (report.version === 1 && typeof report.stopCode === "string" && typeof report.stopReason === "string"
+                && [report.campaigns, report.wins, report.evaluatorRuns, report.agentStarts].every((value) => Number.isSafeInteger(value) && value! >= 0)) {
+                lines.push(`Latest run report: ${report.stopCode} — ${report.stopReason.slice(0, 300)}; ${report.campaigns} campaign(s), ${report.wins} verified win(s), ${report.evaluatorRuns} evaluator run(s) (${report.preflightEvaluatorRuns ?? 0} preflight, ${report.campaignEvaluatorRuns ?? 0} campaign), ${report.agentStarts} agent start(s).`);
+                for (const check of report.preflight?.checks ?? []) lines.push(`  ${check.status ?? "unknown"}: ${check.name ?? "preflight"} — ${(check.reason ?? "").slice(0, 300)}${check.remedy ? ` Next step: ${check.remedy.slice(0, 300)}` : ""}`);
+              } else lines.push("Latest run report is invalid; the next run remains governed by the durable budget and contract.");
+            } catch { lines.push("Latest run report is unreadable."); }
+          }
         }
         lines.push(campaign ? renderCampaignStatus(campaign) : "No active campaign.");
-        return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath }, campaign } };
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath, reportPath: path.join(loopRoot, "latest-report.json") }, campaign } };
       }
       if (action === "stop") {
         const campaign = stopCampaign(path.join(resolveCampaignProjectDir(params.project_dir, ctx.cwd) ?? ctx.cwd, ".dream-rsi"));
@@ -205,7 +224,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign)}` }], details: { campaign } }
           : { content: [{ type: "text", text: "No active loop campaign." }], details: { campaign: null } };
       }
-      if (action === "resume") {
+      if (action === "resume" || action === "confirm") {
         const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
         if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
         const baseRoot = path.join(projectDir, ".dream-rsi");
@@ -217,6 +236,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         }
         if (campaign.state.kind === "running" && phaseIsActive(campaign.campaignRoot, "campaign")) {
           return { content: [{ type: "text", text: "The campaign is already running." }], details: { ok: false, campaign } };
+        }
+        if (action === "confirm" && !campaign.pendingConfirmation) {
+          return { content: [{ type: "text", text: "No saved candidate confirmation is pending; use action=resume for an interrupted campaign." }], details: { ok: false, campaign } };
         }
         setMode(ctx, true);
         pi.appendEntry(LOOP_TARGET_ENTRY, { version: 1, project: projectDir });
@@ -231,7 +253,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           return { content: [{ type: "text", text: "The durable loop budget is invalid; resume stopped without spending." }], details: { ok: false } };
         }
         const result = await runLoop({
-          projectDir, baseRoot, loopRoot, contract: stored.contract, resumeActiveCampaign: true,
+          projectDir, baseRoot, loopRoot, contract: stored.contract, resumeActiveCampaign: true, confirmationOnly: action === "confirm",
           limits: {
             maxCampaigns: durable.max_campaigns!, maxAgentStarts: durable.max_agent_starts!,
             maxEvaluatorRuns: durable.max_evaluator_runs!, deadlineMs: stored.contract.budgets.deadlineMs,
@@ -244,11 +266,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
         });
         return {
-          content: [{ type: "text", text: `Resumed Dream-RSI loop: ${result.stopReason}; ${result.campaigns} campaign(s), ${result.wins} verified win(s).` }],
+          content: [{ type: "text", text: `${action === "confirm" ? "Continued saved confirmation" : "Resumed Dream-RSI loop"} (${result.stopCode}): ${result.stopReason}; ${result.campaigns} campaign(s), ${result.wins} verified win(s).` }],
           details: { ok: result.stopReason !== "resume failed", loop: result },
         };
       }
-      if (action !== "start") return { content: [{ type: "text", text: "action must be start, status, stop or resume." }], details: { ok: false } };
+      if (action !== "start") return { content: [{ type: "text", text: "action must be start, status, stop, resume or confirm." }], details: { ok: false } };
       if (params.consent !== true) return { content: [{ type: "text", text: "consent must be true: discovered repository code runs on this host with host access." }], details: { ok: false } };
       setMode(ctx, true);
       const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
@@ -331,6 +353,93 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       }
       if (typeof params.agent_timeout_ms === "number") taskDefaults.agent_timeout_ms = params.agent_timeout_ms;
       if (typeof params.evaluator_timeout_ms === "number") taskDefaults.evaluator_timeout_ms = params.evaluator_timeout_ms;
+      let evaluatorBootstrap: { authorized: boolean; paths: string[]; run: (input: { projectDir: string; contract: ReturnType<typeof normalizeRunContract>; focus?: string; scopeRoots: string[]; deadlineMs: number; beforeAgentSpawn: () => void; signal?: AbortSignal }) => Promise<{ validatedPaths: string[] }> } | undefined;
+      if (params.evaluator_bootstrap !== undefined) {
+        const config = params.evaluator_bootstrap as { authorized?: unknown; paths?: unknown };
+        if (!config || typeof config !== "object" || typeof config.authorized !== "boolean" || !Array.isArray(config.paths)
+          || config.paths.length === 0 || config.paths.length > 10 || config.paths.some((entry) => typeof entry !== "string" || !entry.trim())) {
+          return { content: [{ type: "text", text: "evaluator_bootstrap must set authorized and a non-empty exact paths array." }], details: { ok: false } };
+        }
+        const paths = config.paths.map((entry) => (entry as string).replace(/\\/g, "/").replace(/^\.\//, ""));
+        if (paths.some((entry) => entry === "" || entry.startsWith("/") || entry.split("/").some((part) => !part || part === "." || part === "..")) || new Set(paths).size !== paths.length) {
+          return { content: [{ type: "text", text: "evaluator_bootstrap.paths must contain unique normalized project-relative paths." }], details: { ok: false } };
+        }
+        if (config.authorized) {
+          const agent = taskDefaults.agent ?? defaultTask().agent;
+          const timeoutMs = taskDefaults.agent_timeout_ms ?? defaultTask().agent_timeout_ms;
+          evaluatorBootstrap = {
+            authorized: true,
+            paths,
+            run: async ({ projectDir: target, contract: approvedContract, focus, scopeRoots, deadlineMs, beforeAgentSpawn, signal: bootstrapSignal }) => {
+              if (bootstrapSignal?.aborted) throw new Error("bootstrap cancelled before it started");
+              if (deadlineMs <= 0) throw new Error("bootstrap deadline elapsed before the agent started");
+              const bootstrapDeadlineAt = Date.now() + deadlineMs;
+              const scratch = path.join(loopRoot, "bootstrap", crypto.randomUUID());
+              try {
+                await copyWorkspace(target, scratch, { exclude: [path.join(target, ".git"), path.join(target, ".dream-rsi")] });
+                const remainingAfterCopyMs = bootstrapDeadlineAt - Date.now();
+                if (bootstrapSignal?.aborted) throw new Error("bootstrap cancelled while preparing its workspace");
+                if (remainingAfterCopyMs <= 0) throw new Error("bootstrap deadline elapsed while preparing its workspace");
+                const prompt = [
+                  "Create the smallest deterministic benchmark workload and pinned evaluator needed to measure this approved objective.",
+                  `Objective: ${approvedContract.outcome.statement}`,
+                  `Metric unit: ${approvedContract.outcome.unit}; higher is better: ${approvedContract.outcome.higherIsBetter}.`,
+                  focus ? `Additional workload details: ${focus}` : "",
+                  `You may create or update only these exact project-relative files: ${paths.join(", ")}.`,
+                  "Do not change the declared metric, direction, correctness behavior, or unrelated source files.",
+                  "Make the workload discoverable as a benchmark command in the existing project manifest when one of the allowed files permits it.",
+                  "Use deterministic pinned synthetic inputs when the objective requires them. Ensure the command runs locally without network access.",
+                  "Do not claim a measurement result. The host will run the generated workload and existing gates independently.",
+                ].filter(Boolean).join("\n");
+                const run = await runAgent({ agent, resolveAgent: resolveAgent(ctx), cwd: scratch, prompt, timeoutMs: Math.max(1, Math.min(timeoutMs, remainingAfterCopyMs)), signal: bootstrapSignal, beforeSpawn: beforeAgentSpawn, logPath: path.join(loopRoot, "bootstrap", "agent.log") });
+                if (!run.ok) throw new Error(run.spawnError ?? (run.timedOut ? "bootstrap agent timed out" : `bootstrap agent exited ${run.code}`));
+                const pendingWrites: Array<{ relative: string; targetPath: string; contents: string; previous: string | null }> = [];
+                let totalBootstrapBytes = 0;
+                for (const relative of paths) {
+                  const source = path.resolve(scratch, relative);
+                  const targetPath = path.resolve(target, relative);
+                  const assertSafeFilePath = (base: string, absolute: string): void => {
+                    const within = path.relative(path.resolve(base), absolute);
+                    if (!within || within === ".." || within.startsWith(`..${path.sep}`) || path.isAbsolute(within)) throw new Error(`bootstrap path escapes its workspace: ${relative}`);
+                    let current = path.resolve(base);
+                    const parts = path.relative(current, absolute).split(path.sep);
+                    for (const [index, part] of parts.entries()) {
+                      current = path.join(current, part);
+                      if (!fs.existsSync(current)) continue;
+                      const stat = fs.lstatSync(current);
+                      if (stat.isSymbolicLink()) throw new Error(`bootstrap path uses a symbolic link: ${relative}`);
+                      if (index < parts.length - 1 && !stat.isDirectory()) throw new Error(`bootstrap parent is not a directory: ${relative}`);
+                      if (index === parts.length - 1 && !stat.isFile()) throw new Error(`bootstrap path is not a regular file: ${relative}`);
+                    }
+                  };
+                  assertSafeFilePath(scratch, source);
+                  assertSafeFilePath(target, targetPath);
+                  if (!fs.existsSync(source) || !fs.lstatSync(source).isFile()) throw new Error(`bootstrap did not create a regular file: ${relative}`);
+                  const sourceStat = fs.statSync(source);
+                  if (sourceStat.size > 2 * 1024 * 1024) throw new Error(`bootstrap file exceeds the 2 MiB limit: ${relative}`);
+                  totalBootstrapBytes += sourceStat.size;
+                  if (totalBootstrapBytes > 5 * 1024 * 1024) throw new Error("bootstrap output exceeds the 5 MiB total limit");
+                  if (!pathWithin(relative, scopeRoots) || pathProtected(relative, approvedContract.scope.protectedAssets)) throw new Error(`bootstrap path is outside editable scope or protected: ${relative}`);
+                  const contents = fs.readFileSync(source, "utf8");
+                  if (contents.includes("\0")) throw new Error(`bootstrap produced a non-text file: ${relative}`);
+                  const previous = fs.existsSync(targetPath) && fs.lstatSync(targetPath).isFile() ? fs.readFileSync(targetPath, "utf8") : null;
+                  pendingWrites.push({ relative, targetPath, contents, previous });
+                }
+                const validatedPaths = pendingWrites.map(({ relative }) => relative);
+                for (const { relative, targetPath, contents, previous } of pendingWrites) {
+                  if (bootstrapSignal?.aborted) throw new Error("bootstrap cancelled before copy-back");
+                  if (Date.now() >= bootstrapDeadlineAt) throw new Error("bootstrap deadline elapsed before copy-back");
+                  if (!pathWithin(relative, scopeRoots) || pathProtected(relative, approvedContract.scope.protectedAssets)) throw new Error(`bootstrap path became out of scope or protected before copy-back: ${relative}`);
+                  if (previous === contents) continue;
+                  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+                  writeFileAtomic(targetPath, contents, true);
+                }
+                return { validatedPaths };
+              } finally { fs.rmSync(scratch, { recursive: true, force: true }); }
+            },
+          };
+        } else evaluatorBootstrap = { authorized: false, paths, run: async () => ({ validatedPaths: [] }) };
+      }
       setMode(ctx, true);
       // Retain the loop target in the session so the advertised stop and status can reach a
       // loop that runs outside the calling directory.
@@ -345,6 +454,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         ...(includeLogs && ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
         contract,
         ...(Object.keys(taskDefaults).length > 0 ? { taskDefaults } : {}),
+        ...(evaluatorBootstrap ? { evaluatorBootstrap } : {}),
         resolveAgent: resolveAgent(ctx),
         signal,
         onProgress: (message) => {
@@ -355,11 +465,13 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
       });
       const lines = [
-        `Dream-RSI loop finished: ${result.stopReason}`,
+        `Dream-RSI loop finished (${result.stopCode}): ${result.stopReason}`,
         `  campaigns this run: ${result.campaigns} (${result.wins} verified win(s))`,
-        `  spend this run: ${result.agentStarts} agent start(s), ${result.evaluatorRuns} evaluator run(s)`,
+        `  spend this run: ${result.agentStarts} agent start(s), ${result.evaluatorRuns} evaluator run(s) (${result.preflightEvaluatorRuns} preflight; ${result.campaignEvaluatorRuns} campaign)`,
+        `  preflight: ${result.preflight.status}${result.preflight.checks.length ? ` — ${result.preflight.checks.filter((check) => check.status === "blocked").length} blocker(s), ${result.preflight.checks.length} check(s)` : " — not run"}`,
+        ...result.preflight.checks.map((check) => `    ${check.status}: ${check.name} — ${check.reason}${check.remedy ? ` Next step: ${check.remedy}` : ""}`),
         `  levers ranked: ${result.inventory?.levers.length ?? 0}; memory: ${result.memoryPath}`,
-        ...(result.contract ? [`  contract: ${result.contract.fingerprint.slice(0, 12)} (approved ${result.contract.approvedAt})`] : []),
+        ...(result.contract ? [`  trusted-local contract recorded ${result.contract.fingerprint.slice(0, 12)} (${result.contract.approvedAt}); this is consent/settings, not campaign readiness`] : []),
         ...(result.verifications.length > 0
           ? [`  independent post-apply checks: ${result.verifications.filter((check) => check.passed).length}/${result.verifications.length} passed`]
           : []),
@@ -598,6 +710,7 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
     `  calls: ${campaign.agentStarts}/${campaign.limits.maxAgentStarts} agent starts, ${campaign.evaluatorRuns}/${campaign.limits.maxEvaluatorRuns} evaluator runs`,
     `  effective evaluator timeout: ${campaign.effectiveEvaluatorTimeoutMs}ms`,
     `  deadline: ${campaign.deadlineAt}`,
+    ...(campaign.pendingConfirmation ? [`  pending confirmation: ${campaign.pendingConfirmation.cell}, ${campaign.pendingConfirmation.pairs}/${campaign.pendingConfirmation.maxPairs} paired samples; use action=confirm to continue without repeating paid pairs`] : []),
     ...(campaign.check ? renderCampaignCheckStatus(campaign.check) : []),
     renderCampaignRuntime(runtime),
   ];

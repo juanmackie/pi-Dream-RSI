@@ -189,9 +189,9 @@ function contractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "50%", m
 
 test("cold start: dream_rsi_loop with consent and focus applies and independently verifies an improvement", async () => {
   const fixture = coldStartProject();
-  // Use enough deterministic quadratic work for the default 5% threshold to
-  // sit above process-startup jitter while keeping the change substantial.
-  fs.writeFileSync(path.join(fixture.projectDir, "bench.mjs"), BENCH.replace("24_000", "60_000"));
+  // Keep the cold-start workload bounded while keeping the 50% threshold
+  // above process-startup jitter.
+  fs.writeFileSync(path.join(fixture.projectDir, "bench.mjs"), BENCH.replace("24_000", "22_000"));
   const baselineMs = measureScript(fixture.projectDir, "bench.mjs");
   const baselineGate = runFixtureCommand(fixture.projectDir, "test.mjs");
   assert.equal(baselineGate.status, 0, "the fixture's correctness oracle passes before the change");
@@ -203,14 +203,15 @@ test("cold start: dream_rsi_loop with consent and focus applies and independentl
   const result = await harness.tools.get("dream_rsi_loop").execute("cold-start", {
     action: "start", consent: true,
     focus: "reduce the wall-clock duration of the declared benchmark without changing its output",
-    minimum_gain: "25%",
+    minimum_gain: "50%",
+    max_campaigns: 2, max_agent_starts: 14, max_evaluator_runs: 120,
     agent_command: process.execPath, agent_args: [fixture.agentPath],
   }, undefined, undefined, context);
   assert.match(result.content[0].text, /Dream-RSI loop finished/);
   const loopResult = result.details.loop;
 
   assert.ok(loopResult.campaigns >= 1, `the loop must run at least one campaign; stopped with "${loopResult.stopReason}": ${JSON.stringify({ inventory: loopResult.inventory, memory: loopResult.memory.notes })}`);
-  assert.equal(loopResult.wins, 1, `exactly one verified improvement; stop reason "${loopResult.stopReason}"`);
+  assert.equal(loopResult.wins, 1, `exactly one verified improvement; stop reason "${loopResult.stopReason}"; ${JSON.stringify({ campaigns: loopResult.campaigns, evaluatorRuns: loopResult.evaluatorRuns, preflightEvaluatorRuns: loopResult.preflightEvaluatorRuns, campaignEvaluatorRuns: loopResult.campaignEvaluatorRuns, agentStarts: loopResult.agentStarts, notes: loopResult.memory.notes, records: loopResult.records })}`);
   assert.ok(loopResult.contract, "the result reports the frozen contract identity");
 
   const applied = fs.readFileSync(path.join(fixture.projectDir, "src", "pipeline.mjs"), "utf8");
@@ -220,7 +221,7 @@ test("cold start: dream_rsi_loop with consent and focus applies and independentl
   const gateAfter = runFixtureCommand(fixture.projectDir, "test.mjs");
   assert.equal(gateAfter.status, 0, "the correctness oracle still passes after the apply");
   const afterMs = measureScript(fixture.projectDir, "bench.mjs");
-  assert.ok(afterMs < baselineMs * 0.9, `the declared benchmark must actually improve beyond the default useful gain (${baselineMs.toFixed(0)} ms -> ${afterMs.toFixed(0)} ms)`);
+  assert.ok(afterMs < baselineMs * 0.5, `the declared benchmark must actually improve beyond the 50% useful gain (${baselineMs.toFixed(0)} ms -> ${afterMs.toFixed(0)} ms)`);
 
   assert.ok(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi", "loop", "contract.json")), "the approved contract is durable");
   const postApply = loopResult.verifications ?? [];
@@ -316,7 +317,9 @@ test("cold start: a repository with no declared measurable command stops with th
     now: () => new Date("2026-10-20T00:00:00.000Z"),
   });
 
-  assert.equal(result.stopReason, "no verifiable lever");
+  assert.equal(result.stopCode, "blocked");
+  assert.match(result.stopReason, /no declared command matches|no benchmark or custom workload/);
+  assert.match(result.stopReason, /Next step:/);
   assert.equal(result.campaigns, 0);
   assert.ok(result.inventory && result.inventory.rejected.length > 0, "the refusal names why nothing was measurable");
   void runNpm;

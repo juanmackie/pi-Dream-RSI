@@ -71,7 +71,7 @@ test("duration evaluator reports median wall-clock, detects a faster variant, an
   try {
     fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ scripts: { test: "node slow.mjs" } }));
     const slow = path.join(projectDir, "slow.mjs");
-    fs.writeFileSync(slow, `const start = Date.now();\nwhile (Date.now() - start < 250) { /* busy */ }\n`);
+    fs.writeFileSync(slow, `const start = Date.now();\nwhile (Date.now() - start < 1000) { /* busy */ }\n`);
     const plan = await synthesizeMetric({
       projectDir,
       lever: lever({ metricKind: "command-duration", metric: "duration (ms, lower is better)", estimates: { expectedGain: 1, costSeconds: 1, confidence: 0.5, readiness: 0.9 } }),
@@ -85,7 +85,7 @@ test("duration evaluator reports median wall-clock, detects a faster variant, an
     assert.ok(slowScore.score >= 200 && slowScore.score < 5_000, `duration score ${slowScore.score} ms`);
     assert.equal(slowScore.samples.length, 3, "warmup is excluded from the reported samples");
 
-    fs.writeFileSync(slow, `const start = Date.now();\nwhile (Date.now() - start < 30) { /* busy */ }\n`);
+    fs.writeFileSync(slow, `const start = Date.now();\nwhile (Date.now() - start < 5) { /* busy */ }\n`);
     const fastScore = runEvaluator(projectDir, plan.evaluatorPath);
     assert.ok(fastScore.score < slowScore.score, `faster variant ${fastScore.score} ms < ${slowScore.score} ms`);
 

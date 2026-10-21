@@ -332,6 +332,17 @@ export class CampaignBudget {
     };
   }
 
+  /** Extend a paused campaign only with allowance granted by its owning durable loop. */
+  extendLimits(agentLimit: number, evaluatorLimit: number): void {
+    if (!Number.isSafeInteger(agentLimit) || agentLimit < this.agentLimit || !Number.isSafeInteger(evaluatorLimit) || evaluatorLimit < this.evaluatorLimit) {
+      throw new Error("campaign budget extension cannot reduce limits or use invalid counts");
+    }
+    allocator(this.root, () => {
+      const ledger = this.read();
+      this.write({ ...ledger, agent_limit: agentLimit, evaluator_limit: evaluatorLimit });
+    });
+  }
+
   reserve(kind: CampaignProcessKind, key: string): void {
     allocator(this.root, () => {
       const ledger = this.read();

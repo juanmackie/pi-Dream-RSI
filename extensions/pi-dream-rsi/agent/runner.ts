@@ -22,6 +22,9 @@ export interface CommandResult {
   code: number | null;
   signal: NodeJS.Signals | null;
   timedOut: boolean;
+  timeoutKind?: "wall" | "idle";
+  idleMs?: number;
+  lastOutputAgeMs?: number;
   /** True when the caller's AbortSignal cancelled the run (the tree was killed). */
   aborted?: boolean;
   /** Spawn failure (missing executable, EINVAL, …). */
@@ -52,6 +55,8 @@ export interface RunOptions {
   outputFormat?: "text" | "pi-json";
   cwd: string;
   timeoutMs: number;
+  /** Optional inactivity timeout reset whenever stdout or stderr emits bytes. */
+  idleTimeoutMs?: number;
   logPath?: string | null;
   env?: Record<string, string>;
   /**
@@ -193,12 +198,15 @@ async function collect(
     return next.length > TAIL_BYTES ? next.slice(next.length - TAIL_BYTES) : next;
   };
 
-  return await new Promise<CommandResult>((resolve) => {
+  return await new Promise<CommandResult>((resolve, reject) => {
     let child: ChildProcess | undefined;
     let settled = false;
     let timedOut = false;
+    let timeoutKind: "wall" | "idle" | undefined;
+    let lastOutputAt = started;
     let aborted = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let grace: ReturnType<typeof setTimeout> | undefined;
 
     const finish = (result: Partial<CommandResult>): void => {
@@ -214,6 +222,7 @@ async function collect(
         catch (error) { logError = error instanceof Error ? error.message : String(error); }
       }
       if (timer) clearTimeout(timer);
+      if (idleTimer) clearTimeout(idleTimer);
       if (grace) clearTimeout(grace);
       options.signal?.removeEventListener("abort", onAbort);
       try {
@@ -227,6 +236,8 @@ async function collect(
           code: null,
           signal: null,
           timedOut,
+          ...(timeoutKind ? { timeoutKind } : {}),
+          ...(options.idleTimeoutMs ? { idleMs: Date.now() - lastOutputAt, lastOutputAgeMs: Date.now() - lastOutputAt } : {}),
           aborted,
           spawnError: null,
           logError,
@@ -268,7 +279,12 @@ async function collect(
       const argv = options.shell
         ? [`${commandText}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
-      options.beforeSpawn?.();
+      try { options.beforeSpawn?.(); }
+      catch (error) {
+        logStream?.end();
+        reject(error);
+        return;
+      }
       child = spawn(argv[0] as string, argv[1] as string[], {
         cwd: options.cwd,
         shell: options.shell,
@@ -286,15 +302,22 @@ async function collect(
     const running = child;
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
-    timer = setTimeout(() => {
+    const timeoutRun = (kind: "wall" | "idle"): void => {
+      if (settled || timedOut) return;
       timedOut = true;
+      timeoutKind = kind;
       killTree(running);
-      // 'close' waits for the stdio pipes, and a grandchild that inherited them can keep them
-      // open forever after the agent itself is gone — settle after a grace period instead of
-      // hanging the whole episode (which is how a timed-out attempt used to leave its live cycle
-      // stuck `running` and block dreaming indefinitely).
+      // A grandchild can inherit stdio after the agent exits; bound the wait for pipe closure.
       grace = setTimeout(() => finish({}), 2000);
-    }, options.timeoutMs);
+    };
+    timer = setTimeout(() => timeoutRun("wall"), options.timeoutMs);
+    const resetIdleTimer = (): void => {
+      if (!options.idleTimeoutMs) return;
+      lastOutputAt = Date.now();
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => timeoutRun("idle"), options.idleTimeoutMs);
+    };
+    if (options.idleTimeoutMs) idleTimer = setTimeout(() => timeoutRun("idle"), options.idleTimeoutMs);
 
     // A missing agent CLI must not read as a silent hang: say which command was not found and how the
     // task can pin it, because the runner resolves `pi` itself and only falls back to PATH otherwise.
@@ -309,14 +332,14 @@ async function collect(
       }
     };
     running.stdout?.on("data", (chunk: Buffer) => {
-      if (chunk.length > 0) sawOutput = true;
+      if (chunk.length > 0) { sawOutput = true; resetIdleTimer(); }
       const text = stdoutDecoder.write(chunk);
       decoder.feed("stdout", text);
       stdoutTail = append(stdoutTail, text);
       writeLog(running.stdout as NodeJS.ReadableStream, chunk);
     });
     running.stderr?.on("data", (chunk: Buffer) => {
-      if (chunk.length > 0) sawOutput = true;
+      if (chunk.length > 0) { sawOutput = true; resetIdleTimer(); }
       const text = stderrDecoder.write(chunk);
       decoder.feed("stderr", text);
       stderrTail = append(stderrTail, text);
@@ -533,7 +556,11 @@ export interface CopyWorkspaceOptions {
 }
 
 function isInside(candidate: string, parent: string): boolean {
-  return candidate === parent || candidate.startsWith(parent + path.sep);
+  const resolvedCandidate = path.resolve(candidate);
+  const resolvedParent = path.resolve(parent);
+  const normalizedCandidate = process.platform === "win32" ? resolvedCandidate.toLowerCase() : resolvedCandidate;
+  const normalizedParent = process.platform === "win32" ? resolvedParent.toLowerCase() : resolvedParent;
+  return normalizedCandidate === normalizedParent || normalizedCandidate.startsWith(normalizedParent + path.sep);
 }
 
 /** Bounded async work queue: at most `max` copies in flight, so a large workspace cannot flood the
@@ -635,6 +662,7 @@ async function copyTree(
 export async function copyWorkspace(from: string, to: string, options: CopyWorkspaceOptions = {}): Promise<void> {
   const source = path.resolve(from);
   const destination = path.resolve(to);
+  if (isInside(source, destination)) throw new Error("workspace destination cannot be the source root or one of its ancestors");
   const excluded = (options.exclude ?? [])
     .map((entry) => path.resolve(entry))
     .filter((entry) => !isInside(source, entry));

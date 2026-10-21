@@ -16,6 +16,13 @@ import * as path from "node:path";
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { readEvaluatorReading, verifyPostApply } from "../extensions/pi-dream-rsi/engine/verify.ts";
 
+test("stdout-json requires a valid evaluator verdict and finite score", () => {
+  assert.equal(readEvaluatorReading({ cwd: ".", output: "stdout-json", stdout: '{"valid":true,"score":4,"fail_class":"ok"}' }), 4);
+  assert.equal(readEvaluatorReading({ cwd: ".", output: "stdout-json", stdout: '{"valid":false,"score":4}' }), null);
+  assert.equal(readEvaluatorReading({ cwd: ".", output: "stdout-json", stdout: '{"valid":true,"score":null}' }), null);
+  assert.equal(readEvaluatorReading({ cwd: ".", output: "stdout-json", stdout: '{"valid":true,"score":4,"fail_class":null}' }), null);
+});
+
 function project(files) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-verify-"));
   for (const [relative, content] of Object.entries(files)) {

@@ -73,6 +73,7 @@ test("resume keeps completed attempts and retries only planned work", async (t) 
     cycle: 1, fingerprint: "resume-fingerprint", baseline: 0, threshold: 0.1,
     config: { ...defaultSearchConfig, batchSize: 3, maxRounds: 1 },
     signal: interruption.signal, agent: task.agent, maxAgentAttempts: 3, maxEvaluatorAttempts: 3,
+    beforeEvaluatorSpawn: () => {},
   };
   let starts = 0;
   await assert.rejects(runExperiment({ ...options, beforeAgentSpawn: () => { if (++starts === 2) interruption.abort(); } }), /experiment stopped/);

@@ -11,7 +11,7 @@ import {
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
 import { readLedger } from "./ledger.ts";
-import { buildReconInventory, reconProject, type ReconOptions, type ReconResult } from "./recon.ts";
+import { buildReconInventory, reconProject, timeLikeOutcome, type ReconOptions, type ReconResult } from "./recon.ts";
 import { measureEvaluatorReading, measureWorkload, verifyPostApply, type PostApplyEvaluator } from "./verify.ts";
 import {
   hasAllowance, readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
@@ -27,6 +27,7 @@ import { collectSignals, type SignalsResult } from "./signals.ts";
 import { defaultTask, type TaskConfig } from "./task.ts";
 import { readJson, writeFileAtomic, writeJson } from "./fsutil.ts";
 import { phaseIsActive } from "./ownership.ts";
+import { normalizeProjectRelativePath, pathProtected, pathWithin } from "./scope.ts";
 import { defaultSearchConfig, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
 import { maybeDream, validateSearchConfig } from "./dream.ts";
 
@@ -61,6 +62,8 @@ export interface LeverCampaignSetup {
   gates?: string[];
   goal?: string;
   scope?: string[];
+  /** Estimated reading cost for budget admission, separate from the process timeout. */
+  expectedReadMs?: number;
 }
 
 export interface LeverSetupContext {
@@ -89,6 +92,14 @@ export interface LoopOptions {
   contract: RunContract;
   /** Resume the paused campaign recorded in the loop's durable active context, then keep looping. */
   resumeActiveCampaign?: boolean;
+  /** Resume only a persisted paired confirmation, without discovery or new agent search. */
+  confirmationOnly?: boolean;
+  /** Explicitly authorized evaluator/workload bootstrap. Paths are checked against editable scope before the callback runs. */
+  evaluatorBootstrap?: {
+    authorized: boolean;
+    paths: string[];
+    run: (context: { projectDir: string; contract: RunContract; focus?: string; scopeRoots: string[]; deadlineMs: number; beforeAgentSpawn: () => void; signal?: AbortSignal }) => Promise<{ validatedPaths: string[] }>;
+  };
   /** How many declared workloads one cold-start recon pass may measure. */
   reconProbes?: number;
   /** Passed through to the campaign when supplied; calibrated inside the campaign otherwise. */
@@ -124,12 +135,29 @@ export interface LoopCampaignRecord extends LoopMemoryRecord {
   campaignRoot: string | null;
 }
 
+export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "stopped";
+
+export interface LoopPreflightCheck {
+  name: "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
+  status: "passed" | "blocked" | "not-checked";
+  reason: string;
+  remedy?: string;
+}
+
 export interface LoopResult {
+  stopCode: LoopStopCode;
+  reportPath: string;
+  preflight: { status: "passed" | "blocked" | "not-checked"; checks: LoopPreflightCheck[] };
+  /** Total evaluator invocations this run, including discovery and qualification. */
+  evaluatorRuns: number;
+  /** Discovery/qualification invocations, reported separately from campaign spend. */
+  preflightEvaluatorRuns: number;
+  campaignEvaluatorRuns: number;
+  evaluatorRunsByPhase: Partial<Record<LoopPhase, number>>;
   stopReason: string;
   /** Campaigns actually started by this run (including rejected preflights). */
   campaigns: number;
   wins: number;
-  evaluatorRuns: number;
   agentStarts: number;
   memoryPath: string;
   budgetPath: string;
@@ -502,6 +530,7 @@ function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCa
     gates: [...new Set([...(context.contract?.preserved.gates ?? []), ...plan.gates])],
     goal: lever.goal,
     scope: [...lever.scopeFiles],
+    expectedReadMs: plan.expectedReadMs,
   };
 }
 
@@ -557,6 +586,127 @@ export function campaignSeedReadings(options: SeedReadingsOptions): CampaignSeed
  * the run: stop reason, per-campaign outcomes, durable memory and budget paths,
  * and a bounded Memento digest for the next run.
  */
+function namedProjectPaths(texts: string[]): string[] {
+  const paths = new Set<string>();
+  const tokenPattern = /"([^"\r\n]+)"|'([^'\r\n]+)'|`([^`\r\n]+)`|([^\s"'`]+)/g;
+  const sourceFile = /\.(?:mjs|cjs|js|jsx|ts|tsx|py|sh|ps1|json|ya?ml|toml)$/i;
+  for (const text of texts) {
+    for (const match of text.matchAll(tokenPattern)) {
+      const token = (match[1] ?? match[2] ?? match[3] ?? match[4] ?? "").replace(/^[([{]+|[,;:)}\]]+$/g, "");
+      const candidates = match[1] !== undefined || match[2] !== undefined || match[3] !== undefined
+        ? [token]
+        : token.split(/&&|\|\||[;&|()<>]/g);
+      for (const candidate of candidates) {
+        const values = candidate.startsWith("-") && candidate.includes("=") ? [candidate.slice(candidate.indexOf("=") + 1)] : [candidate];
+        for (const value of values) {
+          if (sourceFile.test(value)) paths.add(value.replace(/\\/g, "/").replace(/^\.\//, ""));
+        }
+      }
+    }
+    for (const match of text.matchAll(/\btests\.([A-Za-z_][\w]*)\b/g)) paths.add(`tests/${match[1]}.py`);
+  }
+  return [...paths];
+}
+
+function buildLoopPreflight(contract: RunContract, recon: ReconResult, inventory: LeverInventory, focus = "", bootstrapPaths: string[] = []): LoopResult["preflight"] {
+  const checks: LoopPreflightCheck[] = [];
+  const blocker = (name: LoopPreflightCheck["name"], reason: string, remedy: string): void => {
+    checks.push({ name, status: "blocked", reason, remedy });
+  };
+  const metricIsTime = timeLikeOutcome(contract.outcome);
+  const nativeFailureCount = contract.outcome.unit.trim().toLowerCase() === "failures"
+    && !contract.outcome.higherIsBetter
+    && inventory.levers.some((lever) => lever.metricKind === "suite-failures");
+  if (contract.outcome.evaluator || metricIsTime || contract.outcome.proxyJustification || nativeFailureCount) {
+    checks.push({ name: "metric", status: "passed", reason: contract.outcome.evaluator
+      ? `The declared ${contract.outcome.unit} metric has a pinned evaluator command.`
+      : nativeFailureCount ? "The declared lower-is-better failure-count metric has a scoped failing-test measurement."
+        : contract.outcome.proxyJustification ? `The ${contract.outcome.unit} proxy is explicitly justified.` : `The ${contract.outcome.unit} metric is measured directly.` });
+  } else {
+    blocker("metric", `The declared ${contract.outcome.unit} metric has no evaluator and wall-clock time is not an approved substitute.`, "Supply an evaluator command and output format, or explicitly approve a justified proxy.");
+  }
+  if (contract.outcome.evaluator) {
+    checks.push({ name: "evaluator", status: "passed", reason: "The contract supplies an executable evaluator command and output format; execution is checked during qualification." });
+  } else if (nativeFailureCount) {
+    checks.push({ name: "evaluator", status: "passed", reason: "Recon found a scoped failing-test suite, which provides the native failure-count instrument without a separate score evaluator." });
+  } else if (metricIsTime || contract.outcome.proxyJustification) {
+    checks.push({ name: "evaluator", status: "not-checked", reason: "No user evaluator command was supplied; a declared executable workload must be discovered for the approved time metric or proxy." });
+  } else {
+    blocker("evaluator", "No executable evaluator command is declared for the selected metric.", "Supply the evaluator argv and output format; a unit and score direction alone are not an evaluator.");
+  }
+
+  const workloadBlockers = recon.blockers.filter((reason) => /no benchmark or custom workload|declared workload .* did not complete|does not name a local entry file|no declared command matches/i.test(reason));
+  const hasWorkload = recon.probes.some((probe) => probe.ok && recon.commands.some((command) => command.label === probe.label && (command.category === "benchmark" || command.category === "custom")));
+  const hasFailingTest = recon.probes.some((probe) => !probe.ok && !probe.timedOut && probe.spawnFailed !== true && probe.exitCode !== null && probe.exitCode !== undefined
+    && recon.commands.some((command) => command.label === probe.label && command.category === "test"));
+  if (hasWorkload || hasFailingTest || contract.outcome.evaluator) {
+    checks.push({ name: "workload", status: "passed", reason: hasWorkload ? "A declared benchmark or custom workload completed during discovery."
+      : hasFailingTest ? "A declared test command completed with failures and can be measured as a failure-count workload."
+        : "A contract-declared evaluator is available; workload validity is checked during qualification." });
+  } else {
+    const pinnedRequest = `${contract.outcome.statement} ${focus}`.match(/\bpinned\s+(?:synthetic\s+)?[^.;]{1,100}?\bworkload\b/i)?.[0];
+    const reason = pinnedRequest
+      ? `No executable ${pinnedRequest} was discovered; ${workloadBlockers[0] ?? "no runnable benchmark or custom workload is available"}.`
+      : workloadBlockers[0] ?? "No executable workload was found for the approved metric.";
+    blocker("workload", reason, `Declare and pin the requested workload and its evaluator, then include their files in editable scope${focus ? ` for “${focus.slice(0, 140)}”` : ""}; if bootstrapping is authorized, supply its exact in-scope file plan and setup step.`);
+  }
+
+  const paths = new Set(namedProjectPaths([focus, ...contract.preserved.gates]));
+  for (const file of bootstrapPaths) paths.add(file.replace(/\\/g, "/").replace(/^\.\//, ""));
+  const outOfScope = [...paths].filter((file) => !pathWithin(file, contract.scope.roots));
+  const scopeRejections = inventory.levers.length === 0
+    ? inventory.rejected.filter((entry) => /approved editable scope|outside .*scope/i.test(entry.reason))
+    : [];
+  if (scopeRejections.length > 0) blocker("scope", `Candidate work is outside the approved editable scope: ${scopeRejections.map((entry) => entry.reason).join("; ")}.`, "Expand the approved scope to include the required implementation files, or choose a workload exercised by files already in scope.");
+  else if (outOfScope.length > 0) blocker("scope", `Required evaluator or gate file(s) are outside editable scope: ${outOfScope.join(", ")}.`, `Add only the required paths to the approved scope before bootstrapping or editing: ${outOfScope.join(", ")}.`);
+  else checks.push({ name: "scope", status: "passed", reason: "Named evaluator and gate files are covered by editable scope, or no such project files were named." });
+
+  if (contract.preserved.gates.every((gate) => gate.trim().length > 0)) {
+    checks.push({ name: "gates", status: "not-checked", reason: contract.preserved.gates.length
+      ? `${contract.preserved.gates.length} correctness gate(s) are declared; commands and target behavior are exercised before campaign search during qualification.`
+      : "No correctness gates were declared; campaign readiness requires an independently valid evaluator and oracle." });
+  } else {
+    blocker("gates", "At least one correctness gate is empty.", "Replace the empty gate with an executable correctness check or remove it from the approved contract.");
+  }
+  const status = checks.some((check) => check.status === "blocked") ? "blocked"
+    : checks.some((check) => check.status === "not-checked") ? "not-checked" : "passed";
+  return { status, checks };
+}
+
+function qualificationBlockers(plan: MetricPlan | null, fallbackReason?: string): LoopPreflightCheck[] {
+  const failures = plan?.qualification?.checks.filter((check) => check.required && !check.passed) ?? [];
+  const checks = failures.length > 0 ? failures : [{ name: "evaluator", detail: fallbackReason ?? "no further detail was reported" }];
+  return checks.map((failed) => {
+    const name: LoopPreflightCheck["name"] = failed.name === "budget-fit" ? "budget"
+      : failed.name === "oracle" ? "gates"
+        : failed.name === "workload" || failed.name === "missing-workload" ? "workload" : "evaluator";
+    const reason = failures.length > 0
+      ? `Instrument qualification failed (${failed.name}): ${failed.detail}`
+      : `Campaign setup could not produce a usable instrument: ${failed.detail}.`;
+    const remedy = name === "budget" ? "Increase the remaining evaluator or deadline allowance within the approved limits, or reduce the required work."
+      : name === "gates" ? "Declare a passing independent correctness gate or score-validity oracle that detects broken candidate code."
+        : name === "workload" ? "Supply a runnable pinned workload for the declared metric and include its required files in editable scope."
+          : "Fix the declared evaluator and verify its output against the selected metric without changing its unit or direction.";
+    return { name, status: "blocked", reason, remedy };
+  });
+}
+
+function classifyStop(reason: string): LoopStopCode {
+  if (!reason) return "completed";
+  if (reason === "not-approved") return "consent-required";
+  if (reason === "budget" || reason.includes("allowance exhausted")) return "budget-exhausted";
+  if (reason === "deadline" || reason.startsWith("campaign deadline")) return "deadline";
+  if (reason === "cancelled") return "cancelled";
+  if (reason === "no verifiable lever") return "no-verifiable-lever";
+  if (reason === "blocked" || reason.startsWith("blocked:")) return "blocked";
+  if (reason === "paused") return "paused";
+  if (reason === "confirmation pending") return "confirmation-pending";
+  if (reason === "confirmation complete") return "confirmation-complete";
+  if (reason.startsWith("post-apply check failed")) return "post-apply-failure";
+  if (reason.startsWith("campaign failed") || reason.startsWith("resume failed")) return "campaign-failure";
+  return "stopped";
+}
+
 export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const limits = options.limits;
 
@@ -590,6 +740,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let ranking: LeverRankingEntry[] = [];
   let inventory: LeverInventory | null = null;
   let stopReason = "";
+  let preflight: LoopResult["preflight"] = { status: "not-checked", checks: [] };
+  let runStartEvaluatorRuns = 0;
+  let runStartAgentStarts = 0;
+  let runStartPhases: Partial<Record<LoopPhase, import("./budget.ts").LoopPhaseSpend>> = {};
   let resumePending = options.resumeActiveCampaign === true;
   let approved: ApprovedContract | null = null;
   let recon: ReconResult | null = null;
@@ -675,6 +829,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     }
     const before = readCampaignStatus(baseRoot);
     if (!before) throw new Error("the saved loop context has no campaign");
+    if (options.confirmationOnly && !before.pendingConfirmation) throw new Error("confirmation-only resume requires a saved pending candidate");
     const terminal = before.state.kind === "complete" || before.state.kind === "failed";
     if (!terminal && before.state.kind !== "paused" && before.state.kind !== "running") throw new Error("the saved loop context has no paused or interrupted campaign");
     if (before.state.kind === "running" && phaseIsActive(before.campaignRoot, "campaign")) throw new Error("the saved campaign is still running in another process");
@@ -688,9 +843,16 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     } else {
       if (!budget) throw new LoopBudgetExhaustedError("campaign resume");
       const remaining = remainingAllowance(budget);
-      if (remaining.agentStarts <= 0 || remaining.evaluatorRuns <= 0) throw new LoopBudgetExhaustedError("campaign resume");
+      const postApplyReserve = context.instrument.gates.length + (context.instrument.kind === "command-duration" ? 3 : 1);
+      const campaignEvaluatorAllowance = Math.max(0, remaining.evaluatorRuns - postApplyReserve);
+      if (remaining.agentStarts <= 0 || campaignEvaluatorAllowance <= 0) throw new LoopBudgetExhaustedError("campaign resume");
+      const confirmationExtension = options.confirmationOnly ? {
+        agentStarts: Math.max(0, remaining.agentStarts - Math.max(0, before.limits.maxAgentStarts - before.agentStarts)),
+        evaluatorRuns: Math.max(0, campaignEvaluatorAllowance - Math.max(0, before.limits.maxEvaluatorRuns - before.evaluatorRuns)),
+        deadlineMs: Math.max(0, deadlineAt - Date.now() - Math.max(0, Date.parse(before.deadlineAt) - Date.now())),
+      } : undefined;
       const reservation: LoopReservation = {
-        phase: "campaign", agent_starts: remaining.agentStarts, evaluator_runs: remaining.evaluatorRuns,
+        phase: "campaign", agent_starts: remaining.agentStarts, evaluator_runs: campaignEvaluatorAllowance,
         campaigns: 0, campaign_id: before.id,
         campaign_agent_starts_before: before.agentStarts, campaign_evaluator_runs_before: before.evaluatorRuns,
         at: now().toISOString(),
@@ -700,6 +862,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       try {
         result = await resumeCampaignImpl({
         baseRoot, projectDir,
+        ...(options.confirmationOnly ? { confirmationOnly: true, ...((confirmationExtension!.agentStarts + confirmationExtension!.evaluatorRuns + confirmationExtension!.deadlineMs > 0) ? { extendLimits: confirmationExtension } : {}) } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
         ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
         ...(options.onCampaignUpdate ? { onUpdate: options.onCampaignUpdate } : {}),
@@ -760,9 +923,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
     }, result.campaignRoot);
     if (!paused) fs.rmSync(activeContextPath, { force: true });
-    if (paused) stopReason = "paused";
+    if (paused) stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
     else if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
     else if (failed) stopReason = `campaign failed: ${result.stopReason}`;
+    else if (options.confirmationOnly) stopReason = "confirmation complete";
     else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
   };
   // The durable limits come from the caller and are capped by the approved contract.
@@ -799,6 +963,9 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         const open = recovered.charged;
         addNote(`reconciled an interrupted ${open.phase} phase as spent at its granted budget (agent starts ${open.agent_starts}, evaluator runs ${open.evaluator_runs}, campaigns ${open.campaigns}); the reservation was written ${open.at}.`);
       }
+      runStartEvaluatorRuns = budget.evaluator_runs;
+      runStartAgentStarts = budget.agent_starts;
+      runStartPhases = structuredClone(budget.phases ?? {});
     }
     // The approved contract is honoured before any discovery or probe: without
     // trusted-local consent nothing runs on this host.
@@ -807,18 +974,37 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       stopReason = "not-approved";
     } else if (leaseHeld) {
       try {
-        approved = approveRunContract(projectDir, options.contract);
-        const stored = readStoredContract(loopRoot);
-        // Compare identity, not wording: the same sentence with wider scope, different
-        // gates or a larger allowance would silently replace the approved boundary.
-        if (stored && contractIdentity(stored.contract) !== contractIdentity(approved.contract)) {
-          throw new ContractNotApprovedError(
-            `a different run contract is already stored for this project ("${stored.contract.outcome.statement}"); approve that objective and boundary, or move ${contractFile(loopRoot)} aside deliberately`,
-          );
+        const contract = options.contract;
+        const gatePaths = namedProjectPaths(contract.preserved.gates);
+        const rawBootstrapPaths = options.evaluatorBootstrap?.authorized ? options.evaluatorBootstrap.paths : [];
+        const normalizedBootstrapPaths = rawBootstrapPaths.map((file) => normalizeProjectRelativePath(file));
+        const invalidBootstrapPaths = rawBootstrapPaths.filter((_file, index) => normalizedBootstrapPaths[index] === null);
+        const bootstrapPaths = normalizedBootstrapPaths.filter((file): file is string => file !== null);
+        const requiredPaths = [...new Set([...gatePaths, ...bootstrapPaths])];
+        const outsideScope = requiredPaths.filter((file) => !pathWithin(file, contract.scope.roots));
+        const protectedBootstrap = bootstrapPaths.filter((file) => pathProtected(file, contract.scope.protectedAssets));
+        const staticChecks: LoopPreflightCheck[] = [];
+        if (invalidBootstrapPaths.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths must be normalized project-relative files without traversal or absolute paths: ${invalidBootstrapPaths.join(", ")}.`, remedy: "Replace each path with an exact file path inside the project, without `..`, an absolute prefix, or a trailing slash." });
+        if (outsideScope.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Required evaluator, bootstrap, or gate paths are outside editable scope: ${outsideScope.join(", ")}.`, remedy: `Add only the required paths to the approved scope before saving campaign settings: ${outsideScope.join(", ")}.` });
+        if (protectedBootstrap.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths are protected and cannot be changed: ${protectedBootstrap.join(", ")}.`, remedy: "Choose different bootstrap paths that are inside editable scope and outside all protected assets." });
+        if (contract.execution.consent && staticChecks.length > 0) {
+          preflight = { status: "blocked", checks: staticChecks };
+          stopReason = `blocked: ${staticChecks.map((check) => `${check.reason} Next step: ${check.remedy}`).join(" ")}`;
+          addNote(stopReason);
+        } else {
+          approved = approveRunContract(projectDir, contract);
+          const stored = readStoredContract(loopRoot);
+          // Compare identity, not wording: the same sentence with wider scope, different
+          // gates or a larger allowance would silently replace the approved boundary.
+          if (stored && contractIdentity(stored.contract) !== contractIdentity(approved.contract)) {
+            throw new ContractNotApprovedError(
+              `a different run contract is already stored for this project ("${stored.contract.outcome.statement}"); approve that objective and boundary, or move ${contractFile(loopRoot)} aside deliberately`,
+            );
+          }
+          writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approved, contract: approved.contract }, null, 2)}\n`, true);
+          contractId = contractIdentity(approved.contract);
+          void restrictedEnvironment(approved.contract);
         }
-        writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approved, contract: approved.contract }, null, 2)}\n`, true);
-        contractId = contractIdentity(approved.contract);
-        void restrictedEnvironment(approved.contract);
       } catch (error) {
         if (!(error instanceof ContractNotApprovedError)) throw error;
         noteLocally(`not-approved: ${error.reason}`);
@@ -867,20 +1053,67 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       // discovery run. Session signals only rank recon findings; they cannot create a
       // legacy lever or bypass qualification.
       let evidenceCount = 0;
+      const reconOptions = () => ({
+        projectDir,
+        contract: approved!.contract,
+        maxProbes: options.reconProbes ?? 3,
+        ...(options.signal ? { signal: options.signal } : {}),
+        beforeProbe: () => chargeOne("discovery", "evaluator"),
+        onProgress: progress,
+      });
       try {
-        recon = await reconProjectImpl({
-          projectDir,
-          contract: approved.contract,
-          maxProbes: options.reconProbes ?? 3,
-          ...(options.signal ? { signal: options.signal } : {}),
-          beforeProbe: () => chargeOne("discovery", "evaluator"),
-          onProgress: progress,
-        });
+        recon = await reconProjectImpl(reconOptions());
+        const missingWorkload = recon.blockers.some((reason) => /no benchmark or custom workload|no declared command matches|declared workload .* did not complete|does not name a local entry file/i.test(reason));
+        if (missingWorkload && options.evaluatorBootstrap?.authorized) {
+          const approvedContract = approved!.contract;
+          const scopeRoots = approvedContract.scope.roots;
+          const requiredPaths = [...new Set(options.evaluatorBootstrap.paths.map((file) => normalizeProjectRelativePath(file)).filter((file): file is string => file !== null))];
+          const requiredGatePaths = namedProjectPaths(approvedContract.preserved.gates);
+          const outOfScope = [...new Set([...requiredPaths, ...requiredGatePaths].filter((file) => !pathWithin(file, scopeRoots)))];
+          const protectedPaths = requiredPaths.filter((file) => pathProtected(file, approvedContract.scope.protectedAssets));
+          const categories = approvedContract.execution.allowedCommandCategories;
+          const checks: LoopPreflightCheck[] = [];
+          if (outOfScope.length > 0) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap or gate files are outside editable scope: ${outOfScope.join(", ")}.`, remedy: `Add only these required paths to the approved scope: ${outOfScope.join(", ")}.` });
+          if (protectedPaths.length > 0) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths are protected and cannot be changed: ${protectedPaths.join(", ")}.`, remedy: "Choose different bootstrap paths that are inside editable scope and outside all protected assets." });
+          if (!categories.includes("benchmark") && !categories.includes("custom")) checks.push({ name: "workload", status: "blocked", reason: `Approved command categories (${categories.join(", ") || "none"}) do not permit a benchmark or custom workload.`, remedy: "Approve the benchmark or custom command category before bootstrapping a workload." });
+          if (checks.length > 0) {
+            preflight = { status: "blocked", checks };
+            const first = checks[0]!;
+            stopReason = `blocked: ${first.reason} Next step: ${first.remedy}`;
+            addNote(stopReason);
+            break;
+          }
+          if (requiredPaths.length === 0) throw new Error("evaluator bootstrap requires exact planned file paths");
+          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          const bootstrapDeadlineMs = Math.max(0, deadlineAt - Date.now());
+          if (bootstrapDeadlineMs <= 0) { stopReason = "deadline"; break; }
+          progress(`loop: bootstrapping pinned workload in approved scope (${requiredPaths.join(", ")})`);
+          const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: () => chargeOne("qualification", "agent"), ...(options.signal ? { signal: options.signal } : {}) });
+          const validatedPaths = [...new Set(bootstrap.validatedPaths.map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "")))];
+          const invalidPaths = validatedPaths.filter((file) => !requiredPaths.includes(file) || !pathWithin(file, scopeRoots) || pathProtected(file, approvedContract.scope.protectedAssets) || !fs.existsSync(path.resolve(projectDir, file)));
+          if (invalidPaths.length > 0 || requiredPaths.some((file) => !validatedPaths.includes(file))) {
+            throw new Error(`evaluator bootstrap did not validate its approved paths: ${[...new Set([...invalidPaths, ...requiredPaths.filter((file) => !validatedPaths.includes(file))])].join(", ")}`);
+          }
+          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
+          recon = await reconProjectImpl(reconOptions());
+        }
       } catch (error) {
-        if (!(error instanceof LoopBudgetExhaustedError)) throw error;
-        addNote(`${error.message}; discovery stops before the durable evaluator cap is exceeded.`);
-        stopReason = "budget";
-        break;
+        if (error instanceof LoopBudgetExhaustedError) {
+          addNote(`${error.message}; discovery stops before the durable evaluator cap is exceeded.`);
+          stopReason = "budget";
+          break;
+        }
+        if (options.evaluatorBootstrap?.authorized) {
+          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
+          const reason = `Evaluator bootstrap failed: ${error instanceof Error ? error.message : String(error)}.`;
+          preflight = { status: "blocked", checks: [{ name: "workload", status: "blocked", reason, remedy: "Fix the bootstrap failure or supply a runnable pinned workload and evaluator command." }] };
+          stopReason = `blocked: ${reason} Next step: Fix the bootstrap failure or supply a runnable pinned workload and evaluator command.`;
+          addNote(stopReason);
+          break;
+        }
+        throw error;
       }
       const sessionSignals = await collectSignalsImpl({
         projectDir,
@@ -890,6 +1123,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       });
       const usageSignals = sessionSignals.weaknesses.filter((weakness) => weakness.evidence.some((item) => item.source === "session"));
       inventory = buildReconInventory({ contract: approved.contract, recon, attempts: attemptsFromMemory(memory), signals: usageSignals });
+      preflight = buildLoopPreflight(approved.contract, recon, inventory, options.focus, options.evaluatorBootstrap?.authorized ? options.evaluatorBootstrap.paths : []);
       evidenceCount = recon.probes.length;
       for (const blocker of recon.blockers) addNote(`recon blocker: ${blocker}`);
       // Experiments measured under another objective or another instrument are not
@@ -904,13 +1138,32 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (lever && !ordered.some((entry) => entry.id === lever.id)) ordered.push(lever);
       }
       if (ordered.length === 0) {
-        // With an approved contract, recon already ran and named its blockers; the
-        // honest reason is that nothing verifiable was found, not that no evidence exists.
-        stopReason = "no verifiable lever";
+        const blockers = preflight.checks.filter((check) => check.status === "blocked");
+        if (blockers.length > 0) {
+          const first = blockers[0]!;
+          stopReason = `blocked: ${first.reason}${first.remedy ? ` Next step: ${first.remedy}` : ""}`;
+          addNote(stopReason);
+        } else {
+          stopReason = "no verifiable lever";
+        }
+        break;
+      }
+
+      const blockedChecks = preflight.checks.filter((check) => check.status === "blocked");
+      if (blockedChecks.length > 0) {
+        const first = blockedChecks[0]!;
+        stopReason = `blocked: ${first.reason}${first.remedy ? ` Next step: ${first.remedy}` : ""}`;
+        addNote(stopReason);
         break;
       }
 
       let launched = false;
+      const instrumentationBlockers: LoopPreflightCheck[] = [];
+      const noteInstrumentationBlockers = (plan: MetricPlan | null, reason?: string): void => {
+        for (const blocker of qualificationBlockers(plan, reason)) {
+          if (!instrumentationBlockers.some((existing) => existing.name === blocker.name && existing.reason === blocker.reason)) instrumentationBlockers.push(blocker);
+        }
+      };
       for (const lever of ordered) {
         if (rejectedThisRun.has(lever.id)) continue;
         if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
@@ -949,12 +1202,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             loopRoot,
             lever,
             ...(lever.command ? { command: lever.command } : {}),
+            ...(lever.command ? { expectedReadMs: recon?.probes.find((probe) => probe.label === recon?.commands.find((command) => command.source === lever.command!.source)?.label)?.durationMs ?? undefined } : {}),
             ...(scoreEvaluator ? { scoreEvaluator } : {}),
             qualification: {
               contract: approved.contract,
               workRoot: path.join(loopRoot, "qualification"),
               outcome: approved.contract.outcome.statement,
               minimumUsefulGain: approved.contract.outcome.minimumUsefulGain,
+              editableScope: lever.scopeFiles,
               availableEvaluatorRuns: remainingAllowance(budget!).evaluatorRuns,
               ...(options.signal ? { signal: options.signal } : {}),
               beforeEvaluatorRun: () => chargeOne("qualification", "evaluator"),
@@ -967,22 +1222,16 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           }
           setup = defaultSetup({ lever, plan, projectDir, loopRoot, contract: approved?.contract ?? null }, options);
         }
-        if ("reject" in setup) { rejectLever(lever, setup.reject); continue; }
+        if ("reject" in setup) {
+          rejectLever(lever, setup.reject);
+          if (plan?.qualification && !plan.qualification.passed) noteInstrumentationBlockers(plan, setup.reject);
+          else if (!options.taskProvider) noteInstrumentationBlockers(plan, setup.reject);
+          continue;
+        }
         if (plan?.evaluationContract) evaluatorId = plan.evaluationContract.id;
 
-        // Re-read the allowance: discovery and instrument qualification in this same
-        // iteration already spent evaluator runs, so the loop-top figures are stale.
-        // Granting from them would let a campaign push the durable cap past its limit.
-        const fresh = remainingAllowance(budget);
-        if (fresh.campaigns <= 0 || fresh.agentStarts <= 0 || fresh.evaluatorRuns <= 0) { stopReason = "budget"; break; }
-        const grantedAgents = Math.min(campaignDefaults.maxAgentStarts, fresh.agentStarts);
-        const grantedEvaluators = Math.min(campaignDefaults.maxEvaluatorRuns, fresh.evaluatorRuns);
-        const campaignDeadlineMs = Math.max(1_000, Math.min(campaignDefaults.deadlineMs, CAMPAIGN_DEADLINE_MAX_MS, deadlineAt - Date.now()));
-        const campaignStartedMs = Date.now();
-        // Reserve the grant durably before the campaign runs: if this process dies
-        // mid-campaign, the next run charges the reservation instead of losing it.
-        // Independent verification needs a baseline recorded BEFORE any candidate runs.
-        // The qualified instrument carries the baseline needed for independent verification.
+        // Capture the independently reusable baseline before calculating the campaign grant;
+        // any fallback evaluator work here is charged before the campaign reservation is set.
         const instrument = plan ? await captureInstrument({
           plan,
           contract: approved.contract,
@@ -996,9 +1245,19 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (plan && !instrument) {
           // Without an independent instrument this change could not be verified, so it
           // is not run: an unverifiable win would be recorded on faith.
-          rejectLever(lever, `lever ${lever.id} has no independently measurable instrument, so an applied change could not be verified`);
+          const reason = `lever ${lever.id} has no independently measurable instrument, so an applied change could not be verified`;
+          rejectLever(lever, reason);
+          noteInstrumentationBlockers(plan, reason);
           continue;
         }
+
+        const fresh = remainingAllowance(budget);
+        const postApplyReserve = instrument ? instrument.gates.length + (instrument.kind === "command-duration" ? 3 : 1) : 0;
+        if (fresh.campaigns <= 0 || fresh.agentStarts <= 0 || fresh.evaluatorRuns <= postApplyReserve) { stopReason = "budget"; break; }
+        const grantedAgents = Math.min(campaignDefaults.maxAgentStarts, fresh.agentStarts);
+        const grantedEvaluators = Math.min(campaignDefaults.maxEvaluatorRuns, fresh.evaluatorRuns - postApplyReserve);
+        const campaignDeadlineMs = Math.max(1_000, Math.min(campaignDefaults.deadlineMs, CAMPAIGN_DEADLINE_MAX_MS, deadlineAt - Date.now()));
+        const campaignStartedMs = Date.now();
 
         // Recorded before the campaign so the experiment names the baseline it started from.
         const baselineFingerprint = projectFingerprint(projectDir);
@@ -1036,6 +1295,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             baseRoot,
             projectDir,
             task: setup.task,
+            ...(setup.expectedReadMs !== undefined ? { expectedReadMs: setup.expectedReadMs } : {}),
             searchConfig: readSearchConfig(),
             goal: setup.goal ?? lever.goal,
             scope: setup.scope ?? [...lever.scopeFiles],
@@ -1247,7 +1507,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           stopReason = "budget";
           break;
         }
-        stopReason = "no verifiable lever";
+        if (instrumentationBlockers.length > 0) {
+          const blockedNames = new Set(instrumentationBlockers.map((check) => check.name));
+          preflight = { status: "blocked", checks: [...preflight.checks.filter((check) => !blockedNames.has(check.name)), ...instrumentationBlockers] };
+          stopReason = `blocked: ${instrumentationBlockers.map((check) => `${check.reason}${check.remedy ? ` Next step: ${check.remedy}` : ""}`).join(" ")}`;
+          addNote(stopReason);
+        } else stopReason = "no verifiable lever";
         break;
       }
     }
@@ -1266,13 +1531,22 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     }
   }
 
-  return {
-    stopReason,
+  const stopCode = classifyStop(stopReason);
+  const reportPath = path.join(loopRoot, "latest-report.json");
+  const spentPhases = budget?.phases ?? {};
+  const evaluatorRunsByPhase = Object.fromEntries(Object.entries(spentPhases).map(([phase, spend]) => [
+    phase, Math.max(0, (spend?.evaluator_runs ?? 0) - (runStartPhases[phase as LoopPhase]?.evaluator_runs ?? 0)),
+  ])) as Partial<Record<LoopPhase, number>>;
+  const totalEvaluatorRuns = budget ? budget.evaluator_runs - runStartEvaluatorRuns : records.reduce((sum, record) => sum + record.evaluatorRuns, 0);
+  const preflightEvaluatorRuns = (evaluatorRunsByPhase.discovery ?? 0) + (evaluatorRunsByPhase.qualification ?? 0);
+  const campaignEvaluatorRuns = evaluatorRunsByPhase.campaign ?? 0;
+  const result: LoopResult = {
+    stopCode, reportPath, preflight, stopReason,
+    evaluatorRuns: totalEvaluatorRuns, preflightEvaluatorRuns, campaignEvaluatorRuns, evaluatorRunsByPhase,
     // A campaign that threw has no root but did start and spend; it must appear in the count.
     campaigns: records.filter((record) => record.campaignRoot !== null || record.outcome === "error").length,
     wins: records.filter((record) => record.outcome === "win").length,
-    evaluatorRuns: records.reduce((sum, record) => sum + record.evaluatorRuns, 0),
-    agentStarts: records.reduce((sum, record) => sum + record.agentStarts, 0),
+    agentStarts: budget ? budget.agent_starts - runStartAgentStarts : records.reduce((sum, record) => sum + record.agentStarts, 0),
     memoryPath,
     budgetPath,
     memory,
@@ -1283,4 +1557,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     contract: approved ? { fingerprint: approved.fingerprint, approvedAt: approved.approvedAt } : null,
     verifications,
   };
+  try {
+    writeJson(reportPath, { version: 1, at: now().toISOString(), stopCode, stopReason: stopReason.slice(0, 1000), preflight, campaigns: result.campaigns, wins: result.wins,
+      evaluatorRuns: result.evaluatorRuns, preflightEvaluatorRuns, campaignEvaluatorRuns, agentStarts: result.agentStarts,
+      evaluatorRunsByPhase,
+      agentStartsByPhase: Object.fromEntries(Object.entries(spentPhases).map(([phase, spend]) => [phase, Math.max(0, (spend?.agent_starts ?? 0) - (runStartPhases[phase as LoopPhase]?.agent_starts ?? 0))])),
+      verifications: verifications.map(({ campaignId, outcome, passed, at }) => ({ campaignId, outcome, passed, at })) });
+  } catch (error) {
+    memory.notes.push(`run report could not be saved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000));
+  }
+  return result;
 }

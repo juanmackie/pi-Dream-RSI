@@ -17,7 +17,17 @@ import * as path from "node:path";
 
 import { absoluteGain, normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { buildReconInventory, reconProject } from "../extensions/pi-dream-rsi/engine/recon.ts";
-import { qualifyInstrument, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
+import { parseFailureCount, qualifyInstrument, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
+
+test("conventional test reports preserve individual failure and error counts", () => {
+  assert.equal(parseFailureCount("Tests: 2 failed, 7 passed"), 2, "Jest summary");
+  assert.equal(parseFailureCount("2 failed, 3 passed, 1 error"), 3, "pytest failure and error summary");
+  assert.equal(parseFailureCount("test result: FAILED. 5 passed; 2 failed; 0 ignored"), 2, "Cargo-style summary");
+  assert.equal(parseFailureCount("FAILED (failures=2, errors=1)"), 3, "Python unittest summary");
+  assert.equal(parseFailureCount("# fail 2"), 2, "Node TAP summary");
+  assert.equal(parseFailureCount("not ok 1 - first\nnot ok 2 - second"), 2, "TAP records");
+  assert.equal(parseFailureCount("unknown runner failure"), 1, "unknown formats fail closed at one failure");
+});
 
 /** Deterministic busy work, so the measured span is the project's work. */
 const WORK = `export function work(ms) {
@@ -141,6 +151,8 @@ async function qualifyOnce(projectDir, runContract, overrides = {}) {
     projectDir,
     loopRoot: path.join(projectDir, ".dream-rsi", "loop"),
     lever,
+    expectedReadMs: recon.probes.find((probe) => probe.label === recon.commands.find((command) => command.source === lever.command?.source)?.label)?.durationMs
+      ?? recon.probes.find((probe) => probe.ok)?.durationMs ?? undefined,
     ...(lever.command ? { command: lever.command } : {}),
     ...(lever.metricKind === "score" && evaluator ? {
       scoreEvaluator: {
@@ -241,7 +253,7 @@ test("measurement refuses an insufficient evaluator allowance before spending", 
   assert.equal(report.checks.length, 1, "an infeasible measurement returns a direct admission diagnosis");
   assert.equal(report.checks[0].name, "budget-fit");
   assert.match(report.checks[0].detail, /before spending evaluator runs/);
-  assert.match(report.checks[0].detail, /only 10 evaluator run\(s\) remain/);
+  assert.match(report.checks[0].detail, /qualification may need 10 run\(s\)/);
 });
 
 test("an instrument that cannot resolve the useful gain is refused, not accommodated", async () => {
@@ -275,11 +287,13 @@ test("an instrument with no independent oracle is refused", async () => {
     "bench.mjs": BENCH,
     "src/work.mjs": WORK,
   });
-  const { report } = await qualify(projectDir, contract());
+  let evaluatorRuns = 0;
+  const { report } = await qualify(projectDir, contract(), { beforeEvaluatorRun: () => { evaluatorRuns += 1; } });
   assert.equal(report.passed, false);
   const oracle = report.checks.find((check) => check.name === "oracle");
   assert.equal(oracle.passed, false);
-  assert.match(oracle.detail, /no declared correctness command exists/);
+  assert.match(oracle.detail, /before spending evaluator runs/);
+  assert.equal(evaluatorRuns, 0, "oracle readiness is checked before paid evaluator work");
 });
 
 test("a workload that does not complete on the unchanged target is refused immediately", async () => {
@@ -389,10 +403,10 @@ test("the score budget-fit check reports the promotion floor the confirmation ac
   assert.match(budget.detail, /promotion floor|evaluator run/i, "the check explains the floor instead of repeating the old timeout estimate");
 
   const tightProject = scoreProject();
-  const tight = await qualify(tightProject, scoreContract({ budgets: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 240, deadlineMs: 90_000, falseAcceptBudget: 0.01 } }));
+  const tight = await qualify(tightProject, scoreContract({ budgets: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 240, deadlineMs: 1_000, falseAcceptBudget: 0.01 } }));
   const tightBudget = tight.report.checks.find((check) => check.name === "budget-fit");
   assert.equal(tightBudget.passed, false, "a deadline below the promotion floor is refused");
-  assert.match(tightBudget.detail, /does not fit|does not cover/);
+  assert.match(tightBudget.detail, /deadline|does not fit|does not cover/);
 });
 
 test("a score evaluator that ignores the editable code is refused: inert code must invalidate or worsen the score", async () => {

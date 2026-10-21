@@ -41,10 +41,30 @@ test("noisy decisions use staged looks, futility, and reject non-finite evidence
   assert.ok(plan.estimatedPowerAtEffect(0.15) > plan.estimatedPowerAtEffect(0.1));
   const extendedPlan = planTest({ baseline: [1, 0.9, 1.1, 1, 1.02], higherIsBetter: true, threshold: 0.05, maxCycles: 5, maxPairs: 16 });
   assert.equal(extendedPlan.maxPairs, 16);
+  const unevenPlan = planTest({ baseline: [1, 0.9, 1.1, 1, 1.02], higherIsBetter: true, threshold: 0.05, maxCycles: 5, maxPairs: 14 });
+  assert.equal(unevenPlan.looks, 2, "sequential look strides divide the even maximum sample exactly");
+  assert.equal(unevenPlan.maxPairs / unevenPlan.looks, 7);
   assert.ok(extendedPlan.minimumDetectableEffect < plan.minimumDetectableEffect, "additional paired budget lowers the estimated MDE");
-  assert.throws(() => planTest({ baseline: [1, 1], higherIsBetter: true, threshold: 0, maxCycles: 5, maxPairs: 10 }), /multiple of 4/);
+  assert.throws(() => planTest({ baseline: [1, 1], higherIsBetter: true, threshold: 0, maxCycles: 5, maxPairs: 9 }), /even number/);
   const boundaryPlan = planTest({ baseline: [0.94, 1.06, 0.97, 1.03, 1], higherIsBetter: true, threshold: 0.05, maxCycles: 5 });
   assert.equal(decide({ plan: boundaryPlan, gains: Array(8).fill(0.05), baseline: [0.94, 1.06, 0.97, 1.03, 1], look: 4 }).decision, "reject");
+});
+
+test("noisy confirmation can stop at a two-pair look and resume without repeating paid pairs", async () => {
+  const { planTest, runPaired } = await jump("engine/measure.ts");
+  const baseline = [1, 1.1, 0.9, 1.05, 0.95];
+  const plan = planTest({ baseline, higherIsBetter: true, threshold: 0, maxCycles: 5, maxPairs: 8 });
+  let calls = 0;
+  const first = await runPaired({ plan, baselineReadings: baseline, maxPairsToRun: 2, instrument: ({ condition }) => { calls += 1; return condition === "after" ? 1.01 : 1; } });
+  assert.equal(first.decision.decision, "continue");
+  assert.equal(first.pairs.length, 2);
+  assert.equal(first.runs, 4);
+  const resumed = await runPaired({ plan, baselineReadings: first.baseline, initialPairs: first.pairs, maxPairsToRun: 4,
+    instrument: ({ condition }) => { calls += 1; return condition === "after" ? 1.01 : 1; } });
+  assert.equal(resumed.decision.decision, "continue");
+  assert.equal(resumed.pairs.length, 4);
+  assert.equal(resumed.runs, 4, "the resumed invocation spends only for new pairs");
+  assert.equal(calls, 8);
 });
 
 test("lower-is-better relative confirmation measures a proportional cost reduction in log space", async () => {

@@ -44,6 +44,16 @@ export interface PairedRunInput {
   plan: MeasurementPlan;
   instrument: (sample: { condition: "before" | "after"; pair: number; order: number; baseline: boolean }) => number | InstrumentResult | Promise<number | InstrumentResult>;
   higherIsBetter?: boolean;
+  /** Previously qualified baseline readings. When supplied, do not spend runs repeating them. */
+  baselineReadings?: number[];
+  /** Stop after this many pairs and return `continue` if later confirmation remains affordable. */
+  maxPairsToRun?: number;
+  /** Persisted observations from an interrupted confirmation. */
+  initialPairs?: Array<{ before: number; after: number; gain: number }>;
+  /** Persist the baseline once collected so an interrupted confirmation does not repeat it. */
+  onBaselineReadings?: (readings: number[]) => void;
+  /** Called after a complete before/after pair, so campaign state can persist it. */
+  onPair?: (pair: { before: number; after: number; gain: number }, index: number) => void | Promise<void>;
 }
 
 export interface PairedRunResult {
@@ -100,14 +110,15 @@ export function planTest(options: {
   if (options.relative && options.baseline.some((value) => value === 0)) throw new Error("relative baseline samples must have non-zero magnitude");
   const baselineNoise = options.noiseRel ?? sampleSd(noiseSamples);
   const requestedPairs = options.maxPairs ?? 8;
-  if (!Number.isInteger(requestedPairs) || requestedPairs < 4 || requestedPairs > 64 || requestedPairs % 4 !== 0) throw new Error("maxPairs must be a multiple of 4 from 4 through 64");
+  if (!Number.isInteger(requestedPairs) || requestedPairs < 2 || requestedPairs > 64 || requestedPairs % 2 !== 0) throw new Error("maxPairs must be an even number from 2 through 64");
   const maxPairs = deterministic ? 1 : requestedPairs;
-  const looks = deterministic ? 1 : 4;
+  let looks = deterministic ? 1 : Math.min(4, maxPairs / 2);
+  while (looks > 1 && maxPairs % looks !== 0) looks -= 1;
   if (options.alphaConf !== undefined && (!Number.isFinite(options.alphaConf) || options.alphaConf <= 0 || options.alphaConf >= 0.5)) {
     throw new Error("alphaConf must be a finite number greater than 0 and below 0.5");
   }
   const alphaConf = options.alphaConf ?? 0.10 / (2 * options.maxCycles);
-  const critical = deterministic ? 0 : studentTQuantile(1 - alphaConf / 4, Math.max(1, maxPairs - 1));
+  const critical = deterministic ? 0 : studentTQuantile(1 - alphaConf / looks, Math.max(1, maxPairs - 1));
   const minimumDetectableEffect = deterministic ? 0 : (critical + normalQuantile(0.75)) * Math.SQRT2 * baselineNoise / Math.sqrt(maxPairs);
   const baselineMagnitude = mean(options.baseline.map(Math.abs));
   const noiseRel = options.relative
@@ -273,7 +284,7 @@ export function decide(input: DecisionInput): MeasurementDecision {
   const sd = Math.max(baselineComponent, pairedSd);
   const look = input.look ?? Math.ceil(gains.length / (plan.maxPairs / plan.looks));
   const degrees = Math.max(1, gains.length - 1);
-  const critical = studentTQuantile(1 - plan.alphaConf / 4, degrees);
+  const critical = studentTQuantile(1 - plan.alphaConf / plan.looks, degrees);
   const statistic = (estimate - plan.threshold) * Math.sqrt(gains.length) / Math.max(sd, Number.EPSILON);
   if (statistic >= critical) return { decision: "accept", estimate, statistic, critical, pairs: gains.length, reason: "one-sided Student t boundary crossed" };
   const uncertainty = sd / Math.sqrt(gains.length);
@@ -288,9 +299,12 @@ function unpack(result: number | InstrumentResult): InstrumentResult {
 
 export async function runPaired(input: PairedRunInput): Promise<PairedRunResult> {
   const { plan, instrument } = input;
-  const baseline: number[] = [];
+  const baseline: number[] = input.baselineReadings ? [...input.baselineReadings] : [];
+  if (baseline.some((value) => !Number.isFinite(value)) || (baseline.length > 0 && baseline.length < 2)) {
+    return { decision: { decision: "reject", estimate: null, statistic: null, critical: null, pairs: 0, reason: "invalid reused baseline measurements" }, baseline, pairs: [], runs: 0 };
+  }
   let runs = 0;
-  for (let index = 0; index < plan.baselineRuns; index += 1) {
+  for (let index = 0; !input.baselineReadings && index < plan.baselineRuns; index += 1) {
     const result = unpack(await instrument({ condition: "before", pair: index, order: runs, baseline: true })); runs += 1;
     if (!result.valid || !Number.isFinite(result.value)) return { decision: { decision: "reject", estimate: null, statistic: null, critical: null, pairs: 0, reason: "invalid baseline measurement" }, baseline, pairs: [], runs };
     baseline.push(result.value);
@@ -298,12 +312,22 @@ export async function runPaired(input: PairedRunInput): Promise<PairedRunResult>
   if (plan.deterministic && baseline.some((value) => Math.abs(value - baseline[0]!) > plan.exactTolerance)) {
     return { decision: { decision: "reject", estimate: null, statistic: null, critical: null, pairs: 0, reason: "evaluator declared deterministic but baseline varied" }, baseline, pairs: [], runs };
   }
-  const pairs: PairedRunResult["pairs"] = [];
+  input.onBaselineReadings?.(baseline);
+  const maxPairsToRun = input.maxPairsToRun ?? plan.maxPairs;
+  if (!Number.isInteger(maxPairsToRun) || maxPairsToRun < 1 || maxPairsToRun > plan.maxPairs) throw new Error("maxPairsToRun must be between 1 and the plan maximum");
+  const initialPairs = input.initialPairs ?? [];
+  if (initialPairs.length > maxPairsToRun || initialPairs.some((pair) => !Number.isFinite(pair.before) || !Number.isFinite(pair.after) || !Number.isFinite(pair.gain))) throw new Error("saved confirmation pairs are invalid or exceed the current limit");
+  const pairs: PairedRunResult["pairs"] = initialPairs.map((pair) => ({ ...pair }));
   const baselineCenter = baseline.length > 0 ? mean(baseline) : 0;
   const normalizedBaseline = plan.relative && baselineCenter > 0
     ? baseline.map((value) => input.higherIsBetter === false ? Math.log(baselineCenter / value) : Math.log(value / baselineCenter))
     : baseline.map((value) => input.higherIsBetter === false ? -value : value);
-  for (let pair = 0; pair < plan.maxPairs; pair += 1) {
+  const lookStride = plan.deterministic ? 1 : plan.maxPairs / plan.looks;
+  if (pairs.length > 0 && pairs.length % lookStride === 0) {
+    const priorDecision = decide({ plan, gains: pairs.map((entry) => entry.gain), baseline: normalizedBaseline, look: Math.min(plan.looks, pairs.length / lookStride) });
+    if (priorDecision.decision !== "continue") return { decision: priorDecision, baseline, pairs, runs };
+  }
+  for (let pair = pairs.length; pair < maxPairsToRun; pair += 1) {
     const reverse = pair % 2 === 1;
     const first = reverse ? "after" : "before";
     const second = reverse ? "before" : "after";
@@ -319,7 +343,9 @@ export async function runPaired(input: PairedRunInput): Promise<PairedRunResult>
       if (before <= 0 || after <= 0) return { decision: { decision: "reject", estimate: null, statistic: null, critical: null, pairs: pairs.length, reason: "relative measurement requires positive scores" }, baseline, pairs, runs };
       gain = input.higherIsBetter === false ? Math.log(before / after) : Math.log(after / before);
     }
-    pairs.push({ before, after, gain });
+    const observation = { before, after, gain };
+    pairs.push(observation);
+    await input.onPair?.(observation, pair);
     if (plan.deterministic) {
       return { decision: decide({ plan, gains: [gain] }), baseline, pairs, runs };
     }
@@ -328,6 +354,8 @@ export async function runPaired(input: PairedRunInput): Promise<PairedRunResult>
       if (decision.decision !== "continue") return { decision, baseline, pairs, runs };
     }
   }
-  const decision = decide({ plan, gains: pairs.map((entry) => entry.gain), baseline: normalizedBaseline, look: plan.looks });
-  return { decision, baseline, pairs, runs };
+  const decision = maxPairsToRun < plan.maxPairs
+    ? decide({ plan, gains: pairs.map((entry) => entry.gain), baseline: normalizedBaseline, look: Math.max(1, Math.ceil(maxPairsToRun / (plan.maxPairs / plan.looks))) })
+    : decide({ plan, gains: pairs.map((entry) => entry.gain), baseline: normalizedBaseline, look: plan.looks });
+  return { decision: decision.decision === "continue" && maxPairsToRun < plan.maxPairs ? { ...decision, reason: "confirmation remains resumable within the plan maximum" } : decision, baseline, pairs, runs };
 }

@@ -94,7 +94,7 @@ test("start refuses caps that cannot fund one promotion before any scorer call",
       }),
       (error) => error instanceof campaign.CampaignInfeasibleError
         && /8 evaluator run\(s\) remain but 9 are needed/.test(error.message)
-        && /Recommended caps: max_evaluator_runs >= 28, max_agent_starts >= 3/.test(error.message),
+        && /Recommended caps: max_evaluator_runs >= 11, max_agent_starts >= 3/.test(error.message),
     );
     assert.equal(fs.existsSync(counter), false, "no evaluator reading is paid for");
     assert.equal(fs.existsSync(path.join(project.dreamRoot, "campaigns")), false, "no campaign directory is created");
@@ -473,24 +473,31 @@ test("campaign deadline aborts an in-flight child instead of waiting for its age
 
 test("stop pauses durably and explicit resume consumes the same agent-start budget", async () => {
   const project = makeProject();
+  let campaign;
+  let run;
   try {
-    const campaign = await jump("engine/campaign.ts");
+    campaign = await jump("engine/campaign.ts");
     const gate = path.join(project.dir, "resume-gate");
     const agent = path.join(project.projectDir, "pause-until-resume.mjs");
-    fs.writeFileSync(agent, `import { existsSync, writeFileSync } from "node:fs";\nconst gate = ${JSON.stringify(gate)};\nwriteFileSync("started.marker", "yes");\nprocess.stdin.on("data", () => {});\nprocess.stdin.on("end", () => { const poll = setInterval(() => { if (existsSync(gate)) { clearInterval(poll); process.exit(0); } }, 20); });\n`);
+    fs.writeFileSync(agent, `import { existsSync, writeFileSync } from "node:fs";\nconst gate = ${JSON.stringify(gate)};\nwriteFileSync("started.marker", String(process.pid));\nprocess.stdin.on("data", () => {});\nprocess.stdin.on("end", () => { const poll = setInterval(() => { if (existsSync(gate)) { clearInterval(poll); process.exit(0); } }, 20); });\n`);
     const task = { ...project.task, agent: { ...project.task.agent, args: [agent] }, agent_timeout_ms: 30_000 };
-    const run = campaign.runCampaign(campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 3 }));
-    await waitFor(() => {
+    run = campaign.runCampaign(campaignOptions(project, task, { maxCycles: 1, maxAgentStarts: 3 }));
+    await Promise.race([waitFor(() => {
       const status = campaign.readCampaignStatus(project.dreamRoot);
       return status?.state.kind === "running" && status.state.phase === "experiment"
         && fs.existsSync(path.join(status.campaignRoot, "cycles", "c0001", "work", "n1", "started.marker"));
-    });
+    }, 20_000), run.then(() => { throw new Error("campaign finished before its first agent started"); })]);
     await assert.rejects(campaign.resumeCampaign({ baseRoot: project.dreamRoot, projectDir: project.projectDir }), /campaign is already running/);
     const stopped = campaign.stopCampaign(project.dreamRoot);
     assert.equal(stopped?.state.kind, "running");
     const paused = await run;
     assert.equal(paused.state.kind, "paused");
     assert.equal(paused.agentStarts, 1);
+    const startedMarker = path.join(paused.campaignRoot, "cycles", "c0001", "work", "n1", "started.marker");
+    const agentPid = Number(fs.readFileSync(startedMarker, "utf8"));
+    const { childIdentity } = await jump("agent/runner.ts");
+    assert.ok(Number.isSafeInteger(agentPid) && agentPid > 0);
+    assert.equal(childIdentity(agentPid), null, "pause must not resolve while the cancelled agent still owns project files");
 
     const recordPath = path.join(paused.campaignRoot, "campaign.json");
     const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
@@ -524,7 +531,26 @@ test("stop pauses durably and explicit resume consumes the same agent-start budg
     assert.match(resumed.stopReason, /cycle limit reached|agent start limit reached|experiment allowance exhausted/);
     const ledger = JSON.parse(fs.readFileSync(path.join(resumed.campaignRoot, "campaign-processes.json"), "utf8"));
     assert.equal(ledger.agent_starts, resumed.agentStarts, "the durable ledger is the authority, not an in-memory counter");
-  } finally { project.cleanup(); }
+    const workRoot = path.join(resumed.campaignRoot, "cycles", "c0001", "work");
+    for (const attempt of fs.readdirSync(workRoot, { withFileTypes: true })) {
+      const marker = path.join(workRoot, attempt.name, "started.marker");
+      if (!fs.existsSync(marker)) continue;
+      const pid = Number(fs.readFileSync(marker, "utf8"));
+      assert.ok(Number.isSafeInteger(pid) && pid > 0);
+      assert.equal(childIdentity(pid), null, `resumed campaign must exit agent ${pid} before returning and cleanup`);
+    }
+  } finally {
+    try {
+      if (run && campaign) {
+        try {
+          if (campaign.readCampaignStatus(project.dreamRoot)?.state.kind === "running") campaign.stopCampaign(project.dreamRoot);
+        } finally {
+          // Drain the started campaign before deleting its process ledger and workspaces.
+          await run.catch(() => undefined);
+        }
+      }
+    } finally { project.cleanup(); }
+  }
 });
 
 test("resume pays only the readings an interrupted preflight still owes", async () => {
@@ -631,10 +657,10 @@ test("preflight stops when the remaining runs cannot fund a noisy confirmation",
     const task = { ...project.task, score_program: `node "${scorer}"` };
     const result = await campaign.runCampaign({ ...campaignOptions(project, task, { maxCycles: 1, maxEvaluatorRuns: 9 }), verifierInputs: [scorer] });
     assert.equal(result.state.kind, "failed");
-    assert.equal(result.evaluatorRuns, 2, "the noisy floor is checked as soon as two readings disagree");
-    assert.equal(result.check.runs.length, 2);
+    assert.equal(result.evaluatorRuns, 5, "the evaluator needs five baseline readings before it can establish noise");
+    assert.equal(result.check.runs.length, 5);
     assert.equal(result.agentStarts, 0);
-    assert.match(result.stopReason, /cannot fund one verified promotion/);
+    assert.match(result.stopReason, /cannot fund one verified promotion|minimum detectable effect exceeds 50%/);
   } finally { project.cleanup(); }
 });
 

@@ -13,4 +13,4 @@ Completed experiments become worlds for deterministic replay. A dream agent may 
 
 Defaults are 6 campaigns, 72 agent starts, 200 evaluator runs, and 120 minutes. Use lower caps when the user requests them. State remains under `<project>/.dream-rsi/`; applied edits remain in the working tree and can be reverted with Git.
 
-Use `action: "status"`, `"stop"`, or `"resume"` to control a saved run. Report the stop reason and actual spend. Do not start a real model run unless the user explicitly authorizes its cost.
+Use `action: "status"`, `"stop"`, or `"resume"` to control a saved run. When status shows pending candidate confirmation, use `action: "confirm"`; it resumes saved pairs without repeating paid readings and does not start another search. Report the stop reason and actual spend. Do not start a real model run unless the user explicitly authorizes its cost.

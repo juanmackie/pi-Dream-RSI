@@ -147,7 +147,9 @@ test("loop ranks contract-bounded recon levers and accounts for campaign spend",
     assert.equal(result.campaigns, 1);
     assert.equal(result.wins, 0, "a campaign claim without an independent instrument cannot be counted as a verified win");
     assert.equal(result.agentStarts, 5);
-    assert.equal(result.evaluatorRuns, 9, "the campaign's reported evaluator spend excludes discovery probes");
+    assert.equal(result.campaignEvaluatorRuns, 9, "campaign evaluator spend remains distinct from discovery probes");
+    assert.equal(result.preflightEvaluatorRuns, 3, "discovery probes are reported as preflight spend");
+    assert.equal(result.evaluatorRuns, 12, "total evaluator spend includes preflight and campaign runs");
 
     const call = stub.calls[0];
     assert.equal(call.verifierInputs.length, 0, "the fixture setup avoids synthesizing an evaluator in loop accounting tests");
@@ -233,7 +235,9 @@ test("loop stops when recon finds no eligible workload without starting a campai
       runCampaignImpl: stub.impl,
       now: () => NOW,
     });
-    assert.equal(result.stopReason, "no verifiable lever");
+    assert.equal(result.stopCode, "blocked");
+    assert.match(result.stopReason, /no executable workload/i);
+    assert.match(result.stopReason, /Next step:/);
     assert.equal(stub.calls.length, 0);
     assert.equal(result.campaigns, 0);
     assert.deepEqual(result.records, []);

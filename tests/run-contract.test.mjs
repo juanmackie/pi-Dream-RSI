@@ -398,7 +398,8 @@ test("loop resume finishes the saved campaign context, records it, and continues
 
     assert.equal(resumeCalls.length, 1);
     assert.equal(result.records[0]?.leverId, "saved-lever", "the resumed campaign outcome is added to loop memory");
-    assert.equal(result.stopReason, "no verifiable lever", "resume continues into a fresh discovery pass");
+    assert.equal(result.stopCode, "blocked", "resume continues into discovery and reports its missing workload blocker");
+    assert.match(result.stopReason, /no benchmark or custom workload is declared/);
     assert.equal(fs.existsSync(path.join(loopRoot, "active.json")), false, "terminal resume context is removed");
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });

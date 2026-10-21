@@ -38,6 +38,8 @@ export interface ExperimentNode {
   valid: boolean;
   failClass: string | null;
   timedOut: boolean;
+  timeoutKind?: "wall" | "idle";
+  salvaged?: boolean;
   cost: number;
   retries: number;
   process?: { pid: number; identity: string | null; children?: { pid: number; identity: string | null }[]; startedAt: string };
@@ -241,7 +243,7 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   options.onProgress?.(progressFromWorld(options.root, world));
   const command = await runAgent({
     agent: options.agent, resolveAgent: options.resolveAgent, cwd: workspace, prompt,
-    timeoutMs: options.task.agent_timeout_ms, logPath: path.join(attempt, "agent.log"), signal: options.signal,
+    timeoutMs: options.task.agent_timeout_ms, idleTimeoutMs: Math.min(options.task.agent_timeout_ms, 4 * 60 * 1000), logPath: path.join(attempt, "agent.log"), signal: options.signal,
     beforeSpawn: () => {
       options.beforeAgentSpawn(`experiment-${options.cycle}-${node.id}`);
       world.agentStarts += 1;
@@ -266,7 +268,7 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   if (!fs.existsSync(proposal) && fs.existsSync(workspaceProposal)) {
     fs.copyFileSync(workspaceProposal, proposal);
   }
-  const proposed = fs.existsSync(proposal);
+  let proposed = fs.existsSync(proposal);
   const edited = workspaceDigest({ root: workspace, cycleSeedRoot: parentWorkspace, exclude: ["proposal.md", options.task.score_path, ...excluded] }) !== before;
   const evidence = path.join(attempt, "attempt-evidence.json");
   if (!edited) {
@@ -275,6 +277,11 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
     writeFileAtomic(evidence, `${JSON.stringify({ agent: afterAgent, evaluation: null, outcome: { valid: false, fail_class: node.failClass, error: node.error } }, null, 2)}\n`);
     saveWorld(file, world); options.onProgress?.(progressFromWorld(options.root, world)); return;
   }
+  if (!proposed && afterAgent.timedOut && edited) {
+    fs.writeFileSync(proposal, `Salvaged proposal: the agent timed out (${afterAgent.timeoutKind ?? "wall"}) after changing the workspace. The host will evaluate the scoped patch and correctness gates; inspect the changed files and risks before promotion.\n`, "utf8");
+    proposed = true;
+    node.salvaged = true;
+  }
   if (!proposed) {
     node.stage = "done"; node.valid = false; node.failClass = "no_proposal"; node.error = "agent edited the workspace but did not write proposal.md";
     writeFileAtomic(evidence, `${JSON.stringify({ agent: afterAgent, evaluation: null, outcome: { valid: false, fail_class: node.failClass, error: node.error } }, null, 2)}\n`);
@@ -282,6 +289,8 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   }
   node.stage = "evaluating";
   node.timedOut = afterAgent.timedOut;
+  if (afterAgent.timeoutKind) node.timeoutKind = afterAgent.timeoutKind;
+  if (afterAgent.timedOut && proposed) node.salvaged = true;
   saveWorld(file, world);
   options.onProgress?.(progressFromWorld(options.root, world));
   await evaluateAttempt(options, world, node, file, workspace, attempt, afterAgent.timedOut, afterAgent);

@@ -49,7 +49,7 @@ export function absoluteGain(minimumGain: number | string, baseline: number): nu
 }
 
 /** How a declared score evaluator reports its number. */
-export const SCORE_EVALUATOR_OUTPUTS = ["score-json", "stdout-number"] as const;
+export const SCORE_EVALUATOR_OUTPUTS = ["score-json", "stdout-number", "stdout-json"] as const;
 export type ScoreEvaluatorOutput = (typeof SCORE_EVALUATOR_OUTPUTS)[number];
 
 /**
@@ -197,7 +197,7 @@ export function validateRunContract(raw: unknown): string[] {
         const argv = stringList(evaluator.argv);
         if (argv === null || argv.length === 0) errors.push("outcome.evaluator.argv must be a non-empty array of non-empty strings");
         if (typeof evaluator.output !== "string" || !SCORE_EVALUATOR_OUTPUTS.includes(evaluator.output as ScoreEvaluatorOutput)) {
-          errors.push('outcome.evaluator.output must be "score-json" or "stdout-number"');
+          errors.push('outcome.evaluator.output must be "score-json", "stdout-number", or "stdout-json"');
         }
         if (evaluator.inputs !== undefined && evaluator.inputs !== null) {
           const inputs = stringList(evaluator.inputs);

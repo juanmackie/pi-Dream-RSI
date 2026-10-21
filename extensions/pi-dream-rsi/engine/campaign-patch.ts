@@ -44,6 +44,7 @@ export interface CandidatePatchVerification extends ApplyVerification {
   medianPairedGain: number | null;
   medianAfter: number | null;
   medianAfterRaw: number | null;
+  measurementDecision?: "accept" | "reject" | "continue" | "futile";
 }
 
 export interface GateRun {
@@ -412,6 +413,12 @@ export async function verifyCandidatePatch(options: {
   minimumGain?: number;
   requireValidBeforeAfter?: boolean;
   measurementPlan?: MeasurementPlan;
+  /** Previously paid baseline values, in raw evaluator units. */
+  baselineReadings?: number[];
+  /** Bind persisted pair results to the exact verifier and target snapshot. */
+  confirmationIdentity?: string;
+  /** Pair limit for a resumable confirmation; defaults to the plan maximum. */
+  maxPairsToRun?: number;
 }): Promise<CandidatePatchVerification> {
   const { dreamRoot, projectDir, task, patch, evidenceDir, signal, beforeSpawn } = options;
   const targetRoot = path.resolve(projectDir, task.workspace);
@@ -421,25 +428,92 @@ export async function verifyCandidatePatch(options: {
   const stop = (): void => { if (signal?.aborted) throw new Error("candidate verification was cancelled"); };
   stop();
   if (options.measurementPlan) {
-    const outcomes = new Map<string, ScoreOutcome>();
+    type SavedPair = { measurement: { before: number; after: number; gain: number }; beforeOutcome: ScoreOutcome; afterOutcome: ScoreOutcome };
+    type SavedConfirmation = { version: 1; identity: string; baseline: number[]; pairs: SavedPair[]; readings?: Record<string, ScoreOutcome> };
+    const confirmationPath = path.join(evidenceDir, "confirmation.json");
+    const identity = options.confirmationIdentity ?? crypto.createHash("sha256").update(JSON.stringify(patch)).digest("hex");
+    let saved: SavedConfirmation | null = null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(confirmationPath, "utf8")) as SavedConfirmation;
+      const validOutcome = (value: unknown): value is ScoreOutcome => !!value && typeof value === "object"
+        && typeof (value as ScoreOutcome).valid === "boolean" && typeof (value as ScoreOutcome).fail_class === "string"
+        && ((value as ScoreOutcome).score === null || (typeof (value as ScoreOutcome).score === "number" && Number.isFinite((value as ScoreOutcome).score)))
+        && ((value as ScoreOutcome).raw_score === null || (typeof (value as ScoreOutcome).raw_score === "number" && Number.isFinite((value as ScoreOutcome).raw_score)))
+        && ((value as ScoreOutcome).error === null || typeof (value as ScoreOutcome).error === "string");
+      const closeEnough = (actual: number, expected: number): boolean => Math.abs(actual - expected) <= 1e-12 * Math.max(1, Math.abs(actual), Math.abs(expected));
+      const validPair = (pair: SavedPair): boolean => {
+        if (!pair || !Number.isFinite(pair.measurement?.before) || !Number.isFinite(pair.measurement?.after) || !Number.isFinite(pair.measurement?.gain)
+          || !validOutcome(pair.beforeOutcome) || !validOutcome(pair.afterOutcome) || !validScore(pair.beforeOutcome) || !validScore(pair.afterOutcome)
+          || typeof pair.beforeOutcome.raw_score !== "number" || typeof pair.afterOutcome.raw_score !== "number") return false;
+        const before = pair.beforeOutcome.raw_score, after = pair.afterOutcome.raw_score;
+        if (options.measurementPlan!.relative && (before <= 0 || after <= 0)) return false;
+        const gain = options.measurementPlan!.relative
+          ? task.higher_is_better ? Math.log(after / before) : Math.log(before / after)
+          : task.higher_is_better ? after - before : before - after;
+        return closeEnough(pair.measurement.before, before) && closeEnough(pair.measurement.after, after) && closeEnough(pair.measurement.gain, gain);
+      };
+      const validPairs = Array.isArray(parsed.pairs) && parsed.pairs.every(validPair);
+      const validReadings = parsed.readings === undefined || (!!parsed.readings && typeof parsed.readings === "object" && Object.values(parsed.readings).every(validOutcome));
+      if (parsed.version === 1 && parsed.identity === identity && Array.isArray(parsed.baseline) && parsed.baseline.every(Number.isFinite) && validPairs && validReadings) saved = parsed;
+    } catch { /* no resumable confirmation yet */ }
+    const outcomes = new Map<string, ScoreOutcome>(Object.entries(saved?.readings ?? {}));
+    for (const [index, pair] of (saved?.pairs ?? []).entries()) {
+      const beforeOrder = index * 2 + (index % 2);
+      const afterOrder = index * 2 + (index % 2 === 1 ? 0 : 1);
+      const beforeKey = `pair${index}:before:${beforeOrder}`;
+      const afterKey = `pair${index}:after:${afterOrder}`;
+      if (!outcomes.has(beforeKey)) outcomes.set(beforeKey, pair.beforeOutcome);
+      if (!outcomes.has(afterKey)) outcomes.set(afterKey, pair.afterOutcome);
+    }
+    const initialPairs = saved?.pairs.map((pair) => {
+      const before = pair.beforeOutcome.raw_score!;
+      const after = pair.afterOutcome.raw_score!;
+      const gain = options.measurementPlan!.relative
+        ? task.higher_is_better ? Math.log(after / before) : Math.log(before / after)
+        : task.higher_is_better ? after - before : before - after;
+      return { before, after, gain };
+    }) ?? [];
+    const baselineReadings = saved?.baseline.length ? saved.baseline : options.baselineReadings;
+    let baselineUsed = baselineReadings ? [...baselineReadings] : [];
     const measured = await runPaired({
       plan: options.measurementPlan,
       higherIsBetter: task.higher_is_better,
+      ...(baselineReadings ? { baselineReadings } : {}),
+      ...(initialPairs.length ? { initialPairs } : {}),
+      ...(options.maxPairsToRun ? { maxPairsToRun: options.maxPairsToRun } : {}),
+      onBaselineReadings: (readings) => {
+        baselineUsed = [...readings];
+        saved = { version: 1, identity, baseline: baselineUsed, pairs: saved?.pairs ?? [], readings: saved?.readings ?? {} };
+        writeJsonAtomic(confirmationPath, saved);
+      },
       instrument: async ({ condition, pair, order, baseline }) => {
         stop();
-        const outcome = await scoreCopy({
-          sourceRoot: targetRoot,
-          scratch: `${scratchBase}-${baseline ? `baseline${order}` : `pair${pair}-${condition}`}`,
-          task,
-          dreamRoot,
-          logPath: path.join(evidenceDir, `measure-${order}-${condition}.log`),
-          signal,
-          beforeSpawn,
-          evaluatorKey: `candidate-${baseline ? "baseline" : condition}:pair${pair}`,
-          ...(condition === "after" ? { patch } : {}),
-        });
-        outcomes.set(`${baseline ? "baseline" : `pair${pair}`}:${condition}:${order}`, outcome);
+        const readingKey = `${baseline ? "baseline" : `pair${pair}`}:${condition}:${order}`;
+        let outcome = outcomes.get(readingKey);
+        if (!outcome) {
+          outcome = await scoreCopy({
+            sourceRoot: targetRoot,
+            scratch: `${scratchBase}-${baseline ? `baseline${order}` : `pair${pair}-${condition}`}`,
+            task,
+            dreamRoot,
+            logPath: path.join(evidenceDir, `measure-${order}-${condition}.log`),
+            signal,
+            beforeSpawn,
+            evaluatorKey: `candidate-${baseline ? "baseline" : condition}:pair${pair}`,
+            ...(condition === "after" ? { patch } : {}),
+          });
+          outcomes.set(readingKey, outcome);
+          saved = { version: 1, identity, baseline: baselineUsed, pairs: saved?.pairs ?? [], readings: Object.fromEntries(outcomes) };
+          writeJsonAtomic(confirmationPath, saved);
+        }
         return { valid: validScore(outcome), value: typeof outcome.raw_score === "number" ? outcome.raw_score : outcome.score ?? Number.NaN };
+      },
+      onPair: (measurement, index) => {
+        const beforeOutcome = [...outcomes.entries()].find(([key]) => key.startsWith(`pair${index}:before:`))?.[1];
+        const afterOutcome = [...outcomes.entries()].find(([key]) => key.startsWith(`pair${index}:after:`))?.[1];
+        if (!beforeOutcome || !afterOutcome) throw new Error(`cannot persist incomplete confirmation pair ${index}`);
+        saved = { version: 1, identity, baseline: baselineUsed, pairs: [...(saved?.pairs ?? []).slice(0, index), { measurement, beforeOutcome, afterOutcome }], readings: Object.fromEntries(outcomes) };
+        writeJsonAtomic(confirmationPath, saved);
       },
     });
     const pairs: CandidateVerificationPair[] = measured.pairs.map((entry, index) => {
@@ -472,6 +546,7 @@ export async function verifyCandidatePatch(options: {
       medianPairedGain,
       medianAfter,
       medianAfterRaw,
+      measurementDecision: measured.decision.decision,
     };
   }
   const expectedPairs = options.repeats ?? 1;

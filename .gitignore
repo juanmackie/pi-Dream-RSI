@@ -18,6 +18,7 @@ eval/*
 !eval/fixtures/
 !eval/tournament/
 !eval/tournament/**
+.pi*
 
 # Local runtime state (lock files, in-progress markers)
 state/

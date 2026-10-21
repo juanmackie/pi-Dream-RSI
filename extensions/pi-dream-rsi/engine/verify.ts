@@ -20,7 +20,7 @@ export interface PostApplyEvaluator {
   /** Exact evaluator argv. */
   argv: string[];
   /** `score-json` reads `eval/score.json`; `stdout-number` parses exactly one number. */
-  output: "score-json" | "stdout-number";
+  output: "score-json" | "stdout-number" | "stdout-json";
 }
 
 export interface PostApplyExpectation {
@@ -108,7 +108,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  */
 export function readEvaluatorReading(options: {
   cwd: string;
-  output: "score-json" | "stdout-number";
+  output: "score-json" | "stdout-number" | "stdout-json";
   /** Captured stdout of the evaluator process (used by stdout-number). */
   stdout?: string;
 }): number | null {
@@ -117,6 +117,12 @@ export function readEvaluatorReading(options: {
     if (!/^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(text)) return null;
     const value = Number(text);
     return Number.isFinite(value) ? value : null;
+  }
+  if (options.output === "stdout-json") {
+    let parsed: unknown;
+    try { parsed = JSON.parse(options.stdout ?? ""); } catch { return null; }
+    if (!isRecord(parsed) || parsed.valid !== true || ("fail_class" in parsed && parsed.fail_class !== "ok")) return null;
+    return typeof parsed.score === "number" && Number.isFinite(parsed.score) ? parsed.score : null;
   }
   let parsed: unknown;
   try { parsed = JSON.parse(fs.readFileSync(path.join(options.cwd, ...SCORE_READING_PATH.split("/")), "utf8")); }

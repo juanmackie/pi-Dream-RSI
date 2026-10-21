@@ -5,7 +5,8 @@ import * as path from "node:path";
 import { copyWorkspace, runShellCommand } from "../agent/runner.ts";
 import { absoluteGain, restrictedEnvironment, type MinimumGain, type RunContract } from "./intake.ts";
 import type { LeverCommand, LeverProposal } from "./levers.ts";
-import { promotionFloor } from "./campaign.ts";
+import { PROMOTION_AGENT_STARTS, promotionFloor } from "./campaign.ts";
+import { planAdmission } from "./admission.ts";
 
 /**
  * Synthesize and pre-calibrate the instrument for a lever when the intake has
@@ -26,13 +27,15 @@ export interface MetricPlan {
   /** Declared evaluator inputs (project-relative) pinned as verifier inputs, never candidate-editable. */
   evaluatorInputs: string[];
   /** Where the declared score evaluator reports its number; absent for synthesized duration/failure metrics. */
-  evaluatorOutput?: "score-json" | "stdout-number";
+  evaluatorOutput?: "score-json" | "stdout-number" | "stdout-json";
   scorePath: string;
   /** Exact argv the generated evaluator runs in the candidate copy. */
   argv: string[];
   headCommand: string;
   gates: string[];
   sampleTimeoutMs: number;
+  /** Expected evaluator duration used for admission; never the timeout budget. */
+  expectedReadMs: number;
   ready: boolean;
   rejections: string[];
   notes: string[];
@@ -47,7 +50,7 @@ export interface ScoreMetricSpec {
   /** Exact declared evaluator argv; measured verbatim. */
   argv: string[];
   /** Where the number comes from. */
-  output: "score-json" | "stdout-number";
+  output: "score-json" | "stdout-number" | "stdout-json";
   /** Project-relative evaluator code/data pinned as verifier inputs. */
   inputs?: string[];
   /** Approved outcome unit (for example "points"). */
@@ -105,6 +108,8 @@ export interface QualificationOptions {
   outcome: string;
   /** Smallest change worth applying, from the approved contract. */
   minimumUsefulGain: MinimumGain;
+  /** Candidate-visible files used to test oracle sensitivity. */
+  editableScope?: string[];
   /** Durable accounting, called immediately before each qualification process starts. */
   beforeEvaluatorRun?: () => void;
   /** Remaining evaluator allowance after discovery and earlier loop work. */
@@ -126,6 +131,8 @@ export interface QualificationOptions {
 
 export interface SynthesizeMetricOptions {
   projectDir: string;
+  /** Observed duration of the declared workload from discovery, when available. */
+  expectedReadMs?: number;
   /** Exact declared workload from cold-start discovery, preferred over head resolution. */
   command?: LeverCommand;
   /**
@@ -147,7 +154,6 @@ export interface SynthesizeMetricOptions {
 const FAILURE_REPEATS = 3;
 const DURATION_REPEATS = 3;
 const MIN_SAMPLE_TIMEOUT_MS = 30_000;
-const MAX_SAMPLE_TIMEOUT_MS = 600_000;
 const SCORE_PATH = "eval/score.json";
 
 function clamp(value: number, min: number, max: number): number {
@@ -159,6 +165,24 @@ function clamp(value: number, min: number, max: number): number {
  * Resolve a canonical command label into argv using only standard project
  * evidence (lockfiles). No repository name, path, or answer participates.
  */
+export function parseFailureCount(output: string): number {
+  const unitTest = [...output.matchAll(/(?:failures?|errors?)\s*=\s*(\d+)/gi)];
+  if (unitTest.length > 0) {
+    const count = unitTest.reduce((sum, match) => sum + Number(match[1]), 0);
+    return Math.max(1, Math.min(1_000_000, Number.isSafeInteger(count) ? count : 1));
+  }
+  const junit = output.match(/Failures:\s*(\d+)(?:\s*,\s*Errors:\s*(\d+))?/i);
+  if (junit) return Math.max(1, Math.min(1_000_000, Number(junit[1]) + Number(junit[2] ?? 0)));
+  const common = output.match(/\b(\d+)\s+(?:failed|failing)\b/i) ?? output.match(/\b(?:fail(?:ed)?)\s+(\d+)\b/i);
+  if (common) {
+    const failures = Number(common[1]);
+    const errors = output.match(/\b(\d+)\s+errors?\b/i);
+    return Math.max(1, Math.min(1_000_000, failures + Number(errors?.[1] ?? 0)));
+  }
+  const tapFailures = output.match(/^\s*not ok\b/gim)?.length ?? 0;
+  return Math.max(1, Math.min(1_000_000, tapFailures || 1));
+}
+
 export function commandForHead(head: string, projectDir: string, overrides?: Record<string, string[]>): string[] | null {
   if (overrides?.[head]) return [...overrides[head]];
   switch (head) {
@@ -190,7 +214,7 @@ interface EvaluatorSourceSpec {
   sampleTimeoutMs: number;
   injectedDelayMs?: number;
   /** score mode: where the declared evaluator reports its number. */
-  scoreOutput?: "score-json" | "stdout-number";
+  scoreOutput?: "score-json" | "stdout-number" | "stdout-json";
   /** score mode: the approved unit, recorded in the reading. */
   unit?: string;
 }
@@ -270,6 +294,17 @@ function main() {
     if (result.status !== 0) {
       return write({ error: "evaluator exited with status " + result.status, fail_class: "evaluator_error", mode: MODE, unit: SCORE_UNIT });
     }
+    if (SCORE_OUTPUT === "stdout-json") {
+      let parsed = null;
+      try { parsed = JSON.parse(String(result.stdout || "").trim()); } catch { parsed = null; }
+      if (!parsed || typeof parsed !== "object" || parsed.valid !== true || parsed.fail_class && parsed.fail_class !== "ok") {
+        return write({ error: "stdout-json evaluator must print one valid JSON score verdict", fail_class: "invalid_output", mode: MODE, unit: SCORE_UNIT });
+      }
+      if (typeof parsed.score !== "number" || !Number.isFinite(parsed.score)) {
+        return write({ error: "stdout-json evaluator score must be a finite number", fail_class: "invalid_output", mode: MODE, unit: SCORE_UNIT });
+      }
+      return write({ score: parsed.score, raw_score: parsed.score, valid: true, fail_class: "ok", error: null, mode: MODE, unit: SCORE_UNIT, samples: [parsed.score] });
+    }
     if (SCORE_OUTPUT === "stdout-number") {
       const text = String(result.stdout || "").trim();
       if (!/^[+-]?(?:(?:\\d+(?:\\.\\d*)?)|(?:\\.\\d+))(?:e[+-]?\\d+)?$/i.test(text)) {
@@ -322,9 +357,14 @@ function main() {
       // Count individual failures when the runner reports a machine-readable
       // summary (Node test, TAP and Jest). A deterministic one-test regression
       // can then be distinguished from inert code that breaks additional tests.
-      const summary = output.match(/(?:^|\\n)\\s*(?:ℹ\\s*)?#?\\s*fail(?:ed)?\\s+(\\d+)\\b/im)
-        || output.match(/(?:^|\\n)\\s*Tests:\\s*(\\d+)\\s+failed\\b/im);
-      const failureCount = failed ? Math.max(1, summary ? Number(summary[1]) : 1) : 0;
+      const unitTest = [...output.matchAll(/(?:failures?|errors?)\\s*=\\s*(\\d+)/gi)];
+      const junit = output.match(/Failures:\\s*(\\d+)(?:\\s*,\\s*Errors:\\s*(\\d+))?/i);
+      const common = output.match(/\\b(\\d+)\\s+(?:failed|failing)\\b/i) || output.match(/\\b(?:fail(?:ed)?)\\s+(\\d+)\\b/i);
+      const commonErrors = output.match(/\\b(\\d+)\\s+errors?\\b/i);
+      const tapFailures = (output.match(/^\\s*not ok\\b/gim) || []).length;
+      const reportedFailures = unitTest.length ? unitTest.reduce((sum, match) => sum + Number(match[1]), 0)
+        : junit ? Number(junit[1]) + Number(junit[2] || 0) : common ? Number(common[1]) + Number(commonErrors?.[1] || 0) : tapFailures;
+      const failureCount = failed ? Math.max(1, Math.min(1_000_000, Number.isSafeInteger(reportedFailures) ? reportedFailures : 1)) : 0;
       failures += failureCount;
       samples.push(failureCount);
     }
@@ -387,6 +427,7 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
     headCommand: head,
     gates: [],
     sampleTimeoutMs: MIN_SAMPLE_TIMEOUT_MS,
+    expectedReadMs: Math.max(1, Math.ceil(options.expectedReadMs ?? lever.estimates.costSeconds * 1000)),
     ready: false,
     rejections,
     notes,
@@ -446,8 +487,9 @@ export async function synthesizeMetric(options: SynthesizeMetricOptions): Promis
   if (mode !== "score" && head === "npm test" && argv[0] !== "npm") notes.push(`npm-test head resolved to the ${argv[0]} runner from lockfile evidence.`);
 
   const repeats = mode === "score" ? 1 : clamp(Math.round(options.repeats ?? (mode === "failures" ? FAILURE_REPEATS : DURATION_REPEATS)), 1, 10);
-  const estimatedMs = lever.estimates.costSeconds * 1000;
-  plan.sampleTimeoutMs = clamp(Math.ceil(estimatedMs * 4), MIN_SAMPLE_TIMEOUT_MS, MAX_SAMPLE_TIMEOUT_MS);
+  const estimatedMs = Math.max(1, Math.ceil(options.expectedReadMs ?? lever.estimates.costSeconds * 1000));
+  plan.expectedReadMs = estimatedMs;
+  plan.sampleTimeoutMs = clamp(Math.ceil(estimatedMs * 2 + 60_000), MIN_SAMPLE_TIMEOUT_MS, 15 * 60 * 1000);
 
   // Gate policy: a pass/fail gate equal to the metric command cannot pass on the
   // unfixed target, so failure-count metrics keep only additional declared gates.
@@ -658,7 +700,7 @@ export async function qualifyInstrument(
   const rejections: string[] = [];
   const projectDir = path.resolve(options.projectDir);
   const workRoot = path.resolve(options.workRoot);
-  const gates = [...(options.gates ?? plan.gates)];
+  const gates = [...new Set([...(options.contract.preserved.gates ?? []), ...(options.gates ?? plan.gates)])];
   const baselineRuns = Math.max(2, options.baselineRuns ?? 3);
   const passes = Math.max(1, Math.min(options.baselinePasses ?? 2, 4));
   const editable = options.editableScope ?? [];
@@ -669,18 +711,20 @@ export async function qualifyInstrument(
     + (metricMode === "duration" || editable.length > 0 ? 1 : 0)
     + 1 // nonexistent-workload control
     + (gates.length * 2) // pristine and inert correctness controls
-  const promotionCeiling = promotionFloor({
-    readings: 1,
-    gates: gates.length,
-    deterministic: false,
-    evaluatorTimeoutMs: plan.sampleTimeoutMs,
-    agentTimeoutMs: declaredAgentTimeoutMs(options.contract),
-  });
   const availableEvaluatorRuns = Math.min(
     options.availableEvaluatorRuns ?? options.contract.budgets.maxEvaluatorRuns,
     options.contract.budgets.maxEvaluatorRuns,
   );
-  const requiredEvaluatorRuns = qualificationRunCeiling + promotionCeiling.evaluatorRuns;
+  const admission = planAdmission({
+    remaining: { agentStarts: options.contract.budgets.maxAgentStarts, evaluatorRuns: availableEvaluatorRuns, wallMs: options.contract.budgets.deadlineMs },
+    expectedReadMs: plan.expectedReadMs,
+    gates: gates.length,
+    deterministic: false,
+    baselineReuse: true,
+    postApplyRuns: 1,
+    promotionAgentStarts: PROMOTION_AGENT_STARTS,
+    search: { agentStarts: 0, evaluatorRuns: qualificationRunCeiling, wallMs: qualificationRunCeiling * plan.expectedReadMs },
+  });
   const evaluatorFile = path.resolve(projectDir, plan.evaluatorPath);
   let evaluatorRunsStarted = 0;
   const common = {
@@ -701,8 +745,23 @@ export async function qualifyInstrument(
     if (!passed && required) rejections.push(detail);
   };
 
-  if (requiredEvaluatorRuns > availableEvaluatorRuns) {
-    const detail = `measurement refused before spending evaluator runs: qualification may need ${qualificationRunCeiling} run(s) and one independently verified promotion needs up to ${promotionCeiling.evaluatorRuns} more (${requiredEvaluatorRuns} total), but only ${availableEvaluatorRuns} evaluator run(s) remain`;
+  const missingOracle = gates.length === 0 && metricMode !== "score"
+    ? "no correctness gate was declared or discovered; declare a passing test gate or use a score evaluator with an explicit validity oracle"
+    : editable.length === 0
+      ? "no editable file was identified, so qualification cannot test whether the oracle detects a broken candidate"
+      : null;
+  if (missingOracle) {
+    record("oracle", false, `measurement refused before spending evaluator runs: ${missingOracle}`);
+    const failed: QualificationReport = { passed: false, checks, contract: null, rejections };
+    plan.qualification = failed;
+    plan.ready = false;
+    plan.rejections.push(...rejections);
+    return failed;
+  }
+
+  if (!admission.feasible) {
+    const missingRuns = admission.shortfall?.requiredEvaluatorRuns ?? (qualificationRunCeiling + admission.reserve.evaluatorRuns);
+    const detail = `measurement refused before spending evaluator runs: ${admission.shortfall?.code ?? "admission"} prevents funding a complete promotion; qualification may need ${qualificationRunCeiling} run(s), with at least ${Math.max(0, missingRuns - qualificationRunCeiling)} more reserved for correctness gates, confirmation, and independent post-apply verification`;
     record("budget-fit", false, detail);
     const failed: QualificationReport = { passed: false, checks, contract: null, rejections };
     plan.qualification = failed;
@@ -902,7 +961,7 @@ export async function qualifyInstrument(
       readings: 1,
       gates: gates.length,
       deterministic,
-      readingMs: plan.sampleTimeoutMs,
+      expectedReadMs: plan.expectedReadMs,
       evaluatorTimeoutMs: plan.sampleTimeoutMs,
       agentTimeoutMs: declaredAgentTimeoutMs(options.contract),
     });
@@ -913,7 +972,7 @@ export async function qualifyInstrument(
       ? `the promotion floor needs ${floor.evaluatorRuns} evaluator run(s) and ${Math.ceil(floor.durationMs / 1000)} s of evaluator time (${confirmation}), which fits the remaining ${runsRemaining} run(s) and ${Math.round(deadlineMs / 1000)} s run deadline`
       : `the promotion floor needs ${floor.evaluatorRuns} evaluator run(s) and ${Math.ceil(floor.durationMs / 1000)} s of evaluator time (${confirmation}), which does not fit the remaining ${runsRemaining} run(s) or ${Math.round(deadlineMs / 1000)} s run deadline`);
   } else {
-    const confirmationCostMs = plan.sampleTimeoutMs * (metricMode === "duration" ? 4 : 3);
+    const confirmationCostMs = plan.expectedReadMs * (metricMode === "duration" ? 4 : 3);
     const confirmationRuns = metricMode === "duration" ? 4 : 3;
     const runsRemaining = Math.max(0, availableEvaluatorRuns - evaluatorRunsStarted);
     const budgetFits = confirmationCostMs <= options.contract.budgets.deadlineMs && confirmationRuns <= runsRemaining;
