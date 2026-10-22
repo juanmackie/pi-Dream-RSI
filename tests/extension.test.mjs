@@ -17,6 +17,18 @@ async function boot(project) {
   return { context, harness };
 }
 
+function waitFor(predicate, timeoutMs = 20_000) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const tick = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - started > timeoutMs) return reject(new Error("timed out waiting for the detached loop"));
+      setTimeout(tick, 25);
+    };
+    tick();
+  });
+}
+
 test("registers assessment and loop tools with the v3 command surface", async () => {
   const project = makeProject();
   try {
@@ -53,6 +65,149 @@ test("loop start requires trusted-local consent before creating state", async ()
     const declined = await loop.execute("declined-consent", { action: "start", consent: false, focus: "reduce runtime" }, undefined, undefined, context);
     assert.match(declined.content[0].text, /consent must be true/);
     assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the loop command starts directly with --consent and never asks the LLM to call the tool", async () => {
+  const project = makeProject();
+  const empty = path.join(project.dir, "empty");
+  fs.mkdirSync(empty);
+  try {
+    const { context, harness } = await boot(project);
+    context.cwd = empty;
+    context.hasUI = false;
+    context.mode = "tui";
+    await harness.commands.get("dream-rsi").handler("loop reduce startup time --consent --no-logs", context);
+    assert.equal(harness.sentMessages.length, 0, "no chat message asks an LLM to call dream_rsi_loop");
+    assert.equal(harness.uiPrompts.length, 0, "an explicit flag needs no dialog");
+    await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"));
+    const finished = harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop").message.content;
+    assert.match(finished, /Dream-RSI loop finished/);
+    assert.ok(harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data?.active === true),
+      "the command enters loop mode before the detached run");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the loop command finishes the run before a one-shot session ends", async () => {
+  const project = makeProject();
+  const empty = path.join(project.dir, "empty");
+  fs.mkdirSync(empty);
+  try {
+    const { context, harness } = await boot(project);
+    context.cwd = empty;
+    context.hasUI = false;
+    context.mode = "print";
+    const written = [];
+    const original = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return original(chunk, ...rest); };
+    try {
+      await harness.commands.get("dream-rsi").handler("loop reduce startup time --consent --no-logs", context);
+    } finally {
+      process.stderr.write = original;
+    }
+    const finished = harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop");
+    assert.ok(finished, "the one-shot session reports the result before it ends");
+    assert.match(finished.message.content, /Dream-RSI loop finished/);
+    assert.equal(harness.sentMessages.length, 0, "no chat message asks an LLM to call dream_rsi_loop");
+    assert.ok(written.some((text) => /Dream-RSI loop finished/.test(text)),
+      "a print session shows the report on the standard error stream");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("a stop during the consent dialog keeps the loop from starting", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    context.mode = "tui";
+    let answer;
+    context.ui.confirm = async (title, message) => {
+      harness.uiPrompts.push({ kind: "confirm", title, message });
+      return new Promise((resolve) => { answer = resolve; });
+    };
+    const running = harness.commands.get("dream-rsi").handler("loop reduce startup time", context);
+    await waitFor(() => Boolean(answer));
+    await harness.commands.get("dream-rsi").handler("stop", context);
+    answer(true);
+    await running;
+    assert.match(harness.notifications.at(-1), /stopped before it started/i,
+      "a stop during the consent dialog prevents the run");
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "no loop state is created");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the loop command stops the running loop when no campaign exists yet", async () => {
+  const project = makeProject();
+  try {
+    // A declared workload that never finishes keeps the loop busy while the stop arrives.
+    fs.writeFileSync(path.join(project.projectDir, "bench.mjs"), "setTimeout(() => {}, 60000);\n");
+    fs.writeFileSync(path.join(project.projectDir, "package.json"), `${JSON.stringify({
+      name: "slow-loop", private: true, scripts: { bench: "node bench.mjs" },
+    }, null, 2)}\n`);
+    const { context, harness } = await boot(project);
+    context.hasUI = false;
+    context.mode = "tui";
+    await harness.commands.get("dream-rsi").handler("loop --consent --no-logs", context);
+    await waitFor(() => harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data?.active === true));
+    await harness.commands.get("dream-rsi").handler("stop", context);
+    assert.match(harness.notifications.at(-1), /running Dream-RSI loop was asked to stop/i,
+      "the stop reaches the detached run even before a campaign record exists");
+    await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), 60_000);
+    const report = harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop").message.content;
+    assert.match(report, /cancelled/i, "the aborted run reports a cancellation");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the loop command confirms through the UI before starting", async () => {
+  const project = makeProject();
+  const empty = path.join(project.dir, "empty");
+  fs.mkdirSync(empty);
+  try {
+    const { context, harness } = await boot(project);
+    context.cwd = empty;
+    context.hasUI = true;
+    context.mode = "tui";
+    harness.uiAnswers.confirm.push(true);
+    await harness.commands.get("dream-rsi").handler("loop", context);
+    assert.equal(harness.uiPrompts[0]?.kind, "confirm", "the UI is asked for host-access consent");
+    assert.equal(harness.sentMessages.length, 0, "a confirmed start does not fall back to the chat path");
+    await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"));
+    assert.match(harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop").message.content, /Dream-RSI loop finished/);
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("the loop command does not start when UI consent is declined or no UI accepts it", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = true;
+    harness.uiAnswers.confirm.push(false);
+    await harness.commands.get("dream-rsi").handler("loop reduce runtime", context);
+    assert.equal(harness.uiPrompts[0]?.kind, "confirm");
+    assert.match(harness.notifications.at(-1), /not started.*consent/i);
+    assert.equal(harness.sentMessages.length, 0, "a declined dialog does not ask the LLM to continue");
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "no loop state is created");
+
+    context.hasUI = false;
+    await harness.commands.get("dream-rsi").handler("loop reduce runtime", context);
+    assert.equal(harness.sentMessages.length, 1, "a headless caller keeps the in-chat consent fallback");
+    assert.match(harness.sentMessages[0].content, /Ask the user for explicit trusted-local consent first/,
+      "the fallback asks for consent instead of asserting it");
+    assert.match(harness.sentMessages[0].content, /Only after the user confirms.*consent=true/);
+    assert.match(harness.notifications.at(-1), /needs consent.*--consent/i);
+    assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "the fallback does not spawn before consent");
   } finally {
     project.cleanup();
   }

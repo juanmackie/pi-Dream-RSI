@@ -10,13 +10,19 @@ Use assessment to inspect opportunities without running project commands:
 /dream-rsi assess "make the parser faster"
 ```
 
-Start the autonomous loop with the goal and explicit trusted-local consent:
+Start the autonomous loop with the goal. The command asks for trusted-local consent in an interactive session:
 
 ```text
 /dream-rsi loop "reduce benchmark time without changing results"
 ```
 
-The loop finds measurable levers, qualifies its metric, runs isolated experiments, and applies only changes that pass confirmation, correctness gates, review, and an independent post-apply check. The loop stops when it reaches its budget or cannot find a verifiable lever.
+In a non-interactive session, pass `--consent` to accept consent in the command:
+
+```text
+/dream-rsi loop "reduce benchmark time without changing results" --consent
+```
+
+The loop finds measurable levers, qualifies its metric, runs isolated experiments, and applies only changes that pass confirmation, correctness gates, review, and an independent post-apply check. The loop stops when it reaches its budget, cannot find a verifiable lever, or its agent stops working.
 
 Its dream step uses completed experiment worlds to compare bounded search configurations through deterministic replay. An agent may propose configuration data; the loop never executes agent-written code as its search policy.
 
@@ -29,7 +35,7 @@ Default durable limits are 6 campaigns, 72 agent starts, 200 evaluator runs, and
 ## Commands
 
 - `/dream-rsi assess [goal]` reads project signals and ranks improvement opportunities.
-- `/dream-rsi loop [goal]` starts the unattended loop.
+- `/dream-rsi loop [goal] [--consent] [--no-logs]` starts the unattended loop.
 - `/dream-rsi status`, `watch`, `stop`, and `resume` inspect or control it.
 
 ## State and rollback

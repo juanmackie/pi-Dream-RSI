@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Start `/dream-rsi loop` without a chat round trip. The command asks for trusted-local consent in an interactive session, accepts an explicit `--consent` flag otherwise, and runs the loop itself. A one-shot session waits for the run and writes the report to the standard error stream; an interactive session detaches and reports into the session. `/dream-rsi stop` and session shutdown abort the running loop.
+- Fail loudly on a dead agent. A charged liveness probe runs the agent before the first campaign and stops the run as `blocked` when the command is missing, the process fails, or the agent reports a provider error. During a campaign a failed agent attempt is an `agent_error`, and three consecutive failures stop the run as `blocked`. The status shows the command and the model the child really used, including a child default model.
 - Align the project docs and release guidance with the 3.0 lean loop, recorded-world replay, and canonical `main` workflow.
 
 ## 3.0.0

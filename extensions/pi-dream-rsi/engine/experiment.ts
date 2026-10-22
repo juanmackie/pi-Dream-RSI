@@ -22,6 +22,27 @@ export const defaultSearchConfig: SearchConfig = {
   version: 1, batchSize: 2, exploreShare: 0.5, refineTop: 1, maxRounds: 3, patience: 1,
 };
 
+/** Stop before a dead agent can burn the whole campaign allowance. */
+export const MAX_CONSECUTIVE_AGENT_ERRORS = 3;
+
+/**
+ * Count trailing attempts that failed without an edit because the agent process reported an error.
+ *
+ * `prior` is the streak carried in from the previous cycle. Any attempt that is not an
+ * error resets it, so a healthy attempt between two errors breaks the run of errors.
+ */
+function consecutiveAgentErrors(world: ExperimentWorld, prior = 0): number {
+  const done = world.nodes
+    .filter((node) => node.stage === "done")
+    .sort((a, b) => a.seq - b.seq);
+  let streak = Math.max(0, prior);
+  for (const node of done) {
+    if (node.agentError === true && node.edited !== true) streak += 1;
+    else streak = 0;
+  }
+  return streak;
+}
+
 export interface ExperimentAction {
   kind: "branch" | "refine";
   parent: string | null;
@@ -40,6 +61,10 @@ export interface ExperimentNode {
   timedOut: boolean;
   timeoutKind?: "wall" | "idle";
   salvaged?: boolean;
+  /** The agent process reported a model/provider error (JSON mode) for this attempt. */
+  agentError?: boolean;
+  /** Whether the attempt changed the workspace before it ended. */
+  edited?: boolean;
   cost: number;
   retries: number;
   process?: { pid: number; identity: string | null; children?: { pid: number; identity: string | null }[]; startedAt: string };
@@ -105,6 +130,8 @@ export interface ExperimentOptions {
   scope?: string[];
   gates?: string[];
   historySummary?: string;
+  /** Trailing non-editing agent errors from earlier cycles, so the breaker spans the campaign. */
+  priorAgentErrorStreak?: number;
   signal: AbortSignal;
   agent: AgentConfig;
   resolveAgent?: (agent: AgentConfig) => AgentConfig | null;
@@ -271,11 +298,33 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   let proposed = fs.existsSync(proposal);
   const edited = workspaceDigest({ root: workspace, cycleSeedRoot: parentWorkspace, exclude: ["proposal.md", options.task.score_path, ...excluded] }) !== before;
   const evidence = path.join(attempt, "attempt-evidence.json");
+  // An attempt fails when the agent process failed: a terminal assistant error, or a
+  // non-zero exit. A timeout is a separate case, and a retried error that a later
+  // message recovered is not a failure.
+  const failedExit = !afterAgent.ok && !afterAgent.timedOut && !afterAgent.aborted;
+  const agentErrored = (afterAgent.evidence?.terminalError ?? false) || failedExit;
+  const agentLabel = afterAgent.effectiveAgent
+    ? `command "${afterAgent.effectiveAgent.command}" model "${afterAgent.effectiveAgent.model ?? "child default"}"`
+    : `command "${options.agent.command}" model "unknown"`;
+  const failureReason = afterAgent.evidence?.terminalError
+    ? "the agent reported a model or provider error"
+    : failedExit
+      ? `the agent exited with code ${afterAgent.code ?? "unknown"}`
+      : null;
+  node.agentError = agentErrored;
+  node.edited = edited;
   if (!edited) {
-    node.stage = "done"; node.valid = false; node.failClass = proposed ? "no_edit" : "no_proposal";
-    node.error = proposed ? "agent made no workspace changes" : "agent did not write proposal.md";
+    node.stage = "done"; node.valid = false;
+    node.failClass = agentErrored ? "agent_error" : proposed ? "no_edit" : "no_proposal";
+    node.error = agentErrored
+      ? `agent process failed: ${failureReason} (${agentLabel})`
+      : proposed ? "agent made no workspace changes" : "agent did not write proposal.md";
     writeFileAtomic(evidence, `${JSON.stringify({ agent: afterAgent, evaluation: null, outcome: { valid: false, fail_class: node.failClass, error: node.error } }, null, 2)}\n`);
-    saveWorld(file, world); options.onProgress?.(progressFromWorld(options.root, world)); return;
+    saveWorld(file, world); options.onProgress?.(progressFromWorld(options.root, world));
+    if (agentErrored && consecutiveAgentErrors(world, options.priorAgentErrorStreak ?? 0) >= MAX_CONSECUTIVE_AGENT_ERRORS) {
+      throw new Error(`blocked: ${MAX_CONSECUTIVE_AGENT_ERRORS} consecutive non-editing agent attempts failed (${agentLabel}). Check the agent command, model, and provider credentials before resuming.`);
+    }
+    return;
   }
   if (!proposed && afterAgent.timedOut && edited) {
     fs.writeFileSync(proposal, `Salvaged proposal: the agent timed out (${afterAgent.timeoutKind ?? "wall"}) after changing the workspace. The host will evaluate the scoped patch and correctness gates; inspect the changed files and risks before promotion.\n`, "utf8");
@@ -283,7 +332,11 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
     node.salvaged = true;
   }
   if (!proposed) {
-    node.stage = "done"; node.valid = false; node.failClass = "no_proposal"; node.error = "agent edited the workspace but did not write proposal.md";
+    node.stage = "done"; node.valid = false;
+    node.failClass = agentErrored ? "agent_error" : "no_proposal";
+    node.error = agentErrored
+      ? `agent process failed: ${failureReason} (${agentLabel}) after editing the workspace`
+      : "agent edited the workspace but did not write proposal.md";
     writeFileAtomic(evidence, `${JSON.stringify({ agent: afterAgent, evaluation: null, outcome: { valid: false, fail_class: node.failClass, error: node.error } }, null, 2)}\n`);
     saveWorld(file, world); options.onProgress?.(progressFromWorld(options.root, world)); return;
   }

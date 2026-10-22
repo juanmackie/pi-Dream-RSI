@@ -127,6 +127,7 @@ function agentSource() {
 let prompt = "";
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
+  if (/Dream-RSI agent liveness probe/i.test(prompt)) { process.stdout.write("ok\\n"); return; }
   if (/adversarial review/i.test(prompt)) {
     writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
     return;
@@ -381,6 +382,7 @@ function scoreAgentSource() {
 let prompt = "";
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
+  if (/Dream-RSI agent liveness probe/i.test(prompt)) { process.stdout.write("ok\\n"); return; }
   // The review workspace is the one carrying REVIEW.md; the live agent works on
   // the candidate copy.
   if (/adversarial review/i.test(prompt) || existsSync("REVIEW.md")) {
@@ -565,6 +567,7 @@ function twoWorkloadAgentSource() {
 let prompt = "";
 process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
+  if (/Dream-RSI agent liveness probe/i.test(prompt)) { process.stdout.write("ok\\n"); return; }
   if (/adversarial review/i.test(prompt)) {
     writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
     return;

@@ -3,7 +3,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { runAgent, type CommandResult } from "../agent/runner.ts";
+import { runAgent, type CommandResult, type EffectiveAgent } from "../agent/runner.ts";
 import { EXTENSION_DIR, PACKAGE_DIR } from "../layout.ts";
 import { defaultSearchConfig, experimentSeed, experimentWorkspace, experimentWorldPath, runExperiment, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
 import { CampaignBudget, CampaignLimitError } from "./budget.ts";
@@ -217,6 +217,8 @@ export interface CampaignRecord {
   state: CampaignState;
   pendingConfirmation?: { iteration: number; candidate: Candidate; patch: CandidatePatch[]; patchHash: string; evidenceDir: string; confirmationIdentity: string; targetDigest: string; pairs: number; maxPairs: number };
   pendingApply?: { iteration: number; candidate: Candidate; patch: CandidatePatch[]; before: number; after: number; transactionId: string };
+  /** The agent command/model actually used by this campaign's latest child process. */
+  effectiveAgent?: EffectiveAgent;
 }
 
 export interface CampaignStatus {
@@ -245,6 +247,8 @@ export interface CampaignStatus {
   pendingConfirmation?: { iteration: number; cell: string; pairs: number; maxPairs: number };
   /** Evaluator preflight evidence, including a partial check after an abort. */
   check?: { qualified: boolean; runs: CampaignCheckRun[]; diagnoses: string[]; reportPath: string | null };
+  /** The agent command/model actually used by this campaign's latest child process. */
+  effectiveAgent?: EffectiveAgent;
 }
 
 export interface CampaignRejection {
@@ -511,6 +515,7 @@ function statusOf(record: CampaignRecord): CampaignStatus {
     health: ledgerHealth(campaignMemory(record)),
     ...(record.pendingConfirmation ? { pendingConfirmation: { iteration: record.pendingConfirmation.iteration, cell: record.pendingConfirmation.candidate.cell, pairs: record.pendingConfirmation.pairs, maxPairs: record.pendingConfirmation.maxPairs } } : {}),
     ...(checkStatusOf(record) ? { check: checkStatusOf(record)! } : {}),
+    ...(record.effectiveAgent ? { effectiveAgent: record.effectiveAgent } : {}),
   };
 }
 function emit(record: CampaignRecord, options: Pick<CampaignOptions, "onProgress" | "onUpdate">): void {
@@ -592,6 +597,29 @@ function measurementPlan(record: CampaignRecord, maxPairs = 8) {
     ...(record.confirmationAlpha === undefined ? {} : { alphaConf: record.confirmationAlpha }) });
 }
 
+/**
+ * Trailing non-editing agent errors recorded in the cycles before `iteration`.
+ *
+ * The current cycle is excluded: its own attempts are already in the saved world, and
+ * counting both would report one error twice.
+ */
+function priorAgentErrorStreak(record: CampaignRecord, iteration: number): number {
+  const attempts = verifiedLedgerEntries(ledgerFile(record)).filter((entry) => entry.kind === "attempt"
+    && typeof entry.facts?.iteration === "number" && (entry.facts.iteration as number) < iteration);
+  let streak = 0;
+  for (let index = attempts.length - 1; index >= 0; index -= 1) {
+    const entry = attempts[index]!;
+    // `edited` is the attempt-local fact. The cumulative patch size cannot decide this:
+    // a refinement that inherited its parent's change reports a non-zero size while it
+    // changed nothing itself.
+    const noEdit = entry.facts?.edited === false
+      || (entry.facts?.edited === undefined && (entry.editCount ?? 0) === 0);
+    if (entry.outcome === "agent_error" && noEdit) streak += 1;
+    else break;
+  }
+  return streak;
+}
+
 function recordExperimentAttempts(record: CampaignRecord, iteration: number, world: ExperimentWorld): void {
   const prior = verifiedLedgerEntries(ledgerFile(record));
   for (const node of world.nodes) {
@@ -610,11 +638,18 @@ function recordExperimentAttempts(record: CampaignRecord, iteration: number, wor
       agent: "experiment", outcome: node.failClass ?? "unknown", title, editCount,
       ...(evidence ? { verifierRead: evidence.verifierRead } : {}),
       facts: { iteration, cell: node.id, mode: "experiment",
-        score: node.score, valid: node.valid, timedOut: node.timedOut, measured: typeof node.score === "number" } });
+        score: node.score, valid: node.valid, timedOut: node.timedOut, measured: typeof node.score === "number",
+        // Whether this attempt changed its own workspace. The cumulative patch size
+        // above can be non-zero for a refinement that inherited its parent's change.
+        edited: node.edited === true } });
   }
 }
 
 function recordAgentResult(record: CampaignRecord, role: LedgerAgentRole, result: CommandResult): void {
+  if (result.effectiveAgent) {
+    record.effectiveAgent = result.effectiveAgent;
+    persist(record);
+  }
   appendCampaignLedger(record, {
     kind: "agent_result",
     campaignId: record.id,
@@ -1637,6 +1672,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
           threshold: record.minimumGain, config: record.searchConfig ?? defaultSearchConfig, signal, agent: record.task.agent,
           goal: record.goal, scope: record.scope, gates: record.gates ?? [],
           historySummary: campaignMemory(record).slice(-6).map((entry) => `${entry.kind}: ${entry.outcome ?? "recorded"}${entry.facts?.reason ? ` (${entry.facts.reason})` : ""}`).join("\n"),
+          priorAgentErrorStreak: priorAgentErrorStreak(record, iteration),
           resolveAgent: options.resolveAgent,
           maxAgentAttempts: Math.max(0, record.limits.maxAgentStarts - cycleSpend.agent_starts - 1),
           maxEvaluatorAttempts: Math.max(0, record.limits.maxEvaluatorRuns - cycleSpend.evaluator_runs - confirmationFloor - (record.gates ?? []).length),

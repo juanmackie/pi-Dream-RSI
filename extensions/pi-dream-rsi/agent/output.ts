@@ -2,7 +2,7 @@
 import * as path from "node:path";
 export interface OutputEvent {
   stream: "stdout" | "stderr";
-  kind: "text" | "tool-start" | "tool-update" | "tool-end" | "usage";
+  kind: "text" | "tool-start" | "tool-update" | "tool-end" | "usage" | "agent-error" | "agent-outcome";
   text: string;
   toolId?: string;
   toolName?: string;
@@ -12,6 +12,10 @@ export interface OutputEvent {
   edit?: boolean;
   read?: boolean;
   verifierRead?: boolean;
+  /** True for assistant stdout text; false for stderr and malformed-line fallbacks. */
+  assistant?: boolean;
+  /** True when the run ended with an assistant error that no retry recovered. */
+  terminalError?: boolean;
 }
 
 export interface AgentOutputEvidence {
@@ -22,6 +26,15 @@ export interface AgentOutputEvidence {
   modelChanges: number;
   editCount: number;
   verifierRead: boolean;
+  /** Number of message_end/agent_end records that reported a model or provider error. */
+  errorCount: number;
+  /**
+   * True when the run ended with an assistant error. A retried error that a later
+   * message recovered is not terminal: the agent finished its work.
+   */
+  terminalError: boolean;
+  /** True when the process produced assistant text; a liveness signal, not a quality signal. */
+  assistantText: boolean;
 }
 
 export class BoundedTail {
@@ -32,6 +45,15 @@ export class BoundedTail {
   }
 }
 
+/** A message record that says the model/provider failed, as opposed to a tool result error. */
+function isAssistantError(message: unknown): boolean {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return false;
+  const value = message as Record<string, unknown>;
+  if (value.role === "toolResult") return false;
+  return value.stopReason === "error"
+    || (typeof value.errorMessage === "string" && value.errorMessage.trim() !== "");
+}
+
 /** Incremental JSONL decoder, with a bounded raw fallback for malformed/oversized lines. */
 export class OutputDecoder {
   private pending = "";
@@ -40,6 +62,8 @@ export class OutputDecoder {
   private emit: (event: OutputEvent) => void;
   private protectedPaths: Set<string>;
   private cwd: string;
+  /** Whether the last assistant message ended in an error. */
+  private lastMessageFailed = false;
   constructor(json: boolean, emit: (event: OutputEvent) => void, options: { protectedReadPaths?: string[]; cwd?: string } = {}) {
     this.json = json;
     this.emit = emit;
@@ -51,7 +75,7 @@ export class OutputDecoder {
     return process.platform === "win32" ? absolute.toLowerCase() : absolute;
   }
   feed(stream: "stdout" | "stderr", text: string): void {
-    if (!this.json || stream === "stderr") { this.emit({ stream, kind: "text", text }); return; }
+    if (!this.json || stream === "stderr") { this.emit({ stream, kind: "text", text, assistant: !this.json && stream === "stdout" }); return; }
     this.pending += text;
     let end: number;
     if (this.discardingLine) {
@@ -72,7 +96,14 @@ export class OutputDecoder {
       this.discardingLine = true;
     }
   }
-  finish(): void { if (this.pending && !this.discardingLine) this.line(this.pending); this.pending = ""; this.discardingLine = false; }
+  finish(): void {
+    if (this.pending && !this.discardingLine) this.line(this.pending);
+    this.pending = "";
+    this.discardingLine = false;
+    // The run's outcome is the last assistant message. An error that a retry recovered
+    // is telemetry, not a failed attempt.
+    if (this.json) this.emit({ stream: "stdout", kind: "agent-outcome", text: "outcome", terminalError: this.lastMessageFailed });
+  }
   private line(line: string): void {
     if (!line.trim()) return;
     try {
@@ -98,9 +129,21 @@ export class OutputDecoder {
             model: typeof message.model === "string" ? message.model : undefined,
             stopReason: typeof message.stopReason === "string" ? message.stopReason : undefined });
         }
+        const candidates = value.type === "message_end"
+          ? [message]
+          : Array.isArray(value.messages) ? value.messages : [];
+        const failed = candidates.find((candidate: unknown) => isAssistantError(candidate)) as Record<string, unknown> | undefined;
+        this.lastMessageFailed = Boolean(failed);
+        if (failed) {
+          const text = typeof failed.errorMessage === "string" && failed.errorMessage.trim()
+            ? failed.errorMessage
+            : `agent stopped with ${typeof failed.stopReason === "string" ? failed.stopReason : "an error"}`;
+          this.emit({ stream: "stdout", kind: "agent-error", text: text.slice(0, 500),
+            stopReason: typeof failed.stopReason === "string" ? failed.stopReason : "error" });
+        }
       }
       if (value.type === "message_update" && event?.type === "text_delta") {
-        this.emit({ stream: "stdout", kind: "text", text: String(event.delta ?? "") });
+        this.emit({ stream: "stdout", kind: "text", text: String(event.delta ?? ""), assistant: true });
       } else if (["tool_execution_start", "tool_execution_update", "tool_execution_end"].includes(value.type)) {
         const kind = value.type === "tool_execution_start" ? "tool-start" : value.type === "tool_execution_end" ? "tool-end" : "tool-update";
         const content = value.partialResult ?? value.result ?? value.args ?? "";

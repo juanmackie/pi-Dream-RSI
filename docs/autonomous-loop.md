@@ -4,7 +4,9 @@ Dream-RSI runs a bounded loop over a local project. It ranks measurable levers, 
 
 ## Consent and budgets
 
-Start with `dream_rsi_loop` and `consent: true`. Consent accepts that project code, evaluators, gates, and agents run on the host with the host user's access. Dream-RSI does not contain hostile code.
+Start with `/dream-rsi loop [goal]`. The command asks for consent in an interactive session and starts the loop itself. It does not need the chat model to call a tool. In a non-interactive session, pass `--consent` to accept consent in the command, or let the command send the request to the chat model. Add `--no-logs` to skip reading local session files.
+
+Consent accepts that project code, evaluators, gates, and agents run on the host with the host user's access. The tool `dream_rsi_loop` with `action: "start"` and `consent: true` starts the same loop.
 
 Defaults are 6 campaigns, 72 agent starts, 200 evaluator runs, and 120 minutes. Budgets persist across runs under `.dream-rsi/loop/` and are not renewed on resume. A campaign receives at most 18 agent starts, 48 evaluator runs, and 60 minutes from the remaining allowance.
 
@@ -16,6 +18,12 @@ Evaluator bootstrap is opt-in. Set `evaluator_bootstrap.authorized` to `true` an
 
 Run reports count all evaluator invocations this run and break them out by phase. Discovery and qualification are reported as preflight spend, separately from campaign evaluator runs. Durable counters remain cumulative across runs; compare run deltas with the durable budget rather than treating the cumulative phase totals as this run's spend. Score evaluators can return one number on stdout, a valid score JSON object on stdout, or write the declared score file. Qualification checks known oracle prerequisites before evaluator runs and admits a search only when its remaining budget can fund gates, an initial confirmation look, review, and independent post-apply verification. Expected reading duration sizes the budget; the process timeout remains a separate kill limit.
 
+## Agent health
+
+Before the first campaign the loop spends one agent start on a liveness probe. The probe runs the effective agent in a copy of the task workspace and asks for a short reply. A missing command, an exit code other than zero, or a reported model or provider error stops the run as `blocked` and names the agent command and the model. In the agent's JSON mode an empty reply also stops the run. The probe is charged to the durable budget and never starts after the run's deadline.
+
+During a campaign the loop reads the agent's JSON output. A run that ends with a model or provider error is an `agent_error`, not an ordinary no-gain attempt. An error that the agent retried and recovered is not a failure. An agent that exits with a failure code is an `agent_error` too. Three consecutive attempts that fail without changing the workspace stop the run as `blocked` and name the agent command and the model. A healthy attempt between two failures breaks that run of failures. The status output shows the command and the model that the child process really used. A child default model is shown as such when no session or saved model was resolved.
+
 ## Experiment and dream cycle
 
 Each campaign uses a bounded hill climb with a fixed, qualified metric. Attempts run in isolated workspaces; the campaign confirms candidate gains, runs correctness gates and adversarial review, then applies an accepted patch. The loop checks the applied result independently before it starts another campaign.
@@ -26,6 +34,8 @@ Completed experiments are recorded as worlds. When enough eligible worlds exist,
 
 Project state lives under `.dream-rsi/`. Campaign records and append-only attempt evidence are retained. Search configs, dream decisions, durable budgets, and the latest typed stop-code report live under `.dream-rsi/loop/`. Temporary evaluator and gate workspaces stay under `.dream-rsi/runtime/`; copies exclude Dream-RSI state so a run cannot inspect its own scratch data. Each attempt starts a fresh agent process and receives prior notes and experiment history.
 
-`status` reports progress and spend, including any pending paired confirmation. `stop` pauses the active campaign. `resume` restarts an interrupted attempt and continues the loop. If a candidate needs another confirmation look, `confirm` resumes its saved readings and pairs without repeating completed evaluator calls; it uses only the remaining durable loop allowance, keeps the post-apply verification reserve, and does not start a new search. Gates, review, and independent post-apply verification still run before the result is recorded as a win. A paused 2.x campaign is marked failed with the 3.0 restart path; stored v1 loop contracts are normalized when read.
+`status` reports progress and spend, including any pending paired confirmation. `stop` pauses the active campaign. It also stops a loop that is running in this session, even before that loop has a campaign record. `resume` restarts an interrupted attempt and continues the loop. If a candidate needs another confirmation look, `confirm` resumes its saved readings and pairs without repeating completed evaluator calls; it uses only the remaining durable loop allowance, keeps the post-apply verification reserve, and does not start a new search. Gates, review, and independent post-apply verification still run before the result is recorded as a win. A paused 2.x campaign is marked failed with the 3.0 restart path; stored v1 loop contracts are normalized when read.
+
+A loop started by the command runs detached from the chat turn in an interactive session. It reports its progress in the status line and sends the final report into the session. A one-shot session waits for the run and writes the final report to the standard error stream. Closing the session aborts the run, so no agent process outlives the session.
 
 Applied changes remain in the working tree. Review the diff, then keep or revert it with Git.

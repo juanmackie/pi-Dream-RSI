@@ -43,6 +43,23 @@ process.exit(3);
 process.stdin.on("data", () => {});
 process.stdin.on("end", () => { setInterval(() => {}, 1000); });
 `,
+  // Reports a provider error on the attempts named in DREAM_STREAK_MODE and a clean
+  // reply on the others. The counter lives outside the candidate workspace so the
+  // attempt order survives the per-attempt copy.
+  "agent-streak.mjs": `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+const file = process.env.DREAM_STREAK_FILE ?? "";
+const steps = (process.env.DREAM_STREAK_MODE ?? "").split(",");
+const count = file && existsSync(file) ? Number(readFileSync(file, "utf8").trim() || "0") : 0;
+if (file) writeFileSync(file, String(count + 1));
+const step = steps[count] ?? "ok";
+if (step === "error") {
+  console.log(JSON.stringify({ type: "message_end", message: { model: "fixture/streak", stopReason: "error", errorMessage: "fixture provider failed" } }));
+} else {
+  console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } }));
+  console.log(JSON.stringify({ type: "message_end", message: { model: "fixture/streak", stopReason: "stop" } }));
+}
+`,
   "agent-scenario.mjs": `
 import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 let prompt = ""; process.stdin.on("data", (chunk) => { prompt += chunk; });
@@ -206,6 +223,7 @@ export function mockPi() {
   };
   const context = {
     mode: "print",
+    hasUI: false,
     cwd: null,
     sessionManager: {
       getSessionId: () => "test-session",

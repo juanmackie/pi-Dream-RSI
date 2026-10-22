@@ -112,6 +112,7 @@ function agentSource(replacements, mode = "fix") {
 import * as path from "node:path";
 let prompt = ""; process.stdin.on("data", (chunk) => { prompt += chunk; });
 process.stdin.on("end", () => {
+  if (/Dream-RSI agent liveness probe/i.test(prompt)) { process.stdout.write("ok\\n"); return; }
   if (/Perform an adversarial review/i.test(prompt)) {
     writeFileSync("review.json", JSON.stringify({ verdict: "accept", reasons: [] }));
     return;
@@ -228,11 +229,37 @@ test("value", () => {
   },
   noise: {
     name: "noise",
-    mode: "noise",
-    files: {
+    mode: "noise",    files: {
       "package.json": JSON.stringify({ name: "loop-e2e-noise", private: true, scripts: { test: "node test.mjs", "test:gate": "node gate.mjs" } }, null, 2) + "\n",
       "test.mjs": NPM_TEST,
       "gate.mjs": `import { parse } from "./src/parser.js";\nif (parse(" x ") !== "x") process.exit(1);\n`,
+      "src/parser.js": "// NEEDS_FIX\nexport const parse = (text) => text.trim();\n",
+    },
+    fixed: { "src/parser.js": "// FIXED\nexport const parse = (text) => text.trim();\n" },
+    replacements: [],
+    sessionCommand: "npm test",
+    editTargets: ["src/parser.js", "src/parser.js"],
+    verify: { command: "npm", args: ["test"], shim: true },
+  },
+  // A process that answers the liveness probe but reports a provider error on every
+  // experiment attempt. The loop must stop after three consecutive non-editing errors
+  // instead of spending the campaign allowance on attempts that can only fail.
+  breaker: {
+    name: "breaker",
+    agentSource: `const ok = { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } };
+const done = { type: "message_end", message: { model: "fixture/breaker", stopReason: "stop" } };
+const failed = { type: "message_end", message: { model: "fixture/breaker", stopReason: "error", errorMessage: "fixture provider failed" } };
+let prompt = ""; process.stdin.on("data", (chunk) => { prompt += chunk; });
+process.stdin.on("end", () => {
+  for (const line of /Dream-RSI agent liveness probe/i.test(prompt) ? [ok, done] : [failed]) console.log(JSON.stringify(line));
+});
+`,
+    agentOutputFormat: "pi-json",
+    agentModel: "fixture/breaker",
+    files: {
+      "package.json": JSON.stringify({ name: "loop-e2e-breaker", private: true, scripts: { test: "node test.mjs", "test:gate": "node gate.mjs" } }, null, 2) + "\n",
+      "test.mjs": NPM_TEST,
+      "gate.mjs": `import { parse } from "./src/parser.js";\nif (typeof parse !== "function") process.exit(1);\n`,
       "src/parser.js": "// NEEDS_FIX\nexport const parse = (text) => text.trim();\n",
     },
     fixed: { "src/parser.js": "// FIXED\nexport const parse = (text) => text.trim();\n" },
@@ -284,7 +311,7 @@ function buildFixtureRepo(dir, spec) {
   git(["add", "-A"], dir);
   git(["commit", "-q", "-m", "fixture"], dir);
   git(["checkout", "--", "."], dir);
-  write("e2e-agent.mjs", agentSource(spec.replacements, spec.mode ?? "fix"));
+  write("e2e-agent.mjs", spec.agentSource ?? agentSource(spec.replacements, spec.mode ?? "fix"));
   git(["add", "-A"], dir);
   git(["commit", "-q", "-m", "stub agent"], dir);
 }
@@ -301,7 +328,7 @@ function runSpecCommand(spec, cwd) {
 }
 
 /** One trusted-local contract run on a fresh clone, with no supplied winning patch. */
-async function executeFixture(spec, fixtureDir, { limits } = {}) {
+async function executeFixture(spec, fixtureDir, { limits, campaignDefaults } = {}) {
   const sourceDir = path.join(fixtureDir, "source");
   buildFixtureRepo(sourceDir, spec);
   const cloneDir = cloneFixture(sourceDir, path.join(fixtureDir, "clone"));
@@ -322,7 +349,8 @@ async function executeFixture(spec, fixtureDir, { limits } = {}) {
     models: { providers: ["local"] },
     budgets: { maxCampaigns: limits?.maxCampaigns ?? 1, maxAgentStarts: limits?.maxAgentStarts ?? 36,
       maxEvaluatorRuns: limits?.maxEvaluatorRuns ?? 100, deadlineMs: limits?.deadlineMs ?? 1_800_000, falseAcceptBudget: 0.1 },
-    agent: { command: process.execPath, args: [path.join(cloneDir, "e2e-agent.mjs")], prompt_via: "stdin", model: null, thinking: null },
+    agent: { command: process.execPath, args: [path.join(cloneDir, "e2e-agent.mjs")], prompt_via: "stdin", model: spec.agentModel ?? null, thinking: null,
+      ...(spec.agentOutputFormat ? { output_format: spec.agentOutputFormat } : {}) },
   });
   const sessionDir = path.join(fixtureDir, "sessions");
   writeFixtureSessions(sessionDir, cloneDir, spec);
@@ -332,7 +360,7 @@ async function executeFixture(spec, fixtureDir, { limits } = {}) {
     sessionDir,
     limits: { maxCampaigns: limits?.maxCampaigns ?? 1, maxAgentStarts: limits?.maxAgentStarts ?? 36,
       maxEvaluatorRuns: limits?.maxEvaluatorRuns ?? 100, deadlineMs: limits?.deadlineMs ?? 1_800_000, plateauK: 2 },
-    campaignDefaults: { maxCycles: 2, maxAgentStarts: 24, maxEvaluatorRuns: 48, deadlineMs: 600_000 },
+    campaignDefaults: campaignDefaults ?? { maxCycles: 2, maxAgentStarts: 24, maxEvaluatorRuns: 48, deadlineMs: 600_000 },
     includeLogs: true,
     contract,
     taskDefaults: { agent_timeout_ms: 20_000, evaluator_timeout_ms: 60_000 },
@@ -477,6 +505,32 @@ test("known-negative: noise edits and an out-of-scope cheat apply nothing", asyn
     const after = runSpecCommand(FIXTURES.noise, run.cloneDir);
     assert.notEqual(after.status, 0, "the fixture still fails: nothing was applied");
     t.diagnostic(`noise: agentStarts=${run.result.agentStarts} evaluatorRuns=${run.result.evaluatorRuns} wallMs=${run.wallMs}`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dead-agent circuit breaker
+// ---------------------------------------------------------------------------
+
+test("a dead agent stops the loop after three consecutive errored attempts", async (t) => {
+  await withFixtureDir("breaker", async (dir) => {
+    const run = await executeFixture(FIXTURES.breaker, dir, {
+      limits: { maxCampaigns: 1, maxAgentStarts: 12, maxEvaluatorRuns: 60, deadlineMs: 600_000 },
+      campaignDefaults: { maxCycles: 2, maxAgentStarts: 12, maxEvaluatorRuns: 60, deadlineMs: 600_000 },
+    });
+    assert.equal(run.result.stopCode, "blocked", `stop: ${run.result.stopReason}; records: ${JSON.stringify(run.result.records)}`);
+    assert.match(run.result.stopReason, /3 consecutive non-editing agent attempts/);
+    assert.match(run.result.stopReason, /command ".*node.*" model "fixture\/breaker"/,
+      "the stop names the command and effective model");
+    const failed = run.result.records.find((record) => record.outcome === "error");
+    assert.ok(failed?.campaignRoot, "the failed campaign retains its root for diagnosis");
+    const attempts = readLedger(failed.campaignRoot).filter((entry) => entry.kind === "attempt");
+    assert.equal(attempts.length, 3, "the breaker stops at the third errored attempt");
+    assert.ok(attempts.every((entry) => entry.outcome === "agent_error" && entry.editCount === 0),
+      `each attempt is classified as a non-editing agent error: ${JSON.stringify(attempts)}`);
+    assert.doesNotMatch(fs.readFileSync(path.join(run.cloneDir, "src", "parser.js"), "utf8"), /FIXED/,
+      "no candidate was applied");
+    t.diagnostic(`breaker: agentStarts=${run.result.agentStarts} evaluatorRuns=${run.result.evaluatorRuns} wallMs=${run.wallMs}`);
   });
 });
 

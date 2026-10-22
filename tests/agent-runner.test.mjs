@@ -47,6 +47,106 @@ test("verifier-read telemetry only matches explicitly protected paths", () => {
   assert.doesNotMatch(JSON.stringify(protectedRead), /src\\measure|measure\.ts/);
 });
 
+test("pi JSON provider errors become agent-error evidence", () => {
+  const events = [];
+  const decoder = new OutputDecoder(true, (event) => events.push(event));
+  decoder.feed("stdout", `${JSON.stringify({ type: "message_end", message: { model: "provider/model", stopReason: "error", errorMessage: "provider quota exceeded" } })}\n`);
+  decoder.feed("stdout", `${JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "partial reply" } })}\n`);
+  decoder.finish();
+  const errors = events.filter((event) => event.kind === "agent-error");
+  assert.equal(errors.length, 1, "one message_end error is reported once");
+  assert.equal(errors[0].text, "provider quota exceeded");
+  assert.equal(errors[0].stopReason, "error");
+  assert.equal(events.find((event) => event.kind === "text" && event.assistant)?.text, "partial reply",
+    "assistant text remains distinguishable from error evidence");
+});
+
+test("a retried error that a later message recovered is not a terminal failure", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-retry-"));
+  try {
+    const script = path.join(dir, "retry.mjs");
+    fs.writeFileSync(script, `console.log(JSON.stringify({ type: "message_end", message: { model: "provider/model", stopReason: "error", errorMessage: "provider quota exceeded" } }));\n`
+      + `console.log(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "ok" } }));\n`
+      + `console.log(JSON.stringify({ type: "message_end", message: { model: "provider/model", stopReason: "stop" } }));\n`);
+    const result = await runAgent({
+      agent: { command: process.execPath, args: [script], output_format: "pi-json", prompt_via: "stdin", model: null },
+      cwd: dir, prompt: "retry", timeoutMs: 10_000,
+    });
+    assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+    assert.equal(result.evidence?.errorCount, 1, "the failed attempt stays in the telemetry");
+    assert.equal(result.evidence?.terminalError, false, "the recovered run did not end in an error");
+    assert.equal(result.evidence?.assistantText, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a run that ends with an assistant error is a terminal failure", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-terminal-"));
+  try {
+    const script = path.join(dir, "fail.mjs");
+    fs.writeFileSync(script, `console.log(JSON.stringify({ type: "message_end", message: { model: "provider/model", stopReason: "error", errorMessage: "provider quota exceeded" } }));\n`);
+    const result = await runAgent({
+      agent: { command: process.execPath, args: [script], output_format: "pi-json", prompt_via: "stdin", model: null },
+      cwd: dir, prompt: "fail", timeoutMs: 10_000,
+    });
+    assert.equal(result.evidence?.terminalError, true);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("runAgent records the effective command, model source, and JSON error evidence", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-error-"));
+  try {
+    const script = path.join(dir, "error.mjs");
+    fs.writeFileSync(script, `console.log(JSON.stringify({ type: "message_end", message: { model: "child/default", stopReason: "error", errorMessage: "quota exceeded" } }));\n`);
+    const agent = { command: process.execPath, args: [script], output_format: "pi-json", prompt_via: "stdin", model: null };
+    const result = await runAgent({ agent, cwd: dir, prompt: "fail", timeoutMs: 10_000 });
+    assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+    assert.equal(result.evidence?.errorCount, 1, "an exit-0 JSON error is not a clean attempt");
+    assert.equal(result.evidence?.assistantText, false);
+    assert.equal(result.effectiveAgent?.model, null);
+    assert.equal(result.effectiveAgent?.modelSource, "child-default", "a null resolved model records the child default");
+
+    const sessionModel = await runAgent({
+      agent: { ...agent, model: "saved/model" }, resolveAgent: (configured) => ({ ...configured, model: "session/model" }),
+      cwd: dir, prompt: "fail", timeoutMs: 10_000,
+    });
+    assert.equal(sessionModel.effectiveAgent?.model, "session/model");
+    assert.equal(sessionModel.effectiveAgent?.modelSource, "session");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a missing shell command on Windows becomes a spawn error, not an ordinary attempt", {
+  skip: process.platform !== "win32" ? "Windows cmd.exe diagnostics only" : false,
+}, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-missing-"));
+  try {
+    const result = await runAgent({
+      agent: { command: "dream-rsi-command-that-does-not-exist", args: [], prompt_via: "stdin" },
+      cwd: dir, prompt: "propose something", timeoutMs: 10_000,
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.timedOut, false);
+    assert.match(result.spawnError, /command not found/,
+      "cmd.exe's not-recognized text is classified as a missing command");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("the effective model follows an explicit model argument", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-model-arg-"));
+  try {
+    const script = path.join(dir, "quiet.mjs");
+    fs.writeFileSync(script, "process.stdin.resume();\nprocess.stdin.on('end', () => {});\n");
+    const result = await runAgent({
+      agent: { command: process.execPath, args: [script, "--model", "provider/explicit"], model: null, prompt_via: "stdin" },
+      cwd: dir, prompt: "run", timeoutMs: 10_000,
+    });
+    assert.equal(result.ok, true, result.spawnError ?? result.stderrTail);
+    assert.equal(result.effectiveAgent?.model, "provider/explicit");
+    assert.equal(result.effectiveAgent?.modelSource, "saved", "an argument-pinned model is not a child default");
+    assert.equal(result.evidence?.assistantText, false, "a silent process produced no assistant text");
+    assert.equal(result.outputFormat, "text");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("runAgent writes a bounded decoded log without raw tool arguments", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-agent-compact-log-"));
   try {

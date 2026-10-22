@@ -5,7 +5,9 @@ description: Run the bounded autonomous Dream-RSI improvement loop on a local pr
 
 # Run the loop
 
-Call `dream_rsi_loop` with `action: "start"`, `consent: true`, the target project, and the user's focus. Ask for explicit trusted-local consent if the user has not provided it. Consent means discovered repository code runs on this host with the host user's access.
+The `/dream-rsi loop [goal]` command starts the loop itself. It asks for trusted-local consent in an interactive session, and it needs `--consent` in a non-interactive session. Consent means discovered repository code runs on this host with the host user's access. Do not start a loop through this skill unless the user asked for one.
+
+The tool `dream_rsi_loop` with `action: "start"`, `consent: true`, the target project, and the user's focus starts the same loop.
 
 The loop ranks project levers, builds and qualifies a metric, explores isolated candidate workspaces, reviews and confirms changes, applies verified gains, and checks each apply independently. It stops at its durable campaign, agent, evaluator, or time budget, or when it finds no verifiable lever.
 

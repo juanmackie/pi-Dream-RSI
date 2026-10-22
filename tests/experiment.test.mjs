@@ -171,6 +171,56 @@ test("experiment leaves the supplied confirmation and gate reserve unused", asyn
   assert.ok(world.evaluatorRuns < 3, "the campaign grant stays within the evaluator reserve supplied by its caller");
 });
 
+test("a healthy attempt breaks the carried agent-error streak", async (t) => {
+  const project = makeProject({ agent: "agent-streak.mjs" });
+  t.after(project.cleanup);
+  const counter = path.join(project.dir, "streak-count.txt");
+  const task = normalizeTask(project.task);
+  task.agent = { ...task.agent, output_format: "pi-json", env: { DREAM_STREAK_FILE: counter, DREAM_STREAK_MODE: "ok,error" } };
+  const root = path.join(project.dreamRoot, "campaigns", "streak-reset");
+  const options = {
+    root, projectDir: project.projectDir, targetRoot: project.seed, seedRoot: project.seed, task,
+    cycle: 1, fingerprint: "streak-fingerprint", baseline: 0, threshold: 0.1,
+    config: { ...defaultSearchConfig, batchSize: 2, maxRounds: 1, patience: 1 }, signal: new AbortController().signal,
+    agent: task.agent, beforeAgentSpawn: () => {}, beforeEvaluatorSpawn: () => {},
+    maxAgentAttempts: 2, maxEvaluatorAttempts: 2, priorAgentErrorStreak: 2,
+  };
+  const world = await runExperiment(options);
+  assert.equal(world.status, "complete", "one healthy attempt breaks the carried streak");
+  assert.equal(world.nodes[0].failClass, "no_proposal");
+  assert.equal(world.nodes[1].failClass, "agent_error");
+
+  // Without the healthy attempt the carried streak reaches the breaker.
+  const second = makeProject({ agent: "agent-streak.mjs" });
+  t.after(second.cleanup);
+  const secondCounter = path.join(second.dir, "streak-count.txt");
+  const secondTask = normalizeTask(second.task);
+  secondTask.agent = { ...secondTask.agent, output_format: "pi-json", env: { DREAM_STREAK_FILE: secondCounter, DREAM_STREAK_MODE: "error" } };
+  await assert.rejects(runExperiment({
+    ...options,
+    root: path.join(second.dreamRoot, "campaigns", "streak-break"),
+    projectDir: second.projectDir, targetRoot: second.seed, seedRoot: second.seed, task: secondTask,
+    agent: secondTask.agent,
+  }), /blocked: 3 consecutive non-editing agent attempts/);
+});
+
+test("an agent that exits with a failure code is an agent error, not a silent no-op", async (t) => {
+  const project = makeProject({ agent: "agent-fail.mjs" });
+  t.after(project.cleanup);
+  const task = normalizeTask(project.task);
+  const root = path.join(project.dreamRoot, "campaigns", "failed-agent");
+  const world = await runExperiment({
+    root, projectDir: project.projectDir, targetRoot: project.seed, seedRoot: project.seed, task,
+    cycle: 1, fingerprint: "failed-agent-fingerprint", baseline: 0, threshold: 0.1,
+    config: { ...defaultSearchConfig, batchSize: 1, maxRounds: 1 }, signal: new AbortController().signal,
+    agent: task.agent, beforeAgentSpawn: () => {}, beforeEvaluatorSpawn: () => {},
+    maxAgentAttempts: 1, maxEvaluatorAttempts: 1,
+  });
+  assert.equal(world.nodes[0].failClass, "agent_error");
+  assert.match(world.nodes[0].error, /exited with code 3/);
+  assert.equal(world.evaluatorRuns, 0, "a failed agent spends no evaluator run");
+});
+
 test("a completed experiment does not restart and patience uses strict threshold gain", async (t) => {
   const project = makeProject();
   t.after(project.cleanup);

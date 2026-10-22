@@ -16,6 +16,8 @@ import { THINKING_LEVELS, type AgentConfig } from "../engine/task.ts";
 
 const TAIL_BYTES = 64 * 1024;
 const AGENT_LOG_BYTES = 50 * 1024;
+/** cmd.exe text for a command it could not resolve; shell:true otherwise reports only the exit code. */
+const WINDOWS_MISSING_COMMAND = /(?:is not recognized as an internal or external command|The system cannot find the (?:file|path) specified)/i;
 
 export interface CommandResult {
   ok: boolean;
@@ -44,6 +46,18 @@ export interface CommandResult {
   hadOutput?: boolean;
   /** Structural, content-free telemetry decoded from pi JSONL output. */
   evidence?: AgentOutputEvidence;
+  /** How this process's output was decoded: `pi-json` or plain text. */
+  outputFormat?: "text" | "pi-json";
+  /** The executable and model this process actually used, including a child default. */
+  effectiveAgent?: EffectiveAgent;
+}
+
+/** What a spawned agent really ran, as opposed to what the saved task asked for. */
+export interface EffectiveAgent {
+  command: string;
+  model: string | null;
+  /** Where the model came from; `child-default` means no model was resolved. */
+  modelSource: "session" | "saved" | "child-default";
 }
 
 export interface RunOptions {
@@ -154,7 +168,7 @@ async function collect(
       })
     : Promise.resolve();
   // Observer failures cannot change execution or the score.
-  const evidence: AgentOutputEvidence = { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, stopReasons: {}, modelChanges: 0, editCount: 0, verifierRead: false };
+  const evidence: AgentOutputEvidence = { usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, stopReasons: {}, modelChanges: 0, editCount: 0, verifierRead: false, errorCount: 0, terminalError: false, assistantText: false };
   let lastModel: string | undefined;
   let compactLog = Buffer.alloc(0);
   const appendCompactLog = (line: string, newline = true): void => {
@@ -172,7 +186,11 @@ async function collect(
       if (event.kind === "text" && event.text) appendCompactLog(compactText(event.text), false);
       else if (event.kind.startsWith("tool-")) appendCompactLog(`${event.kind} ${event.toolName ?? "tool"}`);
       else if (event.kind === "usage") appendCompactLog(`usage ${event.model ?? ""} ${event.stopReason ?? ""} ${event.usage?.total ?? 0}`.trim());
+      else if (event.kind === "agent-error") appendCompactLog(compactText(`agent-error ${event.text.slice(0, 500)}`));
     }
+    if (event.kind === "text" && event.assistant && event.text.trim()) evidence.assistantText = true;
+    if (event.kind === "agent-error") evidence.errorCount += 1;
+    if (event.kind === "agent-outcome") evidence.terminalError = event.terminalError === true;
     if (event.kind === "usage") {
       for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) evidence.usage[key] += event.usage?.[key] ?? 0;
       if (event.stopReason) evidence.stopReasons[event.stopReason] = (evidence.stopReasons[event.stopReason] ?? 0) + 1;
@@ -231,6 +249,13 @@ async function collect(
         // the stream is already gone; the error listener recorded why
       }
       void logClosed.then(() => {
+        // With shell:true, Windows reports a missing executable only as cmd.exe text plus a
+        // non-zero exit code; without this, a missing agent looks like an ordinary failed attempt.
+        const shellSpawnError = !result.spawnError && options.shell && process.platform === "win32"
+          && (result.code === 1 || result.code === 3 || result.code === 9009)
+          && WINDOWS_MISSING_COMMAND.test(stderrTail)
+          ? `command not found: ${command} — check the executable name or install it on PATH`
+          : null;
         const completed: CommandResult = {
           ok: false,
           code: null,
@@ -239,7 +264,7 @@ async function collect(
           ...(timeoutKind ? { timeoutKind } : {}),
           ...(options.idleTimeoutMs ? { idleMs: Date.now() - lastOutputAt, lastOutputAgeMs: Date.now() - lastOutputAt } : {}),
           aborted,
-          spawnError: null,
+          spawnError: shellSpawnError,
           logError,
           durationMs: Date.now() - started,
           stdoutTail,
@@ -247,6 +272,7 @@ async function collect(
           logPath: options.logPath ?? null,
           hadOutput: sawOutput,
           evidence,
+          outputFormat: options.outputFormat === "pi-json" ? "pi-json" : "text",
           ...result,
         };
         try {
@@ -493,13 +519,45 @@ export function piSelfInvocation(options: PiSelfOptions = {}): { command: string
 }
 
 /**
+ * The model an argument list selects, if any. A task may pin the model in its own
+ * command line (`--model provider/model` or `--model=provider/model`) instead of
+ * in the `model` field.
+ */
+function modelFromArgs(args: string[]): string | null {
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index]!;
+    if (argument === "--model") {
+      const value = args[index + 1];
+      return value && !value.startsWith("-") ? value : null;
+    }
+    if (argument.startsWith("--model=")) {
+      const value = argument.slice("--model=".length);
+      return value ? value : null;
+    }
+  }
+  return null;
+}
+
+/**
  * Run one discovery attempt / policy revision. `agent.env` (task.json's `agent.env`) is merged over the
  * stripped inherited environment, so a task can hand the agent a variable it genuinely needs.
  */
 export function runAgent(options: AgentRun): Promise<CommandResult> {
   const resolved = options.resolveAgent?.(options.agent) ?? null;
   const agent = resolved ?? options.agent;
+  // The default `pi` agent re-spawns the running pi invocation, so it never depends on PATH. A custom
+  // command keeps the platform shell so Windows .cmd/.bat shims still resolve.
+  const self = agent.command === "pi" ? piSelfInvocation() : null;
+  const command = self ? self.command : agent.command;
   const args = buildAgentArgs(agent, { overrideExplicit: resolved !== null });
+  // A configured model can also travel as an explicit argument. Without this the status would
+  // claim a child default while the child really ran with that model.
+  const argumentModel = modelFromArgs(args);
+  const effectiveAgent: EffectiveAgent = {
+    command,
+    model: agent.model ?? argumentModel,
+    modelSource: agent.model ? (resolved ? "session" : "saved") : argumentModel ? "saved" : "child-default",
+  };
   const unsafeModel = Boolean(agent.model && !MODEL_PATTERN.test(agent.model));
   const unsafeThinking = Boolean(agent.thinking && !THINKING_LEVELS.includes(agent.thinking));
   if (unsafeModel || unsafeThinking) {
@@ -514,12 +572,9 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
       stderrTail: "",
       logPath: options.logPath ?? null,
       hadOutput: false,
+      effectiveAgent,
     });
   }
-  // The default `pi` agent re-spawns the running pi invocation, so it never depends on PATH. A custom
-  // command keeps the platform shell so Windows .cmd/.bat shims still resolve.
-  const self = agent.command === "pi" ? piSelfInvocation() : null;
-  const command = self ? self.command : agent.command;
   const invocationArgs = self ? [...self.args, ...args] : args;
   const shell = self ? false : process.platform === "win32";
   const modeIndex = args.indexOf("--mode");
@@ -527,10 +582,15 @@ export function runAgent(options: AgentRun): Promise<CommandResult> {
     (args.includes("--mode=json") || (modeIndex >= 0 && args[modeIndex + 1] === "json")));
   options = { ...options, outputFormat: json ? "pi-json" : "text", compactAgentLog: true };
   const env = { ...(agent.env ?? {}), ...(options.env ?? {}) };
+  const userOnComplete = options.onComplete;
+  const withEffectiveAgent = (result: CommandResult): void => {
+    result.effectiveAgent = effectiveAgent;
+    userOnComplete?.(result);
+  };
   if (agent.prompt_via === "arg") {
-    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, quoteExecutable: shell, env });
+    return collect(command, [...invocationArgs, options.prompt], { ...options, shell, quoteExecutable: shell, env, onComplete: withEffectiveAgent });
   }
-  return collect(command, invocationArgs, { ...options, shell, quoteExecutable: shell, env, stdin: options.prompt });
+  return collect(command, invocationArgs, { ...options, shell, quoteExecutable: shell, env, stdin: options.prompt, onComplete: withEffectiveAgent });
 }
 
 /**

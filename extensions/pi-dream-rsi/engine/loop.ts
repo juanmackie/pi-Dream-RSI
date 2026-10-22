@@ -30,6 +30,7 @@ import { phaseIsActive } from "./ownership.ts";
 import { normalizeProjectRelativePath, pathProtected, pathWithin } from "./scope.ts";
 import { defaultSearchConfig, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
 import { maybeDream, validateSearchConfig } from "./dream.ts";
+import { copyWorkspace, runAgent } from "../agent/runner.ts";
 
 /**
  * The unattended loop: one iteration = recon, ranked lever, synthesized or
@@ -582,6 +583,18 @@ export function campaignSeedReadings(options: SeedReadingsOptions): CampaignSeed
 }
 
 /**
+ * Keep a campaign's own stop classification.
+ *
+ * A blocked run and an unavailable agent name a condition the operator must fix, so
+ * they stay `blocked`. Everything else is a campaign failure.
+ */
+function classifyCampaignFailure(reason: string): string {
+  if (reason.startsWith("blocked:")) return reason;
+  if (/agent unavailable/i.test(reason)) return `blocked: ${reason}`;
+  return `campaign failed: ${reason}`;
+}
+
+/**
  * Run the unattended loop until a stop rule fires. Returns a full record of
  * the run: stop reason, per-campaign outcomes, durable memory and budget paths,
  * and a bounded Memento digest for the next run.
@@ -822,6 +835,88 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     budget = settleReservation(budget, grant, { agentStarts: grant.agent_starts, evaluatorRuns: grant.evaluator_runs, campaigns: 0 });
     writeLoopBudget(budgetPath, budget);
   };
+  let agentProbed = false;
+  /**
+   * One charged agent start in a copy of the tree the campaign would use. A dead command,
+   * a missing model, or a provider error must stop before the first campaign, not after it
+   * has burned its allowance on attempts that can only fail.
+   *
+   * The probe runs in a copy of the task workspace because a task may launch its agent
+   * with a project-relative command or script. An empty directory would break that
+   * launcher and report a healthy agent as dead.
+   */
+  const probeAgentLiveness = async (task: TaskConfig): Promise<void> => {
+    if (agentProbed) return;
+    agentProbed = true;
+    // Test seams replace the campaign engine, so a real probe would change their exact spend.
+    if (options.runCampaignImpl || options.taskProvider) return;
+    if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+    const remainingMs = deadlineAt - Date.now();
+    if (remainingMs <= 0) { stopReason = "deadline"; return; }
+    const scratch = fs.mkdtempSync(path.join(loopRoot, "liveness-"));
+    try {
+      const startedAt = Date.now();
+      const workspaceRoot = path.resolve(projectDir, task.workspace ?? ".");
+      try {
+        await copyWorkspace(workspaceRoot, scratch, {
+          exclude: [path.join(projectDir, ".git"), path.join(projectDir, ".dream-rsi")],
+        });
+      } catch (error) {
+        stopReason = `blocked: the agent liveness probe could not prepare its workspace copy: ${error instanceof Error ? error.message : String(error)}`;
+        addNote(stopReason);
+        progress(`loop: ${stopReason}`);
+        return;
+      }
+      let result: Awaited<ReturnType<typeof runAgent>>;
+      // The copy spent part of the wall-clock budget, so the remaining time is measured
+      // again. An expired or cancelled run must not spawn or charge an agent.
+      const timeLeft = deadlineAt - Date.now();
+      if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+      if (timeLeft <= 0) { stopReason = "deadline"; return; }
+      try {
+        result = await runAgent({
+          agent: task.agent,
+          ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+          cwd: scratch,
+          prompt: "Dream-RSI agent liveness probe. Reply with the single word ok. Do not change files.",
+          timeoutMs: Math.max(1, Math.min(task.agent_timeout_ms, timeLeft, 4 * 60 * 1000)),
+          ...(options.signal ? { signal: options.signal } : {}),
+          beforeSpawn: () => chargeOne("qualification", "agent"),
+          logPath: path.join(loopRoot, "liveness", "agent.log"),
+        });
+      } catch (error) {
+        if (error instanceof LoopBudgetExhaustedError) {
+          stopReason = "budget";
+          addNote(`${error.message}; the run stops here rather than overspending.`);
+          return;
+        }
+        throw error;
+      }
+      if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+      const effective = result.effectiveAgent;
+      const label = `command "${effective?.command ?? task.agent.command}" model "${effective?.model ?? "child default"}"`;
+      const detail = result.spawnError
+        ? result.spawnError
+        : result.timedOut
+          ? `timed out after ${Math.ceil((Date.now() - startedAt) / 1000)}s`
+          : !result.ok
+            ? `exited with code ${result.code ?? "unknown"}`
+            : (result.evidence?.terminalError ?? false)
+              ? "reported a model or provider error"
+              : result.outputFormat === "pi-json" && !result.evidence?.assistantText
+                ? "returned no assistant text"
+                : null;
+      if (detail) {
+        stopReason = `blocked: agent liveness probe failed before the first campaign: ${label} ${detail}. Fix the agent command or model, then start again.`;
+        addNote(stopReason);
+        progress(`loop: ${stopReason}`);
+      } else {
+        progress(`loop: agent liveness probe passed (${label})`);
+      }
+    } finally {
+      fs.rmSync(scratch, { recursive: true, force: true });
+    }
+  };
   const resumeSavedCampaign = async (): Promise<void> => {
     const context = readJson<LoopResumeContext>(activeContextPath);
     if (!context || context.version !== 1 || !context.lever?.id || !context.setup?.task || !context.plan || !context.instrument) {
@@ -925,7 +1020,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     if (!paused) fs.rmSync(activeContextPath, { force: true });
     if (paused) stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
     else if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
-    else if (failed) stopReason = `campaign failed: ${result.stopReason}`;
+    else if (failed) stopReason = classifyCampaignFailure(result.stopReason);
     else if (options.confirmationOnly) stopReason = "confirmation complete";
     else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
   };
@@ -1063,6 +1158,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       });
       try {
         recon = await reconProjectImpl(reconOptions());
+        // An aborted run must not report the abort as a broken workload.
+        if (options.signal?.aborted) { stopReason = "cancelled"; break; }
         const missingWorkload = recon.blockers.some((reason) => /no benchmark or custom workload|no declared command matches|declared workload .* did not complete|does not name a local entry file/i.test(reason));
         if (missingWorkload && options.evaluatorBootstrap?.authorized) {
           const approvedContract = approved!.contract;
@@ -1251,6 +1348,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           continue;
         }
 
+        if (!agentProbed) {
+          await probeAgentLiveness(setup.task);
+          if (stopReason) break;
+        }
+        // The probe spent part of the wall-clock budget; a run that is out of time must
+        // not start a campaign on the strength of a probe that finished too late.
+        if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
+
         const fresh = remainingAllowance(budget);
         const postApplyReserve = instrument ? instrument.gates.length + (instrument.kind === "command-duration" ? 3 : 1) : 0;
         if (fresh.campaigns <= 0 || fresh.agentStarts <= 0 || fresh.evaluatorRuns <= postApplyReserve) { stopReason = "budget"; break; }
@@ -1338,7 +1443,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             continue;
           }
           const message = error instanceof Error ? error.message : String(error);
-          stopReason = `campaign failed: ${message}`;
+          stopReason = classifyCampaignFailure(message);
           // A thrown campaign's real spend is unknown, so charge the reserved
           // grant; otherwise a crash loop could hand out the same allowance twice.
           // A thrown campaign's real spend is unknown, so charge the reserved
@@ -1492,7 +1597,9 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // recorded above, but a failing campaign must not be followed by another one. A lever-level
         // preflight rejection also arrives as a failed state; it is recorded as "rejected" above and
         // must not halt an unattended run that still has other levers to screen.
-        if (failed && !cancelled && outcome !== "rejected") stopReason = `campaign failed: ${result.stopReason}`;
+        if (failed && !cancelled && outcome !== "rejected") {
+          stopReason = classifyCampaignFailure(result.stopReason);
+        }
         if (cancelled) stopReason = "cancelled";
         // A promoted change that does not survive independent checking halts the run: the
         // tree no longer agrees with the measurement that promoted it, so continuing would
