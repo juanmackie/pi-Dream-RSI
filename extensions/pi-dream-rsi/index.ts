@@ -31,6 +31,8 @@ const LOOP_TARGET_ENTRY = "pi-dream-rsi/loop-target";
 interface LoopRunSlot {
   /** The abort controller of the run; it also covers the consent dialog. */
   controller: AbortController;
+  /** Canonical project owned by this session's active run. */
+  projectDir: string;
 }
 const signalsParams = {
   type: "object",
@@ -86,6 +88,50 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   const closingSessions = new Set<string>();
   /** One running or reserved loop per session; the controller aborts the run. */
   const activeLoopRuns = new Map<string, LoopRunSlot>();
+  const loopIndicators = new Map<string, { timer: ReturnType<typeof setInterval> | undefined; frame: number }>();
+  const reserveLoopRun = (sessionId: string, projectDir: string, controller = new AbortController()): LoopRunSlot | null => {
+    if (activeLoopRuns.has(sessionId)) return null;
+    const slot = { controller, projectDir: path.resolve(projectDir) };
+    activeLoopRuns.set(sessionId, slot);
+    return slot;
+  };
+  const releaseLoopRun = (sessionId: string, slot: LoopRunSlot): void => {
+    if (activeLoopRuns.get(sessionId) === slot) activeLoopRuns.delete(sessionId);
+  };
+  const signalForLoopRun = (signal: AbortSignal | undefined, slot: LoopRunSlot): AbortSignal =>
+    signal ? AbortSignal.any([signal, slot.controller.signal]) : slot.controller.signal;
+  const alreadyRunning = (slot?: LoopRunSlot): any => ({
+    content: [{ type: "text", text: slot?.controller.signal.aborted
+      ? "A Dream-RSI loop is still stopping in this session. Wait for it to finish before starting another; use /dream-rsi status to check progress."
+      : "A Dream-RSI loop is already running in this session. Use /dream-rsi status, watch or stop." }],
+    details: { ok: false },
+  });
+  const setStatusUnlessAnimating = (ctx: ExtensionContext, sessionId: string, status: string | undefined): void => {
+    if (!closingSessions.has(sessionId) && !loopIndicators.has(sessionId)) ctx.ui.setStatus("dream-rsi", status);
+  };
+  const withLoopIndicator = async <T>(ctx: ExtensionContext, sessionId: string, run: () => Promise<T>): Promise<T> => {
+    if (ctx.mode !== "tui") return run();
+    // Every caller owns the session's activeLoopRuns slot before entering this helper.
+    const frames = ["◳", "◲", "◱", "◰"];
+    const indicator = { frame: 0, timer: undefined as ReturnType<typeof setInterval> | undefined };
+    loopIndicators.set(sessionId, indicator);
+    const showLooping = (): void => {
+      if (closingSessions.has(sessionId)) return;
+      ctx.ui.setStatus("dream-rsi", `dream-rsi: ${frames[indicator.frame]} looping`);
+      indicator.frame = (indicator.frame + 1) % frames.length;
+    };
+    showLooping();
+    indicator.timer = setInterval(showLooping, 150);
+    try {
+      return await run();
+    } finally {
+      if (indicator.timer) clearInterval(indicator.timer);
+      if (loopIndicators.get(sessionId) === indicator) {
+        loopIndicators.delete(sessionId);
+        if (!closingSessions.has(sessionId)) ctx.ui.setStatus("dream-rsi", modes.get(sessionId) ? "dream-rsi: active" : undefined);
+      }
+    }
+  };
   const dashboardFor = (ctx: ExtensionContext): Dashboard => {
     const id = ctx.sessionManager.getSessionId();
     let dashboard = dashboards.get(id);
@@ -105,7 +151,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   const setMode = (ctx: ExtensionContext, enabled: boolean): void => {
     modes.set(ctx.sessionManager.getSessionId(), enabled);
     pi.appendEntry(MODE_ENTRY, { version: 1, project: dreamRoot(ctx), active: enabled });
-    ctx.ui.setStatus("dream-rsi", enabled ? "dream-rsi: active" : undefined);
+    setStatusUnlessAnimating(ctx, ctx.sessionManager.getSessionId(), enabled ? "dream-rsi: active" : undefined);
   };
   const reconstruct = (ctx: ExtensionContext): void => {
     const id = ctx.sessionManager.getSessionId();
@@ -119,7 +165,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       if (data.project === dreamRoot(ctx)) active = data.active === true;
     }
     modes.set(id, active);
-    ctx.ui.setStatus("dream-rsi", active ? "dream-rsi: active" : undefined);
+    setStatusUnlessAnimating(ctx, id, active ? "dream-rsi: active" : undefined);
   };
   /**
    * The project of the last loop started in this session, as a canonical `.dream-rsi` root.
@@ -144,7 +190,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
    */
   const startLoop = async (params: Record<string, any>, ctx: ExtensionContext, signal: AbortSignal | undefined, onUpdate?: LoopUpdate): Promise<any> => {
     if (params.consent !== true) return { content: [{ type: "text", text: "consent must be true: discovered repository code runs on this host with host access." }], details: { ok: false } };
-    setMode(ctx, true);
     const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
     if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
     // Progress and phase callbacks report the campaign state of the project
@@ -317,25 +362,27 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     // loop that runs outside the calling directory.
     pi.appendEntry(LOOP_TARGET_ENTRY, { version: 1, project: projectDir });
     const includeLogs = params.include_logs !== false;
-    const result = await runLoop({
-      projectDir,
-      limits,
-      campaignDefaults,
-      ...(typeof params.focus === "string" && params.focus.trim() ? { focus: params.focus.trim() } : {}),
-      includeLogs,
-      ...(includeLogs && ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
-      contract,
-      ...(Object.keys(taskDefaults).length > 0 ? { taskDefaults } : {}),
-      ...(evaluatorBootstrap ? { evaluatorBootstrap } : {}),
-      resolveAgent: resolveAgent(ctx),
-      signal,
-      onProgress: (message) => {
-        if (!closingSessions.has(ctx.sessionManager.getSessionId())) ctx.ui.setStatus("dream-rsi", `dream-rsi: loop — ${message.replace(/^loop:\s*/, "").slice(0, 48)}`);
-        onUpdate?.({ content: [{ type: "text", text: `Dream-RSI loop: ${message}` }], details: { campaign: readCampaignStatus(baseRoot) } });
-      },
-      onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-      onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-    });
+    const sessionId = ctx.sessionManager.getSessionId();
+    let result: Awaited<ReturnType<typeof runLoop>>;
+    result = await withLoopIndicator(ctx, sessionId, () => runLoop({
+        projectDir,
+        limits,
+        campaignDefaults,
+        ...(typeof params.focus === "string" && params.focus.trim() ? { focus: params.focus.trim() } : {}),
+        includeLogs,
+        ...(includeLogs && ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
+        contract,
+        ...(Object.keys(taskDefaults).length > 0 ? { taskDefaults } : {}),
+        ...(evaluatorBootstrap ? { evaluatorBootstrap } : {}),
+        resolveAgent: resolveAgent(ctx),
+        signal,
+        onProgress: (message) => {
+          setStatusUnlessAnimating(ctx, sessionId, `dream-rsi: loop — ${message.replace(/^loop:\s*/, "").slice(0, 48)}`);
+          onUpdate?.({ content: [{ type: "text", text: `Dream-RSI loop: ${message}` }], details: { campaign: readCampaignStatus(baseRoot) } });
+        },
+        onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(sessionId)),
+        onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(sessionId), () => loopIndicators.has(sessionId)),
+      }));
     const lines = [
       `Dream-RSI loop finished (${result.stopCode}): ${result.stopReason}`,
       `  campaigns this run: ${result.campaigns} (${result.wins} verified win(s))`,
@@ -449,12 +496,30 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath, reportPath: path.join(loopRoot, "latest-report.json") }, campaign } };
       }
       if (action === "stop") {
-        const campaign = stopCampaign(path.join(resolveCampaignProjectDir(params.project_dir, ctx.cwd) ?? ctx.cwd, ".dream-rsi"));
-        return campaign
-          ? { content: [{ type: "text", text: `Stop requested.\n${renderCampaignStatus(campaign)}` }], details: { campaign } }
-          : { content: [{ type: "text", text: "No active loop campaign." }], details: { campaign: null } };
+        const sessionId = ctx.sessionManager.getSessionId();
+        const slot = activeLoopRuns.get(sessionId);
+        const hasRequestedProject = params.project_dir !== undefined;
+        const requestedProject = hasRequestedProject ? resolveCampaignProjectDir(params.project_dir, ctx.cwd) : null;
+        const retainedTarget = !hasRequestedProject ? loopTargetRoot(ctx) : null;
+        const targetProject = hasRequestedProject
+          ? requestedProject
+          : slot?.projectDir ?? (retainedTarget ? path.dirname(retainedTarget) : ctx.cwd);
+        const aborted = Boolean(slot && targetProject && path.resolve(targetProject) === slot.projectDir);
+        if (aborted) slot!.controller.abort();
+        const campaign = targetProject ? stopCampaign(path.join(targetProject, ".dream-rsi")) : null;
+        const lines = campaign
+          ? [`Stop requested.\n${renderCampaignStatus(campaign)}`]
+          : [aborted ? "The running Dream-RSI loop was asked to stop; no campaign is recorded yet." : "No active loop campaign."];
+        if (slot && !aborted) {
+          const state = slot.controller.signal.aborted ? "still stopping" : "still running";
+          lines.push(`A loop is ${state} in this session for ${slot.projectDir}; the requested project did not match, so that run was not stopped.`);
+        }
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { campaign, aborted, running: Boolean(slot) } };
       }
       if (action === "resume" || action === "confirm") {
+        const sessionId = ctx.sessionManager.getSessionId();
+        const activeSlot = activeLoopRuns.get(sessionId);
+        if (activeSlot) return alreadyRunning(activeSlot);
         const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
         if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
         const baseRoot = path.join(projectDir, ".dream-rsi");
@@ -470,8 +535,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (action === "confirm" && !campaign.pendingConfirmation) {
           return { content: [{ type: "text", text: "No saved candidate confirmation is pending; use action=resume for an interrupted campaign." }], details: { ok: false, campaign } };
         }
-        setMode(ctx, true);
-        pi.appendEntry(LOOP_TARGET_ENTRY, { version: 1, project: projectDir });
         const loopRoot = path.join(baseRoot, "loop");
         const stored = readStoredContract(loopRoot);
         if (!stored) return { content: [{ type: "text", text: "The paused campaign has no saved loop contract; it cannot resume safely." }], details: { ok: false } };
@@ -482,26 +545,39 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (![durable.max_campaigns, durable.max_agent_starts, durable.max_evaluator_runs].every((value) => typeof value === "number" && Number.isSafeInteger(value) && value > 0)) {
           return { content: [{ type: "text", text: "The durable loop budget is invalid; resume stopped without spending." }], details: { ok: false } };
         }
-        const result = await runLoop({
-          projectDir, baseRoot, loopRoot, contract: stored.contract, resumeActiveCampaign: true, confirmationOnly: action === "confirm",
-          limits: {
-            maxCampaigns: durable.max_campaigns!, maxAgentStarts: durable.max_agent_starts!,
-            maxEvaluatorRuns: durable.max_evaluator_runs!, deadlineMs: stored.contract.budgets.deadlineMs,
-          },
-          includeLogs: params.include_logs !== false,
-          ...(ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
-          resolveAgent: resolveAgent(ctx), signal,
-          onProgress: (message) => onUpdate?.({ content: [{ type: "text", text: `Dream-RSI resume: ${message}` }], details: { campaign: readCampaignStatus(baseRoot) } }),
-          onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-          onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(ctx.sessionManager.getSessionId())),
-        });
-        return {
-          content: [{ type: "text", text: `${action === "confirm" ? "Continued saved confirmation" : "Resumed Dream-RSI loop"} (${result.stopCode}): ${result.stopReason}; ${result.campaigns} campaign(s), ${result.wins} verified win(s).` }],
-          details: { ok: result.stopReason !== "resume failed", loop: result },
-        };
+        const slot = reserveLoopRun(sessionId, projectDir);
+        if (!slot) return alreadyRunning(activeLoopRuns.get(sessionId));
+        setMode(ctx, true);
+        pi.appendEntry(LOOP_TARGET_ENTRY, { version: 1, project: projectDir });
+        try {
+          const result = await withLoopIndicator(ctx, sessionId, () => runLoop({
+            projectDir, baseRoot, loopRoot, contract: stored.contract, resumeActiveCampaign: true, confirmationOnly: action === "confirm",
+            limits: {
+              maxCampaigns: durable.max_campaigns!, maxAgentStarts: durable.max_agent_starts!,
+              maxEvaluatorRuns: durable.max_evaluator_runs!, deadlineMs: stored.contract.budgets.deadlineMs,
+            },
+            includeLogs: params.include_logs !== false,
+            ...(ctx.sessionManager.getSessionDir() ? { sessionDir: ctx.sessionManager.getSessionDir() } : {}),
+            resolveAgent: resolveAgent(ctx), signal: signalForLoopRun(signal, slot),
+            onProgress: (message) => onUpdate?.({ content: [{ type: "text", text: `Dream-RSI resume: ${message}` }], details: { campaign: readCampaignStatus(baseRoot) } }),
+            onPhaseProgress: campaignPhaseProgress(dashboardFor(ctx), baseRoot, onUpdate, () => closingSessions.has(sessionId)),
+            onCampaignUpdate: campaignUpdate(ctx, onUpdate, () => closingSessions.has(sessionId), () => loopIndicators.has(sessionId)),
+          }));
+          return {
+            content: [{ type: "text", text: `${action === "confirm" ? "Continued saved confirmation" : "Resumed Dream-RSI loop"} (${result.stopCode}): ${result.stopReason}; ${result.campaigns} campaign(s), ${result.wins} verified win(s).` }],
+            details: { ok: result.stopReason !== "resume failed", loop: result },
+          };
+        } finally { releaseLoopRun(sessionId, slot); }
       }
       if (action !== "start") return { content: [{ type: "text", text: "action must be start, status, stop, resume or confirm." }], details: { ok: false } };
-      return await startLoop(params, ctx, signal, onUpdate);
+      if (params.consent !== true) return await startLoop(params, ctx, signal, onUpdate);
+      const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
+      if (!projectDir) return { content: [{ type: "text", text: "project_dir must name an existing local project directory." }], details: { ok: false } };
+      const sessionId = ctx.sessionManager.getSessionId();
+      const slot = reserveLoopRun(sessionId, projectDir);
+      if (!slot) return alreadyRunning(activeLoopRuns.get(sessionId));
+      try { return await startLoop(params, ctx, signalForLoopRun(signal, slot), onUpdate); }
+      finally { releaseLoopRun(sessionId, slot); }
     },
   });
 
@@ -540,8 +616,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const includeLogs = !tokens.includes("--no-logs");
         const focus = tokens.filter((token) => token !== "--consent" && token !== "--no-logs").join(" ");
         const sessionId = ctx.sessionManager.getSessionId();
-        if (activeLoopRuns.has(sessionId)) {
-          report("A Dream-RSI loop is already running in this session. Use /dream-rsi status, watch or stop.", "error");
+        const currentSlot = activeLoopRuns.get(sessionId);
+        if (currentSlot) {
+          report(alreadyRunning(currentSlot).content[0].text, "error");
           return;
         }
         // A one-shot session ends when this handler returns, so the run must finish first.
@@ -550,12 +627,13 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // The slot is reserved before the consent dialog, so a second command cannot
         // start a run that this one would later overwrite. The controller exists from the
         // start, so a stop during the dialog still reaches this command.
-        const controller = new AbortController();
-        const slot: LoopRunSlot = { controller };
-        activeLoopRuns.set(sessionId, slot);
-        const release = (): void => {
-          if (activeLoopRuns.get(sessionId) === slot) activeLoopRuns.delete(sessionId);
-        };
+        const slot = reserveLoopRun(sessionId, ctx.cwd);
+        if (!slot) {
+          report(alreadyRunning(activeLoopRuns.get(sessionId)).content[0].text, "error");
+          return;
+        }
+        const controller = slot.controller;
+        const release = (): void => releaseLoopRun(sessionId, slot);
         let consent = explicitConsent;
         if (!consent && ctx.hasUI) {
           consent = await ctx.ui.confirm(
@@ -646,7 +724,6 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         let aborted = false;
         if (slot) {
           slot.controller.abort();
-          activeLoopRuns.delete(ctx.sessionManager.getSessionId());
           aborted = true;
         }
         let where = root;
@@ -726,6 +803,11 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   pi.on("session_shutdown", async (_event, ctx) => {
     const id = ctx.sessionManager.getSessionId();
     closingSessions.add(id);
+    const indicator = loopIndicators.get(id);
+    if (indicator) {
+      if (indicator.timer) clearInterval(indicator.timer);
+      loopIndicators.delete(id);
+    }
     const slot = activeLoopRuns.get(id);
     if (slot) {
       slot.controller.abort();
@@ -863,9 +945,14 @@ function renderCampaignCheckStatus(check: NonNullable<CampaignStatus["check"]>):
   return lines;
 }
 
-function campaignUpdate(ctx: ExtensionContext, onUpdate: ((update: any) => void) | undefined, isClosing: () => boolean): (campaign: CampaignStatus) => void {
+export function campaignUpdate(
+  ctx: ExtensionContext,
+  onUpdate: ((update: any) => void) | undefined,
+  isClosing: () => boolean,
+  isIndicatorActive: () => boolean = () => false,
+): (campaign: CampaignStatus) => void {
   return (campaign) => {
-    if (!isClosing()) {
+    if (!isClosing() && !isIndicatorActive()) {
       const phase = campaign.state.kind === "running" ? campaign.state.phase : campaign.state.kind;
       ctx.ui.setStatus("dream-rsi", `dream-rsi: ${phase} (${campaign.completedCycles.length}/${campaign.limits.maxCycles})`);
     }

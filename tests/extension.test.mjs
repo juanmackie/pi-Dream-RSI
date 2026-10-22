@@ -5,9 +5,11 @@ import * as path from "node:path";
 
 import { makeProject, mockPi } from "./fixtures.mjs";
 
-const { default: dreamRsi } = await import("../extensions/pi-dream-rsi/index.ts");
+const { default: dreamRsi, campaignUpdate } = await import("../extensions/pi-dream-rsi/index.ts");
 const { defaultTask, normalizeTask } = await import("../extensions/pi-dream-rsi/engine/task.ts");
 const { normalizeRunContract, approveRunContract, contractFile } = await import("../extensions/pi-dream-rsi/engine/intake.ts");
+const { runCampaign } = await import("../extensions/pi-dream-rsi/engine/campaign.ts");
+const { readOrCreateLoopBudget } = await import("../extensions/pi-dream-rsi/engine/budget.ts");
 
 async function boot(project) {
   const { pi, context, harness } = mockPi();
@@ -15,6 +17,39 @@ async function boot(project) {
   context.cwd = project.projectDir;
   await harness.handlers.get("session_start")({}, context);
   return { context, harness };
+}
+
+async function preparePausedLoop(project) {
+  const result = await runCampaign({
+    baseRoot: project.dreamRoot, projectDir: project.projectDir, task: project.task,
+    goal: "Increase valid markers for the loop lifecycle fixture.", scope: ["solution.py"],
+    verifierInputs: [project.script("score-ok.mjs")],
+    limits: { maxCycles: 1, maxAgentStarts: 18, maxEvaluatorRuns: 48, deadlineMs: 60_000 },
+  });
+  const recordPath = path.join(result.campaignRoot, "campaign.json");
+  const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+  record.state = { kind: "paused", phase: "experiment", iteration: 1, reason: "fixture resume" };
+  record.pendingConfirmation = {
+    iteration: 1, candidate: { cell: "fixture-cell" }, patch: [], patchHash: "fixture-hash",
+    evidenceDir: path.join(result.campaignRoot, "history"), confirmationIdentity: "fixture-identity",
+    targetDigest: "fixture-digest", pairs: 1, maxPairs: 2,
+  };
+  fs.writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`);
+
+  const budgets = { maxCampaigns: 2, maxAgentStarts: 10, maxEvaluatorRuns: 40, deadlineMs: 600_000 };
+  const contract = normalizeRunContract({
+    version: 1,
+    outcome: { statement: "fixture loop resume", unit: "ms", higherIsBetter: false, minimumUsefulGain: "5%" },
+    preserved: { gates: [] }, scope: { roots: [], protectedAssets: [] },
+    execution: { mode: "trusted-local", consent: true, envAllowlist: [], allowedCommandCategories: ["test"] },
+    models: { providers: ["local"] },
+    budgets: { ...budgets, falseAcceptBudget: 0.1 },
+  });
+  const loopRoot = path.join(project.dreamRoot, "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  const approved = approveRunContract(project.projectDir, contract);
+  fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approved }, null, 2)}\n`);
+  readOrCreateLoopBudget(path.join(loopRoot, "budget.json"), budgets);
 }
 
 function waitFor(predicate, timeoutMs = 20_000) {
@@ -87,6 +122,123 @@ test("the loop command starts directly with --consent and never asks the LLM to 
     assert.match(finished, /Dream-RSI loop finished/);
     assert.ok(harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data?.active === true),
       "the command enters loop mode before the detached run");
+    assert.equal(harness.statuses.at(-1)?.[1], "dream-rsi: active",
+      "the status returns to the normal active state after the loop finishes");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("a tool-started TUI loop animates and the tool stop cancels it", async () => {
+  const project = makeProject();
+  fs.writeFileSync(path.join(project.projectDir, "bench.mjs"), "import { writeFileSync } from 'node:fs'; writeFileSync('bench.started', 'yes'); setTimeout(() => {}, 60000);\n");
+  fs.writeFileSync(path.join(project.projectDir, "package.json"), `${JSON.stringify({
+    name: "tool-loop", private: true, scripts: { benchmark: "node bench.mjs" },
+  }, null, 2)}\n`);
+  let context;
+  let harness;
+  let tool;
+  let run;
+  let settled = false;
+  try {
+    ({ context, harness } = await boot(project));
+    context.hasUI = false;
+    context.mode = "tui";
+    tool = harness.tools.get("dream_rsi_loop");
+    run = tool.execute("tool-start", { action: "start", consent: true, include_logs: false }, undefined, undefined, context);
+    run.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => fs.existsSync(path.join(project.projectDir, "bench.started")));
+    await waitFor(() => harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length >= 2);
+    const stopped = await tool.execute("tool-stop", { action: "stop" }, undefined, undefined, context);
+    assert.match(stopped.content[0].text, /asked to stop/i);
+    const result = await run;
+    assert.match(result.content[0].text, /cancelled/i);
+    assert.equal(harness.statuses.at(-1)?.[1], "dream-rsi: active", "the indicator is restored after tool cancellation");
+  } finally {
+    if (run && !settled && tool && context) {
+      await tool.execute("cleanup-stop", { action: "stop" }, undefined, undefined, context);
+      await run;
+    }
+    project.cleanup();
+  }
+});
+
+test("tool stop reports a project mismatch and can cancel a command-started run", async () => {
+  const project = makeProject();
+  fs.writeFileSync(path.join(project.projectDir, "bench.mjs"), "import { writeFileSync } from 'node:fs'; writeFileSync('bench.started', 'yes'); setTimeout(() => {}, 60000);\n");
+  fs.writeFileSync(path.join(project.projectDir, "package.json"), `${JSON.stringify({
+    name: "cross-path-loop", private: true, scripts: { benchmark: "node bench.mjs" },
+  }, null, 2)}\n`);
+  const otherProject = path.join(project.dir, "other-project");
+  fs.mkdirSync(otherProject);
+  let context;
+  let harness;
+  let tool;
+  let started = false;
+  try {
+    ({ context, harness } = await boot(project));
+    context.hasUI = false;
+    context.mode = "tui";
+    tool = harness.tools.get("dream_rsi_loop");
+    await harness.commands.get("dream-rsi").handler("loop --consent --no-logs", context);
+    started = true;
+    await waitFor(() => fs.existsSync(path.join(project.projectDir, "bench.started")));
+    await waitFor(() => harness.statuses.some(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")));
+
+    const mismatch = await tool.execute("wrong-project-stop", { action: "stop", project_dir: otherProject }, undefined, undefined, context);
+    assert.equal(mismatch.details.aborted, false);
+    assert.match(mismatch.content[0].text, /still running in this session.*was not stopped/i);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), false,
+      "a stop for another project does not cancel the session-owned loop");
+
+    const stopped = await tool.execute("stop-command-run", { action: "stop" }, undefined, undefined, context);
+    assert.equal(stopped.details.aborted, true);
+    assert.match(stopped.content[0].text, /asked to stop/i);
+    await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), 60_000);
+    const report = harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop").message.content;
+    assert.match(report, /cancelled/i);
+    assert.equal(harness.statuses.at(-1)?.[1], "dream-rsi: active");
+  } finally {
+    if (started && context && tool && !harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop")) {
+      await tool.execute("cleanup-stop", { action: "stop" }, undefined, undefined, context);
+      await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), 60_000);
+    }
+    project.cleanup();
+  }
+});
+
+test("rejected resume and confirm requests do not enable loop mode", async () => {
+  const project = makeProject();
+  try {
+    const { context, harness } = await boot(project);
+    context.mode = "tui";
+    const tool = harness.tools.get("dream_rsi_loop");
+    for (const action of ["resume", "confirm"]) {
+      const result = await tool.execute(`missing-${action}`, { action }, undefined, undefined, context);
+      assert.match(result.content[0].text, /No paused or interrupted campaign/i);
+    }
+    assert.equal(harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data?.active === true), false);
+    assert.equal(harness.statuses.at(-1)?.[1], null, "rejected actions leave the status inactive");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("resume and confirm use the TUI lifecycle and restore status on saved-context failure", async () => {
+  const project = makeProject();
+  try {
+    await preparePausedLoop(project);
+    const { context, harness } = await boot(project);
+    context.hasUI = false;
+    context.mode = "tui";
+    const tool = harness.tools.get("dream_rsi_loop");
+    for (const action of ["resume", "confirm"]) {
+      const result = await tool.execute(`fixture-${action}`, { action, include_logs: false }, undefined, undefined, context);
+      assert.match(result.content[0].text, /resume failed/i, `${action} reports the intentionally missing saved loop context`);
+      assert.ok(harness.statuses.some(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")), `${action} enters the shared TUI lifecycle`);
+      assert.equal(harness.statuses.at(-1)?.[1], "dream-rsi: active", `${action} restores active status after failure`);
+    }
   } finally {
     project.cleanup();
   }
@@ -115,6 +267,8 @@ test("the loop command finishes the run before a one-shot session ends", async (
     assert.equal(harness.sentMessages.length, 0, "no chat message asks an LLM to call dream_rsi_loop");
     assert.ok(written.some((text) => /Dream-RSI loop finished/.test(text)),
       "a print session shows the report on the standard error stream");
+    assert.equal(harness.statuses.every(([, status]) => !/looping/.test(status ?? "")), true,
+      "a non-TUI session never shows the animated status");
   } finally {
     project.cleanup();
   }
@@ -156,13 +310,100 @@ test("the loop command stops the running loop when no campaign exists yet", asyn
     context.hasUI = false;
     context.mode = "tui";
     await harness.commands.get("dream-rsi").handler("loop --consent --no-logs", context);
-    await waitFor(() => harness.entries.some((entry) => entry.customType === "pi-dream-rsi/mode" && entry.data?.active === true));
+    await waitFor(() => harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length >= 2);
+    const frames = new Set(harness.statuses.map(([, status]) => status).filter((status) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")));
+    assert.ok(frames.size > 1, "the white-square status animates while the loop is active");
     await harness.commands.get("dream-rsi").handler("stop", context);
     assert.match(harness.notifications.at(-1), /running Dream-RSI loop was asked to stop/i,
       "the stop reaches the detached run even before a campaign record exists");
     await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), 60_000);
     const report = harness.injectedMessages.find((entry) => entry.message.customType === "dream-rsi/loop").message.content;
     assert.match(report, /cancelled/i, "the aborted run reports a cancellation");
+    assert.equal(harness.statuses.at(-1)?.[1], "dream-rsi: active", "the indicator is cleared after a stopped loop");
+  } finally {
+    project.cleanup();
+  }
+});
+
+test("overlapping tool actions cannot replace the animation for an active command run", async () => {
+  const project = makeProject();
+  fs.writeFileSync(path.join(project.projectDir, "bench.mjs"), "import { writeFileSync } from 'node:fs'; writeFileSync('bench.started', 'yes'); setTimeout(() => {}, 60000);\n");
+  fs.writeFileSync(path.join(project.projectDir, "package.json"), `${JSON.stringify({
+    name: "overlapping-loop", private: true, scripts: { benchmark: "node bench.mjs" },
+  }, null, 2)}\n`);
+  let started = false;
+  let context;
+  let harness;
+  try {
+    ({ context, harness } = await boot(project));
+    context.hasUI = false;
+    context.mode = "tui";
+    await harness.commands.get("dream-rsi").handler("loop --consent --no-logs", context);
+    started = true;
+    await waitFor(() => fs.existsSync(path.join(project.projectDir, "bench.started")));
+    await waitFor(() => harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length >= 2);
+    const tool = harness.tools.get("dream_rsi_loop");
+    const before = harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length;
+    const overlaps = [];
+    for (const action of ["resume", "confirm", "start"]) {
+      overlaps.push(await tool.execute(`overlap-${action}`, { action, consent: true, include_logs: false }, undefined, undefined, context));
+    }
+    const afterCall = harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length;
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    const afterWait = harness.statuses.filter(([, status]) => /dream-rsi: [◳◲◱◰] looping/.test(status ?? "")).length;
+    assert.ok(afterWait > afterCall && afterCall >= before, "the original run keeps animating after overlapping tool actions return");
+    for (const overlap of overlaps) {
+      assert.equal(overlap.details?.ok, false, "a second run is rejected before touching the active indicator");
+      assert.match(overlap.content[0].text, /already running/i);
+    }
+  } finally {
+    if (started && context && harness) {
+      await harness.commands.get("dream-rsi").handler("stop", context);
+      await waitFor(() => harness.injectedMessages.some((entry) => entry.message.customType === "dream-rsi/loop"), 60_000);
+    }
+    project.cleanup();
+  }
+});
+
+test("campaign updates preserve the loop animation while still publishing campaign details", () => {
+  const statuses = [];
+  const updates = [];
+  const ctx = { ui: { setStatus: (...args) => statuses.push(args) } };
+  let animating = true;
+  const update = campaignUpdate(ctx, (value) => updates.push(value), () => false, () => animating);
+  const campaign = {
+    state: { kind: "running", phase: "experiment", iteration: 1 }, completedCycles: [],
+    limits: { maxCycles: 2, maxAgentStarts: 10, maxEvaluatorRuns: 20 }, goal: "fixture goal",
+    projectDir: "/fixture", scope: [], noGainCycles: 0, bestScore: 1, agentStarts: 0, evaluatorRuns: 0,
+    effectiveEvaluatorTimeoutMs: 1000, deadlineAt: new Date().toISOString(), rejections: [],
+  };
+  update(campaign);
+  assert.equal(statuses.length, 0, "campaign phase status does not overwrite the active animation");
+  assert.equal(updates.length, 1, "campaign details still reach the tool update callback");
+  animating = false;
+  update(campaign);
+  assert.equal(statuses.at(-1)?.[1], "dream-rsi: experiment (0/2)", "campaign status resumes after animation ownership ends");
+});
+
+test("session shutdown clears the loop animation and aborts the running loop", async () => {
+  const project = makeProject();
+  fs.writeFileSync(path.join(project.projectDir, "bench.mjs"), "setTimeout(() => {}, 60000);\n");
+  fs.writeFileSync(path.join(project.projectDir, "package.json"), `${JSON.stringify({
+    name: "shutdown-loop", private: true, scripts: { bench: "node bench.mjs" },
+  }, null, 2)}\n`);
+  try {
+    const { context, harness } = await boot(project);
+    context.hasUI = false;
+    context.mode = "tui";
+    await harness.commands.get("dream-rsi").handler("loop --consent --no-logs", context);
+    await waitFor(() => harness.statuses.some(([, status]) => /looping$/.test(status ?? "")));
+    await harness.handlers.get("session_shutdown")({}, context);
+    const countAtShutdown = harness.statuses.length;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.equal(harness.statuses.length, countAtShutdown, "no animation ticks occur after shutdown");
+    await waitFor(() => fs.existsSync(path.join(project.dreamRoot, "loop", "latest-report.json")), 60_000);
+    assert.match(fs.readFileSync(path.join(project.dreamRoot, "loop", "latest-report.json"), "utf8"), /\"stopCode\":\s*\"cancelled\"/,
+      "cleanup waits until the aborted loop has written its final cancellation report");
   } finally {
     project.cleanup();
   }
