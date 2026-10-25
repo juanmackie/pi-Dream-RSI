@@ -492,7 +492,7 @@ test("a non-time outcome cannot fall back to a wall-clock duration lever without
   assert.equal(timed.levers[0]?.metricKind, "command-duration", "a time-like unit needs no justification");
 });
 
-test("the score lever is ranked ahead of a duration lever that the same contract permits", async () => {
+test("a declared evaluator excludes alternate metrics even when a proxy justification exists", async () => {
   const dir = project(SCORE_PROJECT);
   const runContract = scoreContract({
     outcome: evaluatorOutcome({ proxyJustification: "wall-clock duration tracks the same model's accuracy" }),
@@ -503,8 +503,46 @@ test("the score lever is ranked ahead of a duration lever that the same contract
     probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
   });
   const inventory = buildReconInventory({ contract: runContract, recon });
-  assert.equal(inventory.levers[0]?.metricKind, "score", "the declared outcome outranks a proxy");
-  assert.ok(inventory.levers.some((lever) => lever.metricKind === "command-duration"), "the justified proxy is still offered");
+  assert.deepEqual(inventory.levers.map((lever) => lever.metricKind), ["score"], "qualification failure must not substitute a proxy for the declared instrument");
+  assert.ok(inventory.rejected.some((entry) => /declared evaluator is authoritative/.test(entry.reason)), "alternate measurements are rejected with an explicit reason");
+});
+
+test("an importless evaluator can claim explicit roots without borrowing unrelated manifest graphs", async () => {
+  const dir = project({
+    "package.json": `${JSON.stringify({ name: "dynamic-score", private: true, type: "module", scripts: { bench: "node bench.mjs" } }, null, 2)}\n`,
+    "bench.mjs": 'import "./docs/unrelated.mjs";\n',
+    "docs/unrelated.mjs": "export const unrelated = true;\n",
+    "src/model.mjs": "export const accuracy = () => 0.5;\n",
+    "eval/score.mjs": 'console.log(JSON.stringify({ score: 1, valid: true }));\n',
+  });
+  const runContract = scoreContract();
+  const recon = await reconProject({
+    projectDir: dir,
+    contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  });
+  assert.ok(recon.graphs["npm run bench"].includes("docs/unrelated.mjs"), "the unrelated manifest graph is present but must not be borrowed");
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  assert.equal(inventory.levers.length, 1, `expected an explicitly rooted dynamic claim, got ${JSON.stringify(inventory.rejected)}`);
+  assert.deepEqual(inventory.levers[0].scopeFiles, ["src/model.mjs"]);
+  assert.ok(inventory.levers[0].reasons.some((reason) => /unverified dynamic claim/i.test(reason)));
+  assert.deepEqual(inventory.levers[0].command.argv, ["node", "eval/score.mjs"], "the evaluator remains pinned");
+});
+
+test("an importless evaluator with whole-workspace scope cannot nominate arbitrary files", async () => {
+  const dir = project({
+    "package.json": `${JSON.stringify({ name: "unscoped-score", private: true, type: "module" }, null, 2)}\n`,
+    "src/model.mjs": "export const accuracy = () => 0.5;\n",
+    "eval/score.mjs": 'console.log(JSON.stringify({ score: 1, valid: true }));\n',
+  });
+  const runContract = scoreContract({ scope: { roots: [], protectedAssets: [] } });
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  assert.equal(inventory.levers.length, 0);
+  assert.match(inventory.rejected[0].reason, /no statically reached implementation.*no explicit nonempty editable roots/i);
 });
 
 test("a score evaluator whose exercised code is all outside the approved scope is rejected with the reason", async () => {

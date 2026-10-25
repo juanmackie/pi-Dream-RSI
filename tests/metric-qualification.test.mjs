@@ -270,6 +270,62 @@ test("an instrument that cannot resolve the useful gain is refused, not accommod
   assert.equal(plan.evaluationContract, undefined, "a refused instrument has no contract");
 });
 
+test("a behavioral oracle still qualifies when an earlier structural gate accepts inert code", async () => {
+  const projectDir = scoreProject();
+  const runContract = scoreContract({ preserved: { gates: ["node -e 0", "node test.mjs"] } });
+  const { report } = await qualify(projectDir, runContract);
+  assert.equal(report.passed, true, JSON.stringify(report.rejections));
+  assert.ok(report.checks.some((check) => check.name === "oracle" && check.passed && /node test.mjs/.test(check.detail)));
+  const evidence = JSON.parse(fs.readFileSync(report.evidencePath, "utf8"));
+  assert.ok(evidence.events.some((event) => event.phase === "gate" && event.role === "inert" && event.command === "node test.mjs" && event.inertFiles.includes("src/model.mjs")));
+});
+
+test("all inert-accepting gates refuse before any evaluator workload is charged", async () => {
+  const projectDir = scoreProject({ testScript: SCORE_TEST_ALWAYS_PASSES });
+  let runs = 0;
+  const runContract = scoreContract({ preserved: { gates: ["node -e 0"] } });
+  const { report } = await qualify(projectDir, runContract, { beforeEvaluatorRun: () => { runs += 1; } });
+  assert.equal(report.passed, false);
+  assert.equal(runs, 4, "only pristine and inert gate controls ran; no measured workload was charged");
+  assert.match(report.rejections.join(" "), /oracle|inert/i);
+});
+
+test("qualification refuses a verifier-overlapping editable control before evaluator spend", async () => {
+  const projectDir = scoreProject();
+  const runContract = scoreContract();
+  const lever = buildReconInventory({ contract: runContract, recon: await reconProject({
+    projectDir, contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 300, timedOut: false, error: null }),
+  }) }).levers[0];
+  const plan = await synthesizeMetric({ projectDir, lever, scoreEvaluator: {
+    argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"], unit: "points", higherIsBetter: true,
+  } });
+  let runs = 0;
+  const report = await qualifyInstrument(plan, {
+    projectDir, contract: runContract, workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
+    outcome: runContract.outcome.statement, minimumUsefulGain: runContract.outcome.minimumUsefulGain,
+    editableScope: ["eval/score.mjs"], gates: ["npm run test"], beforeEvaluatorRun: () => { runs += 1; },
+  });
+  assert.equal(report.passed, false);
+  assert.equal(runs, 0);
+  assert.match(report.rejections.join(" "), /verifier-overlapping/);
+
+  // The same refusal must cover a gate script, whatever spelling the gate uses.
+  fs.writeFileSync(path.join(projectDir, "eval", "gate.mjs"), "process.exit(0);\n");
+  let gateRuns = 0;
+  const gatePlan = await synthesizeMetric({ projectDir, lever, scoreEvaluator: {
+    argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"], unit: "points", higherIsBetter: true,
+  } });
+  const gateReport = await qualifyInstrument(gatePlan, {
+    projectDir, contract: runContract, workRoot: path.join(projectDir, ".dream-rsi", "loop", "qualification"),
+    outcome: runContract.outcome.statement, minimumUsefulGain: runContract.outcome.minimumUsefulGain,
+    editableScope: ["eval/gate.mjs"], gates: ["node ./eval/gate.mjs"], beforeEvaluatorRun: () => { gateRuns += 1; },
+  });
+  assert.equal(gateReport.passed, false, "a gate script stays outside candidate scope however the gate is written");
+  assert.equal(gateRuns, 0);
+  assert.match(gateReport.rejections.join(" "), /verifier-overlapping editable control path eval\/gate\.mjs/);
+});
+
 test("an oracle that accepts inert editable code cannot qualify the instrument", async () => {
   const projectDir = nodeProject({ testScript: TEST_ALWAYS_PASSES });
   const { plan, report } = await qualify(projectDir, contract());
@@ -392,6 +448,102 @@ test("a declared score evaluator is qualified as the instrument, with its inputs
   const sensitivity = report.checks.find((check) => check.name === "sensitivity");
   assert.equal(sensitivity.passed, true, sensitivity.detail);
   assert.match(sensitivity.detail, /inert|editable/i, "the score control is the inert editable scope");
+});
+
+test("score qualification preserves bounded, redacted child diagnostics after scratch cleanup", async () => {
+  const secretKey = "DREAM_RSI_QUALIFICATION_TOKEN";
+  const secret = "qualification-secret-value";
+  const previous = process.env[secretKey];
+  process.env[secretKey] = secret;
+  const projectDir = scoreProject({ evaluator: `console.log(JSON.stringify({ valid: false, fail_class: "build_error", error: "compiler rejected source; token=${secret}" }));\nconsole.error("stderr detail: missing generated module");\nprocess.exit(1);\n` });
+  const workRoot = path.join(projectDir, ".dream-rsi", "loop", "qualification");
+  try {
+    const runContract = scoreContract({ execution: { mode: "trusted-local", consent: true, envAllowlist: [secretKey], allowedCommandCategories: ["test", "benchmark"] } });
+    const { report } = await qualify(projectDir, runContract, { workRoot });
+    const workload = report.checks.find((check) => check.name === "workload");
+    assert.equal(workload.passed, false);
+    assert.match(workload.detail, /fail_class=build_error/);
+    assert.match(workload.detail, /compiler rejected source/);
+    assert.match(workload.detail, /stderr detail: missing generated module/);
+    assert.doesNotMatch(workload.detail, /qualification-secret-value/);
+    assert.deepEqual(fs.readdirSync(workRoot).filter((name) => name.startsWith("qualify-")), [], "the disposable qualification copy is still removed");
+    assert.ok(workload.detail.length < 12_500, "child diagnostics stay bounded");
+    assert.ok(report.evidencePath && fs.existsSync(report.evidencePath), "a durable qualification receipt survives scratch cleanup");
+    const evidence = JSON.parse(fs.readFileSync(report.evidencePath, "utf8"));
+    const failingWorkload = evidence.events.find((event) => event.phase === "workload" && event.failClass);
+    assert.ok(failingWorkload, "the failing workload is recorded");
+    assert.equal(failingWorkload.child.exit_code, 1, "the child's own exit status is retained, not the wrapper's");
+    assert.ok(Array.isArray(failingWorkload.child.argv) && failingWorkload.child.argv.length > 0, "the exact argv that ran is retained");
+    assert.doesNotMatch(JSON.stringify(evidence), /qualification-secret-value/);
+    assert.ok(evidence.runtime.node && evidence.runtime.contentHash);
+    assert.ok(evidence.runtime.engineDigest, "the receipt names the engine source that actually ran");
+    assert.ok(evidence.runtime.evaluatorDigest, "the receipt pins the evaluator source that actually ran");
+    const workloadEvents = evidence.events.filter((event) => event.phase === "workload");
+    assert.ok(workloadEvents.every((event) => Number.isInteger(event.wrapperTimeoutMs) && Number.isInteger(event.workloadTimeoutMs)), "each workload event reports the effective outer and inner allowances");
+    assert.ok(workloadEvents.every((event) => event.wrapperTimeoutMs >= event.workloadTimeoutMs), "the wrapper cap bounds the inner workload allowance");
+  } finally {
+    if (previous === undefined) delete process.env[secretKey];
+    else process.env[secretKey] = previous;
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
+});
+
+test("qualification refuses an evaluator that changes while it is being measured", async () => {
+  const projectDir = scoreProject();
+  const evaluatorPath = path.join(projectDir, "eval", "score.mjs");
+  const original = fs.readFileSync(evaluatorPath, "utf8");
+  let rewritten = false;
+  const { plan, report } = await qualify(projectDir, scoreContract(), {
+    attempts: 1,
+    beforeEvaluatorRun: () => {
+      if (rewritten) return;
+      rewritten = true;
+      fs.writeFileSync(evaluatorPath, `${original}\n// edited while qualification was running\n`, "utf8");
+    },
+  });
+
+  assert.equal(report.passed, false, "a moving instrument identity must not qualify");
+  const identity = report.checks.find((check) => check.name === "identity-stability");
+  assert.ok(identity, "the runtime identity is reported explicitly");
+  assert.equal(identity.passed, false);
+  assert.match(identity.detail, /changed while qualification was running/);
+  assert.equal(plan.ready, false);
+});
+
+test("a retained scratch copy is recorded as durable cleanup evidence, not only a console warning", async () => {
+  const projectDir = scoreProject();
+  const workRoot = path.join(projectDir, ".dream-rsi", "loop", "qualification");
+  const errors = [];
+  const originalError = console.error;
+  console.error = (message) => errors.push(String(message));
+  try {
+    const { report } = await qualify(projectDir, scoreContract(), {
+      workRoot,
+      removeScratch: () => {
+        const error = new Error("still in use by a live child process");
+        error.code = "ENOTEMPTY";
+        throw error;
+      },
+    });
+    assert.ok(report.evidencePath && fs.existsSync(report.evidencePath), "the receipt is written even when cleanup fails");
+    const evidence = JSON.parse(fs.readFileSync(report.evidencePath, "utf8"));
+    const cleanup = evidence.events.filter((event) => event.phase === "cleanup");
+    assert.ok(cleanup.length > 0, "a failed cleanup reaches the durable receipt");
+    assert.ok(cleanup.every((event) => event.failClass === "cleanup_failed" && event.retainedScratch), "each retained copy is named");
+    assert.match(cleanup[0].error, /still in use by a live child process/);
+    assert.ok(evidence.events.some((event) => event.phase === "workload"), "the measurement itself is still recorded");
+    // Gate copies are cleaned up before the workload runs, so ordering is checked per event:
+    // a cleanup event may only appear after some measurement event has already been recorded.
+    const firstMeasurement = evidence.events.findIndex((event) => event.phase === "workload" || event.phase === "gate");
+    assert.ok(firstMeasurement >= 0, "the receipt records the measurements before their cleanups");
+    assert.ok(evidence.events.every((event, index) => event.phase !== "cleanup"
+      || evidence.events.slice(0, index).some((prior) => prior.phase === "workload" || prior.phase === "gate")),
+    "every retained copy is attributed to a measurement that was already recorded");
+    assert.ok(errors.some((line) => /could not remove scratch directory/.test(line)), "the operator still sees the retained path");
+  } finally {
+    console.error = originalError;
+    fs.rmSync(projectDir, { recursive: true, force: true });
+  }
 });
 
 test("the score budget-fit check reports the promotion floor the confirmation actually needs", async () => {

@@ -192,6 +192,31 @@ function scanFiles(projectDir: string): ReconFile[] {
   return files;
 }
 
+/** Read-only preparation evidence. Suggestions are not executable approvals or qualified instruments. */
+export function discoverMeasurementOptions(projectDir: string, contract: RunContract) {
+  const declared = discoverCommands(projectDir, contract);
+  const scripts = scanFiles(projectDir)
+    .filter(file => /(?:measure|benchmark|score|evaluator|(?:^|\/)bench\.)/i.test(file.path) && /\.(?:py|mjs|cjs|js)$/.test(file.path))
+    .slice(0, 32)
+    .map(file => {
+      const source = readText(path.join(projectDir, file.path), MAX_SOURCE_BYTES) ?? "";
+      const outputHint = /score\.json/.test(source) ? "score-json"
+        : /JSON\.stringify|json\.dumps/.test(source) && /(?:["']score["']|\bscore\s*:)/.test(source) ? "stdout-json" : null;
+      return {
+        source: file.path, argv: [file.path.endsWith(".py") ? (process.platform === "win32" ? "python" : "python3") : "node", file.path],
+        outputHint, qualification: "not-run" as const,
+        implementationFiles: importGraph(projectDir, file.path).files.filter(entry => entry !== file.path),
+        notes: ["Source-based suggestion only; inspect arguments, output, interpreter and pinned inputs before declaring it.",
+          ...(/--benchmark|--emit-reference/.test(source) ? ["Diagnostic/reference-write modes are mentioned; the suggested argv does not enable them."] : [])],
+      };
+    });
+  return {
+    evaluator: contract.outcome.evaluator ?? null,
+    scripts, commands: declared.commands, diagnostics: [...declared.blockers, ...declared.notes],
+    recommendation: contract.outcome.evaluator ? "reuse-declared-evaluator" : scripts.length ? "inspect-existing-instruments" : "inspect-declared-workloads-or-propose-setup",
+  };
+}
+
 function packageManager(projectDir: string): { name: string; shim: boolean } {
   if (fs.existsSync(path.join(projectDir, "bun.lockb")) || fs.existsSync(path.join(projectDir, "bun.lock"))) return { name: "bun", shim: true };
   if (fs.existsSync(path.join(projectDir, "pnpm-lock.yaml"))) return { name: "pnpm", shim: true };
@@ -542,6 +567,7 @@ export async function probeCommand(options: ReconOptions, command: DiscoveredCom
       timeoutMs: options.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
       envOnly: true,
       env: restrictedEnvironment(options.contract),
+      redactEnvKeys: options.contract.execution.envAllowlist,
       logPath: null,
       ...(options.signal ? { signal: options.signal } : {}),
     });
@@ -609,6 +635,15 @@ export async function reconProject(options: ReconOptions): Promise<ReconResult> 
     graphs[command.label] = walked.files;
     if (measurable.includes(command)) for (const file of walked.files) graph.add(file);
   }
+  const evaluatorGraph = new Set<string>();
+  for (const token of argvPathTokens(options.contract.outcome.evaluator?.argv ?? [])) {
+    const absolute = path.resolve(projectDir, token);
+    if (!isInside(projectDir, absolute) || readText(absolute, MAX_SOURCE_BYTES) === null) continue;
+    const walked = importGraph(projectDir, relativeOf(projectDir, absolute));
+    truncated = truncated || walked.truncated;
+    for (const file of walked.files) evaluatorGraph.add(file);
+  }
+  if (evaluatorGraph.size > 0) graphs["contract.outcome.evaluator"] = [...evaluatorGraph].sort();
   if (hasMeasuredProbe && graph.size === 0) {
     blockers.push("the declared workload does not name a local entry file, so its patch scope cannot be attributed to measured code");
   }
@@ -651,7 +686,11 @@ function pathTokens(values: string[] | undefined): string[] {
 
 /** Only the argv entries that name a project file, not the interpreter or flags. */
 function argvPathTokens(argv: string[]): string[] {
-  return pathTokens(argv).filter((token) => token.includes("/")
+  // An absolute interpreter path can be inside the project (.venv/bin/python).
+  // It is runtime infrastructure, not measured implementation source. Keep argv[0]
+  // only when it is itself a source-script entry point.
+  const files = argv.filter((token, index) => index > 0 || SOURCE_EXTENSIONS.has(path.extname(token).toLowerCase()) || /\.(?:sh|ps1)$/i.test(token));
+  return pathTokens(files).filter((token) => token.includes("/")
     || /\.(?:mjs|cjs|js|jsx|ts|tsx|mts|cts|py|rb|go|rs|java|kt|cs|sh|ps1|json|ya?ml|toml|csv|txt)$/i.test(token));
 }
 
@@ -681,15 +720,14 @@ function scoreEvaluatorLever(options: {
 }): ScoreLeverBuild {
   const { contract, evaluator } = options;
   const id = leverId("recon-command", ["contract.outcome.evaluator", evaluator.output, ...evaluator.argv]);
-  // Scope is the union of the measured workloads' import graphs: the evaluator may
-  // run more than one declared entry, but every proposed file must be exercised.
-  const graph = [...new Set(options.recon.commands
-    .filter((command) => command.category === "benchmark" || command.category === "custom")
-    .flatMap((command) => options.recon.graphs[command.label] ?? []))].sort();
-  // A user-declared editable root is explicit attribution evidence when the
-  // evaluator is a standalone score program with no imported workload graph.
-  const attributable = graph.length > 0
-    ? graph
+  // Trace the evaluator first. Only an evaluator's own static imports establish
+  // static attribution; unrelated manifest command graphs cannot stand in for it.
+  const evaluatorGraph = options.recon.graphs["contract.outcome.evaluator"] ?? [];
+  const reachedImplementation = evaluatorGraph.some((file) => !pinnedEvaluatorFile(evaluator, file));
+  const attributable = reachedImplementation
+    ? evaluatorGraph
+    // Without a reached implementation, explicit roots are only a candidate
+    // nomination. Qualification must prove the evaluator responds to edits.
     : contract.scope.roots.length > 0 ? options.recon.files.map((file) => file.path) : [];
   const inScope = attributable.filter((file) => pathWithin(file, contract.scope.roots)
     && !protectedAsset(contract, file)
@@ -697,7 +735,9 @@ function scoreEvaluatorLever(options: {
   const outOfScope = attributable.filter((file) => !inScope.includes(file));
   if (inScope.length === 0) {
     return {
-      reason: `the declared score evaluator ${evaluator.argv.join(" ")} is measurable but no file it exercises is inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"}), so no patch can be attributed to it`,
+      reason: reachedImplementation
+        ? `the declared score evaluator ${evaluator.argv.join(" ")} statically reaches implementation code, but none is inside the approved editable scope (${contract.scope.roots.join(", ") || "whole workspace"}), so no patch can be attributed to it`
+        : `the declared score evaluator ${evaluator.argv.join(" ")} has no statically reached implementation and no explicit nonempty editable roots nominate candidate files; no patch can be attributed to it`,
     };
   }
   const attempt = options.attempt;
@@ -728,7 +768,9 @@ function scoreEvaluatorLever(options: {
     reasons: [
       `declared score evaluator: ${evaluator.argv.join(" ")} reports ${evaluator.output}; direction ${direction}, unit ${contract.outcome.unit} (from the approved outcome)`,
       `evaluator argv and inputs are pinned verifier inputs and never candidate-editable${pinned.length > 0 ? `: ${pinned.join(", ")}` : ""}`,
-      `scope: ${inScope.length} file(s) from the measured workload's import graph inside the approved editable scope; ${outOfScope.length} measured file(s) excluded`,
+      reachedImplementation
+        ? `scope: ${inScope.length} file(s) from the evaluator's static import graph inside the approved editable scope; ${outOfScope.length} out-of-scope or pinned file(s) excluded`
+        : `unverified dynamic claim: ${inScope.length} candidate file(s) nominated by the explicit editable roots, not static attribution; qualification must verify sensitivity`,
       options.gates.length > 0
         ? `gate: ${options.gates.join(", ")}`
         : "no declared test gate; the declared evaluator's own validity verdict is the only oracle",
@@ -742,7 +784,7 @@ function scoreEvaluatorLever(options: {
 
 /**
  * Turn recon evidence into ranked levers. A declared score evaluator becomes the
- * first lever because it measures the approved outcome directly; otherwise the
+ * only instrument because it measures the approved outcome directly; otherwise the
  * measured workload with the largest attributable duration becomes a duration
  * lever scoped to the code the measurement actually exercises. A declared test
  * command becomes the gate. Everything else is rejected with the reason, never
@@ -759,8 +801,8 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   const gates = passingTests.map((command) => command.label);
   if (gates.length > 0) diagnostics.push(`Declared test gates: ${gates.join(", ")}.`);
 
-  // A declared score evaluator is the primary instrument: it says what the number
-  // is and which direction is better, so it outranks any proxy lever.
+  // A declared score evaluator fixes what the number means and its direction.
+  // Other measurements can be diagnostics, but cannot replace it on failure.
   let scoreLever: LeverProposal | null = null;
   if (contract.outcome.evaluator) {
     const evaluator = contract.outcome.evaluator;
@@ -889,9 +931,12 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
     rejected.push({ id: leverId("recon-command", [blocker]), sourceKind: "recon-command", reason: blocker, readiness: 0 });
   }
 
+  if (contract.outcome.evaluator) {
+    for (const lever of levers) rejected.push({ id: lever.id, sourceKind: lever.sourceKind, readiness: 0,
+      reason: `The declared evaluator is authoritative; ${lever.metricKind} is an alternate measurement and cannot be used as a proxy fallback if that evaluator fails qualification.` });
+    return { levers: scoreLever ? [scoreLever] : [], rejected, diagnostics };
+  }
   levers.sort((a, b) => b.score - a.score || b.estimates.expectedGain - a.estimates.expectedGain || a.id.localeCompare(b.id));
-  // The declared outcome outranks every proxy, regardless of the uncalibrated prior.
-  if (scoreLever) levers.unshift(scoreLever);
   return { levers, rejected, diagnostics };
 }
 

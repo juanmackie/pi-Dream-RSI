@@ -1,0 +1,3 @@
+# Scope authorizes writes, not verification reads
+
+A correctness test outside implementation scope must remain runnable without giving candidates permission to rewrite that test. Dream-RSI therefore checks only candidate edits and exact bootstrap write plans against editable scope; existing evaluator, fixture, and gate references are read/run dependencies, not inferred write requirements. Requiring those references in editable scope both blocked valid narrow contracts and encouraged unnecessary authority expansion, so all preflight paths now share write-plan validation while gate execution and promotion checks remain unchanged.

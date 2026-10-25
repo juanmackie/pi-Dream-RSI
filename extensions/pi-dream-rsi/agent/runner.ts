@@ -73,6 +73,8 @@ export interface RunOptions {
   idleTimeoutMs?: number;
   logPath?: string | null;
   env?: Record<string, string>;
+  /** Environment keys whose values are sensitive and must not appear in captured output. */
+  redactEnvKeys?: string[];
   /**
    * Do not inherit the parent environment at all; use only `env`. Probes,
    * instruments and gates for an unvetted repository run this way so provider
@@ -135,6 +137,43 @@ export function quoteForShell(arg: string): string {
   if (!/[\s"]/.test(arg)) return arg;
   if (arg.includes('"')) throw new Error(`argument cannot be quoted safely for a shell: ${arg}`);
   return `"${arg}"`;
+}
+
+function secretRedactor(values: string[]): { push(text: string, final?: boolean): string } {
+  const secrets = [...new Set(values.filter((value) => value.length > 0))].sort((a, b) => b.length - a.length);
+  const longest = Math.max(0, ...secrets.map((value) => value.length));
+  let pending = "";
+  const redact = (text: string): string => secrets.reduce((safe, secret) => safe.split(secret).join("[redacted]"), text);
+  return {
+    push(text, final = false) {
+      pending += text;
+      if (final) {
+        const output = redact(pending);
+        pending = "";
+        return output;
+      }
+      let output = "";
+      let safeStartLimit = Math.max(0, pending.length - longest + 1);
+      while (true) {
+        let matchIndex = -1;
+        let matchedSecret = "";
+        for (const secret of secrets) {
+          const index = pending.indexOf(secret);
+          if (index >= 0 && index < safeStartLimit && (matchIndex < 0 || index < matchIndex)) {
+            matchIndex = index;
+            matchedSecret = secret;
+          }
+        }
+        if (matchIndex < 0) break;
+        output += redact(pending.slice(0, matchIndex)) + "[redacted]";
+        pending = pending.slice(matchIndex + matchedSecret.length);
+        safeStartLimit = Math.max(0, pending.length - longest + 1);
+      }
+      output += redact(pending.slice(0, safeStartLimit));
+      pending = pending.slice(safeStartLimit);
+      return output;
+    },
+  };
 }
 
 async function collect(
@@ -208,9 +247,22 @@ async function collect(
   const stderrDecoder = new StringDecoder("utf8");
   let stdoutTail = "";
   let stderrTail = "";
+  const inheritedSecrets = Object.entries(process.env)
+    .filter(([key, value]) => value !== undefined && /(secret|token|password|credential|api[_-]?key|auth|private[_-]?key)/i.test(key))
+    .map(([, value]) => value!);
+  const explicitSensitiveKeys = new Set(options.redactEnvKeys ?? []);
+  const suppliedSecrets = Object.entries(options.env ?? {})
+    .filter(([key, value]) => value !== undefined && (explicitSensitiveKeys.has(key) || /(secret|token|password|credential|api[_-]?key|auth|private[_-]?key)/i.test(key)))
+    .map(([, value]) => value);
+  const redactionValues = [...suppliedSecrets, ...inheritedSecrets];
+  const stdoutRedactor = secretRedactor(redactionValues);
+  const stderrRedactor = secretRedactor(redactionValues);
+  const logRedactor = secretRedactor(redactionValues);
   // Whether the child emitted any stdout/stderr bytes at all. Tails alone cannot
   // prove this for older results, so record it explicitly for new executions.
   let sawOutput = false;
+  let stdoutSource: NodeJS.ReadableStream | null = null;
+  let stderrSource: NodeJS.ReadableStream | null = null;
   const append = (current: string, chunk: string): string => {
     const next = current + chunk;
     return next.length > TAIL_BYTES ? next.slice(next.length - TAIL_BYTES) : next;
@@ -231,10 +283,16 @@ async function collect(
       if (settled) return;
       settled = true;
       evidence.durationMs = Date.now() - started;
-      const stdoutEnd = stdoutDecoder.end();
-      const stderrEnd = stderrDecoder.end();
+      const stdoutEnd = stdoutRedactor.push(stdoutDecoder.end(), true);
+      const stderrEnd = stderrRedactor.push(stderrDecoder.end(), true);
       stdoutTail = append(stdoutTail, stdoutEnd); stderrTail = append(stderrTail, stderrEnd);
       decoder.feed("stdout", stdoutEnd); decoder.feed("stderr", stderrEnd); decoder.finish();
+      const stdoutLogEnd = logRedactor.push(stdoutEnd);
+      const stderrLogEnd = logRedactor.push(stderrEnd);
+      const logEnd = logRedactor.push("", true);
+      if (stdoutLogEnd && stdoutSource) writeLog(stdoutSource, Buffer.from(stdoutLogEnd));
+      if (stderrLogEnd && stderrSource) writeLog(stderrSource, Buffer.from(stderrLogEnd));
+      if (logEnd && (stdoutSource || stderrSource)) writeLog((stderrSource ?? stdoutSource)!, Buffer.from(logEnd));
       if (compactAgentLog && options.logPath) {
         try { fs.writeFileSync(options.logPath, compactLog, { flag: "w" }); }
         catch (error) { logError = error instanceof Error ? error.message : String(error); }
@@ -326,6 +384,8 @@ async function collect(
     }
 
     const running = child;
+    stdoutSource = running.stdout;
+    stderrSource = running.stderr;
     options.signal?.addEventListener("abort", onAbort, { once: true });
 
     const timeoutRun = (kind: "wall" | "idle"): void => {
@@ -359,17 +419,19 @@ async function collect(
     };
     running.stdout?.on("data", (chunk: Buffer) => {
       if (chunk.length > 0) { sawOutput = true; resetIdleTimer(); }
-      const text = stdoutDecoder.write(chunk);
+      const text = stdoutRedactor.push(stdoutDecoder.write(chunk));
       decoder.feed("stdout", text);
       stdoutTail = append(stdoutTail, text);
-      writeLog(running.stdout as NodeJS.ReadableStream, chunk);
+      const logText = logRedactor.push(text);
+      if (logText) writeLog(running.stdout as NodeJS.ReadableStream, Buffer.from(logText));
     });
     running.stderr?.on("data", (chunk: Buffer) => {
       if (chunk.length > 0) { sawOutput = true; resetIdleTimer(); }
-      const text = stderrDecoder.write(chunk);
+      const text = stderrRedactor.push(stderrDecoder.write(chunk));
       decoder.feed("stderr", text);
       stderrTail = append(stderrTail, text);
-      writeLog(running.stderr as NodeJS.ReadableStream, chunk);
+      const logText = logRedactor.push(text);
+      if (logText) writeLog(running.stderr as NodeJS.ReadableStream, Buffer.from(logText));
     });
     running.on("close", (code, signal) => finish({ ok: code === 0 && !timedOut && !aborted, code, signal }));
     if (running.pid !== undefined) {
@@ -386,6 +448,11 @@ async function collect(
     // An already-aborted signal never fires 'abort': cancel the freshly spawned child explicitly.
     if (options.signal?.aborted) onAbort();
   });
+}
+
+/** Run one exact executable and argv without shell interpretation. */
+export function runCommand(file: string, args: string[], options: RunOptions): Promise<CommandResult> {
+  return collect(file, args, { ...options, shell: false });
 }
 
 /** Run a task's evaluator. `command` is a shell command line by design (task-controlled). */

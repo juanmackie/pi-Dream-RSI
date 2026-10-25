@@ -5,10 +5,11 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 import { EXT, jump } from "./fixtures.mjs";
 
 const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump("engine/task.ts");
-const { buildAgentArgs, piSelfInvocation, runAgent, describeSpawnError, copyWorkspace } = await jump("agent/runner.ts");
+const { buildAgentArgs, piSelfInvocation, runAgent, runShellCommand, describeSpawnError, copyWorkspace } = await jump("agent/runner.ts");
 const { OutputDecoder } = await jump("agent/output.ts");
 
 test("pi JSON output decodes bounded usage and content-free tool evidence", () => {
@@ -24,6 +25,102 @@ test("pi JSON output decodes bounded usage and content-free tool evidence", () =
   assert.equal(events.filter((event) => event.edit).length, 1);
   assert.equal(events.filter((event) => event.read).length, 1);
   assert.doesNotMatch(JSON.stringify(events), /SECRET|verifier\/private|private\/file/);
+});
+
+test("allowlisted environment values are redacted from evaluator output and logs, including across chunks", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-redact-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const secret = "token-VERY-SECRET-value";
+  const output = path.join(dir, "evaluator.log");
+  const script = path.join(dir, "evaluator.mjs");
+  fs.writeFileSync(script, "process.stdout.write(process.env.DREAM_RSI_SECRET.slice(0, 10)); setTimeout(() => process.stdout.write(process.env.DREAM_RSI_SECRET.slice(10) + '\\n'), 10); setTimeout(() => process.stdout.write('tail'), 20);\n");
+  const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
+  const result = await runShellCommand(`${quote(process.execPath)} ${quote(script)}`, {
+    cwd: dir, timeoutMs: 10_000, envOnly: true, env: { DREAM_RSI_SECRET: secret }, logPath: output,
+  });
+  assert.equal(result.ok, true);
+  assert.match(result.stdoutTail, /\[redacted\]/);
+  assert.doesNotMatch(result.stdoutTail, /VERY-SECRET/);
+  assert.doesNotMatch(fs.readFileSync(output, "utf8"), /VERY-SECRET/);
+});
+
+test("allowlisted credentials split across stdout and stderr are redacted in the combined log", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-redact-streams-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, "evaluator.mjs");
+  const output = path.join(dir, "evaluator.log");
+  fs.writeFileSync(script, "process.stdout.write('abc'); process.stderr.write('def');\n");
+  const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
+  const result = await runShellCommand(`${quote(process.execPath)} ${quote(script)}`, {
+    cwd: dir, timeoutMs: 10_000, envOnly: true, env: { DREAM_RSI_TOKEN: "abcdef" }, redactEnvKeys: ["DREAM_RSI_TOKEN"], logPath: output,
+  });
+  assert.equal(result.ok, true);
+  const log = fs.readFileSync(output, "utf8");
+  assert.match(log, /\[redacted\]/);
+  assert.doesNotMatch(log, /abcdef/);
+});
+
+test("AbortSignal cancellation stops an owned Node descendant before runner resolution", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-abort-tree-"));
+  const pidFile = path.join(dir, "child.pid");
+  const script = path.join(dir, "parent.mjs");
+  const controller = new AbortController();
+  const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const cleanup = () => { try { const pid = Number(fs.readFileSync(pidFile, "utf8")); if (alive(pid)) process.kill(pid, "SIGKILL"); } catch { /* no owned child */ } };
+  t.after(() => { cleanup(); fs.rmSync(dir, { recursive: true, force: true }); });
+  fs.writeFileSync(script, `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(pidFile)}, String(child.pid));\nsetInterval(() => {}, 1000);\n`);
+  const running = runShellCommand(`"${process.execPath}" "${script}"`, { cwd: dir, timeoutMs: 10_000, signal: controller.signal });
+  for (let i = 0; i < 100 && !fs.existsSync(pidFile); i += 1) await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.ok(fs.existsSync(pidFile), "parent created its owned descendant");
+  const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+  controller.abort();
+  const result = await running;
+  assert.equal(result.aborted, true);
+  assert.equal(alive(childPid), false, `descendant ${childPid} survived cancellation`);
+});
+
+test("a timed-out Windows evaluator stops its Python descendants", { skip: process.platform !== "win32" }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-timeout-tree-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, "evaluator.py");
+  const pidFile = path.join(dir, "child.pid");
+  fs.writeFileSync(script, [
+    "import pathlib, subprocess, sys, time",
+    `child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])`,
+    `pathlib.Path(${JSON.stringify(pidFile)}).write_text(str(child.pid))`,
+    "time.sleep(60)",
+  ].join("\n"));
+  const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
+  const result = await runShellCommand(`python ${quote(script)}`, { cwd: dir, timeoutMs: 500 });
+  assert.equal(result.timedOut, true);
+  const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+  const deadline = Date.now() + 5_000;
+  let stillRunning = true;
+  while (stillRunning && Date.now() < deadline) {
+    try {
+      execFileSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", `Get-Process -Id ${childPid} -ErrorAction Stop | Out-Null`], { stdio: "ignore", windowsHide: true });
+    } catch {
+      stillRunning = false;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  assert.equal(stillRunning, false, `Python evaluator descendant ${childPid} survived timeout`);
+});
+
+test("explicitly allowlisted one-character credentials are redacted", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-redact-short-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const script = path.join(dir, "evaluator.mjs");
+  const output = path.join(dir, "evaluator.log");
+  fs.writeFileSync(script, "process.stdout.write(process.env.CUSTOM_AUTH);\n");
+  const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
+  const result = await runShellCommand(`${quote(process.execPath)} ${quote(script)}`, {
+    cwd: dir, timeoutMs: 10_000, envOnly: true, env: { CUSTOM_AUTH: "x" }, redactEnvKeys: ["CUSTOM_AUTH"], logPath: output,
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.stdoutTail, "[redacted]");
+  assert.equal(fs.readFileSync(output, "utf8"), "[redacted]");
 });
 
 test("copyWorkspace refuses a destination that would delete the source root", async (t) => {

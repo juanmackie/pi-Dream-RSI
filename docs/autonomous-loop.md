@@ -4,19 +4,77 @@ Dream-RSI runs a bounded loop over a local project. It ranks measurable levers, 
 
 ## Consent and budgets
 
-Start with `/dream-rsi loop [goal]`. The command asks for consent in an interactive session and starts the loop itself. It does not need the chat model to call a tool. In a non-interactive session, pass `--consent` to accept consent in the command, or let the command send the request to the chat model. Add `--no-logs` to skip reading local session files.
+Start with `/dream-rsi loop [goal]`. The command asks for consent in an interactive session. With a natural-language goal, it loads the loop preparation skill in the current chat before engine start. The agent reads the project, proposes complete settings, obtains any remaining approvals, and returns those settings through `dream_rsi_loop`. No config file is required. In a non-interactive session, pass `--consent`, or let the command ask for consent in chat. Add `--no-logs` to skip local session files during preparation signals and engine execution.
 
-Consent accepts that project code, evaluators, gates, and agents run on the host with the host user's access. The tool `dream_rsi_loop` with `action: "start"` and `consent: true` starts the same loop.
+Consent accepts that project code, evaluators, gates, and agents run on the host with the host user's access. Add evaluator credentials to `env_allowlist` only when needed. Values supplied through this allowlist are redacted from captured process output before it is persisted; evaluator code must not print, return, or otherwise disclose credentials. The tool `dream_rsi_loop` with `action: "start"` and `consent: true` starts the same loop.
 
 Defaults are 6 campaigns, 72 agent starts, 200 evaluator runs, and 120 minutes. Budgets persist across runs under `.dream-rsi/loop/` and are not renewed on resume. A campaign receives at most 18 agent starts, 48 evaluator runs, and 60 minutes from the remaining allowance.
 
 The tool accepts a focus, optional evaluator and gates, editable scope, protected assets, command categories, environment allowlist, and budget caps. A metric unit and direction do not define an evaluator command. A score evaluator must be explicitly declared. Dream-RSI does not silently replace a metric with wall-clock time; a proxy needs an explicit justification.
 
-Startup records a preflight report with separate metric, evaluator, workload, scope, and gate checks. Contract consent means the trusted-local settings were accepted and saved; it does not mean that a workload is measurable or that a campaign can start. Missing instrumentation or required out-of-scope files stop the run as `blocked`, name the missing item, and give a next step. `no-verifiable-lever` is reserved for a completed assessment that found no eligible lever. No campaign is counted when a preflight blocker prevents campaign start.
+Startup records a preflight report with separate metric, evaluator, workload, scope, and gate checks. Contract consent means the trusted-local settings were accepted and saved; it does not mean that a workload is measurable or that a campaign can start. Missing instrumentation or planned writes outside approved scope stop the run as `blocked`, name the missing item, and give a next step. `no-verifiable-lever` is reserved for a completed assessment that found no eligible lever. No campaign is counted when a preflight blocker prevents campaign start.
 
-Evaluator bootstrap is opt-in. Set `evaluator_bootstrap.authorized` to `true` and list the exact project-relative files it may create or update. Every path must be inside editable scope, and the approved command categories must permit a benchmark or custom workload. The bootstrap agent edits an isolated project copy; Dream-RSI copies back only the listed files, then runs discovery against the resulting workload before ranking. The metric, unit, and direction remain the approved ones. If a required gate or bootstrap path is outside scope, the loop stops and names the paths instead of expanding scope.
+Evaluator bootstrap is opt-in. Set `evaluator_bootstrap.authorized` to `true` and list the exact project-relative files it may create or update. Every path must be inside editable scope, and the approved command categories must permit a benchmark or custom workload. The bootstrap agent edits an isolated project copy; Dream-RSI copies back only the listed files, then runs discovery against the resulting workload before ranking. The metric, unit, and direction remain the approved ones. If a planned bootstrap write is outside scope or protected, the loop stops and names the paths instead of expanding scope. Existing evaluators, fixtures, and correctness gates may be read or run outside editable scope; they do not need edit permission.
 
 Run reports count all evaluator invocations this run and break them out by phase. Discovery and qualification are reported as preflight spend, separately from campaign evaluator runs. Durable counters remain cumulative across runs; compare run deltas with the durable budget rather than treating the cumulative phase totals as this run's spend. Score evaluators can return one number on stdout, a valid score JSON object on stdout, or write the declared score file. Qualification checks known oracle prerequisites before evaluator runs and admits a search only when its remaining budget can fund gates, an initial confirmation look, review, and independent post-apply verification. Expected reading duration sizes the budget; the process timeout remains a separate kill limit.
+
+`evaluator_timeout_ms` is the outer limit for one evaluator process. The generated wrapper reserves a stated cleanup and verdict allowance inside that limit and divides the rest across its sequential workload runs, so a setting too small for that split is refused before any workload runs. Each invocation runs through the shared runner, so a timeout or an abort kills the whole process tree and the wrapper waits for cleanup before it writes a verdict. The qualification receipt records the engine source, the generated wrapper, every pinned evaluator input, and the effective outer and inner allowances; if the evaluator or one of its inputs changes while qualification runs, the instrument is refused. A scratch copy that cannot be removed is recorded in that receipt, not only in a console warning.
+
+## Scope and verification dependencies
+
+Editable scope authorizes changes to implementation files and explicitly planned setup files. It is not a list of files the verifier may read or run. Existing tests, evaluator scripts, and fixtures can be outside editable scope or protected from edits while remaining valid verification dependencies. A path mentioned in a goal, gate command, or evaluator declaration does not grant write permission and does not require it.
+
+Startup, preflight, and bootstrap use the same write-plan validation. Only the exact bootstrap files that setup may create or update must be normalized, inside approved scope, and outside protected assets. A gate file listed in that write plan needs write permission because setup will change it, not because the gate will run. Candidate patches remain constrained to attributed implementation scope. Gate execution, instrument qualification, and promotion checks remain mandatory; allowing a test to run outside editable scope never marks it as passing.
+
+Run reports show the requested objective, editable scope, metric source, and number of declared gates. `/dream-rsi status` and the status tool share one read-only report, including the saved objective and latest preflight blocker even when no campaign started. This makes an old saved objective visible instead of hiding it behind “No campaign yet.” Assessment inspects that approval before recommending setup. A recommended evaluator configuration is a proposal, not a state change. `/dream-rsi loop <goal>` now prepares the setup in chat; it must recheck assessment recommendations against source and saved settings before passing them to the tool.
+
+## Changing a saved objective
+
+A trusted-local consent prompt authorizes host execution, not replacement of a saved project boundary. A different objective, scope, gate set, permission, or other approval setting stops as `blocked`, names the saved and requested objectives, and explains how to approve a replacement. A replacement may raise total campaign, agent-start, evaluator-run, or deadline caps, but may not reduce them or change the statistical budget. A rejected or unsaved contract is never reported as recorded. Only missing execution consent uses `consent-required`.
+
+In an interactive session, a changed request shows a summary with **Approve replacement**, **Inspect full contracts**, and **Cancel**. Inspection displays both complete contracts before returning to the decision. In headless use, supply `replace_contract: true` to the tool, or `--replace-contract` to the command, only after reviewing the proposed complete boundary. `--consent` alone never replaces a saved contract.
+
+Omitted tool settings inherit the saved contract. To change scope, gates, or permissions, supply those fields explicitly; an empty array is explicit, not an instruction to reuse defaults. A command that changes only the goal keeps the previous scope and gates but drops the previous evaluator and proxy justification, because an instrument describes one objective. Use the tool, or `/dream-rsi loop --config`, to approve the new implementation scope, evaluator, and correctness gates instead of assuming the new goal widens permissions.
+
+Replacement is serialized by the project loop lease and bound to the saved approval inspected before confirmation. If that approval changes during the dialog, the request is rejected and must be reviewed again. A running or paused campaign, pending confirmation, or unresolved post-apply context prevents replacement; resolve it under the old contract first. Stopping a campaign pauses it; it does not discard that evidence.
+
+Replacement cannot reduce caps, reset accumulated campaign/agent/evaluator spend, or change the statistical budget. A reviewed replacement may explicitly raise the campaign, agent-start, evaluator-run, or deadline allowance; it preserves all counters and the existing deadline history. The effective total caps are bounded by both the request and the approved contract. A replacement cannot silently lower the persisted caps, even if its requested effective allowance is smaller. A cap increase uses a saved transaction so an interrupted write is completed on the next start without resetting spend. One prior approval is retained as `.dream-rsi/loop/contract.previous.json`. If an approval cannot be saved, discovery does not start. An unreadable stored contract is reported, never overwritten. Inspect and preserve corrupt state before any separate recovery action.
+
+See [the glossary](../GLOSSARY.md) and [approval replacement decision](adr/0001-explicit-contract-replacement.md) for the domain terms and rationale.
+
+## Measurement harness setup
+
+For a new session without an evaluator, `setup_harness: true` authorizes an agent to create exactly two project files before experiments, in the project's own language:
+
+- `.dream-rsi-harness/measure.py` and `check.py` for a Python project; `.dream-rsi-harness/measure.mjs` and `check.mjs` for a Node project.
+- The evaluator runs the actual workload on fixed inputs and prints one JSON verdict with a finite `score` and `valid: true`.
+- The check exercises expected behavior and exits nonzero on incorrect results or a missing workload. Fixed synthetic fixtures, if needed, are embedded in these scripts and identified as synthetic.
+
+The language follows the project: a single Python or Node manifest decides, otherwise a bounded source-file count. Python setup prefers an existing `.venv` or `venv` interpreter and otherwise uses the platform Python command; it never installs a runtime or dependencies. Override with `harness_language: "python"` or `"node"` in a repository that has both. An empty-scope command (`--setup-harness`) still selects the lower-is-better runtime metric in milliseconds; set the language only through the tool.
+
+For a new approval, supply `focus`, `unit`, and `higher_is_better` explicitly. During replacement, omitted metric settings, scope, gates, and protected assets inherit the saved boundary before setup adds its two files and correctness check. For example, a tool request for a quality metric can set:
+
+```json
+{
+  "action": "start",
+  "consent": true,
+  "setup_harness": true,
+  "focus": "Improve classification accuracy on the project's fixed labeled cases",
+  "unit": "percent",
+  "higher_is_better": true,
+  "scope_roots": ["src"],
+  "gates": ["npm test"]
+}
+```
+
+This request starts the loop and can incur model cost. Authorize it only for a trusted project. Setup adds only the two harness files to the requested editable scope; implementation scope, metric, direction, existing gates, and durable caps stay unchanged. With no scope specified, the normal whole-workspace scope still applies. The complete harness directory is pinned as evaluator input and excluded from candidate patches.
+
+The command shortcut `/dream-rsi loop <goal> --setup-harness` selects the lower-is-better runtime metric in milliseconds. Interactive consent names the files and metric. In a non-interactive session, execution still requires `--consent`. Use the tool with an explicit unit and direction for other outcomes. Without config/setup flags, a goal enters preparation; a bare `loop` retains saved-setup reuse or declared-workload discovery. All paths retain fail-closed instrument qualification.
+
+The host uses the existing scoped bootstrap to author files in an isolated copy, copies back only the allowed text files, then runs normal discovery and instrument qualification. A project manifest or benchmark command is not required: the generated evaluator is the declared score command. Existing benchmarks do not suppress setup of missing harness files. Setup and all qualification processes count against the durable budget.
+Qualification must establish a reproducible baseline and reject broken or missing behavior before experiments start. The declared evaluator is authoritative: a failed score instrument cannot fall back to another benchmark or metric, even when that alternative has a proxy justification. Discovery traces the evaluator's own local imports for attribution before using manifest workload graphs. An unrelated benchmark cannot displace implementation reached by the evaluator. A constant score with an ineffective correctness check is blocked, not accepted as a usable evaluator. The setup agent must explain an outcome that it cannot measure from available implementation, fixtures, and known answers. Qualification reduces risk; it does not prove that generated fixtures cover every user requirement. Inspect the scripts before relying on them for important behavior.
+
+Existing harness files, protected paths, and symbolic links are not overwritten. Concurrent file creation aborts copy-back and removes only unchanged new files from that copy-back. Failed qualification leaves the generated scripts for inspection and reports the blocker; it starts no campaign and applies no improvement. After successful setup, start without `setup_harness` to reuse the stored contract. To use existing scripts with a new contract, declare their evaluator and gates directly. Setup does not replace a different saved contract or reset its budget. Use `evaluator_bootstrap` instead when you need a custom exact file plan; it cannot be combined with `setup_harness`.
 
 ## Agent health
 
@@ -30,7 +88,59 @@ Each campaign uses a bounded hill climb with a fixed, qualified metric. Attempts
 
 Completed experiments are recorded as worlds. When enough eligible worlds exist, the dream step can ask an agent for bounded search-config proposals. Deterministic replay scores each proposal using only recorded branch and refinement attempts. The incumbent remains a candidate, and only a challenger with sufficient coverage and a clear score margin is adopted. Dream output is configuration data; it does not provide executable policy code.
 
+## Command-owned preparation
+
+`/dream-rsi loop <goal>` reserves the session before consent, then hands the request to the existing loop skill. The request binds a single-use `preparation_id` to the session, canonical project, exact goal, and session-log preference. The same session slot remains visible as `preparation` in status/watch and rejects overlapping starts. Preparation uses the current chat model and its ordinary session billing; it does not start a separately billed child agent or run project commands. No durable loop state or budget is written just to prepare settings.
+
+`dream_rsi_loop` with `action: "prepare"` resolves a proposal through the same boundary as command and tool starts. It reads files only: no lease, approval, budget, command, or agent process is created. It returns the normalized contract, setup plan, execution settings, `proposal_id`, reusable unexpanded tool `settings`, and bounded measurement options. The full digest and settings are in the model-facing text, not only UI metadata. Use `settings` for the next tool call; action, consent, preparation ID, and approval controls remain separate. Existing evaluator scripts are considered as well as manifest workloads. Output-format and import-graph suggestions are source hints, not qualification or authorization. The agent must inspect existing instruments first, distinguish diagnostic output from score output, propose the implementation scope and correctness gates, and obtain missing approvals. It calls `dream_rsi_loop` with complete settings and the ID, not the command again. The handoff requires explicit metric unit/direction, nonempty implementation scope, protected assets, gates, and an evaluator or an explicit setup/discovery choice. The normal contract validator, replacement approval, durable budgets, qualification, search, and independent verification still own execution. A preparation request to replace a contract is not approval of the unseen settings.
+
+Before execution, the complete review shows the evaluator, pinned inputs, implementation scope, protected assets, gates, exact setup writes, execution settings, and durable/statistical budgets. The canonical setup descriptor binds generated/custom mode and create-only/replace-authorized write policy; equivalent JSON key order does not change its identity. Bootstrap, review, and campaigns use the same effective inherited or overridden agent. Process timeouts use the task's integer range of 1–2147483647 milliseconds and are validated before state writes. The digest binds these settings, the existing bounded project fingerprint, and the prior contract identity. The fingerprint is not an exhaustive repository audit; instrument inputs remain pinned and qualification is still required. A prepared headless start must supply the reviewed `proposal_id` and `approve_proposal: true`; host consent is still separate. Interactive starts show **Approve proposal**, **Approve proposal and setup**, or the corresponding replacement choice. Full contract inspection remains available for replacement. A source/settings change invalidates the review before execution. `--config` direct automation still represents an explicitly reviewed settings request; consent and replacement remain explicit actions.
+
+Stop, shutdown/reload, and session-tree changes invalidate preparation. A late or reused ID is rejected before state writes or process starts. The tool also refuses a handoff for another project or goal, and cannot re-enable logs disabled by the command. If the agent needs a decision, answer in chat or cancel with `/dream-rsi stop`; a cancelled handoff needs a new command. Preparation is session-local and is not resumed after reload. The command queues preparation as a follow-up when the chat is busy. A headless config/setup request without consent uses the same cancellable handoff and retains its complete `proposed_settings`, including evaluator, scope, gates, agent, and caps. Quoted goals and settings-file paths with spaces are supported. A skill-expanded handoff is a workflow instruction, not proof that the model inferred the correct measurement; review the proposal and retain qualification.
+
+## Measurement settings file
+
+For headless automation or settings already reviewed, pass a JSON file to start directly without an agent-led preparation turn:
+
+```text
+/dream-rsi loop --config .dream-rsi/proposal.json --replace-contract --consent
+```
+
+```json
+{
+  "focus": "reduce the wall-clock time of preliminary design generation on the envelope-heavy floor",
+  "unit": "ms",
+  "higher_is_better": false,
+  "minimum_gain": "5%",
+  "evaluator": {
+    "argv": ["python", "scripts/measure_design.py"],
+    "output": "score-json",
+    "inputs": ["scripts/measure_design.py", "fixtures/design-speed/reference-layout-digest.json"]
+  },
+  "scope_roots": ["src/ai_sprink"],
+  "gates": ["python -m unittest tests.test_layout", "python -m unittest tests.test_layout_pipework_quality"]
+}
+```
+
+The file may use flat `dream_rsi_loop` field names or a versioned contract envelope (`{"version":1,"contract":{...}}`). For the envelope, Dream-RSI maps outcome, evaluator, scope, gates, budgets, and execution limits to settings; it never imports consent or approval. The file must be one JSON object, a regular file, and at most 64 KiB; unknown keys are refused. `action`, `consent`, `replace_contract`, `project_dir`, `include_logs`, `approve_proposal`, `proposal_id`, and session-local `preparation_id` cannot be set from the file. `false_accept_budget` preserves the statistical allowance (default 0.1, greater than zero and below 0.5); a saved allowance is immutable. A contract envelope can import an agent command and args with the default stdin/null-model/null-thinking policy; unrepresentable overrides are rejected, not silently dropped. A positional goal on the command overrides `focus`. The resolved settings are validated and shown like any other contract, and a changed saved contract still needs `--replace-contract` or interactive approval.
+
+Declare the evaluator exactly as the loop will run it. `score-json` reads the score file the evaluator writes; a `--benchmark` flag that only prints a diagnostic and skips the score file leaves the loop nothing to read. `inputs` pins evaluator code and reference data outside candidate edits. `scope_roots` is where candidates may change code, not where the evaluator or tests live.
+
+When the goal changes, the previous evaluator and proxy justification are not inherited: an instrument and a proxy argument describe one objective. Supply them for the new goal. The report says which settings were dropped. Unit, direction, minimum gain, scope, gates, and budgets still inherit unless supplied, so a replacement that keeps the old scope is visible in the reported editable scope rather than silently widened.
+
+## Live work and watch
+
+`status` and `watch` describe the loop, not only its campaigns. Setup, consent and replacement-approval waits, workload discovery, harness bootstrap, instrument qualification, agent liveness, campaign search, dream replay, and post-apply verification are separate work stages. Status shows the current stage, latest work label, target project, start time, and last progress time. A missing campaign does not mean the loop is idle.
+
+The current session tracks consent and approval waits before an engine lease exists. During review, status/watch show the pending proposal identity, outcome, scope, metric, gates and setup-write count, explicitly labeled as not a saved approval. After the engine starts, it publishes bounded work metadata with its existing lease so another session can inspect the same work. Reads do not update leases, approvals, budgets, or reports. A dead owner is `interrupted`; a remote owner or legacy lease without work metadata is `unverified`; an unreadable lease is `unknown`. A live owner and a last progress timestamp are evidence of ownership, not proof that the workload is making useful progress.
+
+`/dream-rsi status`, `/dream-rsi watch`, and the watch shortcut follow the active loop's project, even when it differs from the calling directory. An explicit status-tool `project_dir` overrides that default. Watch opens before a campaign exists and follows the current campaign when it publishes progress. It drops the old campaign view when a new discovery pass starts. Non-interactive watch returns a snapshot; interactive watch refreshes and supports Escape to close. Closing watch does not stop the loop. Stop requests remain visible as `stopping` until active work unwinds.
+
+Completed reports and loop history are not live activity. Status labels the report with its saved timestamp, marks a report that predates the current approval, and distinguishes a prior report from an active run. Historical remedies must be rechecked against current settings and code; they are not instructions to widen scope or proof that a current run is blocked. The footer's `active` label means the feature is enabled; the animated `looping` label marks an executing start/resume/confirm call. Use the live status stage to distinguish work from an approval wait.
+
 ## State and recovery
+
+Recovery reports a category and next action: configuration, approval, environment, instrument, correctness, budget, cancellation, exhausted search, saved continuation, or completed work. Classification is diagnostic only; it never changes gates, verdicts, scope or retry policy. There are no blind automatic retries. The same preparation ID can correct invalid settings up to three times; exhausting those attempts cancels it without engine execution or budget writes. Approval waits and stale-review responses do not spend that correction allowance. An engine blocker consumes the ID and retains its durable evidence; use a new reviewed proposal or saved resume/confirmation, not an automatic restart. New installations, credentials, wider scope, changed metrics and new setup writes need their own authorization. Historical recovery guidance in status is not a current approval.
 
 Project state lives under `.dream-rsi/`. Campaign records and append-only attempt evidence are retained. Search configs, dream decisions, durable budgets, and the latest typed stop-code report live under `.dream-rsi/loop/`. Temporary evaluator and gate workspaces stay under `.dream-rsi/runtime/`; copies exclude Dream-RSI state so a run cannot inspect its own scratch data. Each attempt starts a fresh agent process and receives prior notes and experiment history.
 
@@ -38,6 +148,6 @@ Project state lives under `.dream-rsi/`. Campaign records and append-only attemp
 
 In a TUI session, an executing start, resume, or confirmation shows an animated status. Campaign phase details continue through progress updates and the dashboard. One loop run may own a session at a time; another start, resume, or confirmation is rejected without replacing its status. On completion, cancellation, or failure, the status returns to the active-mode label. Non-TUI sessions do not show the animation.
 
-A loop started by the command runs detached from the chat turn in an interactive session. It sends the final report into the session. A one-shot session waits for the run and writes the final report to the standard error stream. Closing the session clears the animation and aborts the run, so no agent process outlives the session.
+An explicit config/setup or bare reuse/discovery command runs detached from the chat turn in an interactive session. It sends the final report into the session. A one-shot direct start waits for the run and writes the final report to the standard error stream. A goal command instead queues the preparation skill; its later tool handoff returns the engine report through the normal tool result. Closing the session clears the animation and aborts the run, so no agent process outlives the session.
 
 Applied changes remain in the working tree. Review the diff, then keep or revert it with Git.

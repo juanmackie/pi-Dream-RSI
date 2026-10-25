@@ -4,21 +4,22 @@ import * as path from "node:path";
 
 import {
   CAMPAIGN_DEADLINE_MAX_MS, CampaignInfeasibleError, campaignVerifierIdentity, readCampaignStatus, resumeCampaign, runCampaign,
-  type CampaignOptions, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings,
+  type CampaignOptions, type CampaignRecord, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings,
 } from "./campaign.ts";
 import {
-  ContractNotApprovedError, approveRunContract, contractFile, contractIdentity, projectFingerprint, readStoredContract,
+  ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, contractIdentity, projectFingerprint, readStoredContract, validateRunContract,
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
 import { readLedger } from "./ledger.ts";
 import { buildReconInventory, reconProject, timeLikeOutcome, type ReconOptions, type ReconResult } from "./recon.ts";
 import { measureEvaluatorReading, measureWorkload, verifyPostApply, type PostApplyEvaluator } from "./verify.ts";
 import {
-  hasAllowance, readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
+  hasAllowance, readOrCreateLoopBudget, readSavedBudgetCaps, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
   type LoopBudgetFile, type LoopPhase, type LoopReservation,
 } from "./budget.ts";
 import type { LeverInventory, LeverMetricKind, LeverProposal } from "./levers.ts";
 import { synthesizeMetric, type EvaluationContract, type MetricPlan } from "./metrics.ts";
+import { parseThreshold } from "./measure.ts";
 import {
   attemptsFromMemory, isCurrentExperiment, MAX_NOTES, mementoNotes, readMemory, recordCampaignOutcome,
   ucbSelect, writeMemory, type LeverRankingEntry, type LoopMemory, type LoopMemoryRecord,
@@ -91,6 +92,8 @@ export interface LoopOptions {
   sessionDir?: string;
   /** Approved run contract; the loop never executes without trusted-local consent. */
   contract: RunContract;
+  /** Explicit replacement authorization bound to the saved approval reviewed by the operator. */
+  replaceContract?: string;
   /** Resume the paused campaign recorded in the loop's durable active context, then keep looping. */
   resumeActiveCampaign?: boolean;
   /** Resume only a persisted paired confirmation, without discovery or new agent search. */
@@ -114,6 +117,8 @@ export interface LoopOptions {
   signal?: AbortSignal;
   now?: () => Date;
   onProgress?: (message: string) => void;
+  /** Live loop work, including stages before a campaign exists. */
+  onActivity?: (activity: LoopActivity) => void;
   /** Agent resolver forwarded to each campaign (active session model and thinking level). */
   resolveAgent?: CampaignOptions["resolveAgent"];
   /** Live campaign status updates forwarded to the host UI. */
@@ -139,7 +144,7 @@ export interface LoopCampaignRecord extends LoopMemoryRecord {
 export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "stopped";
 
 export interface LoopPreflightCheck {
-  name: "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
+  name: "contract" | "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
   status: "passed" | "blocked" | "not-checked";
   reason: string;
   remedy?: string;
@@ -218,9 +223,9 @@ interface LoopResumeContext {
   version: 1;
   contractId: string;
   campaignId?: string;
-  lever: LeverProposal;
+  lever: Pick<LeverProposal, "id" | "mechanism" | "sourceKind">;
   setup: LeverCampaignSetup;
-  plan: MetricPlan;
+  plan: Pick<MetricPlan, "evaluationContract">;
   instrument: CapturedInstrument;
   baselineFingerprint: string;
   phase?: "campaign" | "post-apply";
@@ -237,6 +242,195 @@ interface LoopResumeContext {
 function instrumentEvaluator(projectDir: string, plan: MetricPlan): PostApplyEvaluator | undefined {
   if (plan.metricKind === "command-duration" || plan.metricKind === "unmeasurable") return undefined;
   return { argv: [process.execPath, path.resolve(projectDir, plan.evaluatorPath)], output: "score-json" };
+}
+
+function withinDirectory(root: string, candidate: string): boolean {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative !== "" && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function isCommandFileToken(token: string): boolean {
+  const value = token.replace(/^--[^=]+=\s*/, "");
+  return !value.startsWith("-") && (/[\\/]/.test(value) || /\.(?:py|m?js|json|sh|bat|cmd)$/i.test(value));
+}
+
+function commandFileTokens(command: string): string[] {
+  return (command.match(/"[^"\n]+"|'[^'\n]+'|[^\s]+/g) ?? [])
+    .map((token) => token.replace(/^("|')(.*)\1$/, "$2"))
+    .filter(isCommandFileToken)
+    .map((token) => token.replace(/^--[^=]+=\s*/, ""));
+}
+
+/** Rebuild only the frozen context needed to continue a validated pending confirmation. */
+function recoverPendingConfirmationContext(options: {
+  record: CampaignRecord;
+  contract: RunContract;
+  projectDir: string;
+  loopRoot: string;
+  baseRoot: string;
+}): LoopResumeContext {
+  const { record, contract, projectDir, loopRoot, baseRoot } = options;
+  const refuse = (reason: string): never => { throw new Error(`saved confirmation recovery refused: ${reason}`); };
+  const pending = record.pendingConfirmation;
+  const startedAt = Date.parse(record.startedAt);
+  if (!pending || record.state.kind !== "paused" || record.state.phase !== "promote"
+    || record.state.iteration !== pending.iteration || !Number.isSafeInteger(pending.pairs) || pending.pairs < 1
+    || !Number.isSafeInteger(pending.maxPairs) || pending.maxPairs <= pending.pairs) {
+    return refuse("campaign is not paused with incomplete confirmation evidence");
+  }
+  if (path.resolve(record.baseRoot) !== path.resolve(baseRoot)
+    || path.resolve(record.projectDir) !== path.resolve(projectDir)
+    || path.resolve(record.targetRoot) !== path.resolve(projectDir)
+    || path.resolve(record.campaignRoot) !== path.resolve(baseRoot, "campaigns", record.id)
+    || !Number.isFinite(startedAt)) {
+    return refuse("campaign identity or project paths do not match this run");
+  }
+  if (record.goal !== contract.outcome.statement
+    || record.task.higher_is_better !== contract.outcome.higherIsBetter
+    || record.requestedMinimumGain !== contract.outcome.minimumUsefulGain
+    || !record.scope.length || record.scope.some((scope) => !pathWithin(scope, contract.scope.roots))) {
+    return refuse("saved campaign does not match the approved objective, direction, threshold, or scope");
+  }
+  const gates = [...new Set(record.gates ?? [])];
+  if ((contract.preserved.gates ?? []).some((gate) => !gates.includes(gate))) {
+    return refuse("saved campaign omits an approved correctness gate");
+  }
+  const evaluator = contract.outcome.evaluator;
+  if (!evaluator || record.task.score_path !== "eval/score.json" || record.task.score_field !== "score"
+    || record.task.valid_field !== "valid" || record.task.fail_class_field !== "fail_class"
+    || record.task.error_field !== "error") {
+    return refuse("saved campaign does not use the approved score protocol");
+  }
+  const metricRoot = path.resolve(loopRoot, "metrics");
+  const wrapperPath = path.resolve(metricRoot, record.task.name, "evaluate.mjs");
+  if (!/^[a-zA-Z0-9_-]{1,80}$/.test(record.task.name)
+    || !withinDirectory(metricRoot, wrapperPath)
+    || record.task.score_program !== `node "${wrapperPath}"`
+    || !(record.verifierInputs ?? []).some((input) => path.resolve(projectDir, input) === wrapperPath)) {
+    return refuse("saved score wrapper is missing or does not match the campaign task");
+  }
+  const identityInputs = (evaluator.inputs ?? []).map((input) => path.resolve(projectDir, input)).sort();
+  if (JSON.stringify([...(record.identityInputs ?? [])].map((input) => path.resolve(projectDir, input)).sort()) !== JSON.stringify(identityInputs)) {
+    return refuse("saved evaluator inputs do not match the approved contract");
+  }
+  const verifierRoot = path.resolve(loopRoot, "verifiers", record.task.name);
+  for (const input of evaluator.inputs ?? []) {
+    const pinned = path.resolve(verifierRoot, ...input.replace(/\\/g, "/").split("/"));
+    if (!withinDirectory(verifierRoot, pinned) || !(record.verifierInputs ?? []).some((saved) => path.resolve(projectDir, saved) === pinned)) {
+      return refuse("an approved evaluator input is not pinned by the saved campaign");
+    }
+  }
+  try {
+    if (campaignVerifierIdentity(record.projectDir, record.task, record.verifierInputs, gates, record.identityInputs ?? []) !== record.verifierIdentity) {
+      return refuse("the saved verifier identity no longer matches its pinned files");
+    }
+  } catch (error) {
+    return refuse(`the saved verifier could not be validated (${error instanceof Error ? error.message : String(error)})`);
+  }
+  const wrapper = fs.readFileSync(wrapperPath, "utf8");
+  const constant = (name: string): string => {
+    const match = wrapper.match(new RegExp(`^const ${name} = (.+);$`, "m"));
+    if (!match) return refuse(`the pinned wrapper is missing ${name}`);
+    return match[1];
+  };
+  let command: unknown;
+  let output: unknown;
+  let unit: unknown;
+  try {
+    command = JSON.parse(constant("COMMAND"));
+    output = JSON.parse(constant("SCORE_OUTPUT"));
+    unit = JSON.parse(constant("SCORE_UNIT"));
+  } catch (error) {
+    return refuse(`the pinned wrapper has invalid score settings (${error instanceof Error ? error.message : String(error)})`);
+  }
+  const mode = constant("MODE").replace(/^"|"$/g, "");
+  const timeoutMatch = constant("SAMPLE_TIMEOUT_MS").match(/^\d+$/);
+  const sampleTimeoutMs = timeoutMatch ? Number(timeoutMatch[0]) : 0;
+  if (mode !== "score" || !Array.isArray(command) || !command.every((part) => typeof part === "string")
+    || JSON.stringify(command) !== JSON.stringify(evaluator.argv) || output !== evaluator.output || unit !== contract.outcome.unit
+    || !Number.isSafeInteger(sampleTimeoutMs) || sampleTimeoutMs <= 0) {
+    return refuse("the pinned wrapper does not match the approved evaluator settings");
+  }
+  for (const file of [...evaluator.argv.filter(isCommandFileToken).map((token) => token.replace(/^--[^=]+=\s*/, "")), ...gates.flatMap(commandFileTokens)]) {
+    const absolute = path.isAbsolute(file) ? path.resolve(file) : path.resolve(projectDir, file);
+    if (!fs.existsSync(absolute)) return refuse(`a measurement input is missing: ${file}`);
+    const stat = fs.lstatSync(absolute);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.mtimeMs > startedAt) {
+      return refuse(`a measurement input changed or is not a regular file: ${file}`);
+    }
+  }
+  const qualifiedBaseline = (record.checkRuns ?? []).filter((run) =>
+    run.stdoutTail === "seeded from loop qualification" && run.valid && typeof run.score === "number" && Number.isFinite(run.score),
+  );
+  if (qualifiedBaseline.length < 2) return refuse("the campaign has no complete saved qualification baseline");
+  const baseline = qualifiedBaseline.map((run) => contract.outcome.higherIsBetter ? run.score! : -run.score!);
+  const evidenceRoot = path.join(record.campaignRoot, "history");
+  if (!withinDirectory(evidenceRoot, pending.evidenceDir)) return refuse("confirmation evidence is outside the campaign history");
+  type SavedScoreOutcome = { score?: unknown; raw_score?: unknown; valid?: unknown; fail_class?: unknown; error?: unknown };
+  type SavedPair = { measurement?: { before?: unknown; after?: unknown; gain?: unknown }; beforeOutcome?: SavedScoreOutcome; afterOutcome?: SavedScoreOutcome };
+  const evidence = readJson<{ version?: unknown; identity?: unknown; baseline?: unknown; pairs?: SavedPair[]; readings?: Record<string, SavedScoreOutcome> }>(
+    path.join(pending.evidenceDir, "confirmation.json"),
+  );
+  const expectedIdentity = `${record.verifierIdentity}:${pending.patchHash}:${pending.targetDigest}`;
+  const validOutcome = (value: unknown): value is SavedScoreOutcome => !!value && typeof value === "object"
+    && typeof (value as SavedScoreOutcome).valid === "boolean" && typeof (value as SavedScoreOutcome).fail_class === "string"
+    && ((value as SavedScoreOutcome).score === null || (typeof (value as SavedScoreOutcome).score === "number" && Number.isFinite((value as SavedScoreOutcome).score)))
+    && ((value as SavedScoreOutcome).raw_score === null || (typeof (value as SavedScoreOutcome).raw_score === "number" && Number.isFinite((value as SavedScoreOutcome).raw_score)))
+    && ((value as SavedScoreOutcome).error === null || typeof (value as SavedScoreOutcome).error === "string");
+  const validScore = (value: unknown): value is SavedScoreOutcome & { score: number; raw_score: number } => validOutcome(value)
+    && value.valid === true && value.fail_class === "ok" && value.error === null
+    && typeof value.score === "number" && Number.isFinite(value.score)
+    && typeof value.raw_score === "number" && Number.isFinite(value.raw_score);
+  const closeEnough = (actual: number, expected: number): boolean => Math.abs(actual - expected) <= 1e-12 * Math.max(1, Math.abs(actual), Math.abs(expected));
+  const relative = parseThreshold(record.requestedMinimumGain ?? record.minimumGain).kind === "relative";
+  const validPair = (pair: SavedPair): boolean => {
+    const beforeOutcome = pair?.beforeOutcome;
+    const afterOutcome = pair?.afterOutcome;
+    const before = beforeOutcome?.raw_score;
+    const after = afterOutcome?.raw_score;
+    const measurement = pair?.measurement;
+    if (!measurement || typeof measurement.before !== "number" || !Number.isFinite(measurement.before)
+      || typeof measurement.after !== "number" || !Number.isFinite(measurement.after)
+      || typeof measurement.gain !== "number" || !Number.isFinite(measurement.gain)
+      || !validScore(beforeOutcome) || !validScore(afterOutcome) || typeof before !== "number" || typeof after !== "number") return false;
+    if (relative && (before <= 0 || after <= 0)) return false;
+    const gain = relative
+      ? contract.outcome.higherIsBetter ? Math.log(after / before) : Math.log(before / after)
+      : contract.outcome.higherIsBetter ? after - before : before - after;
+    return closeEnough(measurement.before, before) && closeEnough(measurement.after, after) && closeEnough(measurement.gain, gain);
+  };
+  const rawBaseline = record.rawBaselineScores;
+  if (!Array.isArray(rawBaseline) || rawBaseline.length === 0 || rawBaseline.some((value) => !Number.isFinite(value))
+    || !/^[a-f0-9]{64}$/i.test(pending.patchHash) || !/^[a-f0-9]{64}$/i.test(pending.targetDigest)
+    || pending.confirmationIdentity !== expectedIdentity || evidence?.version !== 1 || evidence.identity !== expectedIdentity
+    || !Array.isArray(evidence.baseline) || evidence.baseline.length !== rawBaseline.length
+    || evidence.baseline.some((value, index) => typeof value !== "number" || !Number.isFinite(value) || !closeEnough(value, rawBaseline[index]))
+    || !Array.isArray(evidence.pairs) || evidence.pairs.length !== pending.pairs || !evidence.pairs.every(validPair)
+    || (evidence.readings !== undefined && (!evidence.readings || typeof evidence.readings !== "object" || Object.values(evidence.readings).some((value) => !validOutcome(value))))) {
+    return refuse("saved paired measurements do not match the pending candidate");
+  }
+  if (!pending.patch.length || pending.patch.some((file) => {
+    const relative = normalizeProjectRelativePath(file.relative);
+    return !relative || !pathWithin(relative, contract.scope.roots) || pathProtected(relative, contract.scope.protectedAssets);
+  })) {
+    return refuse("pending candidate patch is empty or outside the approved editable scope");
+  }
+  return {
+    version: 1,
+    contractId: contractIdentity(contract),
+    campaignId: record.id,
+    lever: { id: record.task.name, sourceKind: "recon-command", mechanism: record.mechanism ?? "approved score confirmation" },
+    setup: { task: record.task, verifierInputs: record.verifierInputs, gates, goal: record.goal, scope: record.scope, expectedReadMs: record.expectedReadMs },
+    plan: {},
+    instrument: {
+      argv: [...evaluator.argv], gates, baseline, unit: contract.outcome.unit,
+      higherIsBetter: contract.outcome.higherIsBetter, minimumUsefulGain: contract.outcome.minimumUsefulGain,
+      timeoutMs: sampleTimeoutMs, kind: "score",
+      evaluator: { argv: [process.execPath, wrapperPath], output: "score-json" },
+    },
+    baselineFingerprint: projectFingerprint(projectDir),
+    phase: "campaign",
+  };
 }
 
 /**
@@ -328,6 +522,76 @@ function approvedContract(contract: RunContract): RunContract["budgets"] {
   return contract.budgets;
 }
 
+interface BudgetExtensionCaps {
+  maxCampaigns: number;
+  maxAgentStarts: number;
+  maxEvaluatorRuns: number;
+}
+
+interface BudgetExtensionTransaction {
+  version: 1;
+  previous: ApprovedContract;
+  next: ApprovedContract;
+  previousCaps: BudgetExtensionCaps;
+  nextCaps: BudgetExtensionCaps;
+}
+
+function isBudgetExtensionCaps(value: unknown): value is BudgetExtensionCaps {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const caps = value as Record<string, unknown>;
+  return [caps.maxCampaigns, caps.maxAgentStarts, caps.maxEvaluatorRuns]
+    .every((cap) => Number.isSafeInteger(cap) && (cap as number) > 0);
+}
+
+/** Complete an explicitly approved cap increase after a process interruption. */
+function recoverBudgetExtension(loopRoot: string): void {
+  const transactionPath = path.join(loopRoot, "budget-extension.json");
+  if (!fs.existsSync(transactionPath)) return;
+  const transaction = readJson<BudgetExtensionTransaction>(transactionPath);
+  if (!transaction || transaction.version !== 1 || !transaction.previous || !transaction.next
+    || !isBudgetExtensionCaps(transaction.previousCaps) || !isBudgetExtensionCaps(transaction.nextCaps)
+    || validateRunContract(transaction.previous.contract).length > 0 || validateRunContract(transaction.next.contract).length > 0
+    || !Number.isFinite(Date.parse(transaction.previous.approvedAt)) || !Number.isFinite(Date.parse(transaction.next.approvedAt))) {
+    throw new Error("saved budget-extension transaction is invalid; inspect it before recovery");
+  }
+  const previousId = approvalIdentity(transaction.previous.contract);
+  const nextId = approvalIdentity(transaction.next.contract);
+  const current = readStoredContract(loopRoot);
+  if (!current || ![previousId, nextId].includes(approvalIdentity(current.contract))) {
+    throw new Error("saved budget-extension transaction does not match the current contract; inspect saved state before recovery");
+  }
+  const before = transaction.previous.contract.budgets;
+  const after = transaction.next.contract.budgets;
+  const oldCaps = transaction.previousCaps;
+  const newCaps = transaction.nextCaps;
+  if (after.maxCampaigns < before.maxCampaigns || after.maxAgentStarts < before.maxAgentStarts || after.maxEvaluatorRuns < before.maxEvaluatorRuns
+    || after.deadlineMs < before.deadlineMs || after.falseAcceptBudget !== before.falseAcceptBudget
+    || newCaps.maxCampaigns < oldCaps.maxCampaigns || newCaps.maxAgentStarts < oldCaps.maxAgentStarts || newCaps.maxEvaluatorRuns < oldCaps.maxEvaluatorRuns
+    || newCaps.maxCampaigns > after.maxCampaigns || newCaps.maxAgentStarts > after.maxAgentStarts || newCaps.maxEvaluatorRuns > after.maxEvaluatorRuns) {
+    throw new Error("saved budget-extension transaction does not contain a monotonic cap increase");
+  }
+  const budgetPath = path.join(loopRoot, "budget.json");
+  const caps = readSavedBudgetCaps(budgetPath);
+  const isOldCaps = caps?.max_campaigns === oldCaps.maxCampaigns && caps.max_agent_starts === oldCaps.maxAgentStarts && caps.max_evaluator_runs === oldCaps.maxEvaluatorRuns;
+  const isNewCaps = caps?.max_campaigns === newCaps.maxCampaigns && caps.max_agent_starts === newCaps.maxAgentStarts && caps.max_evaluator_runs === newCaps.maxEvaluatorRuns;
+  if (!caps || (!isOldCaps && !isNewCaps)) {
+    throw new Error("saved budget-extension transaction does not match the durable budget; inspect saved state before recovery");
+  }
+  const budget = readOrCreateLoopBudget(budgetPath, {
+    maxCampaigns: caps.max_campaigns, maxAgentStarts: caps.max_agent_starts,
+    maxEvaluatorRuns: caps.max_evaluator_runs, deadlineMs: after.deadlineMs,
+  });
+  if (budget.campaigns > newCaps.maxCampaigns || budget.agent_starts > newCaps.maxAgentStarts || budget.evaluator_runs > newCaps.maxEvaluatorRuns) {
+    throw new Error("saved budget-extension transaction would set a cap below accumulated spend");
+  }
+  writeFileAtomic(path.join(loopRoot, "contract.previous.json"), `${JSON.stringify(transaction.previous, null, 2)}\n`, true);
+  if (approvalIdentity(current.contract) === previousId) {
+    writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...transaction.next }, null, 2)}\n`, true);
+  }
+  writeLoopBudget(budgetPath, { ...budget, max_campaigns: newCaps.maxCampaigns, max_agent_starts: newCaps.maxAgentStarts, max_evaluator_runs: newCaps.maxEvaluatorRuns });
+  fs.rmSync(transactionPath, { force: true });
+}
+
 /**
  * Memory reduced to experiments comparable with the current objective and
  * instrument. Legacy records without provenance stay comparable, so an upgrade
@@ -352,19 +616,53 @@ function comparableMemory(memory: LoopMemory, current: { contractId: string | nu
   return { ...memory, leverStats, outcomes };
 }
 
-interface LoopLease { pid: number; host: string | null; startedAt: string; heartbeatAt: string; }
+export interface LoopActivity {
+  state: "running" | "awaiting-consent" | "awaiting-approval" | "stopping" | "interrupted" | "unverified" | "unknown";
+  phase: string;
+  detail: string;
+  startedAt: string | null;
+  updatedAt: string | null;
+  campaignId?: string;
+}
+interface LoopLease {
+  pid: number; host: string | null; startedAt: string; heartbeatAt: string;
+  activity?: { phase: string; detail: string; updatedAt: string; campaignId?: string };
+}
+const activityText = (text: string): string => text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 240);
 
 /** Read a lease; an unreadable lease proves nothing on its own. */
 function readLease(file: string): LoopLease | null {
   try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile() || stat.size > 64 * 1024) return null;
     const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<LoopLease> | null;
     if (!parsed || typeof parsed !== "object") return null;
     if (typeof parsed.pid !== "number" || !Number.isSafeInteger(parsed.pid) || parsed.pid <= 0) return null;
     if (typeof parsed.startedAt !== "string" || !Number.isFinite(Date.parse(parsed.startedAt))) return null;
     if (typeof parsed.heartbeatAt !== "string" || !Number.isFinite(Date.parse(parsed.heartbeatAt))) return null;
-    if (parsed.host !== undefined && typeof parsed.host !== "string") return null;
-    return { pid: parsed.pid, host: parsed.host ?? null, startedAt: parsed.startedAt, heartbeatAt: parsed.heartbeatAt };
+    if (parsed.host !== undefined && parsed.host !== null && typeof parsed.host !== "string") return null;
+    const value = parsed.activity;
+    const activity = value && typeof value.phase === "string" && typeof value.detail === "string" && typeof value.updatedAt === "string" && Number.isFinite(Date.parse(value.updatedAt))
+      ? { phase: activityText(value.phase), detail: activityText(value.detail), updatedAt: value.updatedAt,
+        ...(typeof value.campaignId === "string" ? { campaignId: value.campaignId } : {}) } : undefined;
+    return { pid: parsed.pid, host: parsed.host ?? null, startedAt: parsed.startedAt, heartbeatAt: parsed.heartbeatAt, ...(activity ? { activity } : {}) };
   } catch { return null; }
+}
+
+/** Read-only live work inspection; lease presence alone is not proof of a working process. */
+export function readLoopActivity(baseRoot: string): LoopActivity | null {
+  const file = path.join(baseRoot, "loop", "lease.json");
+  if (!fs.existsSync(file)) return null;
+  const lease = readLease(file);
+  if (!lease) return { state: "unknown", phase: "unknown", detail: "A loop lease exists but cannot be read; activity cannot be verified.", startedAt: null, updatedAt: null };
+  let state: LoopActivity["state"] = "unverified";
+  if (lease.host === os.hostname()) {
+    if (!processIsAlive(lease.pid)) state = "interrupted";
+    else if (lease.activity) state = lease.activity.phase === "stopping" ? "stopping" : "running";
+  }
+  return { state, phase: lease.activity?.phase ?? "unknown", detail: lease.activity?.detail ?? "The owner has not published a work stage.",
+    startedAt: lease.startedAt, updatedAt: lease.activity?.updatedAt ?? lease.heartbeatAt,
+    ...(lease.activity?.campaignId ? { campaignId: lease.activity.campaignId } : {}) };
 }
 
 /** A lease file younger than this may still be mid-publication; it is not taken over. */
@@ -518,6 +816,7 @@ function defaultSetup(context: LeverSetupContext, options: LoopOptions): LeverCa
     score_program: `node "${evaluatorAbsolute}"`,
     score_path: plan.scorePath,
     higher_is_better: plan.higherIsBetter,
+    evaluator_timeout_ms: plan.wrapperTimeoutMs,
     problem_file: options.taskDefaults?.problem_file ?? null,
     copy_exclude: [],
     // The approved contract names the candidate agent; the task default (`pi`) is
@@ -594,31 +893,18 @@ function classifyCampaignFailure(reason: string): string {
   return `campaign failed: ${reason}`;
 }
 
-/**
- * Run the unattended loop until a stop rule fires. Returns a full record of
- * the run: stop reason, per-campaign outcomes, durable memory and budget paths,
- * and a bounded Memento digest for the next run.
- */
-function namedProjectPaths(texts: string[]): string[] {
-  const paths = new Set<string>();
-  const tokenPattern = /"([^"\r\n]+)"|'([^'\r\n]+)'|`([^`\r\n]+)`|([^\s"'`]+)/g;
-  const sourceFile = /\.(?:mjs|cjs|js|jsx|ts|tsx|py|sh|ps1|json|ya?ml|toml)$/i;
-  for (const text of texts) {
-    for (const match of text.matchAll(tokenPattern)) {
-      const token = (match[1] ?? match[2] ?? match[3] ?? match[4] ?? "").replace(/^[([{]+|[,;:)}\]]+$/g, "");
-      const candidates = match[1] !== undefined || match[2] !== undefined || match[3] !== undefined
-        ? [token]
-        : token.split(/&&|\|\||[;&|()<>]/g);
-      for (const candidate of candidates) {
-        const values = candidate.startsWith("-") && candidate.includes("=") ? [candidate.slice(candidate.indexOf("=") + 1)] : [candidate];
-        for (const value of values) {
-          if (sourceFile.test(value)) paths.add(value.replace(/\\/g, "/").replace(/^\.\//, ""));
-        }
-      }
-    }
-    for (const match of text.matchAll(/\btests\.([A-Za-z_][\w]*)\b/g)) paths.add(`tests/${match[1]}.py`);
-  }
-  return [...paths];
+/** Scope governs writes, not the read/run dependencies of a verifier or gate. */
+function bootstrapWritePlan(contract: RunContract, rawPaths: string[]): { paths: string[]; checks: LoopPreflightCheck[] } {
+  const normalized = rawPaths.map((file) => normalizeProjectRelativePath(file));
+  const invalid = rawPaths.filter((_file, index) => normalized[index] === null);
+  const paths = [...new Set(normalized.filter((file): file is string => file !== null))];
+  const outside = paths.filter((file) => !pathWithin(file, contract.scope.roots));
+  const protectedPaths = paths.filter((file) => pathProtected(file, contract.scope.protectedAssets));
+  const checks: LoopPreflightCheck[] = [];
+  if (invalid.length) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths must be normalized project-relative files without traversal or absolute paths: ${invalid.join(", ")}.`, remedy: "Replace each path with an exact file path inside the project, without `..`, an absolute prefix, or a trailing slash." });
+  if (outside.length) checks.push({ name: "scope", status: "blocked", reason: `Planned bootstrap writes are outside editable scope: ${outside.join(", ")}.`, remedy: `Approve only the required write paths before setup: ${outside.join(", ")}. Existing evaluator and gate files do not need edit permission to run.` });
+  if (protectedPaths.length) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths are protected and cannot be changed: ${protectedPaths.join(", ")}.`, remedy: "Choose different bootstrap paths that are inside editable scope and outside all protected assets." });
+  return { paths, checks };
 }
 
 function buildLoopPreflight(contract: RunContract, recon: ReconResult, inventory: LeverInventory, focus = "", bootstrapPaths: string[] = []): LoopResult["preflight"] {
@@ -661,18 +947,16 @@ function buildLoopPreflight(contract: RunContract, recon: ReconResult, inventory
     const reason = pinnedRequest
       ? `No executable ${pinnedRequest} was discovered; ${workloadBlockers[0] ?? "no runnable benchmark or custom workload is available"}.`
       : workloadBlockers[0] ?? "No executable workload was found for the approved metric.";
-    blocker("workload", reason, `Declare and pin the requested workload and its evaluator, then include their files in editable scope${focus ? ` for “${focus.slice(0, 140)}”` : ""}; if bootstrapping is authorized, supply its exact in-scope file plan and setup step.`);
+    blocker("workload", reason, `Declare and pin the requested workload and its evaluator${focus ? ` for “${focus.slice(0, 140)}”` : ""}. Use /dream-rsi loop <goal> to prepare and review the evaluator, scope and gates. For automation, supply evaluator.argv/output/inputs, unit and higher_is_better directly with dream_rsi_loop or a reviewed --config file. Preparation is not approval or qualification. Existing verification files need no edit permission; if setup must create or change files, approve its exact in-scope write plan.`);
   }
 
-  const paths = new Set(namedProjectPaths([focus, ...contract.preserved.gates]));
-  for (const file of bootstrapPaths) paths.add(file.replace(/\\/g, "/").replace(/^\.\//, ""));
-  const outOfScope = [...paths].filter((file) => !pathWithin(file, contract.scope.roots));
+  const writeChecks = bootstrapWritePlan(contract, bootstrapPaths).checks;
+  checks.push(...writeChecks);
   const scopeRejections = inventory.levers.length === 0
     ? inventory.rejected.filter((entry) => /approved editable scope|outside .*scope/i.test(entry.reason))
     : [];
   if (scopeRejections.length > 0) blocker("scope", `Candidate work is outside the approved editable scope: ${scopeRejections.map((entry) => entry.reason).join("; ")}.`, "Expand the approved scope to include the required implementation files, or choose a workload exercised by files already in scope.");
-  else if (outOfScope.length > 0) blocker("scope", `Required evaluator or gate file(s) are outside editable scope: ${outOfScope.join(", ")}.`, `Add only the required paths to the approved scope before bootstrapping or editing: ${outOfScope.join(", ")}.`);
-  else checks.push({ name: "scope", status: "passed", reason: "Named evaluator and gate files are covered by editable scope, or no such project files were named." });
+  else if (writeChecks.length === 0) checks.push({ name: "scope", status: "passed", reason: "Candidate edits and planned bootstrap writes are inside the approved boundary. Existing evaluators, fixtures, and correctness gates may be read or run outside editable scope." });
 
   if (contract.preserved.gates.every((gate) => gate.trim().length > 0)) {
     checks.push({ name: "gates", status: "not-checked", reason: contract.preserved.gates.length
@@ -698,8 +982,8 @@ function qualificationBlockers(plan: MetricPlan | null, fallbackReason?: string)
       : `Campaign setup could not produce a usable instrument: ${failed.detail}.`;
     const remedy = name === "budget" ? "Increase the remaining evaluator or deadline allowance within the approved limits, or reduce the required work."
       : name === "gates" ? "Declare a passing independent correctness gate or score-validity oracle that detects broken candidate code."
-        : name === "workload" ? "Supply a runnable pinned workload for the declared metric and include its required files in editable scope."
-          : "Fix the declared evaluator and verify its output against the selected metric without changing its unit or direction.";
+        : name === "workload" ? "Supply a runnable pinned workload for the declared metric. Approve editable scope only for files that setup or candidates must change, not existing verification dependencies."
+          : "Fix the declared evaluator and verify its output against the selected metric without changing its unit or direction.";;
     return { name, status: "blocked", reason, remedy };
   });
 }
@@ -720,6 +1004,10 @@ function classifyStop(reason: string): LoopStopCode {
   return "stopped";
 }
 
+/**
+ * Run the unattended loop until a stop rule fires. Return outcomes, spend,
+ * durable state paths, and a bounded Memento digest for the next run.
+ */
 export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const limits = options.limits;
 
@@ -759,9 +1047,15 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let runStartPhases: Partial<Record<LoopPhase, import("./budget.ts").LoopPhaseSpend>> = {};
   let resumePending = options.resumeActiveCampaign === true;
   let approved: ApprovedContract | null = null;
+  let storedAtStart: ApprovedContract | null = null;
   let recon: ReconResult | null = null;
   const rejectedThisRun = new Set<string>();
-  const progress = options.onProgress ?? (() => {});
+  let updateActivityDetail: ((message: string) => void) | undefined;
+  const progress = (message: string): void => {
+    // Publish work labels, not arbitrary evaluator or provider error text, in live metadata.
+    if (message.startsWith("recon: probing ")) updateActivityDetail?.(message);
+    options.onProgress?.(message);
+  };
   const collectSignalsImpl = options.collectSignalsImpl ?? ((input: { projectDir: string; focus?: string; includeLogs?: boolean; sessionDir?: string }) => collectSignals({ ...input, now: now() }));
   const reconProjectImpl = options.reconProjectImpl ?? reconProject;
   const runCampaignImpl = options.runCampaignImpl ?? runCampaign;
@@ -808,7 +1102,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   // over explicitly, and the takeover is noted.
   const leasePath = path.join(loopRoot, "lease.json");
   const leaseStartedAt = now().toISOString();
-  const lease: LoopLease = { pid: process.pid, host: os.hostname(), startedAt: leaseStartedAt, heartbeatAt: leaseStartedAt };
+  const lease: LoopLease = { pid: process.pid, host: os.hostname(), startedAt: leaseStartedAt, heartbeatAt: leaseStartedAt,
+    activity: { phase: "setup", detail: "Checking saved approval and durable budget", updatedAt: leaseStartedAt } };
   const claim = acquireLease(leasePath, lease, (holder) => now().getTime() - Date.parse(holder.heartbeatAt) < LEASE_STALE_MS);
   const leaseHeld = claim.held;
   if (!claim.held) {
@@ -819,10 +1114,41 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   } else if (claim.stale) {
     addNote(`took over a stale loop lease last refreshed at ${claim.stale.heartbeatAt}.`);
   }
+  let leaseOwnershipWarned = false;
   const touchLease = (): void => {
     if (!leaseHeld) return;
+    const current = readLease(leasePath);
+    if (!current || current.pid !== lease.pid || current.host !== lease.host || current.startedAt !== lease.startedAt) {
+      if (!leaseOwnershipWarned) noteLocally("the loop lease is no longer owned by this run; live activity is not being published and another loop may hold this project");
+      leaseOwnershipWarned = true;
+      return;
+    }
     writeFileAtomic(leasePath, `${JSON.stringify({ ...lease, heartbeatAt: now().toISOString() }, null, 2)}\n`, true);
   };
+  let activityWriteWarning = false;
+  let lastActivityWriteMs = 0;
+  const persistActivity = (always: boolean): void => {
+    // Campaign status updates arrive many times per iteration. Stage changes and progress
+    // labels always publish; only high-frequency detail is coalesced, and it is flushed by
+    // the next lease touch so a long phase never loses its label.
+    if (!always && Date.now() - lastActivityWriteMs < 1000) return;
+    try { touchLease(); lastActivityWriteMs = Date.now(); }
+    catch (error) {
+      if (!activityWriteWarning) noteLocally(`Live activity could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+      activityWriteWarning = true;
+      if (lease.activity) lease.activity.detail = activityText(`${lease.activity.detail} [live activity update not saved]`);
+    }
+  };
+  const setActivity = (phase: string, detail: string, campaignId?: string, coalesce = false): void => {
+    if (!leaseHeld) return;
+    const previousPhase = lease.activity?.phase;
+    lease.activity = { phase, detail: activityText(detail), updatedAt: now().toISOString(), ...(campaignId ? { campaignId } : {}) };
+    persistActivity(!coalesce || phase !== previousPhase);
+    options.onActivity?.({ state: options.signal?.aborted ? "stopping" : "running", ...lease.activity, startedAt: leaseStartedAt });
+  };
+  updateActivityDetail = (message) => setActivity(lease.activity?.phase ?? "setup", message, lease.activity?.campaignId);
+  const onAbort = (): void => setActivity("stopping", "Cancellation requested; waiting for active work to unwind", lease.activity?.campaignId);
+  if (leaseHeld) options.signal?.addEventListener("abort", onAbort, { once: true });
   let budget: LoopBudgetFile | null = null;
   const chargeOne = (phase: LoopPhase, process: "agent" | "evaluator"): void => {
     if (!budget) throw new LoopBudgetExhaustedError(`${phase} process`);
@@ -853,6 +1179,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     if (options.signal?.aborted) { stopReason = "cancelled"; return; }
     const remainingMs = deadlineAt - Date.now();
     if (remainingMs <= 0) { stopReason = "deadline"; return; }
+    setActivity("liveness", "Checking the configured agent before campaign search");
     const scratch = fs.mkdtempSync(path.join(loopRoot, "liveness-"));
     try {
       const startedAt = Date.now();
@@ -914,16 +1241,29 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         progress(`loop: agent liveness probe passed (${label})`);
       }
     } finally {
-      fs.rmSync(scratch, { recursive: true, force: true });
+      try { fs.rmSync(scratch, { recursive: true, force: true }); }
+      catch (e: any) { if (e?.code === "EBUSY" || e?.code === "EPERM") console.error(`EBUSY/EPERM at loop.ts finally scratch remove:`, new Error("EBUSY-site").stack); throw e; }
     }
   };
   const resumeSavedCampaign = async (): Promise<void> => {
-    const context = readJson<LoopResumeContext>(activeContextPath);
+    setActivity("resuming", "Loading saved campaign and confirmation evidence");
+    const contextExists = fs.existsSync(activeContextPath);
+    let context = readJson<LoopResumeContext>(activeContextPath);
+    const before = readCampaignStatus(baseRoot);
+    if (!before) throw new Error("the saved loop context has no campaign");
+    if (!context && !contextExists && options.confirmationOnly) {
+      if (!approved || !before.pendingConfirmation) throw new Error("confirmation recovery requires an approved contract and a saved pending candidate");
+      const record = readJson<CampaignRecord>(path.join(before.campaignRoot, "campaign.json"));
+      if (!record || record.id !== before.id || path.resolve(record.campaignRoot) !== path.resolve(before.campaignRoot)) {
+        throw new Error("saved campaign record is missing or inconsistent; confirmation recovery refused");
+      }
+      context = recoverPendingConfirmationContext({ record, contract: approved.contract, projectDir, loopRoot, baseRoot });
+      writeJson(activeContextPath, context);
+      progress(`loop: reconstructed the frozen context for pending confirmation ${record.id} from validated campaign evidence`);
+    }
     if (!context || context.version !== 1 || !context.lever?.id || !context.setup?.task || !context.plan || !context.instrument) {
       throw new Error("saved loop resume context is missing or invalid; the campaign cannot continue safely");
     }
-    const before = readCampaignStatus(baseRoot);
-    if (!before) throw new Error("the saved loop context has no campaign");
     if (options.confirmationOnly && !before.pendingConfirmation) throw new Error("confirmation-only resume requires a saved pending candidate");
     const terminal = before.state.kind === "complete" || before.state.kind === "failed";
     if (!terminal && before.state.kind !== "paused" && before.state.kind !== "running") throw new Error("the saved loop context has no paused or interrupted campaign");
@@ -957,10 +1297,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       try {
         result = await resumeCampaignImpl({
         baseRoot, projectDir,
+        ...(approved ? { evaluatorEnv: restrictedEnvironment(approved.contract), evaluatorEnvKeys: approved.contract.execution.envAllowlist } : {}),
         ...(options.confirmationOnly ? { confirmationOnly: true, ...((confirmationExtension!.agentStarts + confirmationExtension!.evaluatorRuns + confirmationExtension!.deadlineMs > 0) ? { extendLimits: confirmationExtension } : {}) } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
         ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
-        ...(options.onCampaignUpdate ? { onUpdate: options.onCampaignUpdate } : {}),
+        onUpdate: (status) => {
+          setActivity("resuming", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
+          options.onCampaignUpdate?.(status);
+        },
         ...(options.onPhaseProgress ? { onPhaseProgress: options.onPhaseProgress } : {}),
         onProgress: progress,
         });
@@ -989,6 +1333,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       if (!approved) postApplyFailure = "the saved loop contract is unavailable for independent verification";
       else {
         try {
+          setActivity("post-apply", "Independently verifying the resumed applied change", result.id);
           const checked = await verifyPostApply({
             projectDir, contract: approved.contract,
             argv: context.instrument.argv, gates: context.instrument.gates, baseline: context.instrument.baseline,
@@ -1024,10 +1369,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     else if (options.confirmationOnly) stopReason = "confirmation complete";
     else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
   };
-  // The durable limits come from the caller and are capped by the approved contract.
-  // The approved contract is an upper bound on durable spend, not a suggestion. A
-  // caller asking for more than the contract approved gets the contract's figure; a
-  // caller asking for less gets less. Nothing may widen its own allowance.
+  // Requested limits and approved contract budgets combine into this run's total
+  // allowance. Replacement later prevents that allowance from shrinking saved caps.
   const approvedBudgets = approvedContract(options.contract);
   const durableLimits = {
     maxCampaigns: Math.min(limits.maxCampaigns, approvedBudgets?.maxCampaigns ?? limits.maxCampaigns),
@@ -1038,12 +1381,20 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
 
   try {
     if (leaseHeld) {
+      setActivity("setup", "Checking saved approval and durable budget");
+      recoverBudgetExtension(loopRoot);
+      storedAtStart = readStoredContract(loopRoot);
+      const existingCaps = readSavedBudgetCaps(budgetPath);
       budget = readOrCreateLoopBudget(budgetPath, {
-        maxCampaigns: durableLimits.maxCampaigns,
-        maxAgentStarts: durableLimits.maxAgentStarts,
-        maxEvaluatorRuns: durableLimits.maxEvaluatorRuns,
+        maxCampaigns: existingCaps?.max_campaigns ?? durableLimits.maxCampaigns,
+        maxAgentStarts: existingCaps?.max_agent_starts ?? durableLimits.maxAgentStarts,
+        maxEvaluatorRuns: existingCaps?.max_evaluator_runs ?? durableLimits.maxEvaluatorRuns,
         deadlineMs: durableLimits.deadlineMs,
       });
+      if (!options.replaceContract && (durableLimits.maxCampaigns !== budget.max_campaigns
+        || durableLimits.maxAgentStarts !== budget.max_agent_starts || durableLimits.maxEvaluatorRuns !== budget.max_evaluator_runs)) {
+        throw new Error("loop budget limits are immutable without an explicitly approved contract replacement");
+      }
       // Crash-safe accounting: a leftover reservation means the previous process
       // died mid-phase, so charge the granted budget before spending more.
       const open = budget.open_campaign;
@@ -1070,40 +1421,86 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     } else if (leaseHeld) {
       try {
         const contract = options.contract;
-        const gatePaths = namedProjectPaths(contract.preserved.gates);
+        const proposed = approveRunContract(projectDir, contract);
+        const stored = storedAtStart;
+        const differs = stored && approvalIdentity(stored.contract) !== approvalIdentity(proposed.contract);
+        if (options.replaceContract && (!stored || approvalIdentity(stored.contract) !== options.replaceContract)) {
+          throw new ContractNotApprovedError("The saved run contract changed after replacement approval; inspect it and approve the new boundary again.", "contract");
+        }
+        if (differs && !options.replaceContract) {
+          throw new ContractNotApprovedError(`A different run contract is already stored for this project: "${stored.contract.outcome.statement}". Requested objective: "${contract.outcome.statement}". Inspect both boundaries, then explicitly authorize replace_contract=true or --replace-contract. Consent alone does not replace a contract; replacement can only raise caps and retains all recorded spend.`, "contract");
+        }
         const rawBootstrapPaths = options.evaluatorBootstrap?.authorized ? options.evaluatorBootstrap.paths : [];
-        const normalizedBootstrapPaths = rawBootstrapPaths.map((file) => normalizeProjectRelativePath(file));
-        const invalidBootstrapPaths = rawBootstrapPaths.filter((_file, index) => normalizedBootstrapPaths[index] === null);
-        const bootstrapPaths = normalizedBootstrapPaths.filter((file): file is string => file !== null);
-        const requiredPaths = [...new Set([...gatePaths, ...bootstrapPaths])];
-        const outsideScope = requiredPaths.filter((file) => !pathWithin(file, contract.scope.roots));
-        const protectedBootstrap = bootstrapPaths.filter((file) => pathProtected(file, contract.scope.protectedAssets));
-        const staticChecks: LoopPreflightCheck[] = [];
-        if (invalidBootstrapPaths.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths must be normalized project-relative files without traversal or absolute paths: ${invalidBootstrapPaths.join(", ")}.`, remedy: "Replace each path with an exact file path inside the project, without `..`, an absolute prefix, or a trailing slash." });
-        if (outsideScope.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Required evaluator, bootstrap, or gate paths are outside editable scope: ${outsideScope.join(", ")}.`, remedy: `Add only the required paths to the approved scope before saving campaign settings: ${outsideScope.join(", ")}.` });
-        if (protectedBootstrap.length > 0) staticChecks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths are protected and cannot be changed: ${protectedBootstrap.join(", ")}.`, remedy: "Choose different bootstrap paths that are inside editable scope and outside all protected assets." });
+        const { checks: staticChecks } = bootstrapWritePlan(contract, rawBootstrapPaths);
         if (contract.execution.consent && staticChecks.length > 0) {
           preflight = { status: "blocked", checks: staticChecks };
           stopReason = `blocked: ${staticChecks.map((check) => `${check.reason} Next step: ${check.remedy}`).join(" ")}`;
           addNote(stopReason);
         } else {
-          approved = approveRunContract(projectDir, contract);
-          const stored = readStoredContract(loopRoot);
-          // Compare identity, not wording: the same sentence with wider scope, different
-          // gates or a larger allowance would silently replace the approved boundary.
-          if (stored && contractIdentity(stored.contract) !== contractIdentity(approved.contract)) {
-            throw new ContractNotApprovedError(
-              `a different run contract is already stored for this project ("${stored.contract.outcome.statement}"); approve that objective and boundary, or move ${contractFile(loopRoot)} aside deliberately`,
-            );
+          if (differs) {
+            if (options.signal?.aborted) { stopReason = "cancelled"; }
+            else {
+              const campaign = readCampaignStatus(baseRoot);
+              if (campaign?.state.kind === "running" || campaign?.state.kind === "paused" || campaign?.pendingConfirmation || fs.existsSync(activeContextPath)) {
+                throw new ContractNotApprovedError("Contract replacement is blocked while a campaign is running, paused, awaiting confirmation, or awaiting post-apply recovery. Resume or resolve it under the saved contract first.", "contract");
+              }
+              const priorBudgets = stored.contract.budgets;
+              const nextBudgets = contract.budgets;
+              if (nextBudgets.maxCampaigns < priorBudgets.maxCampaigns || nextBudgets.maxAgentStarts < priorBudgets.maxAgentStarts
+                || nextBudgets.maxEvaluatorRuns < priorBudgets.maxEvaluatorRuns || nextBudgets.deadlineMs < priorBudgets.deadlineMs
+                || nextBudgets.falseAcceptBudget !== priorBudgets.falseAcceptBudget) {
+                throw new ContractNotApprovedError("Contract replacement may raise durable limits but cannot reduce caps or change the statistical budget.", "contract");
+              }
+              if (budget && (nextBudgets.maxCampaigns < budget.campaigns || nextBudgets.maxAgentStarts < budget.agent_starts || nextBudgets.maxEvaluatorRuns < budget.evaluator_runs)) {
+                throw new ContractNotApprovedError("The raised limits are below spend already recorded; choose caps at or above current spend.", "contract");
+              }
+            }
           }
-          writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approved, contract: approved.contract }, null, 2)}\n`, true);
-          contractId = contractIdentity(approved.contract);
-          void restrictedEnvironment(approved.contract);
+          if (!stopReason) {
+            const replacingSavedContract = Boolean(stored && budget && options.replaceContract);
+            const next = replacingSavedContract ? {
+              ...durableLimits,
+              maxCampaigns: Math.max(durableLimits.maxCampaigns, budget!.max_campaigns),
+              maxAgentStarts: Math.max(durableLimits.maxAgentStarts, budget!.max_agent_starts),
+              maxEvaluatorRuns: Math.max(durableLimits.maxEvaluatorRuns, budget!.max_evaluator_runs),
+            } : durableLimits;
+            if (replacingSavedContract && (next.maxCampaigns < budget!.campaigns || next.maxAgentStarts < budget!.agent_starts || next.maxEvaluatorRuns < budget!.evaluator_runs)) {
+              throw new ContractNotApprovedError("The raised limits are below spend already recorded; choose caps at or above current spend.", "contract");
+            }
+            const raisesCaps = Boolean(budget && (next.maxCampaigns > budget.max_campaigns || next.maxAgentStarts > budget.max_agent_starts || next.maxEvaluatorRuns > budget.max_evaluator_runs));
+            try {
+              if (replacingSavedContract && raisesCaps) {
+                const transaction: BudgetExtensionTransaction = { version: 1, previous: stored!, next: proposed,
+                  previousCaps: { maxCampaigns: budget!.max_campaigns, maxAgentStarts: budget!.max_agent_starts, maxEvaluatorRuns: budget!.max_evaluator_runs },
+                  nextCaps: { maxCampaigns: next.maxCampaigns, maxAgentStarts: next.maxAgentStarts, maxEvaluatorRuns: next.maxEvaluatorRuns } };
+                writeFileAtomic(path.join(loopRoot, "budget-extension.json"), `${JSON.stringify(transaction, null, 2)}\n`, true);
+                writeFileAtomic(path.join(loopRoot, "contract.previous.json"), `${JSON.stringify(stored, null, 2)}\n`, true);
+                writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...proposed }, null, 2)}\n`, true);
+                budget = { ...budget!, max_campaigns: next.maxCampaigns, max_agent_starts: next.maxAgentStarts, max_evaluator_runs: next.maxEvaluatorRuns };
+                writeLoopBudget(budgetPath, budget);
+                fs.rmSync(path.join(loopRoot, "budget-extension.json"), { force: true });
+              } else {
+                if (differs) writeFileAtomic(path.join(loopRoot, "contract.previous.json"), `${JSON.stringify(stored, null, 2)}\n`, true);
+                writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...proposed }, null, 2)}\n`, true);
+                if (replacingSavedContract) {
+                  budget = { ...budget!, max_campaigns: next.maxCampaigns, max_agent_starts: next.maxAgentStarts, max_evaluator_runs: next.maxEvaluatorRuns };
+                  writeLoopBudget(budgetPath, budget);
+                }
+              }
+            } catch (error) {
+              throw new ContractNotApprovedError(`The approved run contract could not be saved completely; no discovery was started. A cap-extension transaction will be recovered on the next start when present: ${error instanceof Error ? error.message : String(error)}`, "contract");
+            }
+            approved = proposed;
+            contractId = contractIdentity(approved.contract);
+            void restrictedEnvironment(approved.contract);
+          }
         }
       } catch (error) {
         if (!(error instanceof ContractNotApprovedError)) throw error;
         noteLocally(`not-approved: ${error.reason}`);
-        stopReason = "not-approved";
+        preflight = { status: "blocked", checks: [{ name: "contract", status: "blocked", reason: error.reason,
+          remedy: error.kind === "contract" ? "Inspect the saved contract and approve an explicit replacement only after checking the objective, scope, gates, permissions, new total caps, and retained spend." : "Approve trusted-local execution before repository commands can run." }] };
+        stopReason = error.kind === "contract" ? `blocked: ${error.reason}` : "not-approved";
       }
     }
     while (!stopReason && budget !== null) {
@@ -1152,26 +1549,23 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         projectDir,
         contract: approved!.contract,
         maxProbes: options.reconProbes ?? 3,
+        probeTimeoutMs: Math.max(1, Math.min(120_000, deadlineAt - Date.now())),
         ...(options.signal ? { signal: options.signal } : {}),
         beforeProbe: () => chargeOne("discovery", "evaluator"),
         onProgress: progress,
       });
       try {
+        setActivity("discovery", "Discovering and measuring declared workloads");
         recon = await reconProjectImpl(reconOptions());
         // An aborted run must not report the abort as a broken workload.
         if (options.signal?.aborted) { stopReason = "cancelled"; break; }
         const missingWorkload = recon.blockers.some((reason) => /no benchmark or custom workload|no declared command matches|declared workload .* did not complete|does not name a local entry file/i.test(reason));
-        if (missingWorkload && options.evaluatorBootstrap?.authorized) {
+        const missingSetupFile = options.evaluatorBootstrap?.paths.some((file) => !fs.existsSync(path.resolve(projectDir, file))) ?? false;
+        if (((missingWorkload && !approved.contract.outcome.evaluator) || missingSetupFile) && options.evaluatorBootstrap?.authorized) {
           const approvedContract = approved!.contract;
           const scopeRoots = approvedContract.scope.roots;
-          const requiredPaths = [...new Set(options.evaluatorBootstrap.paths.map((file) => normalizeProjectRelativePath(file)).filter((file): file is string => file !== null))];
-          const requiredGatePaths = namedProjectPaths(approvedContract.preserved.gates);
-          const outOfScope = [...new Set([...requiredPaths, ...requiredGatePaths].filter((file) => !pathWithin(file, scopeRoots)))];
-          const protectedPaths = requiredPaths.filter((file) => pathProtected(file, approvedContract.scope.protectedAssets));
+          const { paths: requiredPaths, checks } = bootstrapWritePlan(approvedContract, options.evaluatorBootstrap.paths);
           const categories = approvedContract.execution.allowedCommandCategories;
-          const checks: LoopPreflightCheck[] = [];
-          if (outOfScope.length > 0) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap or gate files are outside editable scope: ${outOfScope.join(", ")}.`, remedy: `Add only these required paths to the approved scope: ${outOfScope.join(", ")}.` });
-          if (protectedPaths.length > 0) checks.push({ name: "scope", status: "blocked", reason: `Evaluator bootstrap paths are protected and cannot be changed: ${protectedPaths.join(", ")}.`, remedy: "Choose different bootstrap paths that are inside editable scope and outside all protected assets." });
           if (!categories.includes("benchmark") && !categories.includes("custom")) checks.push({ name: "workload", status: "blocked", reason: `Approved command categories (${categories.join(", ") || "none"}) do not permit a benchmark or custom workload.`, remedy: "Approve the benchmark or custom command category before bootstrapping a workload." });
           if (checks.length > 0) {
             preflight = { status: "blocked", checks };
@@ -1184,6 +1578,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           if (options.signal?.aborted) { stopReason = "cancelled"; break; }
           const bootstrapDeadlineMs = Math.max(0, deadlineAt - Date.now());
           if (bootstrapDeadlineMs <= 0) { stopReason = "deadline"; break; }
+          setActivity("bootstrap", "Creating the approved measurement harness and pinned workload");
           progress(`loop: bootstrapping pinned workload in approved scope (${requiredPaths.join(", ")})`);
           const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: () => chargeOne("qualification", "agent"), ...(options.signal ? { signal: options.signal } : {}) });
           const validatedPaths = [...new Set(bootstrap.validatedPaths.map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "")))];
@@ -1193,6 +1588,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           }
           if (options.signal?.aborted) { stopReason = "cancelled"; break; }
           if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
+          setActivity("discovery", "Checking the generated workload before ranking");
           recon = await reconProjectImpl(reconOptions());
         }
       } catch (error) {
@@ -1294,6 +1690,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             : undefined;
           try {
           qualificationFingerprint = projectFingerprint(projectDir);
+          setActivity("qualification", `Qualifying the measurement instrument for ${lever.id}`);
           plan = await synthesizeMetric({
             projectDir,
             loopRoot,
@@ -1301,6 +1698,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(lever.command ? { command: lever.command } : {}),
             ...(lever.command ? { expectedReadMs: recon?.probes.find((probe) => probe.label === recon?.commands.find((command) => command.source === lever.command!.source)?.label)?.durationMs ?? undefined } : {}),
             ...(scoreEvaluator ? { scoreEvaluator } : {}),
+            ...(options.taskDefaults?.evaluator_timeout_ms !== undefined ? { evaluatorTimeoutMs: options.taskDefaults.evaluator_timeout_ms } : {}),
             qualification: {
               contract: approved.contract,
               workRoot: path.join(loopRoot, "qualification"),
@@ -1309,6 +1707,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               editableScope: lever.scopeFiles,
               availableEvaluatorRuns: remainingAllowance(budget!).evaluatorRuns,
               ...(options.signal ? { signal: options.signal } : {}),
+              deadlineAt,
               beforeEvaluatorRun: () => chargeOne("qualification", "evaluator"),
             },
           });
@@ -1396,10 +1795,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         writeLoopBudget(budgetPath, budget);
         let result: CampaignResult;
         try {
+          setActivity("campaign", `Starting bounded experiments for ${lever.id}`);
           result = await runCampaignImpl({
             baseRoot,
             projectDir,
             task: setup.task,
+            evaluatorEnv: restrictedEnvironment(approved.contract), evaluatorEnvKeys: approved.contract.execution.envAllowlist,
             ...(setup.expectedReadMs !== undefined ? { expectedReadMs: setup.expectedReadMs } : {}),
             searchConfig: readSearchConfig(),
             goal: setup.goal ?? lever.goal,
@@ -1418,6 +1819,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
             onUpdate: (status) => {
+              setActivity("campaign", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
               const saved = readJson<LoopResumeContext>(activeContextPath);
               if (saved && saved.version === 1) writeJson(activeContextPath, { ...saved, campaignId: status.id });
               if (budget?.open_campaign?.phase === "campaign") {
@@ -1465,6 +1867,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           .some((entry) => entry.kind === "apply" && entry.outcome === "success");
         const cancelled = options.signal?.aborted === true || /stopped by request/i.test(result.stopReason);
         const failed = result.state?.kind === "failed";
+        const paused = result.state?.kind === "paused" || result.state?.kind === "running";
         let outcome: LoopMemoryRecord["outcome"];
         if (applied) outcome = "win";
         else if (/preflight failed/i.test(result.stopReason)) outcome = "rejected";
@@ -1486,6 +1889,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (applied && approved && instrument) {
           let postApply: Awaited<ReturnType<typeof verifyPostApply>>;
           try {
+          setActivity("post-apply", "Independently verifying the applied change", result.id);
           postApply = await verifyPostApply({
             projectDir,
             contract: approved.contract,
@@ -1557,10 +1961,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(lastCampaignId ? { parentCampaign: lastCampaignId.slice(0, 200) } : {}),
           },
         }, result.campaignRoot);
-        // The frozen instrument remains available until post-apply verification
-        // and the durable outcome record have both completed.
-        fs.rmSync(activeContextPath, { force: true });
-        try {
+        // Keep the frozen instrument and loop context while a paused campaign awaits
+        // confirmation or an interrupted campaign needs a safe resume.
+        if (!paused) fs.rmSync(activeContextPath, { force: true });
+        if (!paused) try {
           const worlds: ExperimentWorld[] = [];
           const campaignsDir = path.join(baseRoot, "campaigns");
           for (const campaign of fs.readdirSync(campaignsDir, { withFileTypes: true })) {
@@ -1576,6 +1980,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             }
           }
           const incumbent = readSearchConfig();
+          setActivity("dream", "Comparing completed experiment worlds for the next search");
           const adopted = await maybeDream({
             projectDir, loopRoot, agent: setup.task.agent, resolveAgent: options.resolveAgent,
             signal: options.signal ?? new AbortController().signal, worlds, incumbent,
@@ -1605,6 +2010,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // tree no longer agrees with the measurement that promoted it, so continuing would
         // build later experiments on an unverified baseline.
         if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
+        if (paused) stopReason = result.pendingConfirmation ? "confirmation pending" : "paused";
         break; // re-rank before the next campaign
       }
       if (stopReason) break;
@@ -1624,6 +2030,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       }
     }
   } finally {
+    options.signal?.removeEventListener("abort", onAbort);
     if (leaseHeld) {
       // Charge this run's wall time durably so a resume inherits what is left.
       if (budget) {

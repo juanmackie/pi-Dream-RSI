@@ -175,6 +175,60 @@ fs.mkdirSync("eval", { recursive: true });
 fs.writeFileSync("eval/score.json", JSON.stringify({ score: ${score}, raw_score: ${score}, valid: true, fail_class: "ok", error: null }));
 `;
 
+test("generated evaluator inner timeout kills its Node descendant before wrapper cleanup", async (t) => {
+  const projectDir = tempDir();
+  const workload = path.join(projectDir, "hang.mjs");
+  const pidFile = path.join(projectDir, "child.pid");
+  const pidAlive = (pid) => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+  const cleanup = () => {
+    try { const pid = Number(fs.readFileSync(pidFile, "utf8")); if (pidAlive(pid)) process.kill(pid, "SIGKILL"); } catch { /* no child */ }
+  };
+  t.after(() => { cleanup(); fs.rmSync(projectDir, { recursive: true, force: true }); });
+  fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+  fs.writeFileSync(workload, `import { spawn } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nconst child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\nwriteFileSync(${JSON.stringify(pidFile)}, String(child.pid));\nsetInterval(() => {}, 1000);\n`);
+  const plan = await synthesizeMetric({
+    projectDir,
+    lever: scoreLever(),
+    scoreEvaluator: { argv: [process.execPath, workload], output: "stdout-number", unit: "points", higherIsBetter: true },
+    evaluatorTimeoutMs: 8_000,
+  });
+  const result = runEvaluator(projectDir, plan.evaluatorPath);
+  const childPid = Number(fs.readFileSync(pidFile, "utf8"));
+  assert.equal(result.valid, false);
+  assert.equal(result.fail_class, "timeout");
+  assert.equal(result.child.timed_out, true, "the killed inner child is reported as timed out, not as a wrapper success");
+  assert.ok(result.child.argv.some((part) => part.includes("hang.mjs")), "the receipt names the workload that was killed");
+  assert.ok(plan.workloadTimeoutMs < plan.wrapperTimeoutMs);
+  assert.equal(pidAlive(childPid), false, `descendant ${childPid} survived generated evaluator timeout`);
+});
+
+test("an evaluator timeout too small for workload and cleanup is rejected before wrapper creation", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, SCORE_JSON_WRITER("0.75"));
+    const plan = await synthesizeMetric({ projectDir, lever: scoreLever(), scoreEvaluator: scoreSpec(), evaluatorTimeoutMs: 5_999 });
+    assert.equal(plan.ready, false);
+    assert.ok(plan.rejections.some((reason) => /too small/.test(reason)));
+    assert.equal(plan.evaluatorPath, "", "an impossible timeout is rejected before creating an executable wrapper");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("an explicit evaluator timeout overrides the synthesized score timeout", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, SCORE_JSON_WRITER("0.75"));
+    const plan = await synthesizeMetric({ projectDir, lever: scoreLever(), scoreEvaluator: scoreSpec(), evaluatorTimeoutMs: 1_800_000 });
+    assert.equal(plan.wrapperTimeoutMs, 1_800_000);
+    assert.ok(plan.workloadTimeoutMs < plan.wrapperTimeoutMs);
+    assert.match(fs.readFileSync(path.resolve(projectDir, plan.evaluatorPath), "utf8"), /const WRAPPER_TIMEOUT_MS = 1800000;/);
+    assert.match(fs.readFileSync(path.resolve(projectDir, plan.evaluatorPath), "utf8"), new RegExp(`const SAMPLE_TIMEOUT_MS = ${plan.workloadTimeoutMs};`));
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("the score metric template runs the declared evaluator and reads eval/score.json", async () => {
   const projectDir = tempDir();
   try {
@@ -193,7 +247,7 @@ test("the score metric template runs the declared evaluator and reads eval/score
     assert.deepEqual(plan.argv, ["node", "eval/score.mjs"], "the declared evaluator argv is measured verbatim");
     assert.deepEqual(plan.evaluatorInputs, ["eval/score.mjs"], "evaluator code is pinned as a verifier input");
     assert.equal(plan.evaluatorOutput, "score-json");
-    assert.ok(plan.sampleTimeoutMs >= 30_000);
+    assert.equal(plan.sampleTimeoutMs, 10 * 60 * 1000, "score evaluators get a ten-minute minimum sample timeout");
     assert.ok(plan.notes.some((note) => /score evaluator/.test(note)), "the plan explains the score instrument");
 
     const reading = runEvaluator(projectDir, plan.evaluatorPath);
@@ -227,6 +281,9 @@ test("the score metric template reads a single number on stdout and fails closed
     assert.equal(reading.valid, true, reading.error ?? "");
     assert.equal(reading.score, 0.8125, "a single numeric stdout is the score");
     assert.equal(reading.unit, "error rate");
+    assert.ok(reading.child.argv.join(" ").includes("eval/score.mjs"), "the receipt names the exact command that ran");
+    assert.equal(reading.child.exit_code, 0, "the child's own exit status is recorded, not only the wrapper's");
+    assert.equal(reading.child.timed_out, false);
 
     writeScoreEvaluator(projectDir, `console.log("not a number");\n`);
     const malformed = runEvaluator(projectDir, plan.evaluatorPath);
@@ -237,6 +294,33 @@ test("the score metric template reads a single number on stdout and fails closed
     const ambiguous = runEvaluator(projectDir, plan.evaluatorPath);
     assert.equal(ambiguous.valid, false, "the declared contract is one number, not a series");
     assert.equal(ambiguous.fail_class, "invalid_output");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("an exit-zero evaluator with malformed stdout-json keeps its structured failure and child provenance", async () => {
+  const projectDir = tempDir();
+  try {
+    fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ private: true }));
+    writeScoreEvaluator(projectDir, `console.log("this is not the declared verdict");\nprocess.exit(0);\n`);
+    const plan = await synthesizeMetric({
+      projectDir,
+      lever: scoreLever(),
+      scoreEvaluator: scoreSpec({ output: "stdout-json" }),
+    });
+    assert.equal(plan.ready, true, plan.rejections.join("; "));
+
+    const reading = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(reading.valid, false, "exit zero is not a valid measurement");
+    assert.equal(reading.fail_class, "invalid_output", "the structured class survives the wrapper");
+    assert.match(String(reading.error ?? ""), /stdout-json/, "the error names the output contract that failed");
+    assert.equal(reading.child.exit_code, 0, "the child really did exit zero");
+    assert.equal(reading.child.timed_out, false);
+    assert.ok(reading.wrapper_timeout_ms > 0 && reading.workload_timeout_ms > 0, "the effective allowances are recorded");
+
+    writeScoreEvaluator(projectDir, `console.log(JSON.stringify({ score: 0.4, valid: true, fail_class: "build_error", error: "compile failed" }));\n`);
+    const contradictory = runEvaluator(projectDir, plan.evaluatorPath);
+    assert.equal(contradictory.valid, false, "a valid verdict with a failing class is not a score");
+    assert.equal(contradictory.fail_class, "invalid_output");
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });
 
