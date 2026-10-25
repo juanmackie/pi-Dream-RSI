@@ -234,7 +234,7 @@ live-model, or accuracy effectiveness. Commands were run from the repository roo
 | Status/history/accounting | two named `tests/extension.test.mjs` cases | 2 passed, 0 failed, exit 0 |
 | Cold-start end-to-end after the overlap fix | `tests/cold-start.test.mjs` consent scenario | 1 passed, 0 failed, exit 0 (45.2 s) |
 | Typecheck | `npm run typecheck` (`tsc --noEmit`) | clean, exit 0 |
-| Diff hygiene | `git diff --check`, `git diff --cached --quiet` | no whitespace errors, nothing staged |
+| Diff hygiene | `git diff --check` | no whitespace errors (checked before the commit) |
 | Full baseline before remediation | `--test-concurrency=2`, all tests | 383 total: 379 passed, 1 failed, 3 skipped, exit 1 |
 | Full suite, first integrated run | `--test-concurrency=2`, all tests | 396 total: 392 passed, 1 failed, 3 skipped, exit 1 |
 | Full suite, after the overlap fix | `--test-concurrency=2`, all tests | 396 total: 393 passed, 0 failed, 3 skipped, exit 0 (406 s) |
@@ -262,8 +262,14 @@ verification gap on the change set, not as a passing result.
 
 The pre-task source/document snapshot and hashes were retained outside the repository, so the
 remediation delta can be separated from pre-existing dirty changes. Only `engine/metrics.ts`,
-`agent/runner.ts`, `engine/loop.ts`, `engine/recon.ts`, the four test files named above,
-`docs/autonomous-loop.md`, and `docs/adr/0003-gate-set-contract.md` belong to this work.
+`agent/runner.ts`, `engine/loop.ts`, `engine/recon.ts`, the five test files named above,
+`docs/autonomous-loop.md`, `docs/adr/0003-gate-set-contract.md` and `docs/reports/` belong to this
+work.
+
+Publication: commit `1a2f635` on `main` was pushed to `origin` (`c42bebc..1a2f635`). Because those
+files already held uncommitted work in this checkout, the commit carries that work in the same files;
+the paths still dirty after the commit predate this session. `docs/reports/remediation-session.patch`
+is this session's diff against the pre-task snapshot, so a reader can separate the two.
 
 ## 5. Conditions before any live retry
 
