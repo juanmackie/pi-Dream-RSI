@@ -583,6 +583,29 @@ function writeInert(target: string): void {
   fs.writeFileSync(target, target.toLowerCase().endsWith(".py") ? "# inert qualification stub\n" : "export {};\n");
 }
 
+const SCRATCH_CLEANUP_ATTEMPTS = 4;
+const SCRATCH_CLEANUP_BACKOFF_MS = 25;
+
+/** Remove a disposable copy; transient Windows locks must not discard a reading. */
+export async function removeScratchDirectory(
+  scratch: string,
+  remove: typeof fs.rmSync = fs.rmSync,
+): Promise<void> {
+  for (let attempt = 0; attempt < SCRATCH_CLEANUP_ATTEMPTS; attempt += 1) {
+    try {
+      remove(scratch, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if ((code !== "EBUSY" && code !== "EPERM") || attempt === SCRATCH_CLEANUP_ATTEMPTS - 1) {
+        console.error(`Dream-RSI could not remove scratch directory ${scratch}: ${error instanceof Error ? error.message : String(error)}; remove it manually when no process is using it.`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, SCRATCH_CLEANUP_BACKOFF_MS * (attempt + 1)));
+    }
+  }
+}
+
 /** Run one instrument script against a throwaway copy of the target. */
 async function runInstrument(options: {
   evaluatorFile: string;
@@ -626,7 +649,7 @@ async function runInstrument(options: {
       error: valid ? null : (result.spawnError ?? (parsed?.error as string | undefined) ?? (result.stderrTail.trim().split(/\r?\n/, 1)[0] || (result.timedOut ? "instrument timed out" : `instrument exited ${result.code}`))),
     };
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    await removeScratchDirectory(scratch);
   }
 }
 
@@ -671,7 +694,7 @@ async function runGateOnCopy(options: {
         : `"${options.command}" failed: ${(result.spawnError ?? result.stderrTail.trim().split(/\r?\n/, 1)[0]) || `exit ${result.code}`}`,
     };
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    await removeScratchDirectory(scratch);
   }
 }
 

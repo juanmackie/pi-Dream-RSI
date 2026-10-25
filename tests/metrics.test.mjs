@@ -5,11 +5,57 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { commandForHead, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
+import { commandForHead, removeScratchDirectory, synthesizeMetric } from "../extensions/pi-dream-rsi/engine/metrics.ts";
 
 function tempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-metrics-"));
 }
+
+test("scratch cleanup retries transient Windows locks without losing a valid measurement", async () => {
+  const root = tempDir();
+  const scratch = path.join(root, "qualify-transient-lock");
+  fs.mkdirSync(scratch);
+  fs.writeFileSync(path.join(scratch, "measurement.json"), JSON.stringify({ valid: true, score: 0.875 }));
+  const measured = JSON.parse(fs.readFileSync(path.join(scratch, "measurement.json"), "utf8"));
+  let attempts = 0;
+  try {
+    await removeScratchDirectory(scratch, (target, options) => {
+      attempts += 1;
+      if (attempts === 1) {
+        const error = new Error("temporarily locked");
+        error.code = "EBUSY";
+        throw error;
+      }
+      fs.rmSync(target, options);
+    });
+    assert.equal(attempts, 2, "cleanup retries the transient lock once");
+    assert.equal(fs.existsSync(scratch), false, "the scratch copy is removed after retry");
+    assert.deepEqual(measured, { valid: true, score: 0.875 }, "the already-valid evaluator result remains usable");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("scratch cleanup reports the retained path after persistent lock errors", async () => {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-retained-scratch-"));
+  const errors = [];
+  const originalError = console.error;
+  console.error = (message) => errors.push(String(message));
+  try {
+    await removeScratchDirectory(scratch, () => {
+      const error = new Error("still locked");
+      error.code = "EPERM";
+      throw error;
+    });
+    assert.equal(fs.existsSync(scratch), true, "cleanup leaves the locked directory for later removal");
+    assert.equal(errors.length, 1, "persistent cleanup failure is reported once");
+    assert.ok(errors[0].includes(scratch), "the warning identifies the retained scratch directory");
+    assert.match(errors[0], /manually/);
+  } finally {
+    console.error = originalError;
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+});
 
 /** Minimal lever proposal: only the fields metrics.ts consumes. */
 function lever(overrides) {
