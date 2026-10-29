@@ -92,7 +92,7 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
   }
   assert.throws(() => normalizeRunContract(null), /must be an object/);
 });
-test("RSI mode saves its accounting contract but blocks all child work until worker controls exist", async () => {
+test("RSI fails closed when sandbox/provider-bounded worker controls are unavailable", async () => {
   const projectDir = tempProject();
   try {
     const contract = normalizeRunContract(validContract({
@@ -109,6 +109,8 @@ test("RSI mode saves its accounting contract but blocks all child work until wor
     });
     assert.equal(result.stopCode, "blocked");
     assert.match(result.stopReason, /provider-bounded or host-isolated worker adapter/);
+    assert.equal(result.preflight.status, "blocked");
+    assert.ok(result.preflight.checks.some((check) => check.status === "blocked" && /host-isolated worker adapter/.test(check.reason)));
     assert.equal(result.agentStarts, 0);
     assert.equal(reconCalls, 0);
     assert.equal(campaignCalls, 0);

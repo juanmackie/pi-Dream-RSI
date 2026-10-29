@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { spawn } from "node:child_process";
 import test from "node:test";
 import { jump, makeProject } from "./fixtures.mjs";
 
-const { selectActions, defaultSearchConfig, runExperiment, experimentWorldPath } = await jump("engine/experiment.ts");
+const { selectActions, defaultSearchConfig, runExperiment, experimentWorldPath, experimentSeed } = await jump("engine/experiment.ts");
 const { normalizeTask } = await jump("engine/task.ts");
+const { childIdentity, stopRecoveredChild } = await jump("agent/runner.ts");
 
 test("experiment opens the configured first batch, then mixes branches and refinements", () => {
   const config = { ...defaultSearchConfig, batchSize: 4, exploreShare: 0.5, refineTop: 1 };
@@ -85,6 +87,58 @@ test("resume keeps completed attempts and retries only planned work", async (t) 
   assert.deepEqual(resumed.nodes.find((node) => node.id === completed.id), completed);
   assert.equal(resumed.status, "complete");
   assert.equal(starts, 4, "the done attempt is not started again");
+});
+
+test("a fresh experiment run kills only the persisted worker identity before retrying an interrupted attempt", async (t) => {
+  const project = makeProject();
+  let child;
+  t.after(() => {
+    if (child && child.exitCode === null && child.signalCode === null) {
+      try { child.kill("SIGKILL"); } catch { /* the recovery path already stopped it */ }
+    }
+    project.cleanup();
+  });
+  const root = path.join(project.dreamRoot, "campaigns", "restart-worker");
+  const seed = experimentSeed(root, 1);
+  const childScript = path.join(project.projectDir, "owned-worker.mjs");
+  fs.mkdirSync(seed, { recursive: true });
+  fs.writeFileSync(path.join(seed, "seed.txt"), "seed\n");
+  fs.writeFileSync(childScript, "setInterval(() => {}, 1000);\n");
+  child = spawn(process.execPath, [childScript], { cwd: project.projectDir, detached: process.platform !== "win32", windowsHide: true, stdio: "ignore" });
+  const closed = new Promise((resolve) => child.once("close", resolve));
+  let identity = null;
+  for (let attempt = 0; attempt < 100 && !identity; attempt += 1) {
+    identity = childIdentity(child.pid);
+    if (!identity) await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.ok(identity, "the worker identity must be available before it is saved");
+  const ownedChild = { pid: child.pid, identity, startedAt: new Date().toISOString() };
+  const task = normalizeTask(project.task);
+  const config = { ...defaultSearchConfig, batchSize: 1, maxRounds: 1, patience: 1 };
+  const interrupted = {
+    version: 1, cycle: 1, status: "interrupted", fingerprint: "restart-fingerprint", config,
+    baseline: 0, threshold: 0.1, rounds: 1, agentStarts: 1, evaluatorRuns: 0, stopped: "parent interrupted",
+    nodes: [{ id: "n1", parent: null, kind: "branch", round: 1, seq: 1, stage: "agent", score: null,
+      valid: false, failClass: null, timedOut: false, cost: 1, retries: 1, process: ownedChild }],
+  };
+  const worldPath = experimentWorldPath(root, 1);
+  fs.mkdirSync(path.dirname(worldPath), { recursive: true });
+  fs.writeFileSync(worldPath, JSON.stringify(interrupted));
+  await assert.rejects(runExperiment({
+    root, projectDir: project.projectDir, targetRoot: project.seed, seedRoot: project.seed, task,
+    cycle: 1, fingerprint: interrupted.fingerprint, baseline: 0, threshold: 0.1, config,
+    signal: new AbortController().signal, agent: task.agent,
+    beforeAgentSpawn: () => { throw new Error("stop after recovery check"); }, beforeEvaluatorSpawn: () => {},
+    maxAgentAttempts: 1, maxEvaluatorAttempts: 1,
+  }), /stop after recovery check/);
+  await Promise.race([closed, new Promise((_, reject) => setTimeout(() => reject(new Error("recovered worker did not exit")), 2500))]);
+  const recovered = JSON.parse(fs.readFileSync(worldPath, "utf8"));
+  assert.equal(recovered.nodes[0].process, undefined, "the restarted attempt clears its recovered ownership before retrying");
+  assert.equal(childIdentity(child.pid), null, "the original worker identity no longer exists");
+  const currentIdentity = childIdentity(process.pid);
+  assert.ok(currentIdentity);
+  await stopRecoveredChild({ pid: process.pid, identity: `reused-pid-${currentIdentity}` });
+  assert.equal(childIdentity(process.pid), currentIdentity, "recovery never kills a process after its saved PID is reused");
 });
 
 test("a stale proposal from an earlier attempt cannot validate a new no-output run", async (t) => {
