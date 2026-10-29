@@ -22,6 +22,7 @@ import { resolveLoopProposal, proposalReview, proposalIdentity, type LoopProposa
 import { discoverMeasurementOptions } from "./engine/recon.ts";
 import { recovery, recoveryForLoop } from "./engine/recovery.ts";
 import { readLoopSettingsFile } from "./engine/settings.ts";
+import { RSI_DAILY_CAPS } from "./engine/budget.ts";
 import { preparationMessage, preparedSettingsError, type LoopPreparation } from "./engine/preparation.ts";
 import { collectSignals } from "./engine/signals.ts";
 import { MAX_TASK_TIMEOUT_MS, type TaskConfig } from "./engine/task.ts";
@@ -63,6 +64,7 @@ const loopParams = {
     action: { type: "string", enum: ["prepare", "start", "status", "stop", "resume", "confirm"], description: "Prepare, start, inspect or stop. Resume an interrupted campaign, or explicitly continue an idle saved loop only when continuous mode is approved; confirm saved paired readings." },
     project_dir: { type: "string", description: "Local project path; defaults to the current project." },
     consent: { type: "boolean", description: "Required for start: discovered repository code runs on this host with host access." },
+    rsi_mode: { type: "boolean", description: "Opt in to renewable UTC-day accounting (6 campaigns, 400,000 reported tokens, 240 wall minutes). Current RSI mode is accounting-only and blocks all repository probes, evaluators, agents, and campaigns until a bounded or isolated worker is available." },
     preparation_id: { type: "string", description: "Session-bound handoff ID supplied by /dream-rsi loop during preparation. Pass it unchanged with complete settings; Stop or reload invalidates it." },
     proposal_id: { type: "string", description: "Digest of the exact settings and source returned by action=prepare. A stale digest is rejected before execution." },
     approve_proposal: { type: "boolean", description: "Explicit approval of the reviewed proposal_id for a headless prepared start. Separate from host consent, setup authorization, and contract replacement." },
@@ -572,10 +574,28 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           lines.push(fs.existsSync(path.join(loopRoot, "contract.json")) ? "No durable loop budget yet; inspect the saved contract below." : "No loop state yet. Run /dream-rsi loop <what you want>.");
         } else {
           try {
-            const budget = JSON.parse(fs.readFileSync(budgetPath, "utf8")) as { campaigns?: number; max_campaigns?: number; agent_starts?: number; max_agent_starts?: number; evaluator_runs?: number; max_evaluator_runs?: number };
-            lines.push(`Dream-RSI loop budget (durable): ${budget.campaigns}/${budget.max_campaigns} campaigns, ${budget.agent_starts}/${budget.max_agent_starts} agent starts, ${budget.evaluator_runs}/${budget.max_evaluator_runs} evaluator runs.`);
-            if ([budget.campaigns, budget.max_campaigns, budget.agent_starts, budget.max_agent_starts, budget.evaluator_runs, budget.max_evaluator_runs].every(Number.isSafeInteger)) {
-              lines.push(`Remaining allowance: ${Math.max(0, budget.max_campaigns! - budget.campaigns!)} campaign(s), ${Math.max(0, budget.max_agent_starts! - budget.agent_starts!)} agent start(s), ${Math.max(0, budget.max_evaluator_runs! - budget.evaluator_runs!)} evaluator run(s).`);
+            const budget = JSON.parse(fs.readFileSync(budgetPath, "utf8")) as {
+              campaigns?: number; max_campaigns?: number; agent_starts?: number; max_agent_starts?: number; evaluator_runs?: number; max_evaluator_runs?: number;
+              tokens_used?: number; wall_ms?: number;
+              rsi?: { window_id?: string; campaigns?: number; agent_starts?: number; evaluator_runs?: number; tokens?: number; wall_ms?: number; tokens_unattributed?: boolean; wall_unattributed?: boolean; active_run?: unknown };
+            };
+            if (budget.rsi) {
+              const daily = budget.rsi;
+              if (typeof daily.window_id !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(daily.window_id)
+                || ![daily.campaigns, daily.agent_starts, daily.evaluator_runs, daily.tokens, daily.wall_ms].every((value) => Number.isSafeInteger(value) && value! >= 0)) {
+                throw new Error("RSI daily budget is invalid");
+              }
+              lines.push(`RSI UTC-day budget (${daily.window_id}): ${daily.campaigns}/${budget.max_campaigns} campaigns, ${daily.agent_starts}/${budget.max_agent_starts} agent starts, ${daily.evaluator_runs}/${budget.max_evaluator_runs} evaluator runs, ${daily.tokens}/${RSI_DAILY_CAPS.tokens} reported tokens, ${daily.wall_ms}/${RSI_DAILY_CAPS.wallMs} wall ms.`);
+              const unattributed = [daily.tokens_unattributed ? "token" : null, daily.wall_unattributed ? "wall-time" : null].filter(Boolean);
+              lines.push(`Lifetime totals: ${budget.campaigns ?? "unknown"} campaigns, ${budget.agent_starts ?? "unknown"} agent starts, ${budget.evaluator_runs ?? "unknown"} evaluator runs, ${budget.tokens_used ?? "unknown"} reported tokens, ${budget.wall_ms ?? "unknown"} wall ms${unattributed.length ? ` (pre-accounting ${unattributed.join(" and ")} history is incomplete)` : ""}.`);
+              if ([daily.campaigns, daily.agent_starts, daily.evaluator_runs, budget.max_campaigns, budget.max_agent_starts, budget.max_evaluator_runs].every(Number.isSafeInteger)) {
+                lines.push(`Remaining RSI allowance: ${Math.max(0, budget.max_campaigns! - daily.campaigns!)} campaign(s), ${Math.max(0, budget.max_agent_starts! - daily.agent_starts!)} agent start(s), ${Math.max(0, budget.max_evaluator_runs! - daily.evaluator_runs!)} evaluator run(s), ${Math.max(0, RSI_DAILY_CAPS.tokens - daily.tokens!)} token(s), ${Math.max(0, RSI_DAILY_CAPS.wallMs - daily.wall_ms!)} wall ms.`);
+              }
+            } else {
+              lines.push(`Dream-RSI loop budget (durable): ${budget.campaigns}/${budget.max_campaigns} campaigns, ${budget.agent_starts}/${budget.max_agent_starts} agent starts, ${budget.evaluator_runs}/${budget.max_evaluator_runs} evaluator runs.`);
+              if ([budget.campaigns, budget.max_campaigns, budget.agent_starts, budget.max_agent_starts, budget.evaluator_runs, budget.max_evaluator_runs].every(Number.isSafeInteger)) {
+                lines.push(`Remaining allowance: ${Math.max(0, budget.max_campaigns! - budget.campaigns!)} campaign(s), ${Math.max(0, budget.max_agent_starts! - budget.agent_starts!)} agent start(s), ${Math.max(0, budget.max_evaluator_runs! - budget.evaluator_runs!)} evaluator run(s).`);
+              }
             }
           } catch { lines.push("Loop budget is unreadable; the next start fails closed."); }
           try {
@@ -692,7 +712,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const stored = readStoredContract(loopRoot);
         const hasInterruptedCampaign = Boolean(campaign && (campaign.state.kind === "paused" || campaign.state.kind === "running"));
         const hasRetainedRecovery = action === "resume" && fs.existsSync(path.join(loopRoot, "active.json"));
-        const continueSavedLoop = action === "resume" && !hasInterruptedCampaign && !hasRetainedRecovery && Boolean(stored?.contract.continuation);
+        const continueSavedLoop = action === "resume" && !hasInterruptedCampaign && !hasRetainedRecovery
+          && Boolean(stored?.contract.continuation || stored?.contract.mode === "rsi");
         if (!hasInterruptedCampaign && !hasRetainedRecovery && !continueSavedLoop) {
           return { content: [{ type: "text", text: "No paused campaign is available. A saved continuous loop can be explicitly continued with action=resume." }], details: { ok: false, campaign } };
         }
@@ -809,6 +830,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const tokens = (rest.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map(token => token.replace(/^(["'])([\s\S]*)\1$/, "$2"));
         const explicitConsent = tokens.includes("--consent");
         const includeLogs = !tokens.includes("--no-logs");
+        const rsiMode = tokens.includes("--rsi-mode");
         const setupHarness = tokens.includes("--setup-harness");
         const replaceContract = tokens.includes("--replace-contract");
         const autoCommitFlag = tokens.includes("--auto-commit") ? true : tokens.includes("--no-auto-commit") ? false : undefined;
@@ -825,7 +847,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           return;
         }
         const ignored = [...(configIndex >= 0 ? ["--config", configFile!] : []), ...(commitPolicyIndex >= 0 ? ["--commit-policy", commitPolicyFlag!] : [])];
-        const focus = tokens.filter((token) => !["--consent", "--no-logs", "--setup-harness", "--replace-contract", "--auto-commit", "--no-auto-commit", ...ignored].includes(token)).join(" ");
+        const focus = tokens.filter((token) => !["--consent", "--no-logs", "--setup-harness", "--replace-contract", "--auto-commit", "--no-auto-commit", "--rsi-mode", ...ignored].includes(token)).join(" ");
         let settings: Record<string, unknown> = {};
         if (configFile) {
           try { settings = readLoopSettingsFile(configFile, ctx.cwd, Object.keys(loopParams.properties)); }
@@ -833,6 +855,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         }
         if (autoCommitFlag !== undefined) settings.auto_commit = autoCommitFlag;
         if (commitPolicyFlag !== undefined) settings.commit_policy = commitPolicyFlag;
+        if (rsiMode) settings.rsi_mode = true;
         const sessionId = ctx.sessionManager.getSessionId();
         const currentSlot = activeLoopRuns.get(sessionId);
         if (currentSlot) {
@@ -1074,7 +1097,7 @@ function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
     "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
-    "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
+    "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
@@ -1084,7 +1107,7 @@ function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
     { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
-    { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
+    { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },
     { value: "stop", label: "stop", description: "Stop the active campaign" },

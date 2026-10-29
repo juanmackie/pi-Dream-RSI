@@ -591,6 +591,31 @@ test("resume explicitly continues an idle saved continuous loop using its existi
   }
 });
 
+test("resume explicitly continues an idle saved RSI contract without requiring continuous mode", async () => {
+  const project = makeProject();
+  try {
+    const contract = normalizeRunContract({
+      version: 1, mode: "rsi",
+      outcome: { statement: "Reduce declared workload duration", unit: "ms", higherIsBetter: false, minimumUsefulGain: "5%" },
+      preserved: { gates: [] }, scope: { roots: [], protectedAssets: [] },
+      execution: { consent: true, envAllowlist: [], allowedCommandCategories: ["test"] },
+      budgets: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: 240 * 60_000, falseAcceptBudget: 0.1 },
+    });
+    const loopRoot = path.join(project.dreamRoot, "loop");
+    fs.mkdirSync(loopRoot, { recursive: true });
+    fs.writeFileSync(contractFile(loopRoot), JSON.stringify({ version: 1, ...approveRunContract(project.projectDir, contract) }));
+    readOrCreateLoopBudget(path.join(loopRoot, "budget.json"), contract.budgets, { rsiMode: true });
+    const { context, harness } = await boot(project);
+    const result = await harness.tools.get("dream_rsi_loop").execute("continue-idle-rsi", { action: "resume" }, undefined, undefined, context);
+    assert.equal(result.details.loop.stopCode, "blocked", "explicit resume reaches the saved RSI contract, then stops at its worker gate");
+    assert.match(result.content[0].text, /Resumed Dream-RSI loop \(blocked\)/);
+    const budget = JSON.parse(fs.readFileSync(path.join(loopRoot, "budget.json"), "utf8"));
+    assert.deepEqual([budget.campaigns, budget.rsi.campaigns, budget.rsi.tokens], [0, 0, 0]);
+    assert.ok(budget.rsi.wall_ms >= 0 && budget.rsi.wall_ms <= 240 * 60_000);
+    assert.equal(budget.wall_ms, budget.rsi.wall_ms, "resume keeps actual wall use in lifetime totals");
+  } finally { project.cleanup(); }
+});
+
 test("resume and confirm use the TUI lifecycle and restore status on saved-context failure", async () => {
   const project = makeProject();
   try {
@@ -1032,6 +1057,23 @@ test("a start without contract fields reuses the stored contract and its durable
   } finally {
     project.cleanup();
   }
+});
+
+test("RSI status reports the UTC-day budget separately from lifetime totals without changing durable state", async (t) => {
+  const project = makeProject(); t.after(project.cleanup);
+  const { contract, loopRoot } = saveLoopApproval(project);
+  const rsiContract = normalizeRunContract({ ...contract, mode: "rsi", budgets: { ...contract.budgets, maxCampaigns: 6, deadlineMs: 240 * 60_000 } });
+  fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approveRunContract(project.projectDir, rsiContract) })}\n`);
+  const budgetPath = path.join(loopRoot, "budget.json");
+  const budget = readOrCreateLoopBudget(budgetPath, rsiContract.budgets, { rsiMode: true });
+  const before = fs.readFileSync(budgetPath, "utf8");
+  const { context, harness } = await boot(project);
+  const status = await harness.tools.get("dream_rsi_loop").execute("rsi-status", { action: "status" }, undefined, undefined, context);
+  assert.match(status.content[0].text, /RSI UTC-day budget/);
+  assert.match(status.content[0].text, /Lifetime totals/);
+  assert.match(status.content[0].text, /reported tokens/);
+  assert.equal(fs.readFileSync(budgetPath, "utf8"), before, "status is read-only");
+  assert.equal(budget.rsi.tokens_unattributed, false);
 });
 
 for (const withBudget of [false, true]) test(`command status exposes saved setup without a campaign or writes (budget present: ${withBudget})`, async (t) => {
@@ -1688,6 +1730,19 @@ test("commit-policy command flag is explicit and does not become part of the obj
   assert.equal(request.proposed_settings.commit_policy, "no-commit");
   assert.doesNotMatch(JSON.stringify(harness.sentMessages), /focused on: reduce runtime --commit-policy/);
   assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "policy review does not bypass trusted-local consent");
+});
+
+test("the RSI-mode command flag is an explicit opt-in and does not become part of the objective", async (t) => {
+  const project = makeProject();
+  t.after(project.cleanup);
+  const { context, harness } = await boot(project);
+  context.hasUI = false;
+  await harness.commands.get("dream-rsi").handler("loop reduce runtime --rsi-mode --no-logs", context);
+  const message = harness.sentMessages.at(-1).content;
+  const request = JSON.parse(message.slice(message.indexOf("{")));
+  assert.equal(request.proposed_settings.rsi_mode, true);
+  assert.doesNotMatch(JSON.stringify(harness.sentMessages), /focused on: reduce runtime --rsi-mode/);
+  assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "mode review does not bypass trusted-local consent");
 });
 
 test("the setup-harness command flag is explicit and does not become part of the objective", async (t) => {

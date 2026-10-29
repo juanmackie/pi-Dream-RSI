@@ -413,6 +413,27 @@ test("a rate wait that reaches the deadline does not dispatch or become a campai
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
+test("an outer deadline is not misclassified as campaign cancellation when a campaign pauses", async () => {
+  const fixture = fixtureProject();
+  try {
+    const stub = stubCampaign({ stateKind: "paused", stopReason: "stopped by request", agentStarts: 1, evaluatorRuns: 0 });
+    const result = await runLoop({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits({ deadlineMs: 2_000 }),
+      runCampaignImpl: async (options) => {
+        const paused = await stub.impl(options);
+        await new Promise((resolve) => {
+          if (options.signal.aborted) resolve();
+          else options.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return paused;
+      },
+    });
+    assert.equal(stub.calls.length, 1, "the campaign reached its real loop boundary");
+    assert.equal(result.stopCode, "deadline", result.stopReason);
+    assert.equal(result.stopReason, "deadline");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
 test("cancellation while waiting for a process-rate slot stops without dispatch", async () => {
   const fixture = fixtureProject();
   const controller = new AbortController();
@@ -594,6 +615,36 @@ test("a pending confirmation retains loop context and reports a resumable stop",
     const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
     assert.equal(context.version, 1);
     assert.ok(context.lever.id, "the frozen lever remains available for confirmation resume");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("an outer loop deadline remains the stop reason when a resumed campaign pauses", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, statement: "Resume a bounded confirmation", evaluator: { argv: ["python", "--config=eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract);
+    let resumed = false;
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits({ deadlineMs: 500 }), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async (options) => {
+        resumed = true;
+        await new Promise((resolve) => {
+          if (options.signal.aborted) resolve();
+          else options.signal.addEventListener("abort", resolve, { once: true });
+        });
+        return { ...readCampaignStatus(options.baseRoot), stopped: true, state: { kind: "paused", phase: "promote", iteration: 1, reason: "stopped by request" }, stopReason: "stopped by request" };
+      },
+    });
+    assert.equal(resumed, true, "the saved campaign entered its real resume boundary");
+    assert.equal(result.stopCode, "deadline", result.stopReason);
+    assert.equal(result.stopReason, "deadline");
+    assert.ok(fs.existsSync(path.join(artifacts.loopRoot, "active.json")), "the paused campaign retains its recovery context");
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 

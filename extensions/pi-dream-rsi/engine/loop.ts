@@ -3,8 +3,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
-  CAMPAIGN_DEADLINE_MAX_MS, CampaignInfeasibleError, campaignVerifierIdentity, readCampaignStatus, resumeCampaign, runCampaign,
-  type CampaignOptions, type CampaignRecord, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings,
+  CAMPAIGN_DEADLINE_MAX_MS, CampaignInfeasibleError, campaignVerifierIdentity, readCampaignStatus, resumeCampaign, runCampaign, stopCampaign,
+  type CampaignOptions, type CampaignRecord, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings, type CampaignStatus,
 } from "./campaign.ts";
 import {
   ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, contractIdentity, effectiveCommitPolicy, projectFingerprint, readStoredContract, validateRunContract,
@@ -16,7 +16,7 @@ import { AutoCommitError, commitVerifiedChanges, ensureAutoCommitBranch, type Au
 import { buildReconInventory, reconProject, timeLikeOutcome, type ReconOptions, type ReconResult } from "./recon.ts";
 import { measureEvaluatorReading, measureWorkload, verifyPostApply, type PostApplyEvaluator } from "./verify.ts";
 import {
-  hasAllowance, readOrCreateLoopBudget, readSavedBudgetCaps, reconcileOpenReservation, remainingAllowance, reserveHourlyProcessStart, settleReservation, writeLoopBudget,
+  RSI_DAILY_CAPS, chargeImmediateProcessStart, hasAllowance, readOrCreateLoopBudget, readSavedBudgetCaps, reconcileOpenReservation, recordCampaignTokenUsage, recordTokenUsage, remainingAllowance, remainingRsiTokens, reserveHourlyProcessStart, reserveRsiRun, settleReservation, settleRsiRun, writeLoopBudget as writeLoopBudgetAtomic,
   type LoopBudgetFile, type LoopPhase, type LoopReservation,
 } from "./budget.ts";
 import type { LeverInventory, LeverMetricKind, LeverProposal } from "./levers.ts";
@@ -163,6 +163,8 @@ export interface LoopOptions {
   resumeCampaignImpl?: (options: CampaignResumeOptions) => Promise<CampaignResult>;
   /** Test seam replacing the independent post-apply measurement. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
+  /** Test seam replacing atomic durable-budget writes. */
+  writeBudgetImpl?: typeof writeLoopBudgetAtomic;
   /** Test seam replacing the campaign pacing wait. */
   waitForCampaignIntervalImpl?: typeof waitForCampaignInterval;
   /** Test seam replacing a rolling-hour process-rate wait. */
@@ -230,6 +232,11 @@ export class LoopBudgetExhaustedError extends Error {
     this.name = "LoopBudgetExhaustedError";
     this.phase = phase;
   }
+}
+
+/** No provider-bounded or auditable no-network worker adapter is available yet. */
+function rsiAgentBlockReason(): string {
+  return "RSI mode refuses all agent dispatch until a provider-bounded or host-isolated worker adapter is implemented and approved";
 }
 
 /** One independent check of an applied change, run outside the campaign's own instrument. */
@@ -557,6 +564,26 @@ function readConsumedWallMs(loopRoot: string): number {
   } catch { return 0; }
 }
 
+function usageTokens(usage: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; total?: number } | undefined): number {
+  if (!usage) return 0;
+  const values = [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.total].filter((value): value is number => value !== undefined);
+  if (values.some((value) => !Number.isSafeInteger(value) || value < 0)) throw new Error("agent reported invalid token usage; refusing to continue");
+  return Math.max(usage.total ?? 0, (usage.input ?? 0) + (usage.output ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0));
+}
+
+function campaignTokenUsage(campaignRoot: string | null): { campaignId: string; tokens: number } | null {
+  if (!campaignRoot) return null;
+  const ledger = readLedger(path.join(campaignRoot, "history", "ledger.jsonl"));
+  if (ledger.diagnostics.length) throw new Error(`campaign token ledger is invalid: ${ledger.diagnostics.join("; ")}`);
+  const campaignId = ledger.entries.find((entry) => entry.campaignId)?.campaignId ?? path.basename(campaignRoot);
+  let tokens = 0;
+  for (const entry of ledger.entries) if (entry.kind === "agent_result") {
+    tokens += usageTokens(entry.usage);
+    if (!Number.isSafeInteger(tokens)) throw new Error("campaign token usage exceeds safe accounting range");
+  }
+  return { campaignId, tokens };
+}
+
 /** The contract's durable budget ceiling. */
 function approvedContract(contract: RunContract): RunContract["budgets"] {
   return contract.budgets;
@@ -617,18 +644,20 @@ function recoverBudgetExtension(loopRoot: string): void {
   if (!caps || (!isOldCaps && !isNewCaps)) {
     throw new Error("saved budget-extension transaction does not match the durable budget; inspect saved state before recovery");
   }
+  const rsiMode = transaction.next.contract.mode === "rsi";
   const budget = readOrCreateLoopBudget(budgetPath, {
     maxCampaigns: caps.max_campaigns, maxAgentStarts: caps.max_agent_starts,
     maxEvaluatorRuns: caps.max_evaluator_runs, deadlineMs: after.deadlineMs,
-  });
-  if (budget.campaigns > newCaps.maxCampaigns || budget.agent_starts > newCaps.maxAgentStarts || budget.evaluator_runs > newCaps.maxEvaluatorRuns) {
-    throw new Error("saved budget-extension transaction would set a cap below accumulated spend");
+  }, { rsiMode });
+  const spend = budget.rsi ?? { campaigns: budget.campaigns, agent_starts: budget.agent_starts, evaluator_runs: budget.evaluator_runs };
+  if (spend.campaigns > newCaps.maxCampaigns || spend.agent_starts > newCaps.maxAgentStarts || spend.evaluator_runs > newCaps.maxEvaluatorRuns) {
+    throw new Error("saved budget-extension transaction would set a cap below spend in the active accounting window");
   }
   writeFileAtomic(path.join(loopRoot, "contract.previous.json"), `${JSON.stringify(transaction.previous, null, 2)}\n`, true);
   if (approvalIdentity(current.contract) === previousId) {
     writeFileAtomic(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...transaction.next }, null, 2)}\n`, true);
   }
-  writeLoopBudget(budgetPath, { ...budget, max_campaigns: newCaps.maxCampaigns, max_agent_starts: newCaps.maxAgentStarts, max_evaluator_runs: newCaps.maxEvaluatorRuns });
+  writeLoopBudgetAtomic(budgetPath, { ...budget, max_campaigns: newCaps.maxCampaigns, max_agent_starts: newCaps.maxAgentStarts, max_evaluator_runs: newCaps.maxEvaluatorRuns });
   fs.rmSync(transactionPath, { force: true });
 }
 
@@ -1032,7 +1061,7 @@ function classifyStop(reason: string): LoopStopCode {
   if (!reason) return "completed";
   if (reason.startsWith("failed:")) return "failed";
   if (reason === "not-approved") return "consent-required";
-  if (reason === "budget" || reason.includes("allowance exhausted")) return "budget-exhausted";
+  if (reason === "budget" || reason.startsWith("budget:") || reason.includes("allowance exhausted")) return "budget-exhausted";
   if (reason.startsWith("plateau:")) return "plateau";
   if (reason === "deadline" || reason.startsWith("campaign deadline")) return "deadline";
   if (reason === "cancelled") return "cancelled";
@@ -1053,6 +1082,7 @@ function classifyStop(reason: string): LoopStopCode {
  */
 export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const limits = options.limits;
+  const writeLoopBudget = options.writeBudgetImpl ?? writeLoopBudgetAtomic;
 
   const projectDir = path.resolve(options.projectDir);
   if (!fs.existsSync(projectDir)) throw new Error(`loop project directory does not exist: ${projectDir}`);
@@ -1068,10 +1098,24 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const startedMs = Date.now();
   // A contract run's wall-clock allowance is durable across restarts; a legacy run
   // keeps the per-run window its callers already rely on.
-  const consumedWallMs = readStoredContract(loopRoot) ? readConsumedWallMs(loopRoot) : 0;
+  const rsiMode = options.contract.mode === "rsi";
+  if (rsiMode && options.evaluatorBootstrap?.authorized) {
+    throw new Error("RSI mode refuses evaluator bootstrap until agent dispatch has provider-bounded or host-isolated controls");
+  }
+  const agentResolver: CampaignOptions["resolveAgent"] | undefined = options.resolveAgent || rsiMode
+    ? (saved) => {
+      if (rsiMode) throw new Error(`${rsiAgentBlockReason()}.`);
+      return options.resolveAgent?.(saved) ?? null;
+    }
+    : undefined;
+  const consumedWallMs = readStoredContract(loopRoot) && !rsiMode ? readConsumedWallMs(loopRoot) : 0;
   const remainingWallMs = Math.max(0, limits.deadlineMs - consumedWallMs);
-  const deadlineAt = startedMs + remainingWallMs;
+  let deadlineAt = startedMs + remainingWallMs;
   const budgetPath = path.join(loopRoot, "budget.json");
+  const readPersistedBudgetSnapshot = (): LoopBudgetFile | null => {
+    try { return JSON.parse(fs.readFileSync(budgetPath, "utf8")) as LoopBudgetFile; }
+    catch { return null; }
+  };
   const memoryPath = path.join(loopRoot, "memory.json");
   const activeContextPath = path.join(loopRoot, "active.json");
   let memory = readMemory(memoryPath);
@@ -1086,6 +1130,29 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let ranking: LeverRankingEntry[] = [];
   let inventory: LeverInventory | null = null;
   let stopReason = "";
+  const runController = new AbortController();
+  const runSignal = runController.signal;
+  let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
+  const abortForDeadline = (): void => {
+    if (!stopReason) stopReason = "deadline";
+    runController.abort(new Error("loop deadline expired"));
+  };
+  const abortForExternalStop = (): void => {
+    if (!stopReason) stopReason = "cancelled";
+    runController.abort(options.signal?.reason);
+  };
+  const markAborted = (): boolean => {
+    if (!runSignal.aborted) return false;
+    if (!stopReason) stopReason = options.signal?.aborted ? "cancelled" : "deadline";
+    return true;
+  };
+  const armDeadline = (): void => {
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    if (runSignal.aborted) return;
+    const delay = deadlineAt - Date.now();
+    if (delay <= 0) abortForDeadline();
+    else deadlineTimer = setTimeout(abortForDeadline, delay);
+  };
   let preflight: LoopResult["preflight"] = { status: "not-checked", checks: [] };
   let runStartEvaluatorRuns = 0;
   let runStartAgentStarts = 0;
@@ -1160,7 +1227,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     const receipt = await commitVerifiedChanges({
       projectDir, branch: autoCommitBranch.branch, expectedHead: autoCommitBranch.head, changes,
       campaignId: args.result.id, leverId: args.leverId, unit: args.instrument.unit, before, after,
-      evidencePath: path.relative(autoCommitBranch.root, campaignRoot).replace(/\\/g, "/"), signal: options.signal,
+      evidencePath: path.relative(autoCommitBranch.root, campaignRoot).replace(/\\/g, "/"), signal: runSignal,
     });
     autoCommits.push(receipt);
     autoCommitBranch = { ...autoCommitBranch, head: receipt.hash };
@@ -1197,9 +1264,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       ? "blocked: another loop is publishing its lease file; retry shortly."
       : `blocked: ${claim.reason ?? `another loop (pid ${claim.holder?.pid ?? "unknown"}) holds the loop lease with a heartbeat at ${claim.holder?.heartbeatAt ?? "unknown"}; stop it or wait for the lease to go stale before looping again.`}`);
     stopReason = "blocked";
-  } else if (claim.stale) {
-    addNote(`took over a stale loop lease last refreshed at ${claim.stale.heartbeatAt}.`);
   }
+  const staleLeaseNote = claim.held && claim.stale ? `took over a stale loop lease last refreshed at ${claim.stale.heartbeatAt}.` : null;
   let leaseOwnershipWarned = false;
   const touchLease = (): boolean => {
     if (!leaseHeld) return false;
@@ -1216,6 +1282,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let lastActivityWriteMs = 0;
   let latestEffectiveAgent: EffectiveAgent | null = null;
   let budget: LoopBudgetFile | null = null;
+  let terminalBudgetSnapshot: LoopBudgetFile | null = null;
   const statusPath = path.join(loopRoot, "status.json");
   const persistActivity = (always: boolean): void => {
     // Campaign status updates arrive many times per iteration. Stage changes and progress
@@ -1232,13 +1299,17 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         campaignId: lease.activity.campaignId ?? null,
         startedAt: leaseStartedAt,
         updatedAt: lease.activity.updatedAt,
-        branch: approved?.contract.git?.branch ?? null,
+        branch: approved?.contract.mode !== "rsi" ? approved?.contract.git?.branch ?? null : null,
         branchTip: autoCommitBranch?.head ?? null,
         effectiveAgent: latestEffectiveAgent,
         budget: budget ? {
           campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
           agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
           evaluatorRuns: budget.evaluator_runs, maxEvaluatorRuns: budget.max_evaluator_runs,
+          lifetimeTokens: budget.tokens_used ?? null,
+          ...(budget.rsi ? { rsiDaily: { windowId: budget.rsi.window_id, campaigns: budget.rsi.campaigns, maxCampaigns: budget.max_campaigns,
+            tokens: budget.rsi.tokens, maxTokens: RSI_DAILY_CAPS.tokens, wallMs: budget.rsi.wall_ms, maxWallMs: RSI_DAILY_CAPS.wallMs,
+            tokensUnattributed: budget.rsi.tokens_unattributed, active: budget.rsi.active_run !== null } } : {}),
         } : null,
       });
       lastActivityWriteMs = Date.now();
@@ -1254,18 +1325,19 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     const previousPhase = lease.activity?.phase;
     lease.activity = { phase, detail: activityText(detail), updatedAt: now().toISOString(), ...(campaignId ? { campaignId } : {}) };
     persistActivity(!coalesce || phase !== previousPhase);
-    options.onActivity?.({ state: options.signal?.aborted ? "stopping" : "running", ...lease.activity, startedAt: leaseStartedAt });
+    options.onActivity?.({ state: runSignal.aborted ? "stopping" : "running", ...lease.activity, startedAt: leaseStartedAt });
   };
   updateActivityDetail = (message) => setActivity(lease.activity?.phase ?? "setup", message, lease.activity?.campaignId);
-  const onAbort = (): void => setActivity("stopping", "Cancellation requested; waiting for active work to unwind", lease.activity?.campaignId);
-  if (leaseHeld) options.signal?.addEventListener("abort", onAbort, { once: true });
-  const waitForHourlyProcessStart = async (phase: LoopPhase, process: "agent" | "evaluator", processSignal: AbortSignal | undefined = options.signal): Promise<void> => {
+  const onAbort = (): void => setActivity("stopping", "Stop requested; waiting for active work to unwind", lease.activity?.campaignId);
+  const waitForHourlyProcessStart = async (phase: LoopPhase, process: "agent" | "evaluator", processSignal: AbortSignal | undefined = runSignal): Promise<void> => {
+    if (markAborted()) throw new Error("loop stopped before process dispatch");
+    if (Date.now() >= deadlineAt) { stopReason = "deadline"; throw new Error("loop deadline expired before process dispatch"); }
     const continuation = approved?.contract.continuation;
     if (!continuation) return;
     const limit = process === "agent" ? continuation.agentStartsPerHour ?? 36 : continuation.evaluatorRunsPerHour ?? 96;
     const stoppedForSignal = (): Error => {
+      if (stopReason === "deadline" || Date.now() >= deadlineAt) { stopReason = "deadline"; return new Error("loop deadline expired during rolling process-rate wait"); }
       if (options.signal?.aborted) { stopReason = "cancelled"; return new Error("loop stopped during rolling process-rate wait"); }
-      if (Date.now() >= deadlineAt) { stopReason = "deadline"; return new Error("loop deadline expired during rolling process-rate wait"); }
       return new Error("campaign stopped during rolling process-rate wait");
     };
     while (true) {
@@ -1289,15 +1361,32 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     }
   };
   const chargeOne = (phase: LoopPhase, process: "agent" | "evaluator"): void => {
+    if (markAborted()) throw new Error("loop stopped before process dispatch");
+    if (Date.now() >= deadlineAt) { stopReason = "deadline"; throw new Error("loop deadline expired before process dispatch"); }
     if (!budget) throw new LoopBudgetExhaustedError(`${phase} process`);
+    if (rsiMode && process === "agent" && remainingRsiTokens(budget) <= 0) throw new LoopBudgetExhaustedError("RSI reported-token allowance");
     const spend = process === "agent" ? { agentStarts: 1 } : { evaluatorRuns: 1 };
     if (!hasAllowance(budget, spend)) throw new LoopBudgetExhaustedError(`${phase} process`);
-    const grant: LoopReservation = {
-      phase, agent_starts: process === "agent" ? 1 : 0,
-      evaluator_runs: process === "evaluator" ? 1 : 0, campaigns: 0, at: now().toISOString(),
-    };
-    budget = settleReservation(budget, grant, { agentStarts: grant.agent_starts, evaluatorRuns: grant.evaluator_runs, campaigns: 0 });
+    budget = chargeImmediateProcessStart(budget, phase, process);
     writeLoopBudget(budgetPath, budget);
+  };
+  const updateRsiCampaignTokens = (status: CampaignStatus): void => {
+    if (!rsiMode || !budget || !status.campaignRoot) return;
+    try {
+      const usage = campaignTokenUsage(status.campaignRoot);
+      if (!usage || usage.tokens === 0) return;
+      budget = recordCampaignTokenUsage(budget, usage.campaignId, usage.tokens);
+      writeLoopBudget(budgetPath, budget);
+      if (remainingRsiTokens(budget) <= 0) {
+        stopReason = "budget: the RSI reported-token allowance is exhausted; the active campaign was asked to stop";
+        addNote(stopReason);
+        stopCampaign(baseRoot);
+      }
+    } catch (error) {
+      stopReason = `budget: unable to account campaign token usage safely: ${error instanceof Error ? error.message : String(error)}`;
+      addNote(stopReason);
+      stopCampaign(baseRoot);
+    }
   };
   let agentProbed = false;
   /**
@@ -1312,9 +1401,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const probeAgentLiveness = async (task: TaskConfig): Promise<void> => {
     if (agentProbed) return;
     agentProbed = true;
+    if (rsiMode) {
+      stopReason = `blocked: ${rsiAgentBlockReason()}`;
+      addNote(stopReason);
+      return;
+    }
     // Test seams replace the campaign engine, so a real probe would change their exact spend.
     if (options.runCampaignImpl || options.taskProvider) return;
-    if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+    if (markAborted()) return;
     const remainingMs = deadlineAt - Date.now();
     if (remainingMs <= 0) { stopReason = "deadline"; return; }
     setActivity("liveness", "Checking the configured agent before campaign search");
@@ -1336,16 +1430,16 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       // The copy spent part of the wall-clock budget, so the remaining time is measured
       // again. An expired or cancelled run must not spawn or charge an agent.
       const timeLeft = deadlineAt - Date.now();
-      if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+      if (markAborted()) return;
       if (timeLeft <= 0) { stopReason = "deadline"; return; }
       try {
         result = await runAgent({
           agent: task.agent,
-          ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+          ...(agentResolver ? { resolveAgent: agentResolver } : {}),
           cwd: scratch,
           prompt: "Dream-RSI agent liveness probe. Reply with the single word ok. Do not change files.",
           timeoutMs: Math.max(1, Math.min(task.agent_timeout_ms, timeLeft, 4 * 60 * 1000)),
-          ...(options.signal ? { signal: options.signal } : {}),
+          signal: runSignal,
           beforeSpawn: async () => { await waitForHourlyProcessStart("qualification", "agent"); chargeOne("qualification", "agent"); },
           logPath: path.join(loopRoot, "liveness", "agent.log"),
         });
@@ -1358,7 +1452,17 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         if (stopReason === "deadline" || stopReason === "cancelled") return;
         throw error;
       }
-      if (options.signal?.aborted) { stopReason = "cancelled"; return; }
+      const tokens = usageTokens(result.evidence?.usage);
+      if (tokens > 0) {
+        budget = recordTokenUsage(budget!, tokens);
+        writeLoopBudget(budgetPath, budget);
+        if (rsiMode && remainingRsiTokens(budget) <= 0) {
+          stopReason = "budget: the observed RSI token total exhausted the UTC-day cap; no further agent process will start";
+          addNote(stopReason);
+          return;
+        }
+      }
+      if (markAborted()) return;
       const effective = result.effectiveAgent;
       if (effective) {
         latestEffectiveAgent = effective;
@@ -1441,10 +1545,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         baseRoot, projectDir,
         ...(approved ? { evaluatorEnv: restrictedEnvironment(approved.contract), evaluatorEnvKeys: approved.contract.execution.envAllowlist } : {}),
         ...(options.confirmationOnly ? { confirmationOnly: true, ...((confirmationExtension!.agentStarts + confirmationExtension!.evaluatorRuns + confirmationExtension!.deadlineMs > 0) ? { extendLimits: confirmationExtension } : {}) } : {}),
-        ...(options.signal ? { signal: options.signal } : {}),
-        ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+        signal: runSignal,
+        ...(agentResolver ? { resolveAgent: agentResolver } : {}),
         beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
         onUpdate: (status) => {
+          updateRsiCampaignTokens(status);
           if (status.effectiveAgent) latestEffectiveAgent = status.effectiveAgent;
           setActivity("resuming", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
           if (status.effectiveAgent) persistActivity(true);
@@ -1461,6 +1566,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       agentDelta = Math.max(0, result.agentStarts - before.agentStarts);
       evaluatorDelta = Math.max(0, result.evaluatorRuns - before.evaluatorRuns);
       budget = settleReservation(budget, reservation, { agentStarts: agentDelta, evaluatorRuns: evaluatorDelta, campaigns: 0 });
+      const resumedUsage = campaignTokenUsage(result.campaignRoot);
+      if (resumedUsage) budget = recordCampaignTokenUsage(budget, resumedUsage.campaignId, resumedUsage.tokens);
       writeLoopBudget(budgetPath, budget);
     }
     evaluatorId = context.plan.evaluationContract?.id ?? null;
@@ -1488,7 +1595,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(context.instrument.kind !== "command-duration" ? { kind: context.instrument.kind, ...(context.instrument.evaluator ? { evaluator: context.instrument.evaluator } : {}) } : {}),
             workRoot: path.join(loopRoot, "post-apply"), timeoutMs: context.instrument.timeoutMs,
             beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
-            ...(options.signal ? { signal: options.signal } : {}),
+            signal: runSignal,
             ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
           });
           if (checked.passed) {
@@ -1519,11 +1626,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
     }, result.campaignRoot, !paused);
     if (!paused) fs.rmSync(activeContextPath, { force: true });
-    if (paused) stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
+    if (paused && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
     else if (postApplyFailure && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = `post-apply check failed: ${postApplyFailure}`;
     else if (failed && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = classifyCampaignFailure(result.stopReason);
-    else if (options.confirmationOnly) stopReason = "confirmation complete";
-    else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
+    else if (options.confirmationOnly && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = "confirmation complete";
+    else if (stopReason !== "deadline" && stopReason !== "cancelled") progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
     if (autoCommitFailure) stopReason = `auto-commit failed: ${autoCommitFailure}`;
   };
   // Requested limits and approved contract budgets combine into this run's total
@@ -1539,6 +1646,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let failureMessage: string | null = null;
   try {
     if (leaseHeld) {
+      runSignal.addEventListener("abort", onAbort, { once: true });
+      options.signal?.addEventListener("abort", abortForExternalStop, { once: true });
+      if (options.signal?.aborted) abortForExternalStop();
+      armDeadline();
+      if (staleLeaseNote) addNote(staleLeaseNote);
       setActivity("setup", "Checking saved approval and durable budget");
       recoverBudgetExtension(loopRoot);
       storedAtStart = readStoredContract(loopRoot);
@@ -1548,7 +1660,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         maxAgentStarts: existingCaps?.max_agent_starts ?? durableLimits.maxAgentStarts,
         maxEvaluatorRuns: existingCaps?.max_evaluator_runs ?? durableLimits.maxEvaluatorRuns,
         deadlineMs: durableLimits.deadlineMs,
-      });
+      }, { rsiMode, persistRsi: !rsiMode || storedAtStart?.contract.mode === "rsi", rsiWindowId: now().toISOString().slice(0, 10), nowMs: now().getTime() });
       if (!options.replaceContract && (durableLimits.maxCampaigns !== budget.max_campaigns
         || durableLimits.maxAgentStarts !== budget.max_agent_starts || durableLimits.maxEvaluatorRuns !== budget.max_evaluator_runs)) {
         throw new Error("loop budget limits are immutable without an explicitly approved contract replacement");
@@ -1563,9 +1675,13 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       const recovered = reconcileOpenReservation(budget, observed);
       if (recovered) {
         budget = recovered.budget;
-        writeLoopBudget(budgetPath, budget);
-        const open = recovered.charged;
-        addNote(`reconciled an interrupted ${open.phase} phase as spent at its granted budget (agent starts ${open.agent_starts}, evaluator runs ${open.evaluator_runs}, campaigns ${open.campaigns}); the reservation was written ${open.at}.`);
+        if (recoveredCampaign && open?.campaign_id && recoveredCampaign.id === open.campaign_id) {
+          const usage = campaignTokenUsage(recoveredCampaign.campaignRoot);
+          if (usage) budget = recordCampaignTokenUsage(budget, usage.campaignId, usage.tokens);
+        }
+        if (!rsiMode || storedAtStart?.contract.mode === "rsi") writeLoopBudget(budgetPath, budget);
+        const charged = recovered.charged;
+        addNote(`reconciled an interrupted ${charged.phase} phase as spent at its granted budget (agent starts ${charged.agent_starts}, evaluator runs ${charged.evaluator_runs}, campaigns ${charged.campaigns}); the reservation was written ${charged.at}.`);
       }
       runStartEvaluatorRuns = budget.evaluator_runs;
       runStartAgentStarts = budget.agent_starts;
@@ -1596,7 +1712,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           addNote(stopReason);
         } else {
           if (differs) {
-            if (options.signal?.aborted) { stopReason = "cancelled"; }
+            if (markAborted()) { /* preserve cancellation or deadline reason */ }
             else {
               const campaign = readCampaignStatus(baseRoot);
               if (campaign?.state.kind === "running" || campaign?.state.kind === "paused" || campaign?.pendingConfirmation || fs.existsSync(activeContextPath)) {
@@ -1612,15 +1728,18 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               if (nextBudgets.maxCampaigns > priorBudgets.maxCampaigns && budget?.campaigns) {
                 throw new ContractNotApprovedError("The campaign cap cannot be increased after campaigns have started because their statistical allowance is already allocated. Keep the saved campaign cap or start a new run before raising it.", "contract");
               }
-              if (budget && (nextBudgets.maxCampaigns < budget.campaigns || nextBudgets.maxAgentStarts < budget.agent_starts || nextBudgets.maxEvaluatorRuns < budget.evaluator_runs)) {
-                throw new ContractNotApprovedError("The raised limits are below spend already recorded; choose caps at or above current spend.", "contract");
+              const currentCampaignSpend = contract.mode === "rsi" ? budget?.rsi?.campaigns ?? budget?.campaigns : budget?.campaigns;
+              const currentAgentSpend = contract.mode === "rsi" ? budget?.rsi?.agent_starts ?? budget?.agent_starts : budget?.agent_starts;
+              const currentEvaluatorSpend = contract.mode === "rsi" ? budget?.rsi?.evaluator_runs ?? budget?.evaluator_runs : budget?.evaluator_runs;
+              if (budget && (nextBudgets.maxCampaigns < currentCampaignSpend! || nextBudgets.maxAgentStarts < currentAgentSpend! || nextBudgets.maxEvaluatorRuns < currentEvaluatorSpend!)) {
+                throw new ContractNotApprovedError("The new daily or lifetime limits are below spend already recorded in the active accounting window; choose caps at or above current spend.", "contract");
               }
             }
           }
           if (!stopReason) {
-            if (contract.git && effectiveCommitPolicy(contract.git) !== "no-commit") {
+            if (contract.mode !== "rsi" && contract.git && effectiveCommitPolicy(contract.git) !== "no-commit") {
               try {
-                autoCommitBranch = await ensureAutoCommitBranch(projectDir, contract.git.branch, options.signal, options.resumeActiveCampaign === true);
+                autoCommitBranch = await ensureAutoCommitBranch(projectDir, contract.git.branch, runSignal, options.resumeActiveCampaign === true);
                 if (projectFingerprint(projectDir) !== proposed.fingerprint) {
                   throw new ContractNotApprovedError("Project source changed when selecting the auto-commit branch; review the checked-out source before execution.", "contract");
                 }
@@ -1636,8 +1755,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               maxAgentStarts: Math.max(durableLimits.maxAgentStarts, budget!.max_agent_starts),
               maxEvaluatorRuns: Math.max(durableLimits.maxEvaluatorRuns, budget!.max_evaluator_runs),
             } : durableLimits;
-            if (replacingSavedContract && (next.maxCampaigns < budget!.campaigns || next.maxAgentStarts < budget!.agent_starts || next.maxEvaluatorRuns < budget!.evaluator_runs)) {
-              throw new ContractNotApprovedError("The raised limits are below spend already recorded; choose caps at or above current spend.", "contract");
+            const activeSpend = budget?.rsi ?? (budget ? { campaigns: budget.campaigns, agent_starts: budget.agent_starts, evaluator_runs: budget.evaluator_runs } : null);
+            if (replacingSavedContract && activeSpend && (next.maxCampaigns < activeSpend.campaigns
+              || next.maxAgentStarts < activeSpend.agent_starts || next.maxEvaluatorRuns < activeSpend.evaluator_runs)) {
+              throw new ContractNotApprovedError("The raised limits are below spend already recorded in the active daily or lifetime accounting window.", "contract");
             }
             const raisesCaps = Boolean(budget && (next.maxCampaigns > budget.max_campaigns || next.maxAgentStarts > budget.max_agent_starts || next.maxEvaluatorRuns > budget.max_evaluator_runs));
             try {
@@ -1664,8 +1785,35 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             }
             approved = proposed;
             contractId = contractIdentity(approved.contract);
+            if (approved.contract.mode === "rsi") {
+              writeLoopBudget(budgetPath, budget!);
+              if (markAborted() || Date.now() >= deadlineAt) {
+                if (!stopReason) stopReason = "deadline";
+              } else {
+                try {
+                  const reservation = reserveRsiRun(budget!, now().getTime(), Math.min(limits.deadlineMs, deadlineAt - Date.now()));
+                  budget = reservation.budget;
+                  deadlineAt = Date.parse(budget.rsi!.active_run!.started_at) + reservation.allowanceMs;
+                  writeLoopBudget(budgetPath, budget);
+                  armDeadline();
+                } catch (error) {
+                  stopReason = `budget: ${error instanceof Error ? error.message : String(error)}`;
+                  addNote(stopReason);
+                }
+              }
+              if (!stopReason) {
+                stopReason = `blocked: ${rsiAgentBlockReason()}`;
+                preflight = { status: "blocked", checks: [{ name: "workload", status: "blocked", reason: stopReason.slice(8), remedy: "Wait for a reviewed, provider-bounded or host-isolated worker adapter before starting RSI execution." }] };
+                addNote(stopReason);
+              }
+            }
             void restrictedEnvironment(approved.contract);
             if (autoCommitBranch) setActivity("setup", `RSI branch ${autoCommitBranch.branch} at ${autoCommitBranch.head}`);
+          } else if (stored && !differs) {
+            // Cancellation before startup may still identify the already-saved contract,
+            // but it must not write a replacement or begin auto-commit setup.
+            approved = stored;
+            contractId = contractIdentity(stored.contract);
           }
         }
       } catch (error) {
@@ -1678,7 +1826,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       }
     }
     while (!stopReason && budget !== null) {
-      if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+      if (markAborted()) break;
       touchLease();
       if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
       const remaining = remainingAllowance(budget);
@@ -1730,7 +1878,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         contract: approved!.contract,
         maxProbes: options.reconProbes ?? 3,
         probeTimeoutMs: Math.max(1, Math.min(120_000, deadlineAt - Date.now())),
-        ...(options.signal ? { signal: options.signal } : {}),
+        signal: runSignal,
         beforeProbe: async () => { await waitForHourlyProcessStart("discovery", "evaluator"); chargeOne("discovery", "evaluator"); },
         onProgress: progress,
       });
@@ -1738,7 +1886,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         setActivity("discovery", "Discovering and measuring declared workloads");
         recon = await reconProjectImpl(reconOptions());
         // An aborted run must not report the abort as a broken workload.
-        if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+        if (markAborted()) break;
         const missingWorkload = recon.blockers.some((reason) => /no benchmark or custom workload|no declared command matches|declared workload .* did not complete|does not name a local entry file/i.test(reason));
         const missingSetupFile = options.evaluatorBootstrap?.paths.some((file) => !fs.existsSync(path.resolve(projectDir, file))) ?? false;
         if (((missingWorkload && !approved.contract.outcome.evaluator) || missingSetupFile) && options.evaluatorBootstrap?.authorized) {
@@ -1755,18 +1903,18 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             break;
           }
           if (requiredPaths.length === 0) throw new Error("evaluator bootstrap requires exact planned file paths");
-          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          if (markAborted()) break;
           const bootstrapDeadlineMs = Math.max(0, deadlineAt - Date.now());
           if (bootstrapDeadlineMs <= 0) { stopReason = "deadline"; break; }
           setActivity("bootstrap", "Creating the approved measurement harness and pinned workload");
           progress(`loop: bootstrapping pinned workload in approved scope (${requiredPaths.join(", ")})`);
-          const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: async () => { await waitForHourlyProcessStart("qualification", "agent"); chargeOne("qualification", "agent"); }, ...(options.signal ? { signal: options.signal } : {}) });
+          const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: async () => { await waitForHourlyProcessStart("qualification", "agent"); chargeOne("qualification", "agent"); }, signal: runSignal });
           const validatedPaths = [...new Set(bootstrap.validatedPaths.map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "")))];
           const invalidPaths = validatedPaths.filter((file) => !requiredPaths.includes(file) || !pathWithin(file, scopeRoots) || pathProtected(file, approvedContract.scope.protectedAssets) || !fs.existsSync(path.resolve(projectDir, file)));
           if (invalidPaths.length > 0 || requiredPaths.some((file) => !validatedPaths.includes(file))) {
             throw new Error(`evaluator bootstrap did not validate its approved paths: ${[...new Set([...invalidPaths, ...requiredPaths.filter((file) => !validatedPaths.includes(file))])].join(", ")}`);
           }
-          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          if (markAborted()) break;
           if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
           setActivity("discovery", "Checking the generated workload before ranking");
           recon = await reconProjectImpl(reconOptions());
@@ -1779,7 +1927,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           break;
         }
         if (options.evaluatorBootstrap?.authorized) {
-          if (options.signal?.aborted) { stopReason = "cancelled"; break; }
+          if (markAborted()) break;
           if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
           const reason = `Evaluator bootstrap failed: ${error instanceof Error ? error.message : String(error)}.`;
           preflight = { status: "blocked", checks: [{ name: "workload", status: "blocked", reason, remedy: "Fix the bootstrap failure or supply a runnable pinned workload and evaluator command." }] };
@@ -1887,7 +2035,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               minimumUsefulGain: approved.contract.outcome.minimumUsefulGain,
               editableScope: lever.scopeFiles,
               availableEvaluatorRuns: remainingAllowance(budget!).evaluatorRuns,
-              ...(options.signal ? { signal: options.signal } : {}),
+              signal: runSignal,
               deadlineAt,
               beforeEvaluatorRun: async () => { await waitForHourlyProcessStart("qualification", "evaluator"); chargeOne("qualification", "evaluator"); },
             },
@@ -1917,7 +2065,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           projectDir,
           workRoot: path.join(loopRoot, "post-apply"),
           beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
-          ...(options.signal ? { signal: options.signal } : {}),
+          signal: runSignal,
           ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
         }) : null;
         if (plan && !instrument) {
@@ -2009,10 +2157,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             limits: { maxCycles: effectiveCommitPolicy(approved.contract.git) === "commit-per-accepted-change" ? 1 : campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
             // The run's rare-event allowance is shared across the campaigns it may confirm.
             confirmationAlpha: approved.contract.budgets.falseAcceptBudget / approved.contract.budgets.maxCampaigns,
-            ...(options.signal ? { signal: options.signal } : {}),
-            ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+            signal: runSignal,
+            ...(agentResolver ? { resolveAgent: agentResolver } : {}),
             beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
             onUpdate: (status) => {
+              updateRsiCampaignTokens(status);
               if (status.effectiveAgent) latestEffectiveAgent = status.effectiveAgent;
               setActivity("campaign", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
               if (status.effectiveAgent) persistActivity(true);
@@ -2061,6 +2210,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         }
 
         budget = settleReservation(budget, reserved, { agentStarts: result.agentStarts, evaluatorRuns: result.evaluatorRuns });
+        const usage = campaignTokenUsage(result.campaignRoot);
+        if (usage) {
+          budget = recordCampaignTokenUsage(budget, usage.campaignId, usage.tokens);
+          if (rsiMode && remainingRsiTokens(budget) <= 0) {
+            stopReason = "budget: the observed RSI token total exhausted the UTC-day cap; no further agent process will start";
+            addNote(stopReason);
+          }
+        }
         writeLoopBudget(budgetPath, budget);
         if (result.state.kind !== "paused" && result.state.kind !== "running") {
           const saved = readJson<LoopResumeContext>(activeContextPath);
@@ -2068,7 +2225,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         }
         const applied = readLedger(path.join(result.campaignRoot, "history", "ledger.jsonl")).entries
           .some((entry) => entry.kind === "apply" && entry.outcome === "success");
-        const cancelled = options.signal?.aborted === true || stopReason === "cancelled" || /stopped by request/i.test(result.stopReason);
+        const cancelled = stopReason !== "deadline" && (options.signal?.aborted === true || stopReason === "cancelled" || /stopped by request/i.test(result.stopReason));
         const failed = result.state?.kind === "failed";
         const paused = result.state?.kind === "paused" || result.state?.kind === "running";
         let outcome: LoopMemoryRecord["outcome"];
@@ -2114,7 +2271,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             workRoot: path.join(loopRoot, "post-apply"),
             timeoutMs: instrument.timeoutMs,
             beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
-            ...(options.signal ? { signal: options.signal } : {}),
+            signal: runSignal,
             ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
           });
           } catch (error) {
@@ -2201,10 +2358,16 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           const incumbent = readSearchConfig();
           setActivity("dream", "Comparing completed experiment worlds for the next search");
           const adopted = await maybeDream({
-            projectDir, loopRoot, agent: setup.task.agent, resolveAgent: options.resolveAgent,
-            signal: options.signal ?? new AbortController().signal, worlds, incumbent,
+            projectDir, loopRoot, agent: setup.task.agent, resolveAgent: agentResolver,
+            signal: runSignal, worlds, incumbent,
             beforeAgentSpawn: async () => { await waitForHourlyProcessStart("dream", "agent"); chargeOne("dream", "agent"); },
             onAgentComplete: (agentResult) => {
+              const tokens = usageTokens(agentResult.evidence?.usage);
+              if (tokens > 0) {
+                budget = recordTokenUsage(budget!, tokens);
+                writeLoopBudget(budgetPath, budget);
+                if (rsiMode && remainingRsiTokens(budget) <= 0) stopReason = "budget: the observed RSI token total exhausted the UTC-day cap";
+              }
               if (!agentResult.effectiveAgent) return;
               latestEffectiveAgent = agentResult.effectiveAgent;
               persistActivity(true);
@@ -2233,8 +2396,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // A promoted change that does not survive independent checking halts the run: the
         // tree no longer agrees with the measurement that promoted it, so continuing would
         // build later experiments on an unverified baseline.
-        if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
-        if (paused) stopReason = result.pendingConfirmation ? "confirmation pending" : "paused";
+        if (postApplyFailure && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = `post-apply check failed: ${postApplyFailure}`;
+        if (paused && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = result.pendingConfirmation ? "confirmation pending" : "paused";
         if (autoCommitFailure) stopReason = `auto-commit failed: ${autoCommitFailure}`;
         break; // re-rank before the next campaign
       }
@@ -2259,15 +2422,22 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     stopReason = `failed: ${failureMessage}`;
     throw error;
   } finally {
-    options.signal?.removeEventListener("abort", onAbort);
+    if (deadlineTimer) clearTimeout(deadlineTimer);
+    options.signal?.removeEventListener("abort", abortForExternalStop);
+    runSignal.removeEventListener("abort", onAbort);
     if (leaseHeld) {
       // Charge this run's wall time durably so a resume inherits what is left.
-      if (budget) {
+      if (budget && (!rsiMode || approved?.contract.mode === "rsi")) {
         try {
-          budget = { ...budget, wall_ms: (budget.wall_ms ?? 0) + Math.max(0, Date.now() - startedMs) };
-          writeLoopBudget(budgetPath, budget);
-        } catch { /* the run's outcome is already recorded; a failed write is reported by status */ }
+          let settledBudget = budget;
+          if (budget.rsi?.active_run) settledBudget = settleRsiRun(budget, now().getTime());
+          else if (!rsiMode) settledBudget = { ...budget, wall_ms: (budget.wall_ms ?? 0) + Math.max(0, Date.now() - startedMs) };
+          writeLoopBudget(budgetPath, settledBudget);
+          budget = settledBudget;
+        } catch { /* Keep the in-memory reservation active if durable settlement fails. */ }
       }
+      const displayedBudget = leaseHeld ? readPersistedBudgetSnapshot() : budget;
+      terminalBudgetSnapshot = displayedBudget;
       // Publish the terminal snapshot while still owning the lease. A blocked contender must
       // not overwrite the active owner's status, and a new owner must not race this final write.
       try {
@@ -2280,15 +2450,20 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           phase: failureMessage === null ? "stopped" : "failed",
           updatedAt: now().toISOString(),
           startedAt: leaseStartedAt,
-          branch: approved?.contract.git?.branch ?? null,
+          branch: approved?.contract.mode !== "rsi" ? approved?.contract.git?.branch ?? null : null,
           branchTip: autoCommitBranch?.head ?? null,
           effectiveAgent: latestEffectiveAgent,
           lastVerifiedCommit: autoCommits.at(-1)?.hash ?? null,
           lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
-          budget: budget ? {
-            campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
-            agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
-            evaluatorRuns: budget.evaluator_runs, maxEvaluatorRuns: budget.max_evaluator_runs,
+          budget: displayedBudget ? {
+            campaigns: displayedBudget.campaigns, maxCampaigns: displayedBudget.max_campaigns,
+            agentStarts: displayedBudget.agent_starts, maxAgentStarts: displayedBudget.max_agent_starts,
+            evaluatorRuns: displayedBudget.evaluator_runs, maxEvaluatorRuns: displayedBudget.max_evaluator_runs,
+            lifetimeTokens: displayedBudget.tokens_used ?? null,
+            ...(displayedBudget.rsi ? { rsiDaily: { windowId: displayedBudget.rsi.window_id, campaigns: displayedBudget.rsi.campaigns, maxCampaigns: displayedBudget.max_campaigns,
+              tokens: displayedBudget.rsi.tokens, maxTokens: RSI_DAILY_CAPS.tokens, wallMs: displayedBudget.rsi.wall_ms, maxWallMs: RSI_DAILY_CAPS.wallMs,
+              tokensUnattributed: displayedBudget.rsi.tokens_unattributed, wallUnattributed: displayedBudget.rsi.wall_unattributed ?? null,
+              active: displayedBudget.rsi.active_run !== null } } : {}),
           } : null,
           reportPath: path.join(loopRoot, "latest-report.json"),
           lastRunPath: path.join(loopRoot, "last-run.md"),
@@ -2304,6 +2479,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   }
 
   const stopCode = classifyStop(stopReason);
+  const outputBudget = leaseHeld ? terminalBudgetSnapshot : budget;
   const reportPath = path.join(loopRoot, "latest-report.json");
   const lastRunPath = path.join(loopRoot, "last-run.md");
   const spentPhases = budget?.phases ?? {};
@@ -2346,6 +2522,15 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       evaluatorRuns: result.evaluatorRuns, preflightEvaluatorRuns, campaignEvaluatorRuns, agentStarts: result.agentStarts,
       evaluatorRunsByPhase,
       rollingProcessLimits,
+      budget: outputBudget ? {
+        lifetime: { campaigns: outputBudget.campaigns, agentStarts: outputBudget.agent_starts, evaluatorRuns: outputBudget.evaluator_runs,
+          tokens: outputBudget.tokens_used ?? null, wallMs: outputBudget.wall_ms ?? 0 },
+        ...(outputBudget.rsi ? { rsiDaily: { windowId: outputBudget.rsi.window_id, campaigns: outputBudget.rsi.campaigns, agentStarts: outputBudget.rsi.agent_starts,
+          evaluatorRuns: outputBudget.rsi.evaluator_runs, tokens: outputBudget.rsi.tokens, wallMs: outputBudget.rsi.wall_ms,
+          maxCampaigns: outputBudget.max_campaigns, maxAgentStarts: outputBudget.max_agent_starts, maxEvaluatorRuns: outputBudget.max_evaluator_runs,
+          maxTokens: RSI_DAILY_CAPS.tokens, maxWallMs: RSI_DAILY_CAPS.wallMs, tokensUnattributed: outputBudget.rsi.tokens_unattributed,
+          wallUnattributed: outputBudget.rsi.wall_unattributed ?? null, active: outputBudget.rsi.active_run !== null } } : {}),
+      } : null,
       agentStartsByPhase: Object.fromEntries(Object.entries(spentPhases).map(([phase, spend]) => [phase, Math.max(0, (spend?.agent_starts ?? 0) - (runStartPhases[phase as LoopPhase]?.agent_starts ?? 0))])),
       verifications: verifications.map(({ campaignId, outcome, passed, at }) => ({ campaignId, outcome, passed, at })),
       autoCommits });
@@ -2358,9 +2543,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     const blocked = preflight.checks.filter((check) => check.status === "blocked");
     const recentAttempts = records.slice(-20);
     const dreamDecisions = memory.notes.filter((note) => note.startsWith("dream adopted search config ")).slice(-10);
-    const caps = budget
-      ? `${budget.campaigns}/${budget.max_campaigns} campaigns, ${budget.agent_starts}/${budget.max_agent_starts} agent starts, ${budget.evaluator_runs}/${budget.max_evaluator_runs} evaluator runs used`
-      : "durable budget unavailable";
+    const caps = outputBudget?.rsi
+      ? `RSI UTC day ${outputBudget.rsi.window_id}: ${outputBudget.rsi.campaigns}/${outputBudget.max_campaigns} campaigns, ${outputBudget.rsi.agent_starts}/${outputBudget.max_agent_starts} agent starts, ${outputBudget.rsi.evaluator_runs}/${outputBudget.max_evaluator_runs} evaluator runs, ${outputBudget.rsi.tokens}/${RSI_DAILY_CAPS.tokens} reported tokens, ${outputBudget.rsi.wall_ms}/${RSI_DAILY_CAPS.wallMs} wall ms; lifetime ${outputBudget.campaigns} campaigns, ${outputBudget.tokens_used ?? 0} reported tokens`
+      : outputBudget
+        ? `${outputBudget.campaigns}/${outputBudget.max_campaigns} campaigns, ${outputBudget.agent_starts}/${outputBudget.max_agent_starts} agent starts, ${outputBudget.evaluator_runs}/${outputBudget.max_evaluator_runs} evaluator runs used; lifetime tokens ${outputBudget.tokens_used ?? 0}`
+        : "durable budget unavailable";
     const lines = [
       "# Dream-RSI last run",
       "",

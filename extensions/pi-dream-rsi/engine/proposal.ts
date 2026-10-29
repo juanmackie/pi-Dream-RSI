@@ -52,6 +52,9 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
   if (params.commit_policy !== undefined && params.auto_commit !== undefined
     && params.auto_commit !== (params.commit_policy !== "no-commit")) throw new Error("auto_commit conflicts with commit_policy");
   if (params.continuous !== undefined && typeof params.continuous !== "boolean") throw new Error("continuous must be a boolean");
+  if (params.rsi_mode !== undefined && typeof params.rsi_mode !== "boolean") throw new Error("rsi_mode must be a boolean");
+  if (prior?.mode === "rsi" && params.rsi_mode === false) throw new Error("RSI mode cannot be disabled without a new accounting boundary; retain its daily and lifetime totals");
+  const rsiMode = params.rsi_mode ?? prior?.mode === "rsi";
   if (params.commit_branch !== undefined && (typeof params.commit_branch !== "string" || !params.commit_branch.trim() || params.commit_branch.length > 255)) throw new Error("commit_branch must be a non-empty local branch name of at most 255 characters");
   if (params.focus !== undefined && (typeof params.focus !== "string" || !params.focus.trim())) throw new Error("focus requires an explicit improvement goal (a non-empty sentence)");
   if (params.evaluator !== undefined) {
@@ -66,10 +69,10 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
     return value;
   };
   const limits: LoopLimits = {
-    maxCampaigns: readLimit("max_campaigns", prior?.budgets.maxCampaigns ?? 6, 64),
+    maxCampaigns: readLimit("max_campaigns", prior?.budgets.maxCampaigns ?? 6, rsiMode ? 6 : 64),
     maxAgentStarts: readLimit("max_agent_starts", prior?.budgets.maxAgentStarts ?? 72, 1000),
     maxEvaluatorRuns: readLimit("max_evaluator_runs", prior?.budgets.maxEvaluatorRuns ?? 200, 5000),
-    deadlineMs: params.deadline_minutes === undefined && prior ? prior.budgets.deadlineMs : readLimit("deadline_minutes", 120, 720) * 60_000,
+    deadlineMs: params.deadline_minutes === undefined && prior ? prior.budgets.deadlineMs : readLimit("deadline_minutes", rsiMode ? 240 : 120, rsiMode ? 240 : 720) * 60_000,
   };
   if (prior && (limits.maxCampaigns < prior.budgets.maxCampaigns || limits.maxAgentStarts < prior.budgets.maxAgentStarts
     || limits.maxEvaluatorRuns < prior.budgets.maxEvaluatorRuns || limits.deadlineMs < prior.budgets.deadlineMs)) {
@@ -140,12 +143,16 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
     }
     : undefined;
   if (gitPolicy?.autoCommit && !hasGitMetadata(projectDir)) throw new Error("auto_commit requires a project inside an existing Git working tree");
+  if (rsiMode && params.evaluator_bootstrap?.authorized) {
+    throw new Error("RSI mode cannot run evaluator bootstrap until its agent use is included in provider-bounded accounting; create and qualify setup files before enabling RSI mode");
+  }
   if (gitPolicy?.autoCommit && params.evaluator_bootstrap?.authorized) {
     throw new Error("auto_commit cannot be combined with evaluator bootstrap in v1 because setup writes are not campaign patches; set auto_commit: false or create and qualify setup files before enabling auto-commit");
   }
   const protectedAssets = [...new Set([...list("protected_assets", prior?.scope.protectedAssets ?? []), ...constitutionProtectedAssets(projectDir)])];
   const contract = normalizeRunContract({
     version: 1,
+    ...(rsiMode ? { mode: "rsi" as const } : {}),
     outcome: {
       statement, unit: params.unit === undefined ? prior?.outcome.unit ?? "ms" : params.unit,
       higherIsBetter: params.higher_is_better === undefined ? prior?.outcome.higherIsBetter ?? false : params.higher_is_better,

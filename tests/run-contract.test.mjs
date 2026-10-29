@@ -12,6 +12,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import {
   ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, isProtectedAsset, normalizeRunContract,
@@ -19,7 +20,8 @@ import {
 } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { constitutionProtectedAssets, pathWithin } from "../extensions/pi-dream-rsi/engine/scope.ts";
 import {
-  readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
+  RSI_DAILY_CAPS, chargeImmediateProcessStart, readOrCreateLoopBudget, reconcileOpenReservation, recordCampaignTokenUsage, recordTokenUsage,
+  remainingAllowance, remainingRsiTokens, reserveRsiRun, settleReservation, settleRsiRun, writeLoopBudget,
 } from "../extensions/pi-dream-rsi/engine/budget.ts";
 import { bootstrapWritePlan, runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { resolveLoopProposal } from "../extensions/pi-dream-rsi/engine/proposal.ts";
@@ -79,6 +81,8 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
     [{ git: { autoCommit: true, branch: "bad branch" } }, /valid local Git branch/],
     [{ git: { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "later" } }, /commitPolicy/],
     [{ git: { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } }, /must match autoCommit/],
+    [{ mode: "future" }, /mode must be "rsi"/],
+    [{ mode: "rsi", budgets: { maxCampaigns: 7 } }, /cannot exceed the approved nightly limits/],
   ];
   for (const [patch, expected] of cases) {
     const errors = validateRunContract(validContract(patch));
@@ -88,6 +92,211 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
   }
   assert.throws(() => normalizeRunContract(null), /must be an object/);
 });
+test("RSI mode saves its accounting contract but blocks all child work until worker controls exist", async () => {
+  const projectDir = tempProject();
+  try {
+    const contract = normalizeRunContract(validContract({
+      mode: "rsi",
+      budgets: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+    }));
+    let reconCalls = 0;
+    let campaignCalls = 0;
+    const result = await runLoop({
+      projectDir, contract,
+      limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+      reconProjectImpl: async () => { reconCalls += 1; throw new Error("must not probe"); },
+      runCampaignImpl: async () => { campaignCalls += 1; throw new Error("must not start a campaign"); },
+    });
+    assert.equal(result.stopCode, "blocked");
+    assert.match(result.stopReason, /provider-bounded or host-isolated worker adapter/);
+    assert.equal(result.agentStarts, 0);
+    assert.equal(reconCalls, 0);
+    assert.equal(campaignCalls, 0);
+    const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
+    assert.equal(budget.rsi.active_run, null);
+    assert.deepEqual([budget.rsi.campaigns, budget.rsi.tokens], [0, 0], "the blocked RSI start launches no campaign or token-using work");
+    assert.ok(budget.rsi.wall_ms >= 0 && budget.rsi.wall_ms <= RSI_DAILY_CAPS.wallMs, "control-plane time stays within the daily reservation");
+    assert.equal(budget.wall_ms, budget.rsi.wall_ms, "actual RSI wall usage is retained in lifetime totals");
+    const status = JSON.parse(fs.readFileSync(path.join(path.dirname(result.budgetPath), "status.json"), "utf8"));
+    assert.equal(status.budget.rsiDaily.active, false, "terminal status reflects the settled reservation");
+    assert.equal(status.budget.rsiDaily.wallMs, budget.rsi.wall_ms);
+    await assert.rejects(runLoop({
+      projectDir, contract,
+      limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+      evaluatorBootstrap: { authorized: true, paths: [] },
+    }), /refuses evaluator bootstrap/);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("recovery under an existing RSI contract is persisted before a replacement proposal can be rejected", async () => {
+  const projectDir = tempProject();
+  const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  try {
+    const saved = normalizeRunContract(validContract({ mode: "rsi", budgets: {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    } }));
+    const proposed = normalizeRunContract(validContract({
+      ...saved, outcome: { ...saved.outcome, statement: "another objective requiring replacement approval" },
+    }));
+    fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approveRunContract(projectDir, saved) })}\n`);
+    const budgetPath = path.join(loopRoot, "budget.json");
+    const start = Date.parse("2026-11-01T12:00:00.000Z");
+    const budget = readOrCreateLoopBudget(budgetPath, saved.budgets, { rsiMode: true, nowMs: start });
+    const reservation = reserveRsiRun(budget, start, 4 * 60 * 60 * 1000);
+    writeLoopBudget(budgetPath, reservation.budget);
+    const result = await runLoop({
+      projectDir, contract: proposed,
+      limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+      now: () => new Date(start + 60_000),
+    });
+    assert.equal(result.stopCode, "blocked");
+    const persisted = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+    assert.equal(persisted.rsi.active_run, null);
+    assert.equal(persisted.rsi.wall_ms, 60_000, "the abandoned reservation is conservatively charged once");
+    const status = JSON.parse(fs.readFileSync(path.join(loopRoot, "status.json"), "utf8"));
+    const report = JSON.parse(fs.readFileSync(result.reportPath, "utf8"));
+    assert.equal(status.budget.rsiDaily.active, false);
+    assert.equal(status.budget.rsiDaily.wallMs, persisted.rsi.wall_ms);
+    assert.equal(report.budget.rsiDaily.wallMs, persisted.rsi.wall_ms);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("terminal RSI status and report reflect the atomic budget file after failed writes", async () => {
+  for (const failure of ["reservation-and-settlement-before-write", "settlement-before-write", "settlement-after-write"]) {
+    const projectDir = tempProject();
+    try {
+      const contract = normalizeRunContract(validContract({ mode: "rsi", budgets: {
+        maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+      } }));
+      let writes = 0;
+      const result = await runLoop({
+        projectDir, contract,
+        limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+        writeBudgetImpl: (file, budget) => {
+          writes += 1;
+          const shouldFail = failure === "reservation-and-settlement-before-write" ? writes === 2 || writes === 3
+            : writes === 3;
+          if (!shouldFail) return writeLoopBudget(file, budget);
+          if (failure === "settlement-after-write" && writes === 3) writeLoopBudget(file, budget);
+          throw new Error(`injected ${failure}`);
+        },
+      });
+      const budget = JSON.parse(fs.readFileSync(path.join(projectDir, ".dream-rsi", "loop", "budget.json"), "utf8"));
+      const status = JSON.parse(fs.readFileSync(path.join(projectDir, ".dream-rsi", "loop", "status.json"), "utf8"));
+      const report = JSON.parse(fs.readFileSync(result.reportPath, "utf8"));
+      const persistedActive = budget.rsi.active_run !== null;
+      assert.equal(status.budget.rsiDaily.active, persistedActive, `${failure}: ${JSON.stringify({ statusBudget: status.budget, budget })}`);
+      assert.equal(status.budget.rsiDaily.wallMs, budget.rsi.wall_ms, failure);
+      assert.equal(report.budget.rsiDaily.wallMs, budget.rsi.wall_ms, failure);
+      assert.equal(report.budget.rsiDaily.active, persistedActive, failure);
+    } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+  }
+});
+
+test("a failed lease-directory startup does not attach a deadline timer or external abort listener", async () => {
+  const projectDir = tempProject();
+  try {
+    fs.writeFileSync(path.join(projectDir, ".dream-rsi"), "not a directory");
+    const controller = new AbortController();
+    let added = 0;
+    let removed = 0;
+    const signal = new Proxy(controller.signal, {
+      get(target, property) {
+        if (property === "addEventListener") return (...args) => { added += 1; return target.addEventListener(...args); };
+        if (property === "removeEventListener") return (...args) => { removed += 1; return target.removeEventListener(...args); };
+        const value = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const contract = normalizeRunContract(validContract());
+    await assert.rejects(runLoop({
+      projectDir, contract, signal,
+      limits: { maxCampaigns: 1, maxAgentStarts: 1, maxEvaluatorRuns: 1, deadlineMs: 100 },
+    }), /ENOTDIR|not a directory/i);
+    assert.equal(added, 0);
+    assert.equal(removed, 0);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("an exhausted RSI wall allowance reports budget-exhausted before repository work", async () => {
+  const projectDir = tempProject();
+  const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  try {
+    const contract = normalizeRunContract(validContract({ mode: "rsi", budgets: {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    } }));
+    fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approveRunContract(projectDir, contract) })}\n`);
+    const budgetPath = path.join(loopRoot, "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, contract.budgets, { rsiMode: true });
+    writeLoopBudget(budgetPath, { ...budget, wall_ms: RSI_DAILY_CAPS.wallMs, rsi: { ...budget.rsi, wall_ms: RSI_DAILY_CAPS.wallMs } });
+    let reconCalls = 0;
+    const result = await runLoop({
+      projectDir, contract,
+      limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+      reconProjectImpl: async () => { reconCalls += 1; throw new Error("must not probe"); },
+    });
+    assert.equal(result.stopCode, "budget-exhausted");
+    assert.equal(reconCalls, 0);
+    assert.equal(result.agentStarts, 0);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("RSI startup does not switch Git branches or run repository checkout hooks", async () => {
+  const projectDir = tempProject();
+  try {
+    const git = (args) => execFileSync("git", args, { cwd: projectDir, stdio: "ignore", windowsHide: true });
+    git(["init", "-q", "-b", "main"]);
+    git(["config", "user.name", "Dream RSI Test"]);
+    git(["config", "user.email", "dream-rsi-test@example.invalid"]);
+    git(["add", "src"]);
+    git(["commit", "-q", "-m", "baseline"]);
+    const hook = path.join(projectDir, ".git", "hooks", "post-checkout");
+    fs.writeFileSync(hook, "#!/bin/sh\nprintf ran > post-checkout.marker\n");
+    fs.chmodSync(hook, 0o755);
+    const contract = normalizeRunContract(validContract({
+      mode: "rsi", git: { autoCommit: true, branch: "dream-rsi/improve" },
+      budgets: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+    }));
+    const result = await runLoop({
+      projectDir, contract,
+      limits: { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs },
+    });
+    assert.equal(result.stopCode, "blocked");
+    assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: projectDir, encoding: "utf8" }).trim(), "main");
+    assert.equal(fs.existsSync(path.join(projectDir, "post-checkout.marker")), false, "RSI approval must not execute untrusted checkout hooks");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(projectDir, ".dream-rsi", "loop", "status.json"), "utf8")).branch, null);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("a rejected legacy-to-RSI contract replacement does not persist an accounting migration", async () => {
+  const projectDir = tempProject();
+  const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  try {
+    const legacy = normalizeRunContract(validContract());
+    const rsi = normalizeRunContract(validContract({ mode: "rsi", budgets: { maxCampaigns: 2, deadlineMs: RSI_DAILY_CAPS.wallMs } }));
+    fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...approveRunContract(projectDir, legacy) })}\n`);
+    readOrCreateLoopBudget(path.join(loopRoot, "budget.json"), legacy.budgets);
+    const contractBefore = fs.readFileSync(contractFile(loopRoot), "utf8");
+    const budgetPath = path.join(loopRoot, "budget.json");
+    const budgetBefore = fs.readFileSync(budgetPath, "utf8");
+    const result = await runLoop({
+      projectDir, contract: rsi,
+      limits: { maxCampaigns: 2, maxAgentStarts: 20, maxEvaluatorRuns: 100, deadlineMs: RSI_DAILY_CAPS.wallMs },
+    });
+    assert.equal(result.stopCode, "blocked");
+    assert.equal(fs.readFileSync(contractFile(loopRoot), "utf8"), contractBefore, "the saved legacy contract remains authoritative");
+    assert.equal(fs.readFileSync(budgetPath, "utf8"), budgetBefore, "unapproved migration leaves legacy counters byte-identical");
+    assert.equal(JSON.parse(budgetBefore).rsi, undefined);
+    const report = JSON.parse(fs.readFileSync(result.reportPath, "utf8"));
+    assert.equal(report.budget.rsiDaily, undefined, "the report does not advertise an unpersisted RSI migration");
+    const status = JSON.parse(fs.readFileSync(path.join(loopRoot, "status.json"), "utf8"));
+    assert.equal(status.budget.rsiDaily, undefined, "the status snapshot matches durable accounting");
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("new Git-backed proposals default to verified auto-commit while legacy contracts keep their policy", () => {
   const projectDir = tempProject();
   try {
@@ -107,6 +316,13 @@ test("new Git-backed proposals default to verified auto-commit while legacy cont
     assert.deepEqual(squash.contract.git, { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" });
     assert.equal(resolveLoopProposal({}, projectDir, squash.contract).contract.git?.commitPolicy, "squash-per-campaign",
       "the saved policy is inherited on resume/reuse");
+    const rsi = resolveLoopProposal({ rsi_mode: true }, projectDir);
+    assert.equal(rsi.contract.mode, "rsi");
+    assert.equal(rsi.contract.budgets.maxCampaigns, 6);
+    assert.equal(rsi.contract.budgets.deadlineMs, RSI_DAILY_CAPS.wallMs);
+    assert.throws(() => resolveLoopProposal({ rsi_mode: true, max_campaigns: 7 }, projectDir), /max_campaigns/);
+    assert.throws(() => resolveLoopProposal({ rsi_mode: false }, projectDir, rsi.contract), /cannot be disabled/);
+    assert.throws(() => resolveLoopProposal({ rsi_mode: true, evaluator_bootstrap: { authorized: true, paths: ["src/harness.mjs"] } }, projectDir), /cannot run evaluator bootstrap/);
     const noCommit = resolveLoopProposal({ commit_policy: "no-commit" }, projectDir);
     assert.deepEqual(noCommit.contract.git, { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "no-commit" });
     assert.throws(() => resolveLoopProposal({ auto_commit: true, commit_policy: "no-commit" }, projectDir), /conflict/);
@@ -142,10 +358,13 @@ test("commit policies survive settings-envelope import and invalid combinations 
     const contract = normalizeRunContract(validContract({ git: { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } }));
     fs.writeFileSync(file, JSON.stringify({ version: 1, contract }));
     const allowed = ["focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "protected_assets", "gates",
-      "max_campaigns", "max_agent_starts", "max_evaluator_runs", "false_accept_budget", "deadline_minutes", "auto_commit", "commit_branch", "commit_policy", "env_allowlist", "command_categories"];
+      "max_campaigns", "max_agent_starts", "max_evaluator_runs", "false_accept_budget", "deadline_minutes", "auto_commit", "commit_branch", "commit_policy", "rsi_mode", "env_allowlist", "command_categories"];
     const settings = readLoopSettingsFile(file, dir, allowed);
     assert.equal(settings.commit_policy, "squash-per-campaign");
     assert.equal(settings.auto_commit, true);
+    const rsiContract = normalizeRunContract(validContract({ mode: "rsi" }));
+    fs.writeFileSync(file, JSON.stringify({ version: 1, contract: rsiContract }));
+    assert.equal(readLoopSettingsFile(file, dir, allowed).rsi_mode, true, "the explicit mode survives settings-envelope round-trip");
     const invalid = { ...contract, git: { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } };
     fs.writeFileSync(file, JSON.stringify({ version: 1, contract: invalid }));
     assert.throws(() => readLoopSettingsFile(file, dir, allowed), /must match autoCommit/);
@@ -276,6 +495,148 @@ test("a stored contract round-trips and a corrupt file fails closed", () => {
 });
 
 const BUDGET_LIMITS = { maxCampaigns: 3, maxAgentStarts: 30, maxEvaluatorRuns: 20, deadlineMs: 60_000 };
+
+test("RSI UTC-day accounting renews only daily counters and preserves lifetime totals", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-nightly-budget-"));
+  const file = path.join(dir, "budget.json");
+  try {
+    const firstDay = Date.parse("2026-11-01T12:00:00.000Z");
+    let budget = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-01", nowMs: firstDay });
+    const reservation = { phase: "campaign", agent_starts: 4, evaluator_runs: 3, campaigns: 1, at: new Date(firstDay).toISOString() };
+    budget = { ...budget, open_campaign: reservation };
+    budget = settleReservation(budget, reservation, { agentStarts: 4, evaluatorRuns: 3, campaigns: 1 });
+    budget = recordTokenUsage(budget, 1_200);
+    budget = recordCampaignTokenUsage(budget, "campaign-1", 300);
+    budget = recordCampaignTokenUsage(budget, "campaign-1", 450);
+    assert.deepEqual(remainingAllowance(budget), { campaigns: 5, agentStarts: 68, evaluatorRuns: 197 });
+    assert.equal(budget.campaigns, 1, "top-level campaign total is lifetime, not renewed");
+    assert.equal(budget.tokens_used, 1_650, "campaign resume receipts add only the newly observed token delta");
+    assert.equal(budget.rsi.tokens, 1_650);
+    assert.equal(remainingRsiTokens(budget), RSI_DAILY_CAPS.tokens - 1_650);
+    const maxedTokens = recordTokenUsage(budget, remainingRsiTokens(budget));
+    assert.equal(remainingRsiTokens(maxedTokens), 0, "the daily token cap has an exact exhausted boundary");
+    const observedOverrun = recordTokenUsage(maxedTokens, 1);
+    assert.equal(remainingRsiTokens(observedOverrun), -1, "reported usage is never clamped or hidden; dispatch guards must stop before another call");
+    const exhaustedWall = { ...budget, rsi: { ...budget.rsi, wall_ms: RSI_DAILY_CAPS.wallMs } };
+    assert.throws(() => reserveRsiRun(exhaustedWall, firstDay, 1_000), /daily wall-clock budget is exhausted/);
+
+    const started = reserveRsiRun(budget, firstDay, RSI_DAILY_CAPS.wallMs);
+    budget = started.budget;
+    assert.equal(started.allowanceMs, RSI_DAILY_CAPS.wallMs);
+    assert.throws(() => reserveRsiRun(started.budget, firstDay, 1_000), /already active/);
+    const actualOverrun = settleRsiRun(started.budget, firstDay + RSI_DAILY_CAPS.wallMs + 1_234);
+    assert.equal(actualOverrun.wall_ms, RSI_DAILY_CAPS.wallMs + 1_234, "clean settlement records actual lifetime elapsed time, not only its grant");
+    budget = settleRsiRun(budget, firstDay + 30 * 60_000);
+    assert.equal(budget.wall_ms, 30 * 60_000);
+    assert.equal(budget.rsi.wall_ms, 30 * 60_000);
+    writeLoopBudget(file, budget);
+
+    const nextDay = Date.parse("2026-11-02T00:10:00.000Z");
+    const renewed = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-02", nowMs: nextDay });
+    assert.deepEqual([renewed.rsi.campaigns, renewed.rsi.agent_starts, renewed.rsi.evaluator_runs, renewed.rsi.tokens, renewed.rsi.wall_ms], [0, 0, 0, 0, 0]);
+    assert.deepEqual([renewed.campaigns, renewed.agent_starts, renewed.evaluator_runs, renewed.tokens_used, renewed.wall_ms], [1, 4, 3, 1_650, 30 * 60_000]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("legacy RSI migration reserves the first-day wall budget and flags unknown lifetime history", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-legacy-migration-"));
+  const file = path.join(dir, "budget.json");
+  try {
+    fs.writeFileSync(file, JSON.stringify({ version: 1, max_campaigns: 6, max_agent_starts: 72, max_evaluator_runs: 200,
+      campaigns: 1, agent_starts: 2, evaluator_runs: 1, open_campaign: null }));
+    const firstDay = Date.parse("2026-11-01T12:00:00.000Z");
+    const migrated = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-01", nowMs: firstDay });
+    assert.deepEqual([migrated.rsi.campaigns, migrated.rsi.agent_starts, migrated.rsi.wall_ms], [1, 2, RSI_DAILY_CAPS.wallMs]);
+    assert.equal(migrated.rsi.tokens_unattributed, true);
+    assert.equal(migrated.rsi.wall_unattributed, true);
+    assert.deepEqual([migrated.tokens_used, migrated.wall_ms], [0, 0], "migration does not invent lifetime usage where no history exists");
+    const nextDay = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-02", nowMs: firstDay + 12 * 60 * 60_000 });
+    assert.deepEqual([nextDay.rsi.campaigns, nextDay.rsi.agent_starts, nextDay.rsi.wall_ms], [0, 0, 0]);
+    assert.equal(nextDay.rsi.tokens_unattributed, true);
+    assert.equal(nextDay.rsi.wall_unattributed, true, "daily renewal preserves lifetime-history warnings");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("RSI cap-extension recovery compares current daily spend, not unbounded lifetime totals", async () => {
+  const projectDir = tempProject();
+  const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  try {
+    const previousContract = normalizeRunContract(validContract({ mode: "rsi", budgets: {
+      maxCampaigns: 6, maxAgentStarts: 10, maxEvaluatorRuns: 20, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    } }));
+    const nextContract = normalizeRunContract({ ...previousContract, budgets: { ...previousContract.budgets, maxAgentStarts: 20 } });
+    const previous = approveRunContract(projectDir, previousContract);
+    const next = approveRunContract(projectDir, nextContract);
+    fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...previous })}\n`);
+    const budgetPath = path.join(loopRoot, "budget.json");
+    let budget = readOrCreateLoopBudget(budgetPath, {
+      maxCampaigns: 6, maxAgentStarts: 10, maxEvaluatorRuns: 20, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true });
+    budget = { ...budget, campaigns: 7, agent_starts: 50, evaluator_runs: 100,
+      rsi: { ...budget.rsi, campaigns: 1, agent_starts: 2, evaluator_runs: 3 } };
+    writeLoopBudget(budgetPath, budget);
+    fs.writeFileSync(path.join(loopRoot, "budget-extension.json"), JSON.stringify({ version: 1, previous, next,
+      previousCaps: { maxCampaigns: 6, maxAgentStarts: 10, maxEvaluatorRuns: 20 },
+      nextCaps: { maxCampaigns: 6, maxAgentStarts: 20, maxEvaluatorRuns: 20 } }));
+    const result = await runLoop({
+      projectDir, contract: nextContract,
+      limits: { maxCampaigns: 6, maxAgentStarts: 20, maxEvaluatorRuns: 20, deadlineMs: RSI_DAILY_CAPS.wallMs },
+    });
+    assert.equal(result.stopCode, "blocked", "recovery completes then stops at the documented RSI worker gate");
+    assert.equal(fs.existsSync(path.join(loopRoot, "budget-extension.json")), false);
+    const savedBudget = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+    assert.deepEqual([savedBudget.campaigns, savedBudget.agent_starts, savedBudget.evaluator_runs], [7, 50, 100]);
+    assert.deepEqual([savedBudget.rsi.campaigns, savedBudget.rsi.agent_starts, savedBudget.rsi.evaluator_runs], [1, 2, 3]);
+    assert.equal(savedBudget.max_agent_starts, 20);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("RSI budget recovery charges an interrupted run and rejects malformed daily state", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-nightly-recovery-"));
+  const file = path.join(dir, "budget.json");
+  try {
+    const startedAt = Date.parse("2026-11-01T23:30:00.000Z");
+    let budget = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-01", nowMs: startedAt });
+    budget = reserveRsiRun(budget, startedAt, RSI_DAILY_CAPS.wallMs).budget;
+    assert.throws(() => reserveRsiRun(budget, startedAt, 1_000), /already active/);
+    writeLoopBudget(file, budget);
+    const recovered = readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-02", nowMs: Date.parse("2026-11-02T00:10:00.000Z") });
+    assert.equal(recovered.wall_ms, 30 * 60_000, "crash recovery charges up to the reserved pre-midnight wall allowance");
+    assert.equal(recovered.rsi.window_id, "2026-11-02");
+    assert.equal(recovered.rsi.wall_ms, 0, "new UTC window starts with a fresh daily counter");
+    assert.throws(() => readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-01", nowMs: Date.parse("2026-11-01T23:59:00.000Z") }), /clock moved backward/);
+    writeLoopBudget(file, { ...recovered, rsi: { ...recovered.rsi, tokens: -1 } });
+    assert.throws(() => readOrCreateLoopBudget(file, {
+      maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: RSI_DAILY_CAPS.wallMs,
+    }, { rsiMode: true, rsiWindowId: "2026-11-02", nowMs: Date.parse("2026-11-02T00:11:00.000Z") }), /RSI budget.*expected schema/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("an immediate process charge preserves an open campaign reservation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-open-charge-"));
+  try {
+    const budget = readOrCreateLoopBudget(path.join(dir, "budget.json"), BUDGET_LIMITS);
+    const reservation = { phase: "campaign", agent_starts: 3, evaluator_runs: 8, campaigns: 1, at: new Date().toISOString() };
+    const started = chargeImmediateProcessStart({ ...budget, open_campaign: reservation }, "campaign", "agent");
+    assert.deepEqual(started.open_campaign, reservation, "a dispatch-time charge cannot erase the crash-recovery reservation");
+    assert.equal(started.agent_starts, budget.agent_starts + 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
 
 test("an approved budget extension preserves spend and refuses a limit below recorded use", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-budget-"));

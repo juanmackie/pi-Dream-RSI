@@ -48,6 +48,20 @@ export interface LoopPhaseSpend {
   campaigns: number;
 }
 
+export interface RsiDailyBudget {
+  window_id: string;
+  campaigns: number;
+  agent_starts: number;
+  evaluator_runs: number;
+  tokens: number;
+  wall_ms: number;
+  active_run: { started_at: string; allowance_ms: number } | null;
+  /** True when token usage before this accounting version could not be reconstructed. */
+  tokens_unattributed: boolean;
+  /** True when lifetime wall time before this accounting version could not be reconstructed. */
+  wall_unattributed?: boolean;
+}
+
 export interface LoopBudgetFile {
   version: 1;
   max_campaigns: number;
@@ -67,7 +81,15 @@ export interface LoopBudgetFile {
   hourly_starts?: { agents: number[]; evaluators: number[] };
   /** Per-phase spend for reporting and durable reconciliation. */
   phases?: Partial<Record<LoopPhase, LoopPhaseSpend>>;
+  /** Provider-reported cumulative lifetime tokens; it is not a provider-side spending ceiling. */
+  tokens_used?: number;
+  /** Idempotent receipt for the single campaign that can be paused and resumed. */
+  last_campaign_token_receipt?: { campaign_id: string; tokens: number };
+  /** Per-UTC-day RSI caps and counters. Existing top-level counters remain lifetime totals. */
+  rsi?: RsiDailyBudget;
 }
+
+export const RSI_DAILY_CAPS = { campaigns: 6, tokens: 400_000, wallMs: 240 * 60_000 } as const;
 
 
 export function readSavedBudgetCaps(file: string): Pick<LoopBudgetFile, "max_campaigns" | "max_agent_starts" | "max_evaluator_runs"> | null {
@@ -96,8 +118,9 @@ function compareLimits(value: Partial<LoopBudgetFile>, limits: LoopBudgetLimits,
   if (!allowIncrease && next.some((limit, index) => limit !== old[index])) {
     throw new Error("loop budget limits are immutable without an approved saved contract");
   }
-  if (limits.maxCampaigns < (value.campaigns as number) || limits.maxAgentStarts < (value.agent_starts as number)
-    || limits.maxEvaluatorRuns < (value.evaluator_runs as number)) {
+  const spend = value.rsi ?? { campaigns: value.campaigns as number, agent_starts: value.agent_starts as number, evaluator_runs: value.evaluator_runs as number };
+  if (limits.maxCampaigns < spend.campaigns || limits.maxAgentStarts < spend.agent_starts
+    || limits.maxEvaluatorRuns < spend.evaluator_runs) {
     throw new Error("loop budget increase cannot set a cap below accumulated spend");
   }
   return next.some((limit, index) => limit !== old[index]);
@@ -107,12 +130,40 @@ function emptyPhases(): Partial<Record<LoopPhase, LoopPhaseSpend>> {
   return {};
 }
 
+function utcWindowId(nowMs: number): string {
+  return new Date(nowMs).toISOString().slice(0, 10);
+}
+
+function isUtcDateKey(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function emptyRsiWindow(windowId: string): RsiDailyBudget {
+  if (!isUtcDateKey(windowId)) throw new Error("RSI budget window must be a UTC date in YYYY-MM-DD form");
+  return { window_id: windowId, campaigns: 0, agent_starts: 0, evaluator_runs: 0, tokens: 0, wall_ms: 0, active_run: null, tokens_unattributed: false, wall_unattributed: false };
+}
+
+function validRsiWindow(raw: unknown): raw is RsiDailyBudget {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return false;
+  const value = raw as Partial<RsiDailyBudget>;
+  return typeof value.window_id === "string" && isUtcDateKey(value.window_id)
+    && isCount(value.campaigns) && isCount(value.agent_starts) && isCount(value.evaluator_runs)
+    && isCount(value.tokens) && isCount(value.wall_ms)
+    && typeof value.tokens_unattributed === "boolean"
+    && (value.wall_unattributed === undefined || typeof value.wall_unattributed === "boolean")
+    && (value.active_run === null || (typeof value.active_run === "object" && value.active_run !== null
+      && typeof value.active_run.started_at === "string" && Number.isFinite(Date.parse(value.active_run.started_at))
+      && isCount(value.active_run.allowance_ms) && value.active_run.allowance_ms > 0));
+}
+
 /**
  * Read the durable budget, creating it on first use. Existing limits stay fixed
  * unless a saved approved contract authorizes a monotonic increase. Counters and
  * reservations remain fail-closed.
  */
-export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, options: { allowIncrease?: boolean } = {}): LoopBudgetFile {
+export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, options: { allowIncrease?: boolean; rsiMode?: boolean; persistRsi?: boolean; rsiWindowId?: string; nowMs?: number } = {}): LoopBudgetFile {
   assertPositiveInteger(limits.maxCampaigns, "maxCampaigns");
   assertPositiveInteger(limits.maxAgentStarts, "maxAgentStarts");
   assertPositiveInteger(limits.maxEvaluatorRuns, "maxEvaluatorRuns");
@@ -133,8 +184,9 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, o
       last_plateau_campaign_id: null,
       hourly_starts: { agents: [], evaluators: [] },
       phases: emptyPhases(),
+      ...(options.rsiMode ? { tokens_used: 0, rsi: emptyRsiWindow(options.rsiWindowId ?? utcWindowId(options.nowMs ?? Date.now())) } : {}),
     };
-    writeLoopBudget(file, created);
+    if (!options.rsiMode || options.persistRsi !== false) writeLoopBudget(file, created);
     return created;
   }
 
@@ -150,6 +202,14 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, o
     || counters.some((entry) => entry === undefined || entry < 0)) {
     throw new Error("loop budget file does not match the expected schema; refusing to continue on corrupted state");
   }
+  if (value.tokens_used !== undefined && !isCount(value.tokens_used)) throw new Error("loop budget token counter does not match the expected schema; refusing to continue on corrupted state");
+  if (value.last_campaign_token_receipt !== undefined && (!value.last_campaign_token_receipt
+    || typeof value.last_campaign_token_receipt.campaign_id !== "string" || !value.last_campaign_token_receipt.campaign_id
+    || !isCount(value.last_campaign_token_receipt.tokens))) {
+    throw new Error("loop budget campaign token receipt is invalid; refusing to continue on corrupted state");
+  }
+  if (value.rsi !== undefined && !validRsiWindow(value.rsi)) throw new Error("loop RSI budget does not match the expected schema; refusing to continue on corrupted state");
+  if (value.rsi && options.rsiMode === false) throw new Error("an RSI budget cannot be downgraded to legacy mode; preserve its daily and lifetime accounting");
   const limitsChanged = compareLimits(value, limits, options.allowIncrease === true);
   const wallMs = value.wall_ms === undefined ? 0 : value.wall_ms;
   if (!isCount(wallMs)) throw new Error("loop budget wall-time counter does not match the expected schema; refusing to continue on corrupted state");
@@ -180,7 +240,7 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, o
 
   const phases = normalizePhases(value.phases);
   const hourlyStarts = normalizeHourlyStarts(value.hourly_starts);
-  const budget: LoopBudgetFile = {
+  let budget: LoopBudgetFile = {
     version: 1,
     max_campaigns: limitsChanged ? limits.maxCampaigns : value.max_campaigns as number,
     max_agent_starts: limitsChanged ? limits.maxAgentStarts : value.max_agent_starts as number,
@@ -195,8 +255,44 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, o
     last_plateau_campaign_id: lastPlateauCampaignId,
     hourly_starts: hourlyStarts,
     phases,
+    ...(value.tokens_used === undefined ? {} : { tokens_used: value.tokens_used }),
+    ...(value.last_campaign_token_receipt === undefined ? {} : { last_campaign_token_receipt: { ...value.last_campaign_token_receipt } }),
+    ...(value.rsi === undefined ? {} : { rsi: {
+      ...structuredClone(value.rsi),
+      wall_unattributed: value.rsi.wall_unattributed ?? (wallMs === 0 && ((value.campaigns as number) > 0 || (value.agent_starts as number) > 0)),
+    } }),
   };
-  if (limitsChanged) writeLoopBudget(file, budget);
+  if (options.rsiMode) {
+    const nowMs = options.nowMs ?? Date.now();
+    const windowId = options.rsiWindowId ?? utcWindowId(nowMs);
+    if (!budget.rsi) {
+      // Preserve legacy spend conservatively in the first day after migration. The old ledger
+      // has no reliable token total, so mark that history as unattributed instead of claiming zero.
+      budget.rsi = {
+        window_id: windowId,
+        campaigns: budget.campaigns,
+        agent_starts: budget.agent_starts,
+        evaluator_runs: budget.evaluator_runs,
+        tokens: 0,
+        wall_ms: RSI_DAILY_CAPS.wallMs,
+        active_run: null,
+        tokens_unattributed: budget.campaigns > 0 || budget.agent_starts > 0,
+        wall_unattributed: (budget.wall_ms ?? 0) === 0 && (budget.campaigns > 0 || budget.agent_starts > 0),
+      };
+      budget.tokens_used ??= 0;
+    } else {
+      emptyRsiWindow(windowId);
+      if (windowId < budget.rsi.window_id) throw new Error("UTC clock moved backward before the saved RSI window; refusing to renew daily allowance");
+      if (budget.rsi.active_run) {
+        if (nowMs < Date.parse(budget.rsi.active_run.started_at)) throw new Error("UTC clock moved backward during an active RSI reservation; refusing to release its allowance");
+        budget = settleRsiRun(budget, nowMs, true);
+      }
+      if (budget.rsi!.window_id !== windowId) {
+        budget.rsi = { ...emptyRsiWindow(windowId), tokens_unattributed: budget.rsi!.tokens_unattributed, wall_unattributed: budget.rsi!.wall_unattributed };
+      }
+    }
+  }
+  if (limitsChanged || (options.rsiMode && options.persistRsi !== false)) writeLoopBudget(file, budget);
   return budget;
 }
 
@@ -291,6 +387,8 @@ export function reconcileOpenReservation(
       campaigns: budget.campaigns + campaigns,
       agent_starts: budget.agent_starts + agentStarts,
       evaluator_runs: budget.evaluator_runs + evaluatorRuns,
+      ...(budget.rsi ? { rsi: { ...budget.rsi, campaigns: budget.rsi.campaigns + campaigns,
+        agent_starts: budget.rsi.agent_starts + agentStarts, evaluator_runs: budget.rsi.evaluator_runs + evaluatorRuns } } : {}),
       open_campaign: null,
       phases,
     },
@@ -304,11 +402,59 @@ export interface RemainingAllowance {
 }
 
 export function remainingAllowance(budget: LoopBudgetFile): RemainingAllowance {
+  const spend = budget.rsi ?? { campaigns: budget.campaigns, agent_starts: budget.agent_starts, evaluator_runs: budget.evaluator_runs };
   return {
-    campaigns: budget.max_campaigns - budget.campaigns,
-    agentStarts: budget.max_agent_starts - budget.agent_starts,
-    evaluatorRuns: budget.max_evaluator_runs - budget.evaluator_runs,
+    campaigns: budget.max_campaigns - spend.campaigns,
+    agentStarts: budget.max_agent_starts - spend.agent_starts,
+    evaluatorRuns: budget.max_evaluator_runs - spend.evaluator_runs,
   };
+}
+
+export function remainingRsiTokens(budget: LoopBudgetFile): number {
+  return budget.rsi ? RSI_DAILY_CAPS.tokens - budget.rsi.tokens : Number.POSITIVE_INFINITY;
+}
+
+/** Account observed provider-reported usage without treating it as a provider-side hard ceiling. */
+export function recordTokenUsage(budget: LoopBudgetFile, tokens: number): LoopBudgetFile {
+  if (!isCount(tokens) || !Number.isSafeInteger((budget.tokens_used ?? 0) + tokens)) throw new Error("token usage must be a non-negative safe integer");
+  return {
+    ...budget,
+    tokens_used: (budget.tokens_used ?? 0) + tokens,
+    ...(budget.rsi ? { rsi: { ...budget.rsi, tokens: budget.rsi.tokens + tokens } } : {}),
+  };
+}
+
+export function recordCampaignTokenUsage(budget: LoopBudgetFile, campaignId: string, tokens: number): LoopBudgetFile {
+  if (!campaignId || !isCount(tokens)) throw new Error("campaign token usage receipt is invalid");
+  const previous = budget.last_campaign_token_receipt;
+  if (previous?.campaign_id === campaignId && tokens < previous.tokens) throw new Error("campaign token usage went backwards; refusing to reduce durable spend");
+  const delta = previous?.campaign_id === campaignId ? tokens - previous.tokens : tokens;
+  return { ...recordTokenUsage(budget, delta), last_campaign_token_receipt: { campaign_id: campaignId, tokens } };
+}
+
+/** Reserve this invocation's wall allowance before work begins; the active lease owns it. */
+export function reserveRsiRun(budget: LoopBudgetFile, startedAtMs: number, requestedMs: number): { budget: LoopBudgetFile; allowanceMs: number } {
+  if (!budget.rsi) throw new Error("RSI daily budget is missing; refusing to start");
+  if (!Number.isSafeInteger(startedAtMs) || startedAtMs < 0 || !Number.isSafeInteger(requestedMs) || requestedMs < 1) {
+    throw new Error("RSI run time bounds are invalid");
+  }
+  if (budget.rsi.active_run) throw new Error("an RSI run reservation is already active; recover the prior loop lease first");
+  const nextUtcDay = Date.UTC(new Date(startedAtMs).getUTCFullYear(), new Date(startedAtMs).getUTCMonth(), new Date(startedAtMs).getUTCDate() + 1);
+  const allowanceMs = Math.min(RSI_DAILY_CAPS.wallMs - budget.rsi.wall_ms, requestedMs, nextUtcDay - startedAtMs);
+  if (!Number.isSafeInteger(allowanceMs) || allowanceMs < 1) throw new Error("the RSI daily wall-clock budget is exhausted");
+  return { budget: { ...budget, rsi: { ...budget.rsi, active_run: { started_at: new Date(startedAtMs).toISOString(), allowance_ms: allowanceMs } } }, allowanceMs };
+}
+
+/** Settle an invocation or conservatively charge a crashed invocation up to its reservation. */
+export function settleRsiRun(budget: LoopBudgetFile, endedAtMs: number, conservativeRecovery = false): LoopBudgetFile {
+  const rsi = budget.rsi;
+  if (!rsi?.active_run) return budget;
+  const startedAtMs = Date.parse(rsi.active_run.started_at);
+  if (!Number.isSafeInteger(endedAtMs) || endedAtMs < startedAtMs) throw new Error("UTC clock moved backward during an active RSI reservation; refusing to settle it");
+  const elapsed = endedAtMs - startedAtMs;
+  const charged = conservativeRecovery ? Math.min(rsi.active_run.allowance_ms, elapsed) : elapsed;
+  return { ...budget, wall_ms: (budget.wall_ms ?? 0) + charged,
+    rsi: { ...rsi, wall_ms: rsi.wall_ms + charged, active_run: null } };
 }
 
 /**
@@ -324,6 +470,22 @@ export function hasAllowance(budget: LoopBudgetFile, spend: { agentStarts?: numb
 }
 
 /** Charge a finished phase against the budget and clear its reservation. */
+export function chargeImmediateProcessStart(budget: LoopBudgetFile, phase: LoopPhase, kind: CampaignProcessKind): LoopBudgetFile {
+  const agentStarts = kind === "agent" ? 1 : 0;
+  const evaluatorRuns = kind === "evaluator" ? 1 : 0;
+  if (!hasAllowance(budget, { agentStarts, evaluatorRuns })) throw new Error("durable process-start budget exhausted");
+  const phases = { ...(budget.phases ?? {}) };
+  const prior = phases[phase] ?? { agent_starts: 0, evaluator_runs: 0, campaigns: 0 };
+  phases[phase] = { ...prior, agent_starts: prior.agent_starts + agentStarts, evaluator_runs: prior.evaluator_runs + evaluatorRuns };
+  return {
+    ...budget,
+    agent_starts: budget.agent_starts + agentStarts,
+    evaluator_runs: budget.evaluator_runs + evaluatorRuns,
+    ...(budget.rsi ? { rsi: { ...budget.rsi, agent_starts: budget.rsi.agent_starts + agentStarts, evaluator_runs: budget.rsi.evaluator_runs + evaluatorRuns } } : {}),
+    phases,
+  };
+}
+
 export function settleReservation(
   budget: LoopBudgetFile,
   reservation: LoopReservation,
@@ -342,6 +504,8 @@ export function settleReservation(
     campaigns: budget.campaigns + campaigns,
     agent_starts: budget.agent_starts + observed.agentStarts,
     evaluator_runs: budget.evaluator_runs + observed.evaluatorRuns,
+    ...(budget.rsi ? { rsi: { ...budget.rsi, campaigns: budget.rsi.campaigns + campaigns,
+      agent_starts: budget.rsi.agent_starts + observed.agentStarts, evaluator_runs: budget.rsi.evaluator_runs + observed.evaluatorRuns } } : {}),
     open_campaign: null,
     phases,
   };

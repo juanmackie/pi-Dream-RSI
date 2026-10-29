@@ -57,7 +57,8 @@ function contractSettings(contract: Record<string, unknown>): Record<string, unk
   if (contract.version !== 1 || !isRecord(contract.outcome) || !isRecord(contract.scope) || !isRecord(contract.preserved)) {
     throw new Error("contract settings must contain version: 1, outcome, scope, and preserved objects");
   }
-  assertKeys(contract, ["version", "outcome", "scope", "preserved", "execution", "budgets", "agent", "git", "continuation"], "contract");
+  assertKeys(contract, ["version", "mode", "outcome", "scope", "preserved", "execution", "budgets", "agent", "git", "continuation"], "contract");
+  if (contract.mode !== undefined && contract.mode !== "rsi") throw new Error('contract settings mode must be "rsi" when present');
   const outcome = contract.outcome;
   const scope = contract.scope;
   const preserved = contract.preserved;
@@ -65,6 +66,7 @@ function contractSettings(contract: Record<string, unknown>): Record<string, unk
   assertKeys(scope, ["roots", "protectedAssets"], "scope");
   assertKeys(preserved, ["gates"], "preserved");
   const settings: Record<string, unknown> = {};
+  if (contract.mode === "rsi") settings.rsi_mode = true;
   const fields: Array<[string, unknown]> = [
     ["focus", outcome.statement], ["unit", outcome.unit], ["higher_is_better", outcome.higherIsBetter],
     ["minimum_gain", outcome.minimumUsefulGain], ["proxy_justification", outcome.proxyJustification],

@@ -20,9 +20,9 @@ This is an application-level promotion guard. Trusted-local child processes stil
 
 ## C3 — Do not exceed durable campaign, process, or evaluator caps
 
-The loop reserves allowance before process dispatch, serializes ownership with a durable lease, reconciles interrupted reservations, and fails closed on malformed accounting. Existing tests cover concurrent reservations, cap edges, corruption, interrupted work, and process dispatch: `tests/loop.test.mjs`, `tests/run-contract.test.mjs`, and `tests/campaign-runtime.test.mjs`.
+The loop reserves allowance before process dispatch, serializes ownership with a durable lease, reconciles interrupted reservations, and fails closed on malformed accounting. RSI mode preserves lifetime totals and adds renewable UTC-day campaign, process, evaluator, reported-token, and wall-time counters. Each explicit RSI start/resume reserves wall allowance and settles actual elapsed time or conservatively recovers an interrupted reservation. The current loop then blocks before all repository probes, evaluators, agents, and campaigns; campaign/process/token allowances are therefore not spent by RSI work in this build. Receipt accounting is in place for campaigns that do run in legacy mode. Tests cover concurrent reservations, cap edges, migration/recovery, corruption, and blocked RSI dispatch: `tests/loop.test.mjs`, `tests/run-contract.test.mjs`, and `tests/campaign-runtime.test.mjs`.
 
-Token usage is not comprehensively charged for every child role, and no provider-enforced per-call token bound is configured. Do not claim a hard token cap or start real-model work until the remaining accounting and provider controls are implemented and separately approved.
+Reported tokens are not a provider-enforced ceiling. RSI mode blocks all agent dispatch and evaluator bootstrap; no bounded provider adapter or host-isolation boundary is implemented. Legacy trusted-local execution is not an OS/network sandbox: arbitrary code can read host files or make network calls. Do not claim a hard provider spending cap or authorize untrusted/model-backed agent execution based only on these counters.
 
 ## C4 — Keep a history-preserving recovery path for each verified commit
 

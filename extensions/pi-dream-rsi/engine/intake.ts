@@ -99,6 +99,8 @@ export interface RunContractOutcome {
 
 export interface RunContract {
   version: 1;
+  /** Opt in to UTC-day RSI renewal. Missing keeps legacy lifetime-capped behavior. */
+  mode?: "rsi";
   outcome: RunContractOutcome;
   preserved: {
     /** Commands that must keep passing; the loop may never remove or weaken them. */
@@ -203,6 +205,7 @@ export function validateRunContract(raw: unknown): string[] {
   if (!isRecord(raw)) return ["run contract must be an object"];
   const errors: string[] = [];
   if (raw.version !== CONTRACT_VERSION) errors.push(`run contract version must be ${CONTRACT_VERSION}`);
+  if (raw.mode !== undefined && raw.mode !== "rsi") errors.push('run contract mode must be "rsi" when present');
 
   const outcome = raw.outcome;
   if (!isRecord(outcome)) errors.push("outcome must be an object");
@@ -273,6 +276,10 @@ export function validateRunContract(raw: unknown): string[] {
       || budgets.falseAcceptBudget <= 0 || budgets.falseAcceptBudget >= 0.5) {
       errors.push("budgets.falseAcceptBudget must be a finite number greater than 0 and below 0.5");
     }
+    if (raw.mode === "rsi" && ((typeof budgets.maxCampaigns === "number" && budgets.maxCampaigns > 6)
+      || (typeof budgets.deadlineMs === "number" && budgets.deadlineMs > 240 * 60_000))) {
+      errors.push("RSI mode cannot exceed the approved nightly limits of 6 campaigns and 240 wall-clock minutes");
+    }
   }
 
   if (raw.git !== undefined) {
@@ -320,6 +327,7 @@ export function normalizeRunContract(raw: unknown): RunContract {
   const value = raw as RunContract;
   return {
     version: CONTRACT_VERSION,
+    ...(value.mode === "rsi" ? { mode: "rsi" as const } : {}),
     outcome: {
       statement: value.outcome.statement.trim(),
       unit: value.outcome.unit.trim(),
