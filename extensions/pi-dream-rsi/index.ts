@@ -598,6 +598,17 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const statusPath = path.join(loopRoot, "status.json");
         const lastRunPath = path.join(loopRoot, "last-run.md");
         lines.push(`Machine-readable live status: ${statusPath}`);
+        try {
+          const status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as { version?: number; state?: string; updatedAt?: string; branch?: string | null; branchTip?: string | null };
+          if (status.version === 1 && typeof status.state === "string" && typeof status.updatedAt === "string" && typeof status.branch === "string") {
+            const branch = status.branch.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 120);
+            const timestamp = Date.parse(status.updatedAt);
+            const observedAt = Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : "unknown time";
+            const state = ["running", "stopping", "stopped", "failed"].includes(status.state) ? status.state : "unknown";
+            const tip = typeof status.branchTip === "string" && /^[a-f0-9]{40,64}$/i.test(status.branchTip) ? status.branchTip : "not available";
+            lines.push(`Latest recorded RSI branch tip: ${tip} on ${branch} (observed ${observedAt}; status ${state}).`);
+          }
+        } catch { /* report the status path even when its snapshot is absent or unreadable */ }
         if (fs.existsSync(reportPath)) {
           if (fs.existsSync(lastRunPath)) lines.push(`Human-readable last-run report: ${lastRunPath}`);
           try {

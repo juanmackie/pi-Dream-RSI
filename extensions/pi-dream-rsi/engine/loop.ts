@@ -1164,6 +1164,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     });
     autoCommits.push(receipt);
     autoCommitBranch = { ...autoCommitBranch, head: receipt.hash };
+    setActivity("campaign", `Verified commit ${receipt.hash} on ${receipt.branch}`, args.result.id);
     addNote(`auto-committed verified campaign ${args.result.id} as ${receipt.hash} on ${receipt.branch}`);
     if (receipt.warning) addNote(`auto-commit warning: ${receipt.warning}`);
     return receipt;
@@ -1231,6 +1232,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         startedAt: leaseStartedAt,
         updatedAt: lease.activity.updatedAt,
         branch: approved?.contract.git?.branch ?? null,
+        branchTip: autoCommitBranch?.head ?? null,
         budget: budget ? {
           campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
           agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
@@ -1655,6 +1657,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             approved = proposed;
             contractId = contractIdentity(approved.contract);
             void restrictedEnvironment(approved.contract);
+            if (autoCommitBranch) setActivity("setup", `RSI branch ${autoCommitBranch.branch} at ${autoCommitBranch.head}`);
           }
         }
       } catch (error) {
@@ -2263,6 +2266,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           updatedAt: now().toISOString(),
           startedAt: leaseStartedAt,
           branch: approved?.contract.git?.branch ?? null,
+          branchTip: autoCommitBranch?.head ?? null,
           lastVerifiedCommit: autoCommits.at(-1)?.hash ?? null,
           lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
           budget: budget ? {

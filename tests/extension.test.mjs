@@ -496,6 +496,11 @@ test("status, watch and its shortcut follow the live loop target before a campai
   fs.mkdirSync(path.join(target.dreamRoot, "loop"), {recursive:true});
   fs.writeFileSync(path.join(target.dreamRoot, "loop/latest-report.json"), JSON.stringify({version:1, at:"2000-01-01T00:00:00Z", stopCode:"blocked",stopReason:"An obsolete scope error",campaigns:0,wins:1,evaluatorRuns:0,agentStarts:0,lastWin:{leverId:"fixture-lever",verifiedGain:12,unit:"points"},autoCommits:[{hash:"0123456789abcdef0123456789abcdef01234567",branch:"dream-rsi/improve",files:["src/work.mjs"]},{hash:"not-a-git-hash",branch:"dream-rsi/improve",files:[]}]}));
   fs.writeFileSync(path.join(target.dreamRoot, "loop/last-run.md"), "# Prior run summary\n");
+  fs.mkdirSync(path.join(caller.dreamRoot, "loop"), { recursive: true });
+  fs.writeFileSync(path.join(caller.dreamRoot, "loop/status.json"), JSON.stringify({
+    version: 1, state: "stopped", updatedAt: "2026-10-29T00:00:00.000Z", branch: "dream-rsi/improve",
+    branchTip: "0123456789abcdef0123456789abcdef01234567",
+  }));
   const {context,harness} = await boot(caller);
   const tool = harness.tools.get("dream_rsi_loop");
   const run = tool.execute("target-start", {action:"start",consent:true,project_dir:target.projectDir,include_logs:false},undefined,undefined,context);
@@ -515,6 +520,14 @@ test("status, watch and its shortcut follow the live loop target before a campai
     assert.doesNotMatch(current.content[0].text, /git revert not-a-git-hash/, "only valid object ids become copyable shell commands");
     const other = await tool.execute("caller-status", {action:"status",project_dir:caller.projectDir},undefined,undefined,context);
     assert.equal(other.details.activity,null,"an explicit project must not inherit another target's activity");
+    assert.match(other.content[0].text, /Latest recorded RSI branch tip: 0123456789abcdef0123456789abcdef01234567 on dream-rsi\/improve/);
+    fs.writeFileSync(path.join(caller.dreamRoot, "loop/status.json"), JSON.stringify({
+      version: 1, state: "running\ninjected", updatedAt: "2026-10-29T00:00:00.000Z\ninjected",
+      branch: "dream-rsi/improve\ninjected", branchTip: "0123456789abcdef0123456789abcdef01234567",
+    }));
+    const malformedStatus = await tool.execute("caller-malformed-status", { action: "status", project_dir: caller.projectDir }, undefined, undefined, context);
+    assert.match(malformedStatus.content[0].text, /on dream-rsi\/improve injected \(observed unknown time; status unknown\)/);
+    assert.doesNotMatch(malformedStatus.content[0].text, /\ninjected/);
     await harness.commands.get("dream-rsi").handler("watch",context);
     assert.ok(harness.injectedMessages.at(-1).message.content.includes(`Project: ${target.projectDir}`));
     await harness.shortcuts.get("ctrl+shift+d").handler(context);
