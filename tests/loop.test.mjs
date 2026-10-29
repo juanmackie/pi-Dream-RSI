@@ -848,6 +848,10 @@ test("loop budget is durable across runs and its limits are immutable", async ()
       runLoop({ ...options, limits: baseLimits({ maxCampaigns: 3, maxAgentStarts: 6 }) }),
       /immutable/,
     );
+    const status = JSON.parse(fs.readFileSync(path.join(path.dirname(first.budgetPath), "status.json"), "utf8"));
+    assert.equal(status.state, "failed");
+    assert.equal(status.stopCode, "failed");
+    assert.match(status.stopReason, /immutable/);
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -1012,6 +1016,8 @@ test("a blocked loop never reconciles or rewrites the owner's budget", async () 
     const reserved = fs.readFileSync(first.budgetPath, "utf8");
     const memoryPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "memory.json");
     const memoryBefore = fs.readFileSync(memoryPath, "utf8");
+    const statusPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "status.json");
+    const statusBefore = fs.readFileSync(statusPath, "utf8");
     fs.writeFileSync(path.join(fixture.projectDir, ".dream-rsi", "loop", "lease.json"),
       JSON.stringify({ pid: 999_999, host: os.hostname(), startedAt: NOW.toISOString(), heartbeatAt: NOW.toISOString() }));
     const blocked = await runLoop(options);
@@ -1021,9 +1027,46 @@ test("a blocked loop never reconciles or rewrites the owner's budget", async () 
       "the owner's budget, including its open reservation, is untouched by the blocked invocation");
     assert.equal(fs.readFileSync(memoryPath, "utf8"), memoryBefore,
       "the blocked invocation does not rewrite the owner's memory");
+    assert.equal(fs.readFileSync(statusPath, "utf8"), statusBefore,
+      "the blocked invocation does not overwrite the last status owned by the lease holder");
     assert.ok(blocked.memory.notes.some((note) => /another loop \(pid 999999\)/.test(note)),
       "the blocked note is still reported in the returned state");
     assert.equal(stub.calls.length, 1, "only the first run started a campaign");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a loop that loses lease ownership cannot publish live or terminal status", async () => {
+  const fixture = fixtureProject();
+  try {
+    let enterCampaign = () => {};
+    let releaseCampaign = () => {};
+    const entered = new Promise((resolve) => { enterCampaign = resolve; });
+    const gate = new Promise((resolve) => { releaseCampaign = resolve; });
+    const options = {
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      now: () => NOW,
+    };
+    const first = runLoop({ ...options, runCampaignImpl: async (campaignOptions) => {
+      enterCampaign();
+      await gate;
+      campaignOptions.onUpdate({ id: "old-owner", state: { kind: "running", phase: "candidate" } });
+      return stubCampaign().impl(campaignOptions);
+    } });
+    await entered;
+    const loopRoot = path.join(fixture.projectDir, ".dream-rsi", "loop");
+    const leasePath = path.join(loopRoot, "lease.json");
+    const replacementLease = { pid: 999_999, host: os.hostname(), startedAt: "2030-01-01T00:00:00.000Z", heartbeatAt: NOW.toISOString() };
+    fs.writeFileSync(leasePath, `${JSON.stringify(replacementLease, null, 2)}\n`);
+    const statusPath = path.join(loopRoot, "status.json");
+    const replacementStatus = `${JSON.stringify({ version: 1, state: "running", phase: "replacement-owner" }, null, 2)}\n`;
+    fs.writeFileSync(statusPath, replacementStatus);
+    releaseCampaign();
+    const result = await first;
+    assert.equal(result.campaigns, 1);
+    assert.equal(fs.readFileSync(statusPath, "utf8"), replacementStatus, "the displaced loop cannot overwrite its new owner's status");
+    assert.deepEqual(JSON.parse(fs.readFileSync(leasePath, "utf8")), replacementLease, "the displaced loop cannot remove its new owner's lease");
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -1733,6 +1776,10 @@ test("negative or fractional budget counters fail closed instead of inflating th
         /refusing to continue on corrupted state/,
         JSON.stringify(tamper),
       );
+      const status = JSON.parse(fs.readFileSync(path.join(path.dirname(first.budgetPath), "status.json"), "utf8"));
+      assert.equal(status.state, "failed", JSON.stringify(tamper));
+      assert.equal(status.stopCode, "failed", JSON.stringify(tamper));
+      assert.match(status.stopReason, /corrupted state/, JSON.stringify(tamper));
     }
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });

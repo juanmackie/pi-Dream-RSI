@@ -506,7 +506,9 @@ test("status, watch and its shortcut follow the live loop target before a campai
     assert.ok(current.content[0].text.includes(`Project: ${target.projectDir}`));
     assert.match(current.content[0].text,/Historical run report.*not the active run/);
     assert.equal(current.details.loop.lastRunPath, path.join(target.dreamRoot, "loop/last-run.md"));
+    assert.equal(current.details.loop.statusPath, path.join(target.dreamRoot, "loop/status.json"));
     assert.ok(current.content[0].text.includes(current.details.loop.lastRunPath));
+    assert.ok(current.content[0].text.includes(current.details.loop.statusPath));
     assert.match(current.content[0].text, /Last verified win: fixture-lever \(12 points gain\)/);
     assert.match(current.content[0].text, /Remaining allowance:/);
     assert.match(current.content[0].text, /Undo on dream-rsi\/improve: `git revert 0123456789abcdef0123456789abcdef01234567`/);

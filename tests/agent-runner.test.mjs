@@ -131,7 +131,9 @@ test("a timed-out Windows evaluator stops its Python descendants", { skip: proce
     "time.sleep(60)",
   ].join("\n"));
   const quote = (value) => `"${value.replaceAll('"', '\\"')}"`;
-  const result = await runShellCommand(`python ${quote(script)}`, { cwd: dir, timeoutMs: 500 });
+  // Python startup and child creation can exceed 500 ms on a loaded Windows runner.
+  // Leave enough time for the child PID to be recorded before the timeout exercises tree cleanup.
+  const result = await runShellCommand(`python ${quote(script)}`, { cwd: dir, timeoutMs: 5_000 });
   assert.equal(result.timedOut, true);
   const childPid = Number(fs.readFileSync(pidFile, "utf8"));
   const deadline = Date.now() + 5_000;

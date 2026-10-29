@@ -179,7 +179,7 @@ export interface LoopCampaignRecord extends LoopMemoryRecord {
   campaignRoot: string | null;
 }
 
-export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "commit-failure" | "plateau" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "stopped";
+export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "commit-failure" | "plateau" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "failed" | "stopped";
 
 export interface LoopPreflightCheck {
   name: "contract" | "git" | "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
@@ -1030,6 +1030,7 @@ function qualificationBlockers(plan: MetricPlan | null, fallbackReason?: string)
 
 function classifyStop(reason: string): LoopStopCode {
   if (!reason) return "completed";
+  if (reason.startsWith("failed:")) return "failed";
   if (reason === "not-approved") return "consent-required";
   if (reason === "budget" || reason.includes("allowance exhausted")) return "budget-exhausted";
   if (reason.startsWith("plateau:")) return "plateau";
@@ -1199,24 +1200,45 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     addNote(`took over a stale loop lease last refreshed at ${claim.stale.heartbeatAt}.`);
   }
   let leaseOwnershipWarned = false;
-  const touchLease = (): void => {
-    if (!leaseHeld) return;
+  const touchLease = (): boolean => {
+    if (!leaseHeld) return false;
     const current = readLease(leasePath);
     if (!current || current.pid !== lease.pid || current.host !== lease.host || current.startedAt !== lease.startedAt) {
       if (!leaseOwnershipWarned) noteLocally("the loop lease is no longer owned by this run; live activity is not being published and another loop may hold this project");
       leaseOwnershipWarned = true;
-      return;
+      return false;
     }
     writeFileAtomic(leasePath, `${JSON.stringify({ ...lease, heartbeatAt: now().toISOString() }, null, 2)}\n`, true);
+    return true;
   };
   let activityWriteWarning = false;
   let lastActivityWriteMs = 0;
+  let budget: LoopBudgetFile | null = null;
+  const statusPath = path.join(loopRoot, "status.json");
   const persistActivity = (always: boolean): void => {
     // Campaign status updates arrive many times per iteration. Stage changes and progress
     // labels always publish; only high-frequency detail is coalesced, and it is flushed by
     // the next lease touch so a long phase never loses its label.
     if (!always && Date.now() - lastActivityWriteMs < 1000) return;
-    try { touchLease(); lastActivityWriteMs = Date.now(); }
+    try {
+      if (!touchLease()) return;
+      if (lease.activity) writeJson(statusPath, {
+        version: 1,
+        state: lease.activity.phase === "stopping" ? "stopping" : "running",
+        phase: lease.activity.phase,
+        detail: lease.activity.detail,
+        campaignId: lease.activity.campaignId ?? null,
+        startedAt: leaseStartedAt,
+        updatedAt: lease.activity.updatedAt,
+        branch: approved?.contract.git?.branch ?? null,
+        budget: budget ? {
+          campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
+          agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
+          evaluatorRuns: budget.evaluator_runs, maxEvaluatorRuns: budget.max_evaluator_runs,
+        } : null,
+      });
+      lastActivityWriteMs = Date.now();
+    }
     catch (error) {
       if (!activityWriteWarning) noteLocally(`Live activity could not be saved: ${error instanceof Error ? error.message : String(error)}`);
       activityWriteWarning = true;
@@ -1233,7 +1255,6 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   updateActivityDetail = (message) => setActivity(lease.activity?.phase ?? "setup", message, lease.activity?.campaignId);
   const onAbort = (): void => setActivity("stopping", "Cancellation requested; waiting for active work to unwind", lease.activity?.campaignId);
   if (leaseHeld) options.signal?.addEventListener("abort", onAbort, { once: true });
-  let budget: LoopBudgetFile | null = null;
   const waitForHourlyProcessStart = async (phase: LoopPhase, process: "agent" | "evaluator", processSignal: AbortSignal | undefined = options.signal): Promise<void> => {
     const continuation = approved?.contract.continuation;
     if (!continuation) return;
@@ -1505,6 +1526,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     deadlineMs: Math.min(limits.deadlineMs, approvedBudgets?.deadlineMs ?? limits.deadlineMs),
   };
 
+  let failureMessage: string | null = null;
   try {
     if (leaseHeld) {
       setActivity("setup", "Checking saved approval and durable budget");
@@ -2214,6 +2236,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         break;
       }
     }
+  } catch (error) {
+    failureMessage = error instanceof Error ? error.message : String(error);
+    stopReason = `failed: ${failureMessage}`;
+    throw error;
   } finally {
     options.signal?.removeEventListener("abort", onAbort);
     if (leaseHeld) {
@@ -2224,9 +2250,36 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           writeLoopBudget(budgetPath, budget);
         } catch { /* the run's outcome is already recorded; a failed write is reported by status */ }
       }
-      // Only the current holder removes the file: a stale takeover by another loop must not be
-      // undone by this process exiting later.
-      releaseOwnedLease(leasePath, lease);
+      // Publish the terminal snapshot while still owning the lease. A blocked contender must
+      // not overwrite the active owner's status, and a new owner must not race this final write.
+      try {
+        const lastWin = [...records].reverse().find((record) => record.outcome === "win");
+        if (touchLease()) writeJson(statusPath, {
+          version: 1,
+          state: failureMessage === null ? "stopped" : "failed",
+          stopCode: classifyStop(stopReason),
+          stopReason: stopReason.slice(0, 1000),
+          phase: failureMessage === null ? "stopped" : "failed",
+          updatedAt: now().toISOString(),
+          startedAt: leaseStartedAt,
+          branch: approved?.contract.git?.branch ?? null,
+          lastVerifiedCommit: autoCommits.at(-1)?.hash ?? null,
+          lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
+          budget: budget ? {
+            campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
+            agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
+            evaluatorRuns: budget.evaluator_runs, maxEvaluatorRuns: budget.max_evaluator_runs,
+          } : null,
+          reportPath: path.join(loopRoot, "latest-report.json"),
+          lastRunPath: path.join(loopRoot, "last-run.md"),
+        });
+      } catch (error) {
+        memory.notes.push(`machine-readable loop status could not be saved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000));
+      } finally {
+        // Only the current holder removes the file: a stale takeover by another loop must not be
+        // undone by this process exiting later.
+        releaseOwnedLease(leasePath, lease);
+      }
     }
   }
 

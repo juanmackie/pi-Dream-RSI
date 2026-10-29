@@ -595,7 +595,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         try { lines.push(`Recorded loop history (not live progress):\n${mementoNotes(readMemory(memoryPath))}`); }
         catch { lines.push("Loop memory is unreadable; the next start fails closed."); }
         const reportPath = path.join(loopRoot, "latest-report.json");
+        const statusPath = path.join(loopRoot, "status.json");
         const lastRunPath = path.join(loopRoot, "last-run.md");
+        lines.push(`Machine-readable live status: ${statusPath}`);
         if (fs.existsSync(reportPath)) {
           if (fs.existsSync(lastRunPath)) lines.push(`Human-readable last-run report: ${lastRunPath}`);
           try {
@@ -624,7 +626,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           if (live.activity && live.activity.campaignId !== campaign.id) lines.push("Recorded campaign (not the active loop's campaign):");
           lines.push(renderCampaignStatus(campaign));
         } else lines.push(live.activity ? "No campaign record is attached to this loop activity." : "No active campaign.");
-        return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath, reportPath, lastRunPath }, activity: live.activity, campaign } };
+        return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: { budgetPath, memoryPath, reportPath, statusPath, lastRunPath }, activity: live.activity, campaign } };
       }
       if (action === "stop") {
         const sessionId = ctx.sessionManager.getSessionId();

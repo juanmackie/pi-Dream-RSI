@@ -457,6 +457,14 @@ test("verified multi-file wins continue on the dedicated local auto-commit branc
     assert.match(lastRun, /Last verified win: .+ gain/);
     assert.ok(lastRun.includes(receipt.hash), "the operator summary links the verified commit");
     assert.match(lastRun, /Next action/);
+    const status = JSON.parse(fs.readFileSync(path.join(path.dirname(run.result.budgetPath), "status.json"), "utf8"));
+    assert.equal(status.version, 1);
+    assert.equal(status.state, "stopped");
+    assert.equal(status.stopCode, run.result.stopCode);
+    assert.equal(status.branch, "dream-rsi/improve");
+    assert.equal(status.lastVerifiedCommit, receipt.hash);
+    assert.equal(status.budget.agentStarts, run.result.agentStarts);
+    assert.equal(status.budget.evaluatorRuns, run.result.evaluatorRuns);
     reportCosts(t, "multifix auto-commit (npm, two files)", [{ agentStarts: run.result.agentStarts, evaluatorRuns: run.result.evaluatorRuns, wallMs: run.wallMs }]);
   });
 });
