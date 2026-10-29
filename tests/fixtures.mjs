@@ -129,7 +129,7 @@ process.exit(0);
 /** Build a throwaway project. Returns paths plus a task object already pointing at the fixtures. */
 export function makeProject(options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-test-"));
-  const projectDir = path.join(dir, "proj");
+  const projectDir = path.join(dir, options.projectName ?? "proj");
   const seed = path.join(projectDir, "seed");
   fs.mkdirSync(seed, { recursive: true });
   fs.writeFileSync(path.join(seed, "solution.py"), 'print("seed")\n', "utf8");

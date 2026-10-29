@@ -1,6 +1,6 @@
 {
   "name": "pi-dream-rsi",
-  "version": "3.0.1",
+  "version": "3.0.2",
   "type": "module",
   "description": "Dream-RSI assessment and bounded autonomous improvement loop for pi",
   "keywords": [
@@ -49,7 +49,9 @@
     "eval/bench.mjs",
     "eval/scenarios.json",
     "docs",
+    "examples",
     "README.md",
+    "GLOSSARY.md",
     "LICENSE",
     "package.json"
   ],

@@ -62,8 +62,8 @@ export interface EffectiveAgent {
 
 export interface RunOptions {
   onOutput?: (event: OutputEvent) => void;
-  /** Synchronous durable budget reservation immediately before the child process is spawned. */
-  beforeSpawn?: () => void;
+  /** Durable budget/rate reservation immediately before the child process is spawned. */
+  beforeSpawn?: () => void | Promise<void>;
   /** Durable child ownership; unlike output observers, errors cancel execution. */
   onSpawn?: (pid: number) => void;
   outputFormat?: "text" | "pi-json";
@@ -81,6 +81,8 @@ export interface RunOptions {
    * keys, tokens and session identity cannot reach them.
    */
   envOnly?: boolean;
+  /** Optional exact bytes sent on stdin to a subprocess. */
+  stdin?: string | Buffer;
   /** Kill the whole process tree, not just the direct child. */
   killTree?: boolean;
   /** Cancellation: aborting kills the process tree and resolves once it is gone. */
@@ -179,7 +181,7 @@ function secretRedactor(values: string[]): { push(text: string, final?: boolean)
 async function collect(
   command: string,
   args: string[],
-  options: RunOptions & { shell: boolean; stdin?: string; quoteExecutable?: boolean },
+  options: RunOptions & { shell: boolean; quoteExecutable?: boolean },
 ): Promise<CommandResult> {
   const started = Date.now();
   if (options.logPath) fs.mkdirSync(path.dirname(options.logPath), { recursive: true });
@@ -267,6 +269,13 @@ async function collect(
     const next = current + chunk;
     return next.length > TAIL_BYTES ? next.slice(next.length - TAIL_BYTES) : next;
   };
+  const writeLog = (source: NodeJS.ReadableStream, text: string | Buffer): void => {
+    if (!logStream || !logStream.writable || logStream.destroyed) return;
+    if (!logStream.write(text)) {
+      source.pause();
+      logStream.once("drain", () => source.resume());
+    }
+  };
 
   return await new Promise<CommandResult>((resolve, reject) => {
     let child: ChildProcess | undefined;
@@ -347,10 +356,12 @@ async function collect(
     const onAbort = (): void => {
       if (settled) return;
       aborted = true;
-      if (child) killTree(child);
+      if (!child) { finish({ aborted: true }); return; }
+      killTree(child);
       if (!grace) grace = setTimeout(() => finish({ aborted: true }), 2000);
     };
 
+    void (async () => {
     try {
       // Session identity is stripped unless the caller re-adds it: a nested attempt must not
       // attach to the session it was spawned from (see STRIPPED_SESSION_ENV).
@@ -363,12 +374,20 @@ async function collect(
       const argv = options.shell
         ? [`${commandText}${args.length ? ` ${args.map(quoteForShell).join(" ")}` : ""}`, []]
         : [command, args];
-      try { options.beforeSpawn?.(); }
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+      try { await options.beforeSpawn?.(); }
       catch (error) {
-        logStream?.end();
+        if (options.signal?.aborted) { finish({ aborted: true }); return; }
+        if (!settled) {
+          settled = true;
+          options.signal?.removeEventListener("abort", onAbort);
+          logStream?.end();
+        }
         reject(error);
         return;
       }
+      if (settled) return;
+      if (options.signal?.aborted) { finish({ aborted: true }); return; }
       child = spawn(argv[0] as string, argv[1] as string[], {
         cwd: options.cwd,
         shell: options.shell,
@@ -386,7 +405,6 @@ async function collect(
     const running = child;
     stdoutSource = running.stdout;
     stderrSource = running.stderr;
-    options.signal?.addEventListener("abort", onAbort, { once: true });
 
     const timeoutRun = (kind: "wall" | "idle"): void => {
       if (settled || timedOut) return;
@@ -410,13 +428,6 @@ async function collect(
     running.on("error", (error: NodeJS.ErrnoException) => finish({ spawnError: describeSpawnError(error, options.shell) }));
     // Respect backpressure: a slow/failed log pauses the child's stream until it drains, so heavy
     // output cannot accumulate unbounded in memory (the OS pipe throttles the child in turn).
-    const writeLog = (source: NodeJS.ReadableStream, text: string | Buffer): void => {
-      if (!logStream || !logStream.writable || logStream.destroyed) return;
-      if (!logStream.write(text)) {
-        source.pause();
-        logStream.once("drain", () => source.resume());
-      }
-    };
     running.stdout?.on("data", (chunk: Buffer) => {
       if (chunk.length > 0) { sawOutput = true; resetIdleTimer(); }
       const text = stdoutRedactor.push(stdoutDecoder.write(chunk));
@@ -447,6 +458,7 @@ async function collect(
     }
     // An already-aborted signal never fires 'abort': cancel the freshly spawned child explicitly.
     if (options.signal?.aborted) onAbort();
+    })();
   });
 }
 

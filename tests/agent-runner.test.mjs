@@ -12,6 +12,46 @@ const { normalizeTask, scoringFingerprint, scoreMatchesDirection } = await jump(
 const { buildAgentArgs, piSelfInvocation, runAgent, runShellCommand, describeSpawnError, copyWorkspace } = await jump("agent/runner.ts");
 const { OutputDecoder } = await jump("agent/output.ts");
 
+test("asynchronous pre-spawn reservations delay dispatch and failures prevent the child", async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-before-spawn-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const marker = path.join(dir, "started");
+  const script = path.join(dir, "start.mjs");
+  fs.writeFileSync(script, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "started");`);
+  const command = `node "${script}"`;
+  let release;
+  let entered;
+  const waiting = new Promise((resolve) => { entered = resolve; });
+  const gate = new Promise((resolve) => { release = resolve; });
+  const running = runShellCommand(command, { cwd: dir, timeoutMs: 5000, beforeSpawn: async () => { entered(); await gate; } });
+  await waiting;
+  assert.equal(fs.existsSync(marker), false, "child is not spawned while the durable reservation waits");
+  release();
+  assert.equal((await running).ok, true);
+  assert.equal(fs.existsSync(marker), true);
+  const blocked = path.join(dir, "blocked");
+  const blockedScript = path.join(dir, "blocked.mjs");
+  fs.writeFileSync(blockedScript, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(blocked)}, "no");`);
+  await assert.rejects(runShellCommand(`node "${blockedScript}"`, {
+    cwd: dir, timeoutMs: 5000, beforeSpawn: async () => { throw new Error("rate gate rejected dispatch"); },
+  }), /rate gate rejected dispatch/);
+  assert.equal(fs.existsSync(blocked), false, "a failed reservation cannot leak a child process");
+  const controller = new AbortController();
+  let waitingResolve;
+  const waitingAbort = new Promise((resolve) => { waitingResolve = resolve; });
+  const cancelledPath = path.join(dir, "cancelled");
+  const cancelledScript = path.join(dir, "cancelled.mjs");
+  fs.writeFileSync(cancelledScript, `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(cancelledPath)}, "no");`);
+  const cancelling = runShellCommand(`node "${cancelledScript}"`, { cwd: dir, timeoutMs: 5000, signal: controller.signal,
+    beforeSpawn: async () => { waitingResolve(); await new Promise((resolve) => controller.signal.addEventListener("abort", resolve, { once: true })); },
+  });
+  await waitingAbort;
+  controller.abort();
+  const cancelled = await cancelling;
+  assert.equal(cancelled.aborted, true);
+  assert.equal(fs.existsSync(cancelledPath), false, "abort during a pre-spawn wait resolves promptly without starting the child");
+});
+
 test("pi JSON output decodes bounded usage and content-free tool evidence", () => {
   const events = [];
   const decoder = new OutputDecoder(true, (event) => events.push(event));

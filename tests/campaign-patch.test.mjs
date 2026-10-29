@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { jump } from "./fixtures.mjs";
 
-const { applyCandidatePatch, buildCandidatePatch, patchConflicts, reconcileCandidatePatch, verifyCandidatePatch, workspaceDigest } = await jump("engine/campaign-patch.ts");
+const { applyCandidatePatch, buildCandidatePatch, patchConflicts, readAppliedPatchPostimages, reconcileCandidatePatch, verifyCandidatePatch, workspaceDigest } = await jump("engine/campaign-patch.ts");
 
 const HAS_GIT = spawnSync("git", ["--version"], { windowsHide: true }).status === 0;
 function git(args, cwd) {
@@ -234,6 +234,28 @@ test("applies and reconciles a complete patch idempotently", async (t) => {
   assert.equal(fs.existsSync(path.join(target, "legacy.txt")), false);
   assert.equal(fs.readFileSync(path.join(target, "helper.txt"), "utf8"), "needed\n");
   assert.deepEqual(applyCandidatePatch(options), receipt);
+});
+
+test("verified promotion postimages must match the ledger hash, changed-path list, and campaign target", async (t) => {
+  const { root, seed, target, candidate } = await fixture(t);
+  const patch = buildCandidatePatch({ cycleSeedRoot: seed, targetRoot: target, candidateRoot: candidate, exclude: ["proposal.md", "eval/score.json"] }).filter((op) => op.relative === "solution.txt");
+  const journalDir = path.join(root, "journal");
+  const transactionId = "verified-promotion";
+  applyCandidatePatch({ seedRoot: target, patch, journalDir, transactionId });
+  const journalPath = path.join(journalDir, `${transactionId}.json`);
+  const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+  const evidence = { transactionId, patchHash: journal.patchHash };
+  const read = (expectedTargetRoot = target) => readAppliedPatchPostimages({ journalDir, transactions: [evidence], expectedTargetRoot });
+  assert.deepEqual(read().changes, [{ path: "solution.txt", afterHash: patch[0].afterHash }]);
+  assert.throws(() => read(path.join(root, "other-target")), /different campaign workspace/);
+
+  journal.entries[0].afterHash = "a".repeat(64);
+  fs.writeFileSync(journalPath, JSON.stringify(journal));
+  assert.throws(() => read(), /does not match its campaign ledger/);
+  journal.entries[0].afterHash = patch[0].afterHash;
+  journal.written = [];
+  fs.writeFileSync(journalPath, JSON.stringify(journal));
+  assert.throws(() => read(), /changed-path list does not match/);
 });
 
 test("reconciles a prepared write journal by restoring its preimage", async (t) => {

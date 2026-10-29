@@ -137,10 +137,12 @@ export async function scoreSeedCopy(options: {
   logPath?: string | null;
   overlay?: Pick<ApplyFile, "relative" | "from">[];
   signal?: AbortSignal;
-  beforeEvaluatorSpawn?: (key: string) => void;
+  beforeEvaluatorSpawn?: (key: string) => void | Promise<void>;
   evaluatorKey?: string;
   exclude?: string[];
   onCommand?: (command: CommandResult) => void;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
 }): Promise<ScoreOutcome> {
   const { dreamRoot, projectDir, task, scratch } = options;
   const seed = path.resolve(projectDir, task.workspace);
@@ -162,6 +164,7 @@ export async function scoreSeedCopy(options: {
       timeoutMs: task.evaluator_timeout_ms,
       logPath: options.logPath ?? null,
       signal: options.signal,
+      ...(options.evaluatorEnv ? { envOnly: true, env: options.evaluatorEnv, redactEnvKeys: options.evaluatorEnvKeys ?? [] } : {}),
       beforeSpawn: () => options.beforeEvaluatorSpawn?.(options.evaluatorKey ?? "apply-score"),
     });
     options.onCommand?.(command);

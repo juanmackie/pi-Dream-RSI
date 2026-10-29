@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
@@ -61,65 +62,9 @@ function measureScript(projectDir, script, repeats = 5) {
   return Math.min(...samples);
 }
 
-/**
- * A planted, causal performance bottleneck: `buildReport` concatenates into one
- * growing string, so its cost is quadratic in `count`. The declared benchmark
- * command measures that cost. The correctness oracle checks the exact output, so
- * skipping the work is not a valid improvement.
- */
-const BENCH = `import { buildReport } from "./src/pipeline.mjs";
-
-const report = buildReport(24_000);
-if (report.length === 0) {
-  console.error("pipeline produced no output");
-  process.exit(1);
-}
-console.log(report.length);
-`;
-
-/**
- * Genuine quadratic work. Concatenating into a growing string is not slow in V8
- * (rope strings make it linear), so the planted cost is re-scanning everything
- * built so far for each item. The fixed version keeps a running total, which
- * produces byte-identical output in linear time.
- */
-
-const QUADRATIC = `export function buildReport(count) {
-  const parts = [];
-  for (let index = 0; index < count; index += 1) parts.push(\`item-\${index};\`);
-  let checksum = 0;
-  for (let index = 0; index < count; index += 1) {
-    for (let inner = 0; inner <= index; inner += 1) checksum += parts[inner].length;
-  }
-  return parts.join("") + "#" + checksum;
-}
-`;
-
-const LINEAR = `export function buildReport(count) {
-  const parts = [];
-  let checksum = 0;
-  let available = 0;
-  for (let index = 0; index < count; index += 1) {
-    const item = \`item-\${index};\`;
-    parts.push(item);
-    available += item.length;
-    checksum += available;
-  }
-  return parts.join("") + "#" + checksum;
-}
-`;
-
-const CORRECTNESS = `import { buildReport } from "./src/pipeline.mjs";
-
-const items = Array.from({ length: 64 }, (_, index) => \`item-\${index};\`);
-const checksum = items.reduce((total, item, index) => total + item.length * (64 - index), 0);
-const expected = items.join("") + "#" + checksum;
-const actual = buildReport(64);
-if (actual !== expected) {
-  console.error("pipeline output does not match the specified report");
-  process.exit(1);
-}
-`;
+// The public example is the exact cold-start acceptance fixture.
+const EXAMPLE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../examples/verified-loop");
+const LINEAR = fs.readFileSync(path.join(EXAMPLE_ROOT, "src/pipeline.optimized.mjs"), "utf8");
 
 /** The stub agent replaces the quadratic loop with the linear one and accepts the review. */
 function agentSource() {
@@ -149,21 +94,16 @@ function coldStartProject() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-cold-"));
   const projectDir = path.join(dir, "proj");
   fs.mkdirSync(path.join(projectDir, "src"), { recursive: true });
-  fs.writeFileSync(path.join(projectDir, "package.json"), `${JSON.stringify({
-    name: "cold-start-fixture",
-    private: true,
-    type: "module",
-    scripts: { test: "node test.mjs", bench: "node bench.mjs" },
-  }, null, 2)}\n`);
-  fs.writeFileSync(path.join(projectDir, "bench.mjs"), BENCH);
-  fs.writeFileSync(path.join(projectDir, "test.mjs"), CORRECTNESS);
-  fs.writeFileSync(path.join(projectDir, "src", "pipeline.mjs"), QUADRATIC);
+  for (const file of ["package.json", "bench.mjs", "test.mjs"]) {
+    fs.copyFileSync(path.join(EXAMPLE_ROOT, file), path.join(projectDir, file));
+  }
+  fs.copyFileSync(path.join(EXAMPLE_ROOT, "src/pipeline.mjs"), path.join(projectDir, "src/pipeline.mjs"));
   const agentPath = path.join(projectDir, "cold-agent.mjs");
   fs.writeFileSync(agentPath, agentSource());
   return { dir, projectDir, agentPath };
 }
 
-function contractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "50%", maxAgentStarts = 24, maxEvaluatorRuns = 120, deadlineMs = 20 * 60 * 1000 }) {
+function contractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "50%", maxAgentStarts = 24, maxEvaluatorRuns = 120, deadlineMs = 20 * 60 * 1000, autoCommit = false }) {
   return normalizeRunContract({
     version: 1,
     projectDir: null,
@@ -184,18 +124,29 @@ function contractFor({ agentPath, maxCampaigns = 2, minimumUsefulGain = "50%", m
       deadlineMs,
       falseAcceptBudget: 0.01,
     },
+    ...(autoCommit ? { git: { autoCommit: true, branch: "dream-rsi/improve" } } : {}),
     agent: { command: process.execPath, args: [agentPath], prompt_via: "stdin", model: null, thinking: null },
   });
 }
 
-test("cold start: dream_rsi_loop with consent and focus applies and independently verifies an improvement", async () => {
+test("cold start: dream_rsi_loop with consent verifies and auto-commits a measurable improvement", async () => {
   const fixture = coldStartProject();
-  // Keep the cold-start workload bounded while keeping the 50% threshold
-  // above process-startup jitter.
-  fs.writeFileSync(path.join(fixture.projectDir, "bench.mjs"), BENCH.replace("24_000", "22_000"));
+  // The public example benchmark is bounded and keeps the 50% threshold above
+  // process-startup jitter.
   const baselineMs = measureScript(fixture.projectDir, "bench.mjs");
   const baselineGate = runFixtureCommand(fixture.projectDir, "test.mjs");
   assert.equal(baselineGate.status, 0, "the fixture's correctness oracle passes before the change");
+  fs.writeFileSync(path.join(fixture.projectDir, ".gitignore"), ".dream-rsi/\n");
+  for (const args of [
+    ["init", "-q", "-b", "main"],
+    ["config", "user.name", "Dream RSI Test"],
+    ["config", "user.email", "dream-rsi-test@example.invalid"],
+    ["add", "-A"],
+    ["commit", "-q", "-m", "fixture baseline"],
+  ]) {
+    const git = spawnSync("git", args, { cwd: fixture.projectDir, encoding: "utf8", windowsHide: true });
+    assert.equal(git.status, 0, `Git fixture setup must succeed (${args[0]}): ${git.stderr}`);
+  }
 
   const { pi, context, harness } = mockPi();
   dreamRsi(pi);
@@ -214,6 +165,18 @@ test("cold start: dream_rsi_loop with consent and focus applies and independentl
   assert.ok(loopResult.campaigns >= 1, `the loop must run at least one campaign; stopped with "${loopResult.stopReason}": ${JSON.stringify({ inventory: loopResult.inventory, memory: loopResult.memory.notes })}`);
   assert.equal(loopResult.wins, 1, `exactly one verified improvement; stop reason "${loopResult.stopReason}"; ${JSON.stringify({ campaigns: loopResult.campaigns, evaluatorRuns: loopResult.evaluatorRuns, preflightEvaluatorRuns: loopResult.preflightEvaluatorRuns, campaignEvaluatorRuns: loopResult.campaignEvaluatorRuns, agentStarts: loopResult.agentStarts, notes: loopResult.memory.notes, records: loopResult.records })}`);
   assert.ok(loopResult.contract, "the result reports the frozen contract identity");
+  assert.equal(loopResult.autoCommits.length, 1, "a clean Git cold start commits its verified win automatically");
+  const receipt = loopResult.autoCommits[0];
+  assert.equal(receipt.branch, "dream-rsi/improve");
+  const gitText = (args) => spawnSync("git", args, { cwd: fixture.projectDir, encoding: "utf8", windowsHide: true });
+  assert.equal(gitText(["branch", "--show-current"]).stdout.trim(), "dream-rsi/improve");
+  assert.equal(gitText(["rev-parse", "main"]).stdout.trim(), gitText(["rev-parse", `${receipt.hash}^`]).stdout.trim(), "the default branch stays unchanged");
+  assert.deepEqual(gitText(["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", receipt.hash]).stdout.split("\0").filter(Boolean), ["src/pipeline.mjs"]);
+  assert.equal(gitText(["status", "--porcelain"]).stdout.trim(), "", "the fixture ends with a clean worktree");
+  const savedReport = JSON.parse(fs.readFileSync(path.join(fixture.projectDir, ".dream-rsi", "loop", "latest-report.json"), "utf8"));
+  const verifiedRecord = loopResult.records.find((record) => record.outcome === "win");
+  assert.equal(savedReport.lastWin.leverId, verifiedRecord.leverId);
+  assert.equal(savedReport.lastWin.unit, "ms");
 
   const applied = fs.readFileSync(path.join(fixture.projectDir, "src", "pipeline.mjs"), "utf8");
   assert.ok(!applied.includes("for (let inner"), "the applied patch removed the quadratic re-scan");
@@ -446,7 +409,7 @@ function measureScore(projectDir) {
   return JSON.parse(fs.readFileSync(path.join(projectDir, "eval", "score.json"), "utf8")).score;
 }
 
-test("cold start: a contract-declared score evaluator proves an accuracy win independently", async () => {
+test("cold start: command preparation continues automatically through an independently verified accuracy win", async () => {
   const fixture = scoreProject();
   const baselineAccuracy = measureScore(fixture.projectDir);
   assert.ok(Math.abs(baselineAccuracy - 0.5) < 1e-9, `the guessing classifier scores 0.5, got ${baselineAccuracy}`);
@@ -456,13 +419,31 @@ test("cold start: a contract-declared score evaluator proves an accuracy win ind
 
   const contract = scoreContractFor({ agentPath: fixture.agentPath });
   const messages = [];
-  const result = await runLoop({
-    projectDir: fixture.projectDir,
-    contract,
-    limits: { maxCampaigns: 2, maxAgentStarts: 24, maxEvaluatorRuns: 120, deadlineMs: 20 * 60 * 1000 },
-    now: () => new Date("2026-10-20T00:00:00.000Z"),
-    onProgress: (message) => messages.push(message),
-  });
+  const { pi, context, harness } = mockPi();
+  context.cwd = fixture.projectDir;
+  dreamRsi(pi);
+  await harness.handlers.get("session_start")({}, context);
+  await harness.commands.get("dream-rsi").handler(`loop ${contract.outcome.statement} --consent --no-logs`, context);
+  const message = harness.sentMessages.at(-1).content;
+  const preparation = JSON.parse(message.slice(message.indexOf("{")));
+  const settings = {
+    preparation_id: preparation.preparation_id, focus: preparation.focus, include_logs: false,
+    unit: contract.outcome.unit, higher_is_better: contract.outcome.higherIsBetter,
+    minimum_gain: contract.outcome.minimumUsefulGain, evaluator: contract.outcome.evaluator,
+    scope_roots: contract.scope.roots, protected_assets: contract.scope.protectedAssets, gates: contract.preserved.gates,
+    command_categories: contract.execution.allowedCommandCategories, false_accept_budget: contract.budgets.falseAcceptBudget,
+    max_campaigns: 2, max_agent_starts: 24, max_evaluator_runs: 120, deadline_minutes: 20,
+    agent_command: process.execPath, agent_args: [fixture.agentPath],
+  };
+  const tool = harness.tools.get("dream_rsi_loop");
+  const preview = await tool.execute("prepare-score", { ...settings, action: "prepare" }, undefined, undefined, context);
+  assert.equal(preview.details.measurementOptions.recommendation, "reuse-declared-evaluator");
+  assert.equal(fs.existsSync(path.join(fixture.projectDir, ".dream-rsi/loop")), false);
+  const started = await tool.execute("approved-score", { ...settings, action: "start", consent: true, approve_proposal: true, proposal_id: preview.details.proposal_id }, undefined,
+    update => messages.push(update.content?.[0]?.text ?? ""), context);
+  const result = started.details.loop;
+  assert.ok(result, started.content[0].text);
+  assert.equal(harness.sentMessages.length, 1, "approval does not need another command or another preparation agent");
 
   assert.ok(result.campaigns >= 1, `the loop must run a campaign for the declared score evaluator; stopped with "${result.stopReason}"`);
   assert.equal(result.wins, 1, `exactly one verified improvement; stop reason "${result.stopReason}"; ${messages.join(" | ")}`);
@@ -497,6 +478,20 @@ test("cold start: a contract-declared score evaluator proves an accuracy win ind
     : [];
   assert.ok(pinned.length > 0, "the declared score evaluator is pinned as a verifier input");
   assert.equal(fs.readFileSync(pinned[0], "utf8"), SCORE_EVALUATOR, "the pinned copy is the approved evaluator");
+
+  const budgetFile = path.join(fixture.projectDir, ".dream-rsi/loop/budget.json");
+  const durableBeforeRestart = fs.readFileSync(budgetFile, "utf8");
+  const restarted = mockPi();
+  restarted.context.cwd = fixture.projectDir;
+  dreamRsi(restarted.pi);
+  await restarted.harness.handlers.get("session_start")({}, restarted.context);
+  const restartedTool = restarted.harness.tools.get("dream_rsi_loop");
+  const status = await restartedTool.execute("restart-status", { action: "status" }, undefined, undefined, restarted.context);
+  assert.match(status.content[0].text, /budget \(durable\)/);
+  assert.ok(status.content[0].text.includes(contract.outcome.statement));
+  const expired = await restartedTool.execute("old-preparation", { ...settings, action: "start", consent: true, approve_proposal: true, proposal_id: preview.details.proposal_id }, undefined, undefined, restarted.context);
+  assert.equal(expired.details.ok, false, "a restart cannot revive a session-local preparation authorization");
+  assert.equal(fs.readFileSync(budgetFile, "utf8"), durableBeforeRestart, "restart inspection and stale handoffs do not renew or spend the durable budget");
 });
 
 // ---------------------------------------------------------------------------
@@ -603,16 +598,27 @@ test("cold start: the loop fixes a second bottleneck after the first, using a fr
     alpha: measureScript(projectDir, "bench-alpha.mjs"),
     beta: measureScript(projectDir, "bench-beta.mjs"),
   };
-
   const agentPath = path.join(projectDir, "two-stage-agent.mjs");
   fs.writeFileSync(agentPath, twoWorkloadAgentSource());
+  fs.writeFileSync(path.join(projectDir, ".gitignore"), ".dream-rsi/\n");
+  for (const args of [
+    ["init", "-q", "-b", "main"],
+    ["config", "user.name", "Dream RSI Test"],
+    ["config", "user.email", "dream-rsi-test@example.invalid"],
+    ["add", "-A"],
+    ["commit", "-q", "-m", "fixture baseline"],
+  ]) {
+    const git = spawnSync("git", args, { cwd: projectDir, encoding: "utf8", windowsHide: true });
+    assert.equal(git.status, 0, `Git fixture setup must succeed (${args[0]}): ${git.stderr}`);
+  }
+
   // Each workload is a real, measurable benchmark here, so a 40% target is well
   // above this machine's jitter and still far below what the fix achieves.
   // The contract's budgets are the authority; they must cover the work this test asks
   // for, because the loop no longer grants more than the contract approved.
   const contract = contractFor({
     agentPath, maxCampaigns: 3, minimumUsefulGain: "40%",
-    maxAgentStarts: 60, maxEvaluatorRuns: 400, deadlineMs: 30 * 60 * 1000,
+    maxAgentStarts: 60, maxEvaluatorRuns: 400, deadlineMs: 30 * 60 * 1000, autoCommit: true,
   });
   const result = await runLoop({
     projectDir,
@@ -622,6 +628,12 @@ test("cold start: the loop fixes a second bottleneck after the first, using a fr
   });
 
   assert.ok(result.wins >= 2, `expected two successive verified improvements, got ${result.wins} (stop reason "${result.stopReason}")`);
+  assert.ok(result.autoCommits.length >= 2, `each verified win must create a local commit, got ${result.autoCommits.length}`);
+  assert.ok(result.autoCommits.every((receipt) => receipt.branch === "dream-rsi/improve"), "all win commits stay on the dedicated branch");
+  const gitText = (args) => spawnSync("git", args, { cwd: projectDir, encoding: "utf8", windowsHide: true });
+  assert.equal(gitText(["branch", "--show-current"]).stdout.trim(), "dream-rsi/improve");
+  assert.equal(gitText(["rev-parse", "main"]).stdout.trim(), gitText(["rev-parse", `dream-rsi/improve~${result.autoCommits.length}`]).stdout.trim(), "the default branch stays unchanged");
+  assert.equal(gitText(["status", "--porcelain"]).stdout.trim(), "", "each accepted patch is committed and the fixture ends clean");
   assert.ok(result.verifications.length >= 2, "each win is checked independently after it is applied");
   assert.ok(result.verifications.every((check) => check.passed), `post-apply checks: ${JSON.stringify(result.verifications)}`);
 

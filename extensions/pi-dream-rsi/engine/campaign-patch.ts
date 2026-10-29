@@ -324,7 +324,8 @@ function validScore(outcome: ScoreOutcome): outcome is ScoreOutcome & { score: n
 
 async function scoreCopy(options: {
   sourceRoot: string; scratch: string; task: TaskConfig; logPath: string; dreamRoot: string;
-  signal?: AbortSignal; beforeSpawn?: (key: string) => void; evaluatorKey: string; patch?: CandidatePatch[];
+  signal?: AbortSignal; beforeSpawn?: (key: string) => void | Promise<void>; evaluatorKey: string; patch?: CandidatePatch[];
+  evaluatorEnv?: Record<string, string>; evaluatorEnvKeys?: string[];
 }): Promise<ScoreOutcome> {
   const { sourceRoot, scratch, task, logPath, signal, beforeSpawn, evaluatorKey } = options;
   try {
@@ -337,6 +338,7 @@ async function scoreCopy(options: {
       timeoutMs: task.evaluator_timeout_ms,
       logPath,
       signal,
+      ...(options.evaluatorEnv ? { envOnly: true, env: options.evaluatorEnv, redactEnvKeys: options.evaluatorEnvKeys ?? [] } : {}),
       beforeSpawn: () => beforeSpawn?.(evaluatorKey),
     });
     return { ...interpretEvaluation(task, command, readScoreFile(scratch, task)), processDurationMs: command.durationMs };
@@ -374,7 +376,7 @@ export async function runCampaignGate(options: {
   timeoutMs: number;
   logPath?: string | null;
   signal?: AbortSignal;
-  beforeSpawn?: (key: string) => void;
+  beforeSpawn?: (key: string) => void | Promise<void>;
   key: string;
   patch?: CandidatePatch[];
 }): Promise<GateRun> {
@@ -408,7 +410,7 @@ export async function verifyCandidatePatch(options: {
   patch: CandidatePatch[];
   evidenceDir: string;
   signal?: AbortSignal;
-  beforeSpawn?: (key: string) => void;
+  beforeSpawn?: (key: string) => void | Promise<void>;
   repeats?: 1 | 3;
   minimumGain?: number;
   requireValidBeforeAfter?: boolean;
@@ -419,6 +421,8 @@ export async function verifyCandidatePatch(options: {
   confirmationIdentity?: string;
   /** Pair limit for a resumable confirmation; defaults to the plan maximum. */
   maxPairsToRun?: number;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
 }): Promise<CandidatePatchVerification> {
   const { dreamRoot, projectDir, task, patch, evidenceDir, signal, beforeSpawn } = options;
   const targetRoot = path.resolve(projectDir, task.workspace);
@@ -500,6 +504,7 @@ export async function verifyCandidatePatch(options: {
             signal,
             beforeSpawn,
             evaluatorKey: `candidate-${baseline ? "baseline" : condition}:pair${pair}`,
+            ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
             ...(condition === "after" ? { patch } : {}),
           });
           outcomes.set(readingKey, outcome);
@@ -557,12 +562,14 @@ export async function verifyCandidatePatch(options: {
       sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-before`, task, dreamRoot,
       logPath: path.join(evidenceDir, `pair${index}-before.log`), signal, beforeSpawn,
       evaluatorKey: `candidate-before:pair${index}`,
+      ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
     });
     stop();
     const after = await scoreCopy({
       sourceRoot: targetRoot, scratch: `${scratchBase}-pair${index}-after`, task, dreamRoot,
       logPath: path.join(evidenceDir, `pair${index}-after.log`), signal, beforeSpawn,
       evaluatorKey: `candidate-after:pair${index}`, patch,
+      ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
     });
     stop();
     const bothValid = validScore(before) && validScore(after);
@@ -640,6 +647,20 @@ function patchFingerprint(patch: CandidatePatch[]): string {
   return digest(JSON.stringify(canonical));
 }
 
+function journalPatchFingerprint(entries: JournalEntry[]): string {
+  const canonical = entries.map((entry) => ({
+    kind: entry.kind,
+    relative: safeRelative(entry.relative),
+    beforeHash: entry.beforeHash,
+    afterHash: entry.afterHash,
+  })).sort((a, b) => a.relative.localeCompare(b.relative));
+  return digest(JSON.stringify(canonical));
+}
+
+export function candidatePatchFingerprint(patch: CandidatePatch[]): string {
+  return patchFingerprint(patch);
+}
+
 function journalPath(journalDir: string, transactionId: string): string {
   if (!/^[a-zA-Z0-9._-]{1,128}$/.test(transactionId) || transactionId === "." || transactionId === "..") throw new Error("invalid transaction id");
   return path.join(path.resolve(journalDir), `${transactionId}.json`);
@@ -712,6 +733,50 @@ function rollbackJournal(journal: PatchJournal, seedRoot: string): string[] {
   }
   journal.state = "rolled_back";
   return conflicts;
+}
+
+export interface AppliedPatchPostimage {
+  path: string;
+  afterHash: string | null;
+}
+
+/** Read immutable expected postimages only for successful, hash-linked promotion transactions. */
+export function readAppliedPatchPostimages(options: {
+  journalDir: string;
+  transactions: Array<{ transactionId: string; patchHash: string }>;
+  expectedTargetRoot?: string;
+}): { targetRoot: string; changes: AppliedPatchPostimage[] } {
+  const changes = new Map<string, string | null>();
+  let targetRoot: string | null = null;
+  for (const transaction of options.transactions) {
+    const file = journalPath(options.journalDir, transaction.transactionId);
+    let journal: PatchJournal;
+    try { journal = JSON.parse(fs.readFileSync(file, "utf8")) as PatchJournal; }
+    catch { throw new Error(`verified promotion journal is missing or unreadable: ${transaction.transactionId}`); }
+    if (journal.transactionId !== transaction.transactionId || journal.patchHash !== transaction.patchHash || journal.state !== "applied"
+      || !Array.isArray(journal.entries) || !Array.isArray(journal.written) || typeof journal.seedRoot !== "string"
+      || journal.patchHash !== journalPatchFingerprint(journal.entries)) {
+      throw new Error(`verified promotion journal does not match its campaign ledger: ${transaction.transactionId}`);
+    }
+    if (targetRoot !== null && path.resolve(targetRoot) !== path.resolve(journal.seedRoot)) throw new Error("campaign promotions targeted different workspaces");
+    if (options.expectedTargetRoot && path.resolve(options.expectedTargetRoot) !== path.resolve(journal.seedRoot)) throw new Error("verified promotion journal targets a different campaign workspace");
+    targetRoot = journal.seedRoot;
+    const written = new Set(journal.written.map((relative) => safeRelative(relative)));
+    if (written.size !== journal.written.length) throw new Error("verified promotion journal repeats a changed path");
+    const entries = new Map(journal.entries.map((entry) => [safeRelative(entry.relative), entry]));
+    if (entries.size !== journal.entries.length) throw new Error("verified promotion journal repeats a candidate path");
+    const expectedWritten = journal.entries.filter((entry) => !entry.untouched).map((entry) => safeRelative(entry.relative)).sort();
+    if (JSON.stringify([...written].sort()) !== JSON.stringify(expectedWritten)) throw new Error("verified promotion journal changed-path list does not match its patch entries");
+    for (const relative of written) {
+      const entry = entries.get(relative);
+      if (!entry || entry.untouched || (entry.afterHash !== null && !/^[a-f0-9]{64}$/.test(entry.afterHash))) {
+        throw new Error(`verified promotion journal has an invalid postimage: ${relative}`);
+      }
+      changes.set(relative, entry.afterHash);
+    }
+  }
+  if (!targetRoot || changes.size === 0) throw new Error("no verified patch postimages were recorded");
+  return { targetRoot, changes: [...changes].map(([file, afterHash]) => ({ path: file, afterHash })) };
 }
 
 /** Reconcile a durable promotion journal. Prepared work is rolled back; committed work returns its receipt. */

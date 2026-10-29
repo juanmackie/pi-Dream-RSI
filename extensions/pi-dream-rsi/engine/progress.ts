@@ -14,6 +14,12 @@ export interface ProgressAttempt {
   score: number | null;
   error: string | null;
   timedOut: boolean;
+  seq?: number;
+  valid?: boolean;
+  failClass?: string | null;
+  agentError?: boolean;
+  edited?: boolean;
+  cost?: number;
 }
 
 export interface ProgressSnapshot {
@@ -27,6 +33,9 @@ export interface ProgressSnapshot {
   workers: number;
   completed: number;
   best: number | null;
+  /** Baseline score and useful-gain threshold from the recorded world. */
+  baseline?: number;
+  threshold?: number;
   activity: string;
   updated_at: number;
   attempts: Record<string, ProgressAttempt>;
@@ -44,6 +53,7 @@ function snapshotFromWorld(root: string, world: ExperimentWorld): ProgressSnapsh
   for (const node of world.nodes) attempts[node.id] = {
     cell: node.id, parent: node.parent ?? "root", kind: node.kind, round: node.round, stage: node.stage,
     retry: Math.max(0, node.retries - 1), score: node.score, error: node.error ?? null, timedOut: node.timedOut,
+    seq: node.seq, valid: node.valid, failClass: node.failClass, agentError: node.agentError, edited: node.edited, cost: node.cost,
   };
   const validScores = world.nodes.flatMap((node) => node.valid && typeof node.score === "number" ? [node.score] : []);
   return {
@@ -51,6 +61,7 @@ function snapshotFromWorld(root: string, world: ExperimentWorld): ProgressSnapsh
     round: world.rounds, round_budget: world.config.maxRounds, workers: world.config.batchSize,
     completed: world.nodes.filter((node) => node.stage === "done").length,
     best: validScores.length ? Math.max(world.baseline, ...validScores) : world.baseline,
+    baseline: world.baseline, threshold: world.threshold,
     activity: world.stopped ?? (world.status === "running" ? "experiment running" : "experiment recorded"),
     updated_at: Date.now(), attempts, config: world.config,
   };
@@ -58,8 +69,18 @@ function snapshotFromWorld(root: string, world: ExperimentWorld): ProgressSnapsh
 
 export function readProgress(root: string, iteration: number): ProgressSnapshot | null {
   const saved = readJson<ProgressSnapshot>(progressPath(root, iteration));
-  if (saved?.version === 1) return saved;
   const world = readJson<ExperimentWorld>(path.join(root, "cycles", `c${String(iteration).padStart(4, "0")}`, "world.json"));
+  if (saved?.version === 1) {
+    if (world?.version !== 1) return saved;
+    const rebuilt = snapshotFromWorld(root, world);
+    const attempts = { ...saved.attempts };
+    for (const [id, current] of Object.entries(rebuilt.attempts)) {
+      const previous = attempts[id];
+      attempts[id] = previous ? { ...previous, seq: current.seq, valid: current.valid, failClass: current.failClass,
+        agentError: current.agentError, edited: current.edited, cost: current.cost } : current;
+    }
+    return { ...saved, baseline: saved.baseline ?? rebuilt.baseline, threshold: saved.threshold ?? rebuilt.threshold, attempts };
+  }
   return world?.version === 1 ? snapshotFromWorld(root, world) : null;
 }
 
@@ -74,8 +95,16 @@ export function progressIterations(root: string): number[] {
 }
 
 export function progressSummary(snapshot: ProgressSnapshot): string {
-  const active = Object.values(snapshot.attempts).filter((attempt) => attempt.stage !== "done").length;
-  return `experiment ${snapshot.iteration}: ${snapshot.status} | round ${snapshot.round}/${snapshot.round_budget} | attempts ${active} active | completed ${snapshot.completed} | best ${snapshot.best ?? "n/a"}\n${snapshot.activity}`;
+  const attempts = Object.values(snapshot.attempts);
+  const active = attempts.filter((attempt) => attempt.stage !== "done").length;
+  const valid = attempts.filter((attempt) => attempt.stage === "done" && attempt.valid === true).length;
+  const invalid = attempts.filter((attempt) => attempt.stage === "done" && attempt.valid === false).length;
+  const agentErrors = attempts.filter((attempt) => attempt.agentError === true && attempt.edited !== true).length;
+  const timeouts = attempts.filter((attempt) => attempt.timedOut).length;
+  const delta = snapshot.baseline !== undefined && snapshot.best !== null ? snapshot.best - snapshot.baseline : null;
+  const score = (value: number | null | undefined): string => typeof value === "number" && Number.isFinite(value) ? Number(value.toFixed(3)).toString() : "n/a";
+  const deltaText = delta === null ? "n/a" : `${delta >= 0 ? "+" : ""}${score(delta)}`;
+  return `experiment ${snapshot.iteration}: ${snapshot.status} | round ${snapshot.round}/${snapshot.round_budget} | candidates ${attempts.length} | complete ${snapshot.completed} | best score ${score(snapshot.best)}\nbaseline ${score(snapshot.baseline)} · Δ ${deltaText} · valid ${valid} · invalid ${invalid} · agent errors ${agentErrors} · timeouts ${timeouts} · ${active} active\n${snapshot.activity}`;
 }
 
 export function progressFromWorld(root: string, world: ExperimentWorld): ProgressSnapshot {
@@ -84,5 +113,6 @@ export function progressFromWorld(root: string, world: ExperimentWorld): Progres
 
 export function nodeFromProgress(snapshot: ProgressSnapshot, node: ExperimentNode): ProgressAttempt {
   return snapshot.attempts[node.id] ?? { cell: node.id, parent: node.parent ?? "root", kind: node.kind, round: node.round,
-    stage: node.stage, retry: node.retries, score: node.score, error: node.error ?? null, timedOut: node.timedOut };
+    stage: node.stage, retry: node.retries, score: node.score, error: node.error ?? null, timedOut: node.timedOut,
+    seq: node.seq, valid: node.valid, failClass: node.failClass, agentError: node.agentError, edited: node.edited, cost: node.cost };
 }

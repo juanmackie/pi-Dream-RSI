@@ -1,0 +1,9 @@
+{
+  "name": "dream-rsi-verified-loop-example",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs",
+    "bench": "node bench.mjs"
+  }
+}

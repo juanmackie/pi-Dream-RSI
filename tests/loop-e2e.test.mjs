@@ -22,7 +22,7 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 
 import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
@@ -304,6 +304,8 @@ function buildFixtureRepo(dir, spec) {
     fs.writeFileSync(file, content);
   };
   for (const [relative, content] of Object.entries(spec.files)) write(relative, content);
+  const targets = Object.keys(spec.fixed);
+  write("dream-e2e-score.mjs", `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";\nconst targets=${JSON.stringify(targets)};\nconst source=targets.map(file=>readFileSync(file,"utf8"));\nconst broken=source.filter(text=>text.includes("NEEDS_FIX")&&!/(?:=\\s*false|=\\s*False)/.test(text)).length;\nconst valid=!source.some(text=>text.includes("export {};")||text.includes("# inert qualification stub"));\nmkdirSync("eval",{recursive:true});\nwriteFileSync("eval/score.json",JSON.stringify({score:targets.length-broken,valid,fail_class:valid?"ok":"wrong_answer",error:valid?null:"inert code"}));\n`);
   git(["init", "-q", "-b", "main"], dir);
   git(["config", "user.email", "loop-e2e@example.invalid"], dir);
   git(["config", "user.name", "loop e2e"], dir);
@@ -328,7 +330,7 @@ function runSpecCommand(spec, cwd) {
 }
 
 /** One trusted-local contract run on a fresh clone, with no supplied winning patch. */
-async function executeFixture(spec, fixtureDir, { limits, campaignDefaults } = {}) {
+async function executeFixture(spec, fixtureDir, { limits, campaignDefaults, autoCommit = false } = {}) {
   const sourceDir = path.join(fixtureDir, "source");
   buildFixtureRepo(sourceDir, spec);
   const cloneDir = cloneFixture(sourceDir, path.join(fixtureDir, "clone"));
@@ -347,6 +349,7 @@ async function executeFixture(spec, fixtureDir, { limits, campaignDefaults } = {
     scope: { roots: scopeRoots, protectedAssets: ["package.json", "e2e-agent.mjs", "dream-e2e-score.mjs", ...targets.filter((file) => /(^|\/)test(s)?(\/|\.)/.test(file))] },
     execution: { mode: "trusted-local", consent: true, envAllowlist: [], allowedCommandCategories: ["test", "build", "custom"] },
     models: { providers: ["local"] },
+    ...(autoCommit ? { git: { autoCommit: true, branch: "dream-rsi/improve" } } : {}),
     budgets: { maxCampaigns: limits?.maxCampaigns ?? 1, maxAgentStarts: limits?.maxAgentStarts ?? 36,
       maxEvaluatorRuns: limits?.maxEvaluatorRuns ?? 100, deadlineMs: limits?.deadlineMs ?? 1_800_000, falseAcceptBudget: 0.1 },
     agent: { command: process.execPath, args: [path.join(cloneDir, "e2e-agent.mjs")], prompt_via: "stdin", model: spec.agentModel ?? null, thinking: null,
@@ -440,11 +443,21 @@ test(`loop wins on fresh clones of the npm fixes fixture (${REPEATS} repeats)`, 
   reportCosts(t, "fixes (npm)", costs);
 });
 
-test("loop wins on a fresh clone of the multi-file nested fixture", async (t) => {
-  await withFixtureDir("multifix", async (dir) => {
-    const run = await executeFixture(FIXTURES.multifix, dir);
+test("verified multi-file wins continue on the dedicated local auto-commit branch", async (t) => {
+  await withFixtureDir("multifix-autocommit", async (dir) => {
+    const run = await executeFixture(FIXTURES.multifix, dir, { autoCommit: true });
     assertVerifiedWin(FIXTURES.multifix, run);
-    reportCosts(t, "multifix (npm, two files)", [{ agentStarts: run.result.agentStarts, evaluatorRuns: run.result.evaluatorRuns, wallMs: run.wallMs }]);
+    assert.equal(run.result.autoCommits.length, 1, "one verified campaign produces one local commit");
+    const receipt = run.result.autoCommits[0];
+    assert.equal(receipt.branch, "dream-rsi/improve");
+    assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "dream-rsi/improve");
+    assert.equal(execFileSync("git", ["rev-parse", "main"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), execFileSync("git", ["rev-parse", `${receipt.hash}^`], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "main remains unchanged");
+    assert.deepEqual(execFileSync("git", ["diff-tree", "--no-commit-id", "--name-only", "-r", "-z", receipt.hash], { cwd: run.cloneDir, encoding: "utf8" }).split("\0").filter(Boolean), receipt.files);
+    const lastRun = fs.readFileSync(path.join(path.dirname(run.result.budgetPath), "last-run.md"), "utf8");
+    assert.match(lastRun, /Last verified win: .+ gain/);
+    assert.ok(lastRun.includes(receipt.hash), "the operator summary links the verified commit");
+    assert.match(lastRun, /Next action/);
+    reportCosts(t, "multifix auto-commit (npm, two files)", [{ agentStarts: run.result.agentStarts, evaluatorRuns: run.result.evaluatorRuns, wallMs: run.wallMs }]);
   });
 });
 
@@ -477,10 +490,13 @@ test("loop wins on a bun-backed project with a declared evaluator", { skip: BUN_
 test("known-negative: noise edits and an out-of-scope cheat apply nothing", async (t) => {
   await withFixtureDir("noise", async (dir) => {
     const run = await executeFixture(FIXTURES.noise, dir, {
+      autoCommit: true,
       limits: { maxCampaigns: 2, plateauK: 2 },
       campaignDefaults: { maxCycles: 1 },
     });
     assert.equal(run.result.wins, 0, "no verified win exists in the noise/cheat fixture");
+    assert.deepEqual(run.result.autoCommits, [], "unverified candidates never create commits");
+    assert.equal(execFileSync("git", ["rev-parse", "main"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), execFileSync("git", ["rev-parse", "dream-rsi/improve"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "the dedicated branch has no commit without a win");
     assert.equal(run.result.campaigns, 2, "both budgeted campaigns ran and rejected");
     assert.equal(run.result.stopReason, "budget");
     assert.ok(run.result.records.every((record) => record.outcome !== "win"));

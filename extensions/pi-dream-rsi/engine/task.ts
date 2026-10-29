@@ -14,6 +14,13 @@ export const DREAM_DIR = ".dream-rsi";
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
+export const MAX_TASK_TIMEOUT_MS = 2_147_483_647;
+
+/** Node timers and process timeout validation share this representable range. */
+export function isTaskTimeout(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1 && value <= MAX_TASK_TIMEOUT_MS;
+}
+
 export interface AgentConfig {
   /** Executable to spawn for one experiment attempt. */
   command: string;
@@ -115,7 +122,7 @@ export function validateTask(raw: unknown): string[] {
   const numbers: [keyof TaskConfig, number, number][] = [
   ];
   for (const key of ["agent_timeout_ms", "evaluator_timeout_ms"] as const) {
-    if (!Number.isSafeInteger(t[key]) || (t[key] ?? 0) < 1 || (t[key] ?? 0) > 2_147_483_647) errors.push(`${key} must be an integer from 1 through 2147483647 milliseconds`);
+    if (!isTaskTimeout(t[key])) errors.push(`${key} must be an integer from 1 through 2147483647 milliseconds`);
   }
   for (const [key, min, max] of numbers) {
     const value = t[key];

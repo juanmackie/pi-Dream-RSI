@@ -1,15 +1,19 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { campaignSeedReadings, runLoop as runLoopCore } from "../extensions/pi-dream-rsi/engine/loop.ts";
-import { CampaignInfeasibleError, campaignVerifierIdentity, promotionFloor } from "../extensions/pi-dream-rsi/engine/campaign.ts";
+import { campaignSeedReadings, readLoopActivity, runLoop as runLoopCore, waitForCampaignInterval } from "../extensions/pi-dream-rsi/engine/loop.ts";
+import { CampaignInfeasibleError, campaignVerifierIdentity, promotionFloor, readCampaignStatus } from "../extensions/pi-dream-rsi/engine/campaign.ts";
 import { normalizeRunContract, projectFingerprint } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { defaultSearchConfig } from "../extensions/pi-dream-rsi/engine/experiment.ts";
 import { defaultTask } from "../extensions/pi-dream-rsi/engine/task.ts";
+import { appendLedgerRecord } from "../extensions/pi-dream-rsi/engine/ledger.ts";
+import { applyCandidatePatch, candidatePatchFingerprint } from "../extensions/pi-dream-rsi/engine/campaign-patch.ts";
+import { readOrCreateLoopBudget, reserveHourlyProcessStart, writeLoopBudget } from "../extensions/pi-dream-rsi/engine/budget.ts";
 
 const NOW = new Date("2026-10-16T00:00:00.000Z");
 
@@ -30,7 +34,7 @@ function runLoop(options) {
   ];
   const reconProjectImpl = options.reconProjectImpl ?? (async (reconOptions) => {
     const selected = commandSpecs.slice(0, Math.max(1, reconOptions.maxProbes ?? 3));
-    for (const command of selected) reconOptions.beforeProbe?.(command);
+    for (const command of selected) await reconOptions.beforeProbe?.(command);
     return {
       commands: selected.map(({ ok, exitCode, durationMs, ...command }) => ({
         ...command, argv: command.label.split(" "), declaredArgv: command.label.split(" "),
@@ -104,7 +108,7 @@ function fixtureProject() {
 }
 
 /** Stub campaign engine: records calls and fabricates a bounded campaign result. */
-function stubCampaign({ outcome = "no-win", stateKind = "complete", stopReason = "stub finished", agentStarts = 5, evaluatorRuns = 9 } = {}) {
+function stubCampaign({ outcome = "no-win", stateKind = "complete", stopReason = "stub finished", agentStarts = 5, evaluatorRuns = 9, pendingConfirmation = false } = {}) {
   const calls = [];
   const impl = async (options) => {
     calls.push(options);
@@ -119,6 +123,7 @@ function stubCampaign({ outcome = "no-win", stateKind = "complete", stopReason =
       id, baseRoot: options.baseRoot, campaignRoot, engineRoot: campaignRoot,
       state: { kind: stateKind, reason: stopReason }, stopped: true, stopReason,
       agentStarts, evaluatorRuns, currentScore: 0, bestScore: 0, baselineScore: 0, startedAt: NOW.toISOString(),
+      ...(pendingConfirmation ? { pendingConfirmation: { iteration: 1, cell: "n1", pairs: 2, maxPairs: 8 } } : {}),
     };
   };
   return { impl, calls };
@@ -127,6 +132,131 @@ function stubCampaign({ outcome = "no-win", stateKind = "complete", stopReason =
 function baseLimits(overrides = {}) {
   return { maxCampaigns: 1, maxAgentStarts: 1000, maxEvaluatorRuns: 1000, deadlineMs: 60_000, ...overrides };
 }
+
+function pendingConfirmationArtifacts(projectDir, contract, { autoCommitFixture = false } = {}) {
+  const baseRoot = path.join(projectDir, ".dream-rsi");
+  const loopRoot = path.join(baseRoot, "loop");
+  const id = "a0000000-0000-4000-8000-000000000001";
+  const campaignRoot = path.join(baseRoot, "campaigns", id);
+  const history = path.join(campaignRoot, "history");
+  const evidenceDir = path.join(history, "r0001_campaign", "n1");
+  const metricsDir = path.join(loopRoot, "metrics", "recovery1");
+  const verifierDir = path.join(loopRoot, "verifiers", "recovery1");
+  const wrapperPath = path.join(metricsDir, "evaluate.mjs");
+  const sourcePath = path.join(projectDir, "eval", "score.mjs");
+  const gatePath = path.join(projectDir, "eval", "gate.mjs");
+  const targetPath = path.join(projectDir, "src", "parser.ts");
+  fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+  fs.mkdirSync(path.dirname(sourcePath), { recursive: true });
+  fs.mkdirSync(metricsDir, { recursive: true });
+  fs.writeFileSync(targetPath, "export const oldValue = 1;\n");
+  fs.writeFileSync(sourcePath, autoCommitFixture
+    ? `import { mkdirSync, readFileSync, writeFileSync } from "node:fs";\nconst value=readFileSync("src/parser.ts","utf8").includes("oldValue = 2")?2:1;mkdirSync("eval",{recursive:true});writeFileSync("eval/score.json",JSON.stringify({score:value,valid:true,fail_class:"ok",error:null}));\n`
+    : "process.stdout.write('score');\n");
+  fs.writeFileSync(gatePath, "process.exit(0);\n");
+  const argv = contract.outcome.evaluator.argv;
+  const declaredInputs = contract.outcome.evaluator.inputs ?? [];
+  const identityInputs = declaredInputs.map((input) => path.resolve(projectDir, input));
+  const pinnedInputs = declaredInputs.map((input) => path.join(verifierDir, ...input.replace(/\\/g, "/").split("/")));
+  for (let index = 0; index < pinnedInputs.length; index += 1) {
+    fs.mkdirSync(path.dirname(pinnedInputs[index]), { recursive: true });
+    fs.copyFileSync(path.resolve(projectDir, declaredInputs[index]), pinnedInputs[index]);
+  }
+  fs.writeFileSync(wrapperPath, [
+    ...(autoCommitFixture ? ['import { spawnSync } from "node:child_process";'] : []),
+    `const COMMAND = ${JSON.stringify(argv)};`,
+    'const MODE = "score";',
+    "const SAMPLE_TIMEOUT_MS = 600000;",
+    'const OUTPUT = "eval/score.json";',
+    `const SCORE_OUTPUT = ${JSON.stringify(contract.outcome.evaluator.output)};`,
+    `const SCORE_UNIT = ${JSON.stringify(contract.outcome.unit)};`,
+    ...(autoCommitFixture ? ["const result=spawnSync(COMMAND[0],COMMAND.slice(1),{stdio:'inherit'});process.exit(result.status??1);"] : []),
+    "",
+  ].join("\n"));
+  const old = new Date(Date.now() - 10 * 60_000);
+  for (const file of [wrapperPath, sourcePath, gatePath]) fs.utimesSync(file, old, old);
+
+  const task = {
+    ...defaultTask("recovery1"),
+    eval_program: "src/parser.ts",
+    score_program: `node "${wrapperPath}"`,
+    score_path: "eval/score.json",
+    higher_is_better: contract.outcome.higherIsBetter,
+  };
+  const verifierInputs = [wrapperPath, ...pinnedInputs];
+  const gates = [...contract.preserved.gates];
+  const verifierIdentity = campaignVerifierIdentity(projectDir, task, verifierInputs, gates, identityInputs);
+  const targetDigest = "b".repeat(64);
+  fs.mkdirSync(history, { recursive: true });
+  fs.writeFileSync(path.join(history, "ledger.jsonl"), "");
+  fs.writeFileSync(path.join(campaignRoot, "campaign-processes.json"), JSON.stringify({
+    version: 1, agent_limit: 20, evaluator_limit: 200, agent_starts: 5, evaluator_runs: 9, last_start: null,
+  }));
+
+  const candidatePath = path.join(campaignRoot, "candidate", "src", "parser.ts");
+  fs.mkdirSync(path.dirname(candidatePath), { recursive: true });
+  fs.writeFileSync(candidatePath, "export const oldValue = 2;\n");
+  const patch = [{
+    kind: "write", relative: "src/parser.ts", from: candidatePath, to: targetPath,
+    beforeHash: createHash("sha256").update(fs.readFileSync(targetPath)).digest("hex"),
+    afterHash: createHash("sha256").update(fs.readFileSync(candidatePath)).digest("hex"), beforeLines: 1, afterLines: 1,
+  }];
+  const patchHash = autoCommitFixture ? candidatePatchFingerprint(patch) : "a".repeat(64);
+  const confirmationIdentity = `${verifierIdentity}:${patchHash}:${targetDigest}`;
+  const outcome = (raw) => ({ score: autoCommitFixture ? raw : -raw, raw_score: raw, valid: true, fail_class: "ok", error: null });
+  const pairs = autoCommitFixture
+    ? [1.5, 1.6].map((after) => ({ measurement: { before: 1, after, gain: after - 1 }, beforeOutcome: outcome(1), afterOutcome: outcome(after) }))
+    : [9.5, 9.4].map((after) => ({ measurement: { before: 10, after, gain: Math.log(10 / after) }, beforeOutcome: outcome(10), afterOutcome: outcome(after) }));
+  fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(path.join(evidenceDir, "confirmation.json"), JSON.stringify({ version: 1, identity: confirmationIdentity, baseline: autoCommitFixture ? [1, 1, 1] : [10, 9], pairs }));
+  const now = Date.now();
+  const record = {
+    version: 1, id, baseRoot, campaignRoot, projectDir, targetRoot: projectDir,
+    goal: contract.outcome.statement, task, scope: ["src/parser.ts"], verifierInputs, verifierIdentity, identityInputs, taskFingerprint: "test-fingerprint",
+    searchConfig: defaultSearchConfig, mechanism: "test recovery", minimumGain: 0.5,
+    requestedMinimumGain: contract.outcome.minimumUsefulGain, expectedReadMs: 1000,
+    baselineScores: autoCommitFixture ? [1, 1, 1] : [-10, -9, -11], rawBaselineScores: autoCommitFixture ? [1, 1, 1] : [10, 9],
+    checkRuns: (autoCommitFixture ? [1, 1, 1] : [-10, -9, -11]).map((score) => ({ durationMs: 0, code: null, valid: true, failClass: "ok", score, error: null, stdoutTail: "seeded from loop qualification", logPath: null })),
+    gates,
+    limits: { maxCycles: 2, maxAgentStarts: 20, maxEvaluatorRuns: 200, deadlineMs: 60_000, plateauCycles: 2, maxCandidatesPerCycle: 8 },
+    startedAt: new Date(now - 60_000).toISOString(), deadlineAt: new Date(now - 1_000).toISOString(),
+    completedCycles: [], baselineScore: -10, baselineRepeatScore: -9, currentScore: -10, bestScore: -10, noGainCycles: 0,
+    state: { kind: "paused", phase: "promote", iteration: 1, reason: "confirmation pending" },
+    pendingConfirmation: {
+      iteration: 1, candidate: { iteration: 1, cell: "n1", score: -8, raw_score: 8, fail_class: "ok", workspace: path.join(campaignRoot, "candidate"), program: targetPath },
+      patch, patchHash, evidenceDir, confirmationIdentity, targetDigest, pairs: 2, maxPairs: 8,
+    },
+  };
+  fs.mkdirSync(path.join(baseRoot, "campaigns"), { recursive: true });
+  fs.writeFileSync(path.join(campaignRoot, "campaign.json"), JSON.stringify(record));
+  fs.writeFileSync(path.join(baseRoot, "campaigns", "active.json"), JSON.stringify({ id }));
+  return { baseRoot, campaignRoot, loopRoot, sourcePath, evidencePath: path.join(evidenceDir, "confirmation.json") };
+}
+
+test("live activity inspection distinguishes lease ownership from stale or unverifiable state", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-activity-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  fs.mkdirSync(path.join(root, "loop"));
+  const file = path.join(root, "loop/lease.json");
+  assert.equal(readLoopActivity(root), null);
+  const lease = { pid: process.pid, host: os.hostname(), startedAt: NOW.toISOString(), heartbeatAt: NOW.toISOString(),
+    activity: { phase: "qualification", detail: "Checking the metric", updatedAt: NOW.toISOString() } };
+  for (const [patch, state] of [[{}, "running"], [{ pid: 999999 }, "interrupted"], [{ host: "another-host" }, "unverified"], [{ host: null }, "unverified"]]) {
+    const before = JSON.stringify({ ...lease, ...patch });
+    fs.writeFileSync(file, before);
+    const observed = readLoopActivity(root);
+    assert.equal(observed.state, state);
+    assert.equal(observed.phase, "qualification");
+    assert.equal(fs.readFileSync(file, "utf8"), before, "inspection is read-only even for a dead owner");
+  }
+  fs.writeFileSync(file, "not JSON");
+  assert.equal(readLoopActivity(root).state, "unknown");
+  fs.writeFileSync(file, JSON.stringify({ ...lease, activity: undefined }));
+  assert.equal(readLoopActivity(root).phase, "unknown", "legacy leases do not invent a work phase");
+  assert.equal(readLoopActivity(root).state, "unverified", "a legacy lease alone is not verified live progress");
+  fs.writeFileSync(file, " ".repeat(65 * 1024));
+  assert.equal(readLoopActivity(root).state, "unknown", "oversized lease input is refused");
+});
 
 test("loop ranks contract-bounded recon levers and accounts for campaign spend", async () => {
   const fixture = fixtureProject();
@@ -176,6 +306,454 @@ test("loop ranks contract-bounded recon levers and accounts for campaign spend",
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
+test("continuous mode stops on its durable no-win plateau without resetting spend on another explicit run", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: { plateauCampaigns: 1, minimumCampaignIntervalMs: 1000 } });
+    const first = stubCampaign();
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
+      limits: baseLimits({ maxCampaigns: 5 }), contract, runCampaignImpl: first.impl, now: () => NOW });
+    assert.equal(result.stopCode, "plateau");
+    assert.equal(first.calls.length, 1);
+    const savedBudget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
+    assert.equal(savedBudget.consecutive_no_win_campaigns, 1);
+    assert.equal(Date.parse(savedBudget.last_campaign_started_at), NOW.getTime());
+
+    const second = stubCampaign();
+    const continued = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
+      limits: baseLimits({ maxCampaigns: 5 }), contract, runCampaignImpl: second.impl, now: () => new Date(NOW.getTime() + 86_400_000) });
+    assert.equal(continued.stopCode, "plateau", "cross-day explicit continuation does not erase plateau history");
+    assert.equal(second.calls.length, 0, "no new campaign starts after the approved plateau");
+    assert.equal(JSON.parse(fs.readFileSync(result.budgetPath, "utf8")).campaigns, 1, "durable campaign spend is unchanged");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("continuous dispatch waits at the real campaign process hook, then reserves one rolling-hour slot", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits();
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: {
+      plateauCampaigns: 3, minimumCampaignIntervalMs: 1000, agentStartsPerHour: 1, evaluatorRunsPerHour: 96,
+    } });
+    const budgetPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    const clockStart = Date.now();
+    writeLoopBudget(budgetPath, { ...budget, hourly_starts: { agents: [clockStart - 3_599_900], evaluators: [] } });
+    let rateClock = clockStart;
+    const waits = [];
+    const stub = stubCampaign({ agentStarts: 1, evaluatorRuns: 0 });
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits, contract,
+      runCampaignImpl: async (options) => {
+        assert.equal(typeof options.beforeProcessRateLimit, "function", "campaign receives the shared dispatch limiter");
+        await options.beforeProcessRateLimit("agent", "first-attempt");
+        return stub.impl(options);
+      },
+      processRateLimitNow: () => rateClock,
+      waitForProcessRateLimitImpl: async (waitMs) => { waits.push(waitMs); rateClock += waitMs; return "ready"; },
+    });
+    assert.equal(waits.length, 1, "one process start is paced at its actual dispatch hook");
+    assert.ok(waits[0] > 0 && waits[0] <= 100, `wait was ${waits[0]}ms`);
+    assert.equal(result.campaigns, 1);
+    const saved = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+    assert.equal(saved.hourly_starts.agents.length, 1, "pruned history and the newly reserved start persist");
+    assert.equal(saved.hourly_starts.agents[0], rateClock);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("parallel campaign dispatches serialize reservations so a burst cannot exceed the hourly cap", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits();
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: {
+      plateauCampaigns: 3, minimumCampaignIntervalMs: 1000, agentStartsPerHour: 1, evaluatorRunsPerHour: 96,
+    } });
+    const budgetPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, hourly_starts: { agents: [], evaluators: [] } });
+    let rateClock = Date.now();
+    const waits = [];
+    const stub = stubCampaign({ agentStarts: 3, evaluatorRuns: 0 });
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits, contract,
+      runCampaignImpl: async (options) => {
+        await Promise.all(["a", "b", "c"].map((key) => options.beforeProcessRateLimit("agent", key)));
+        return stub.impl(options);
+      },
+      processRateLimitNow: () => rateClock,
+      waitForProcessRateLimitImpl: async (waitMs) => { waits.push(waitMs); rateClock += waitMs; return "ready"; },
+    });
+    assert.equal(result.campaigns, 1);
+    assert.equal(waits.length, 2, "only the two excess concurrent starts wait for the next slots");
+    const saved = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+    assert.equal(saved.hourly_starts.agents.length, 1, "serialized reservations never exceed the configured rolling cap");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a rate wait that reaches the deadline does not dispatch or become a campaign failure", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits();
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: {
+      plateauCampaigns: 3, minimumCampaignIntervalMs: 1000, agentStartsPerHour: 1, evaluatorRunsPerHour: 96,
+    } });
+    const budgetPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, hourly_starts: { agents: [Date.now()], evaluators: [] } });
+    let dispatches = 0;
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits, contract,
+      runCampaignImpl: async (options) => {
+        await options.beforeProcessRateLimit("agent", "blocked-attempt");
+        dispatches += 1;
+        return stubCampaign({ agentStarts: 1, evaluatorRuns: 0 }).impl(options);
+      },
+      waitForProcessRateLimitImpl: async () => "deadline",
+    });
+    assert.equal(result.stopCode, "deadline");
+    assert.equal(dispatches, 0);
+    assert.match(result.stopReason, /deadline/);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("cancellation while waiting for a process-rate slot stops without dispatch", async () => {
+  const fixture = fixtureProject();
+  const controller = new AbortController();
+  try {
+    const limits = baseLimits();
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: {
+      plateauCampaigns: 3, minimumCampaignIntervalMs: 1000, agentStartsPerHour: 1, evaluatorRunsPerHour: 96,
+    } });
+    const budgetPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, hourly_starts: { agents: [Date.now()], evaluators: [] } });
+    let enteredResolve;
+    const entered = new Promise((resolve) => { enteredResolve = resolve; });
+    let dispatches = 0;
+    const resultPromise = runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits, contract, signal: controller.signal,
+      runCampaignImpl: async (options) => {
+        await options.beforeProcessRateLimit("agent", "cancelled-attempt");
+        dispatches += 1;
+        return stubCampaign({ agentStarts: 1, evaluatorRuns: 0 }).impl(options);
+      },
+      waitForProcessRateLimitImpl: async (_waitMs, _deadlineAt, signal) => await new Promise((resolve) => {
+        enteredResolve();
+        signal?.addEventListener("abort", () => resolve("cancelled"), { once: true });
+      }),
+    });
+    await entered;
+    controller.abort();
+    const result = await resultPromise;
+    assert.equal(result.stopCode, "cancelled");
+    assert.equal(dispatches, 0);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a campaign deadline aborts its rate wait without cancelling the owning loop", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits();
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: {
+      plateauCampaigns: 3, minimumCampaignIntervalMs: 1000, agentStartsPerHour: 1, evaluatorRunsPerHour: 96,
+    } });
+    const budgetPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, hourly_starts: { agents: [Date.now()], evaluators: [] } });
+    let dispatches = 0;
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits, contract,
+      runCampaignImpl: async (options) => {
+        const campaignSignal = new AbortController();
+        setTimeout(() => campaignSignal.abort(), 10);
+        await options.beforeProcessRateLimit("agent", "campaign-timeout", campaignSignal.signal);
+        dispatches += 1;
+        return stubCampaign({ agentStarts: 1, evaluatorRuns: 0 }).impl(options);
+      },
+      waitForProcessRateLimitImpl: async (_waitMs, _deadlineAt, signal) => await new Promise((resolve) => {
+        signal?.addEventListener("abort", () => resolve("cancelled"), { once: true });
+      }),
+    });
+    assert.notEqual(result.stopCode, "cancelled", "an inner campaign deadline is not operator cancellation of the loop");
+    assert.equal(dispatches, 0);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("hourly process reservations persist, enforce independent rolling limits, and expire at one hour", () => {
+  const fixture = fixtureProject();
+  try {
+    const file = path.join(fixture.projectDir, ".dream-rsi", "loop", "budget.json");
+    const budget = readOrCreateLoopBudget(file, baseLimits());
+    const start = Date.parse("2026-10-16T00:00:00.000Z");
+    const agent1 = reserveHourlyProcessStart(budget, "agent", 2, start);
+    assert.equal(agent1.waitMs, 0);
+    const agent2 = reserveHourlyProcessStart(agent1.budget, "agent", 2, start + 1);
+    assert.equal(agent2.waitMs, 0);
+    const blocked = reserveHourlyProcessStart(agent2.budget, "agent", 2, start + 2);
+    assert.equal(blocked.waitMs, 3_599_998);
+    const evaluator = reserveHourlyProcessStart(blocked.budget, "evaluator", 1, start + 2);
+    assert.equal(evaluator.waitMs, 0, "agent and evaluator allowances are independent");
+    writeLoopBudget(file, evaluator.budget);
+    const restored = readOrCreateLoopBudget(file, baseLimits());
+    const stillBlocked = reserveHourlyProcessStart(restored, "agent", 2, start + 3);
+    assert.ok(stillBlocked.waitMs > 0, "recent process reservations survive restart");
+    const expired = reserveHourlyProcessStart(stillBlocked.budget, "agent", 2, start + 3_600_001);
+    assert.equal(expired.waitMs, 0, "events exactly one hour old no longer consume a slot");
+    const legacy = { ...restored };
+    delete legacy.hourly_starts;
+    writeLoopBudget(file, legacy);
+    assert.deepEqual(readOrCreateLoopBudget(file, baseLimits()).hourly_starts, { agents: [], evaluators: [] }, "legacy loop budgets migrate without resetting other spend");
+    fs.writeFileSync(file, JSON.stringify({ ...legacy, hourly_starts: { agents: ["corrupt"], evaluators: [] } }));
+    assert.throws(() => readOrCreateLoopBudget(file, baseLimits()), /hourly process history is invalid/);
+    const maximumHistory = Array.from({ length: 10_000 }, (_, index) => start + index);
+    fs.writeFileSync(file, JSON.stringify({ ...legacy, hourly_starts: { agents: maximumHistory, evaluators: [] } }));
+    assert.equal(readOrCreateLoopBudget(file, baseLimits()).hourly_starts.agents.length, 10_000, "history matches the contract's maximum 10,000/hour cap");
+    maximumHistory.push(start + 10_000);
+    fs.writeFileSync(file, JSON.stringify({ ...legacy, hourly_starts: { agents: maximumHistory, evaluators: [] } }));
+    assert.throws(() => readOrCreateLoopBudget(file, baseLimits()), /hourly process history is invalid/, "history remains bounded beyond the supported cap");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("continuous campaign starts honor a persisted minimum interval", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits({ maxCampaigns: 1 });
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: { plateauCampaigns: 3, minimumCampaignIntervalMs: 1000 } });
+    const loopRoot = path.join(fixture.projectDir, ".dream-rsi", "loop");
+    fs.mkdirSync(loopRoot, { recursive: true });
+    const budgetPath = path.join(loopRoot, "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, last_campaign_started_at: new Date(Date.now() + 350).toISOString() });
+    const stub = stubCampaign();
+    const startedAt = Date.now();
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits,
+      contract, runCampaignImpl: stub.impl, now: () => NOW });
+    assert.equal(stub.calls.length, 1);
+    assert.ok(Date.now() - startedAt >= 300, "the campaign cannot start before the persisted interval elapses");
+    assert.equal(result.campaigns, 1);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a pacing wait that wakes after the deadline does not reserve or start a campaign", async () => {
+  const fixture = fixtureProject();
+  try {
+    const limits = baseLimits({ maxCampaigns: 1 });
+    const contract = normalizeRunContract({ ...TEST_CONTRACT, continuation: { plateauCampaigns: 3, minimumCampaignIntervalMs: 1000 } });
+    const loopRoot = path.join(fixture.projectDir, ".dream-rsi", "loop");
+    fs.mkdirSync(loopRoot, { recursive: true });
+    const budgetPath = path.join(loopRoot, "budget.json");
+    const budget = readOrCreateLoopBudget(budgetPath, limits);
+    writeLoopBudget(budgetPath, { ...budget, last_campaign_started_at: new Date(Date.now() + 10_000).toISOString() });
+    const stub = stubCampaign();
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits,
+      contract, runCampaignImpl: stub.impl, now: () => NOW,
+      waitForCampaignIntervalImpl: (waitMs, deadlineAt, signal) => {
+        let fakeNow = Date.now();
+        return waitForCampaignInterval(waitMs, deadlineAt, signal, () => fakeNow, async () => { fakeNow = deadlineAt + 1; });
+      },
+    });
+    assert.equal(result.stopCode, "deadline");
+    assert.equal(stub.calls.length, 0, "deadline after the timer wake prevents dispatch");
+    const saved = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+    assert.equal(saved.campaigns, 0);
+    assert.equal(saved.open_campaign, null, "no spend reservation is written after the deadline");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a pending confirmation retains loop context and reports a resumable stop", async () => {
+  const fixture = fixtureProject();
+  try {
+    const stub = stubCampaign({ stateKind: "paused", stopReason: "confirmation pending", pendingConfirmation: true });
+    fs.mkdirSync(path.join(fixture.projectDir, "src"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.projectDir, "src", "parser.ts"), "export const parserSentinel = 100;\\n");
+    fs.mkdirSync(path.join(fixture.projectDir, "eval"), { recursive: true });
+    fs.writeFileSync(path.join(fixture.projectDir, "eval", "score.mjs"), `import * as fs from "node:fs";\nconst valid = fs.readFileSync("src/parser.ts", "utf8").includes("parserSentinel");\nfs.mkdirSync("eval", { recursive: true });\nfs.writeFileSync("eval/score.json", JSON.stringify({ score: 10, valid, fail_class: valid ? "ok" : "inert", error: valid ? null : "editable source is inert" }));\n`);
+    fs.writeFileSync(path.join(fixture.projectDir, "eval", "gate.mjs"), `import * as fs from "node:fs";\nprocess.exit(fs.readFileSync("src/parser.ts", "utf8").includes("parserSentinel") ? 0 : 1);\n`);
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+      continuation: { plateauCampaigns: 1, minimumCampaignIntervalMs: 1000 },
+    });
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir,
+      sessionDir: fixture.sessionDir,
+      limits: baseLimits(),
+      contract,
+      collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
+      reconProjectImpl: async () => ({
+        commands: [], probes: [], graph: ["src/parser.ts"],
+        graphs: { "contract.outcome.evaluator": ["src/parser.ts"] },
+        files: [{ path: "src/parser.ts", bytes: 31, lines: 1 }], notes: [], blockers: [],
+      }),
+      runCampaignImpl: stub.impl,
+      now: () => NOW,
+    });
+
+    assert.equal(result.stopCode, "confirmation-pending", result.stopReason);
+    assert.equal(stub.calls.length, 1);
+    assert.equal(JSON.parse(fs.readFileSync(result.budgetPath, "utf8")).consecutive_no_win_campaigns, 0,
+      "a campaign awaiting confirmation does not count toward the completed no-win plateau");
+    const contextPath = path.join(fixture.projectDir, ".dream-rsi", "loop", "active.json");
+    const context = JSON.parse(fs.readFileSync(contextPath, "utf8"));
+    assert.equal(context.version, 1);
+    assert.ok(context.lever.id, "the frozen lever remains available for confirmation resume");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("confirmation-only resume reconstructs missing context from validated campaign evidence", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, statement: "Recover the saved score confirmation", evaluator: { argv: ["python", "--config=eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract);
+    const calls = [];
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits(), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async (options) => {
+        calls.push(options);
+        const active = JSON.parse(fs.readFileSync(path.join(artifacts.loopRoot, "active.json"), "utf8"));
+        assert.equal(active.campaignId, "a0000000-0000-4000-8000-000000000001", "the validated context is durable before resume starts");
+        assert.equal(active.instrument.timeoutMs, 600000);
+        assert.deepEqual(active.instrument.baseline, [10, 9, 11], "recovery restores the pre-campaign qualification baseline, not later readings");
+        return { ...readCampaignStatus(options.baseRoot), stopped: true, stopReason: "confirmation pending" };
+      },
+    });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].confirmationOnly, true);
+    assert.ok(calls[0].extendLimits.deadlineMs > 0, "the expired inner deadline is extended only from the remaining loop allowance");
+    assert.equal(result.stopCode, "confirmation-pending", result.stopReason);
+    assert.match(result.stopReason, /confirmation pending/);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("a resumed confirmation commits only after its independent post-apply check", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { statement: "Increase the parser score", unit: "points", higherIsBetter: true, minimumUsefulGain: 0.5,
+        evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json", inputs: ["eval/score.mjs"] } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+      git: { autoCommit: true, branch: "dream-rsi/improve" },
+      continuation: { plateauCampaigns: 1, minimumCampaignIntervalMs: 1000 },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract, { autoCommitFixture: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: fixture.projectDir });
+    execFileSync("git", ["config", "user.name", "Dream RSI Test"], { cwd: fixture.projectDir });
+    execFileSync("git", ["config", "user.email", "dream-rsi-test@example.invalid"], { cwd: fixture.projectDir });
+    execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: fixture.projectDir });
+    execFileSync("git", ["add", "package.json", "src", "eval"], { cwd: fixture.projectDir });
+    execFileSync("git", ["commit", "-q", "-m", "baseline"], { cwd: fixture.projectDir });
+    const loopBudgetPath = path.join(artifacts.loopRoot, "budget.json");
+    const loopBudget = readOrCreateLoopBudget(loopBudgetPath, baseLimits());
+    writeLoopBudget(loopBudgetPath, { ...loopBudget, consecutive_no_win_campaigns: 1 });
+
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits(), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async (options) => {
+        const recordPath = path.join(artifacts.campaignRoot, "campaign.json");
+        const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+        const transactionId = "resume-verified-apply";
+        applyCandidatePatch({ seedRoot: record.targetRoot, patch: record.pendingConfirmation.patch,
+          journalDir: path.join(artifacts.campaignRoot, "promotion-journal"), transactionId });
+        appendLedgerRecord(path.join(artifacts.campaignRoot, "history", "ledger.jsonl"), {
+          kind: "apply", campaignId: record.id, stage: "apply", outcome: "success",
+          patchHash: record.pendingConfirmation.patchHash, facts: { transactionId },
+        });
+        const status = readCampaignStatus(options.baseRoot);
+        return { ...status, state: { kind: "complete" }, pendingConfirmation: undefined, stopped: false, stopReason: "confirmation complete" };
+      },
+    });
+
+    assert.equal(result.stopCode, "confirmation-complete", result.stopReason);
+    assert.equal(JSON.parse(fs.readFileSync(loopBudgetPath, "utf8")).consecutive_no_win_campaigns, 0,
+      "saved confirmation recovery runs despite a reached plateau and a verified win clears the streak");
+    assert.equal(result.autoCommits.length, 1, "the resumed verified win produces one local receipt");
+    assert.equal(result.autoCommits[0].branch, "dream-rsi/improve");
+    assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: fixture.projectDir, encoding: "utf8" }).trim(), "dream-rsi/improve");
+    assert.equal(execFileSync("git", ["rev-parse", "main"], { cwd: fixture.projectDir, encoding: "utf8" }).trim(), execFileSync("git", ["rev-parse", `${result.autoCommits[0].hash}^`], { cwd: fixture.projectDir, encoding: "utf8" }).trim());
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("confirmation recovery refuses an evaluator changed since campaign start without resuming", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, statement: "Recover the saved score confirmation", evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json" } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract);
+    fs.appendFileSync(artifacts.sourcePath, "// changed after campaign start\n");
+    let resumes = 0;
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits(), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async () => { resumes += 1; throw new Error("must not resume"); },
+    });
+
+    assert.equal(resumes, 0);
+    assert.match(result.stopReason, /measurement input changed/);
+    assert.equal(fs.existsSync(path.join(artifacts.loopRoot, "active.json")), false, "refused recovery does not persist reconstructed context");
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("confirmation recovery refuses malformed saved score pairs before resume", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, statement: "Recover the saved score confirmation", evaluator: { argv: ["node", "eval/score.mjs"], output: "score-json" } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract);
+    const evidence = JSON.parse(fs.readFileSync(artifacts.evidencePath, "utf8"));
+    delete evidence.pairs[0].beforeOutcome;
+    fs.writeFileSync(artifacts.evidencePath, JSON.stringify(evidence));
+    let resumes = 0;
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits(), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async () => { resumes += 1; throw new Error("must not resume"); },
+    });
+
+    assert.equal(resumes, 0);
+    assert.match(result.stopReason, /saved paired measurements do not match/);
+    assert.equal(fs.existsSync(path.join(artifacts.loopRoot, "active.json")), false);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("confirmation recovery checks a direct evaluator executable changed after campaign start", async () => {
+  const fixture = fixtureProject();
+  try {
+    const contract = normalizeRunContract({
+      ...TEST_CONTRACT,
+      outcome: { ...TEST_CONTRACT.outcome, statement: "Recover the saved score confirmation", evaluator: { argv: ["eval/score.mjs"], output: "score-json" } },
+      preserved: { gates: ["node eval/gate.mjs"] },
+      scope: { roots: ["src"], protectedAssets: ["eval/score.mjs", "eval/gate.mjs"] },
+    });
+    const artifacts = pendingConfirmationArtifacts(fixture.projectDir, contract);
+    fs.appendFileSync(artifacts.sourcePath, "// changed after campaign start\n");
+    let resumes = 0;
+    const result = await runLoopCore({
+      projectDir: fixture.projectDir, sessionDir: fixture.sessionDir, limits: baseLimits(), contract,
+      resumeActiveCampaign: true, confirmationOnly: true, now: () => NOW,
+      resumeCampaignImpl: async () => { resumes += 1; throw new Error("must not resume"); },
+    });
+
+    assert.equal(resumes, 0);
+    assert.match(result.stopReason, /measurement input changed/);
+    assert.equal(fs.existsSync(path.join(artifacts.loopRoot, "active.json")), false);
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
 test("dream adopts a replay winner, charges its agent, and the next campaign snapshots the config", async () => {
   const fixture = fixtureProject();
   try {
@@ -220,6 +798,9 @@ test("dream adopts a replay winner, charges its agent, and the next campaign sna
     assert.deepEqual(budget.phases.dream, { agent_starts: 1, evaluator_runs: 0, campaigns: 0 }, "the dream agent is charged before spawn");
     assert.equal(fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8").trim().split(/\r?\n/).length, 1,
       "the actual replay decision is durably recorded");
+    const lastRun = fs.readFileSync(path.join(loopRoot, "last-run.md"), "utf8");
+    assert.match(lastRun, /## Attempt timeline[\s\S]*no-win · lever/);
+    assert.match(lastRun, /## Dream decisions[\s\S]*adopted search config/);
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 
@@ -493,7 +1074,7 @@ const commandSpecs = [
 ];
 const reconProjectImpl = async (options) => {
   const selected = commandSpecs.slice(0, Math.max(1, options.maxProbes ?? 3));
-  for (const command of selected) options.beforeProbe?.(command);
+  for (const command of selected) await options.beforeProbe?.(command);
   return {
     commands: selected.map(({ ok, exitCode, durationMs, ...command }) => ({ ...command,
       argv: command.label.split(" "), declaredArgv: command.label.split(" "), source: "fixture:" + command.label, shim: false })),

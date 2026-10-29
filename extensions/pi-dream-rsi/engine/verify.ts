@@ -51,7 +51,7 @@ export interface PostApplyExpectation {
   /** Evaluator readings to take. Defaults to 1 for a score kind, 3 for duration. */
   readings?: number;
   /** Called immediately before each process starts, for durable accounting. */
-  beforeProcess?: () => void;
+  beforeProcess?: () => void | Promise<void>;
   signal?: AbortSignal;
   /** Test seam replacing the measurement process. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
@@ -69,16 +69,17 @@ export async function measureWorkload(options: {
   cwd: string;
   contract: { execution: { envAllowlist: string[] } };
   timeoutMs: number;
-  beforeProcess?: () => void;
+  beforeProcess?: () => void | Promise<void>;
   signal?: AbortSignal;
 }): Promise<number | null> {
-  options.beforeProcess?.();
+  await options.beforeProcess?.();
   const started = performance.now();
   const result = await runShellCommand(options.argv.join(" "), {
     cwd: options.cwd,
     timeoutMs: options.timeoutMs,
     envOnly: true,
     env: restrictedEnvironment(options.contract as RunContract),
+    redactEnvKeys: options.contract.execution.envAllowlist,
     logPath: null,
     ...(options.signal ? { signal: options.signal } : {}),
   });
@@ -142,17 +143,18 @@ export interface EvaluatorMeasurementOptions {
   cwd: string;
   contract: RunContract;
   timeoutMs: number;
-  beforeProcess?: () => void;
+  beforeProcess?: () => void | Promise<void>;
   signal?: AbortSignal;
 }
 
 export async function measureEvaluatorReading(options: EvaluatorMeasurementOptions): Promise<number | null> {
-  options.beforeProcess?.();
+  await options.beforeProcess?.();
   const result = await runShellCommand(evaluatorCommandLine(options.evaluator.argv), {
     cwd: options.cwd,
     timeoutMs: options.timeoutMs,
     envOnly: true,
     env: restrictedEnvironment(options.contract),
+    redactEnvKeys: options.contract.execution.envAllowlist,
     logPath: null,
     ...(options.signal ? { signal: options.signal } : {}),
   });
@@ -221,12 +223,13 @@ export async function verifyPostApply(expectation: PostApplyExpectation): Promis
     });
 
     for (const gate of expectation.gates) {
-      expectation.beforeProcess?.();
+      await expectation.beforeProcess?.();
       const result = await runShellCommand(gate, {
         cwd: scratch,
         timeoutMs: expectation.timeoutMs,
         envOnly: true,
         env: restrictedEnvironment(contract),
+        redactEnvKeys: contract.execution.envAllowlist,
         logPath: null,
         ...(expectation.signal ? { signal: expectation.signal } : {}),
       });

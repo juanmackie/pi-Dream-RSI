@@ -5,7 +5,8 @@ import { truncateToWidth, visibleWidth, matchesKey, Key } from "@earendil-works/
 import { progressIterations, progressSummary, readProgress, type ProgressSnapshot } from "./engine/progress.ts";
 
 const clean = (s: string): string => s.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f]/g, " ");
-type RowKind = "title" | "section" | "row" | "selected" | "ok" | "warn" | "error" | "muted";
+type RowKind = "title" | "section" | "row" | "selected" | "live" | "ok" | "warn" | "error" | "muted";
+export interface LoopWatchSnapshot { lines: string[]; campaignRoot: string | null }
 interface DashboardRow { kind: RowKind; text: string; log?: boolean; tree?: boolean }
 interface CampaignDisplayMetadata {
   id: string;
@@ -103,15 +104,28 @@ export class DashboardView {
   private snapshot: ProgressSnapshot | null = null;
   private signature = "";
   private root: string;
-  constructor(root: string, iteration?: number) {
+  private fallbackRoot: string;
+  private loopSnapshot: LoopWatchSnapshot | null = null;
+  private loopSource?: () => LoopWatchSnapshot;
+  constructor(root: string, iteration?: number, loopSource?: () => LoopWatchSnapshot) {
     this.root = root;
+    this.fallbackRoot = root;
+    this.loopSource = loopSource;
     const iterations = progressIterations(root);
     this.iteration = iteration ?? iterations.find((i) => readProgress(root, i)?.status === "running") ?? iterations[0] ?? 0;
     this.refresh();
   }
   refresh(): boolean {
+    this.loopSnapshot = this.loopSource?.() ?? null;
+    const nextRoot = this.loopSnapshot?.campaignRoot ?? this.fallbackRoot;
+    if (nextRoot !== this.root) {
+      this.root = nextRoot;
+      const iterations = progressIterations(nextRoot);
+      this.iteration = iterations.find((i) => readProgress(nextRoot, i)?.status === "running") ?? iterations[0] ?? 0;
+      this.nodeIndex = 0; this.page = null;
+    }
     this.snapshot = readProgress(this.root, this.iteration);
-    const signature = JSON.stringify(this.snapshot);
+    const signature = JSON.stringify([this.loopSnapshot, this.snapshot]);
     const changed = signature !== this.signature; this.signature = signature;
     return changed;
   }
@@ -126,7 +140,7 @@ export class DashboardView {
       this.nodeIndex = 0; this.page = null; this.refresh();
     } else if (matchesKey(data, Key.up) || matchesKey(data, Key.down)) {
       this.nodeIndex = Math.max(0, Math.min(this.cells().length - 1, this.nodeIndex + (matchesKey(data, Key.up) ? -1 : 1))); this.page = null;
-    } else if (matchesKey(data, Key.tab)) { this.pane = (this.pane + 1) % 3; this.page = null; }
+    } else if (matchesKey(data, Key.tab)) { this.pane = (this.pane + 1) % 4; this.page = null; }
     else if (matchesKey(data, Key.pageUp)) { this.page = readLogPage(this.logFile(), this.page?.start); }
     else if (matchesKey(data, Key.pageDown)) this.page = null;
   }
@@ -137,10 +151,14 @@ export class DashboardView {
   invalidate(): void {}
   private rows(): DashboardRow[] {
     const s = this.snapshot;
-    if (!s) return [{ kind: "muted", text: "Dream-RSI: no recorded progress. Esc closes." }];
+    const live: DashboardRow[] = (this.loopSnapshot?.lines ?? []).map((text) => ({ kind: "live", text }));
+    if (!s) return this.loopSnapshot
+      ? [{ kind: "title", text: "Dream-RSI loop watch" }, ...live, { kind: "muted", text: "No campaign progress is available. Loop status is shown above. Esc closes." }]
+      : [{ kind: "muted", text: "Dream-RSI: no recorded progress. Esc closes." }];
     const cells = this.cells(); const selected = cells[this.nodeIndex]; const attempt = s.attempts[selected];
     const rows: DashboardRow[] = [
-      { kind: "title", text: `Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ attempt  Tab pane  PgUp older  PgDn tail  Esc close` },
+      { kind: "title", text: `Dream-RSI watch: ${this.root} | ←/→ cycle  ↑/↓ attempt  Tab attempt/agent/eval/runs  PgUp older  PgDn tail  Esc close` },
+      ...live,
       ...progressSummary(s).split("\n").map((text) => ({ kind: rowKind(text), text })),
       { kind: "row", text: "" },
     ];
@@ -156,8 +174,25 @@ export class DashboardView {
     }
     if (this.pane === 0) {
       rows.push({ kind: "row", text: "" }, { kind: "section", text: "Attempt" }, { kind: rowKind(attempt?.stage ?? ""), text: attempt ? `${attempt.kind} from ${attempt.parent}: ${attempt.stage}` : "(no attempt selected)" });
-    }
-    else {
+    } else if (this.pane === 3) {
+      const attempts = Object.values(s.attempts).sort((a, b) => (a.seq ?? a.round) - (b.seq ?? b.round));
+      const baseline = s.baseline;
+      const score = (value: number | null | undefined): string => typeof value === "number" && Number.isFinite(value) ? Number(value.toFixed(3)).toString() : "—";
+      rows.push({ kind: "row", text: "" }, { kind: "section", text: `Candidate runs · ${attempts.length} total · valid scores are not automatically applied` },
+        { kind: "muted", text: "#  ID  kind   parent  stage       score   Δ baseline  outcome" });
+      for (const item of attempts.slice(-12)) {
+        const measuredScore = item.valid === true ? item.score : null;
+        const delta = baseline !== undefined && measuredScore !== null ? measuredScore - baseline : null;
+        const deltaText = delta === null ? "—" : `${delta >= 0 ? "+" : ""}${score(delta)}`;
+        const outcome = item.stage !== "done" ? item.stage
+          : item.agentError === true && item.edited !== true ? "agent error"
+            : item.timedOut ? item.valid === true ? "timeout · valid" : "timeout"
+              : item.valid === true ? "valid"
+                : item.failClass && item.failClass !== "ok" ? `invalid/${item.failClass}` : "invalid";
+        const line = `${String(item.seq ?? item.round).padStart(2, "0")} ${item.cell} ${item.kind.padEnd(6)} ${item.parent.padEnd(6)} ${item.stage.padEnd(10)} ${score(measuredScore).padStart(7)} ${deltaText.padStart(10)}  ${outcome}`;
+        rows.push({ kind: item.cell === selected ? "selected" : rowKind(outcome), text: line, tree: true });
+      }
+    } else {
       rows.push({ kind: "row", text: "" }, { kind: "section", text: `${this.pane === 1 ? "Agent" : "Evaluator"} log ${this.page ? "(older page)" : "(tail)"}` });
       const tail = this.page?.text ?? readLogPage(this.logFile()).text;
       rows.push(...tail.split("\n").slice(-14).map((text) => ({ kind: rowKind(text), text, log: true })));
@@ -181,11 +216,11 @@ export class DashboardView {
     const currentPhase = metadata.phase ?? this.snapshot?.phase ?? "ready";
     const config = metadata.searchConfig ? ` · search b${metadata.searchConfig.batchSize}/e${metadata.searchConfig.exploreShare}/r${metadata.searchConfig.refineTop}×${metadata.searchConfig.maxRounds}/p${metadata.searchConfig.patience}` : "";
     const adopted = metadata.adoptedAt ? ` · adopted ${metadata.adoptedAt.slice(0, 10)}` : "";
-    const title = `Dream-RSI · ${metadata.id} · cycle ${currentCycle}/${metadata.maxCycles} · ${currentPhase}${config}${adopted}`;
+    const title = this.loopSnapshot && !this.snapshot ? "Dream-RSI · loop activity" : `Dream-RSI · ${metadata.id} · cycle ${currentCycle}/${metadata.maxCycles} · ${currentPhase}${config}${adopted}`;
     const currentRows = this.rows();
-    const body = this.snapshot ? currentRows.slice(1) : currentRows;
-    if (!this.snapshot) body[0] = { kind: "muted", text: "No recorded progress. Esc closes." };
-    const footer: DashboardRow = { kind: "muted", text: "←/→ cycle · ↑/↓ attempt · Tab pane · PgUp/PgDn logs · Esc close" };
+    const body = this.snapshot || this.loopSnapshot ? currentRows.slice(1) : currentRows;
+    if (!this.snapshot && !this.loopSnapshot) body[0] = { kind: "muted", text: "No recorded progress. Esc closes." };
+    const footer: DashboardRow = { kind: "muted", text: "←/→ cycle · ↑/↓ attempt · Tab attempt/agent/eval/runs · PgUp/PgDn logs · Esc close" };
     const cap = Math.max(1, Math.floor(maxRows));
     const height = Math.min(cap, Math.max(body.length + 3, 20));
     if (height < 3) {
@@ -200,7 +235,7 @@ export class DashboardView {
       if (logIndex >= 0) { body.splice(logIndex, 1); continue; }
       const dropIndex = body.findIndex((row) => row.tree && row.kind !== "selected");
       if (dropIndex >= 0) { body.splice(dropIndex, 1); continue; }
-      const otherIndex = body.findIndex((row) => row.kind !== "selected" && row.kind !== "section");
+      const otherIndex = body.findIndex((row) => row.kind !== "selected" && row.kind !== "section" && row.kind !== "live");
       if (otherIndex >= 0) { body.splice(otherIndex, 1); continue; }
       body.pop();
     }
@@ -225,7 +260,7 @@ export class DashboardView {
       const raw = clean(row.text);
       const defaultColor: "accent" | "success" | "warning" | "error" | "muted" | "text" = row.kind === "section" || row.kind === "title" ? "accent"
         : row.kind === "ok" ? "success"
-          : row.kind === "warn" ? "warning"
+          : row.kind === "warn" || row.kind === "live" ? "warning"
             : row.kind === "error" ? "error"
               : row.kind === "muted" ? "muted" : "text";
       const colorStatus = (status: string): "warning" | "success" | "muted" | "error" => {
@@ -272,14 +307,14 @@ export class Dashboard {
     const rows = [...this.active.values()].flatMap((s) => progressSummary(s).split("\n").map(clean));
     this.ctx.ui.setWidget("dream-rsi", rows.length > 0 ? rows : undefined);
   };
-  async watch(root: string, iteration?: number): Promise<string | undefined> {
+  async watch(root: string, iteration?: number, loopSource?: () => LoopWatchSnapshot): Promise<string | undefined> {
     if (this.ctx.mode !== "tui") {
-      const view = new DashboardView(root, iteration);
+      const view = new DashboardView(root, iteration, loopSource);
       const summary = view.render(120).join("\n");
       this.ctx.ui.notify(summary, "info"); return summary;
     }
     await this.ctx.ui.custom<void>((tui, theme, _keys, done) => {
-      const view = new DashboardView(root, iteration);
+      const view = new DashboardView(root, iteration, loopSource);
       let closed = false;
       const close = (): void => { if (closed) return; closed = true; clearInterval(timer); this.closers.delete(close); done(); };
       const timer = setInterval(() => { view.refresh(); tui.requestRender(); }, 250);

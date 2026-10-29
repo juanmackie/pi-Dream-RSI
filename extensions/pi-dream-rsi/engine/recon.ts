@@ -133,7 +133,7 @@ export interface ReconOptions {
   projectDir: string;
   contract: RunContract;
   /** Called immediately before each probe process starts, for durable accounting. */
-  beforeProbe?: (command: DiscoveredCommand) => void;
+  beforeProbe?: (command: DiscoveredCommand) => void | Promise<void>;
   /** Cap on probes in one recon pass. */
   maxProbes?: number;
   probeTimeoutMs?: number;
@@ -560,7 +560,7 @@ export function importGraph(projectDir: string, entry: string): { files: string[
 
 /** Run one declared workload once, in a restricted environment. */
 export async function probeCommand(options: ReconOptions, command: DiscoveredCommand): Promise<ProbeReading> {
-  options.beforeProbe?.(command);
+  await options.beforeProbe?.(command);
   const commandLine = command.argv.map((part) => (/[\s"]/.test(part) ? `"${part.replace(/"/g, '""')}"` : part)).join(" ");
   const result = await runShellCommand(commandLine, {
       cwd: options.projectDir,

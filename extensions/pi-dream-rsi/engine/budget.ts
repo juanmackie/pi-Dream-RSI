@@ -59,10 +59,25 @@ export interface LoopBudgetFile {
   open_campaign: LoopReservation | null;
   /** Accumulated wall time of finished runs; absent in a legacy budget file. */
   wall_ms?: number;
+  /** Durable continuous-mode pacing and plateau state; absent in legacy budgets. */
+  last_campaign_started_at?: string | null;
+  consecutive_no_win_campaigns?: number;
+  last_plateau_campaign_id?: string | null;
+  /** Rolling hour process reservations for continuous-mode soft rate limits. */
+  hourly_starts?: { agents: number[]; evaluators: number[] };
   /** Per-phase spend for reporting and durable reconciliation. */
   phases?: Partial<Record<LoopPhase, LoopPhaseSpend>>;
 }
 
+
+export function readSavedBudgetCaps(file: string): Pick<LoopBudgetFile, "max_campaigns" | "max_agent_starts" | "max_evaluator_runs"> | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, "utf8")) as Partial<LoopBudgetFile> | null;
+    if (!parsed || !Number.isSafeInteger(parsed.max_campaigns) || !Number.isSafeInteger(parsed.max_agent_starts) || !Number.isSafeInteger(parsed.max_evaluator_runs)
+      || (parsed.max_campaigns as number) < 1 || (parsed.max_agent_starts as number) < 1 || (parsed.max_evaluator_runs as number) < 1) return null;
+    return { max_campaigns: parsed.max_campaigns as number, max_agent_starts: parsed.max_agent_starts as number, max_evaluator_runs: parsed.max_evaluator_runs as number };
+  } catch { return null; }
+}
 
 function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`loop limit ${label} must be a positive integer`);
@@ -72,11 +87,20 @@ function isCount(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
 }
 
-function compareLimits(value: Partial<LoopBudgetFile>, limits: LoopBudgetLimits): void {
-  if (value.max_campaigns !== limits.maxCampaigns || value.max_agent_starts !== limits.maxAgentStarts
-    || value.max_evaluator_runs !== limits.maxEvaluatorRuns) {
-    throw new Error("loop budget limits are immutable once created; keep the same limits or move the loop state aside to start a fresh budget");
+function compareLimits(value: Partial<LoopBudgetFile>, limits: LoopBudgetLimits, allowIncrease: boolean): boolean {
+  const old = [value.max_campaigns, value.max_agent_starts, value.max_evaluator_runs];
+  const next = [limits.maxCampaigns, limits.maxAgentStarts, limits.maxEvaluatorRuns];
+  if (next.some((limit, index) => limit < (old[index] as number))) {
+    throw new Error("loop budget limits may only be increased through an approved contract replacement");
   }
+  if (!allowIncrease && next.some((limit, index) => limit !== old[index])) {
+    throw new Error("loop budget limits are immutable without an approved saved contract");
+  }
+  if (limits.maxCampaigns < (value.campaigns as number) || limits.maxAgentStarts < (value.agent_starts as number)
+    || limits.maxEvaluatorRuns < (value.evaluator_runs as number)) {
+    throw new Error("loop budget increase cannot set a cap below accumulated spend");
+  }
+  return next.some((limit, index) => limit !== old[index]);
 }
 
 function emptyPhases(): Partial<Record<LoopPhase, LoopPhaseSpend>> {
@@ -84,10 +108,11 @@ function emptyPhases(): Partial<Record<LoopPhase, LoopPhaseSpend>> {
 }
 
 /**
- * Read the durable budget, creating it on first use. Immutable limits, fail-closed
- * counters, and the same reservation semantics as the original loop budget.
+ * Read the durable budget, creating it on first use. Existing limits stay fixed
+ * unless a saved approved contract authorizes a monotonic increase. Counters and
+ * reservations remain fail-closed.
  */
-export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): LoopBudgetFile {
+export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits, options: { allowIncrease?: boolean } = {}): LoopBudgetFile {
   assertPositiveInteger(limits.maxCampaigns, "maxCampaigns");
   assertPositiveInteger(limits.maxAgentStarts, "maxAgentStarts");
   assertPositiveInteger(limits.maxEvaluatorRuns, "maxEvaluatorRuns");
@@ -103,6 +128,10 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
       evaluator_runs: 0,
       open_campaign: null,
       wall_ms: 0,
+      last_campaign_started_at: null,
+      consecutive_no_win_campaigns: 0,
+      last_plateau_campaign_id: null,
+      hourly_starts: { agents: [], evaluators: [] },
       phases: emptyPhases(),
     };
     writeLoopBudget(file, created);
@@ -121,9 +150,19 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
     || counters.some((entry) => entry === undefined || entry < 0)) {
     throw new Error("loop budget file does not match the expected schema; refusing to continue on corrupted state");
   }
-  compareLimits(value, limits);
+  const limitsChanged = compareLimits(value, limits, options.allowIncrease === true);
   const wallMs = value.wall_ms === undefined ? 0 : value.wall_ms;
   if (!isCount(wallMs)) throw new Error("loop budget wall-time counter does not match the expected schema; refusing to continue on corrupted state");
+  const lastCampaignStartedAt = value.last_campaign_started_at === undefined ? null : value.last_campaign_started_at;
+  if (lastCampaignStartedAt !== null && (typeof lastCampaignStartedAt !== "string" || !Number.isFinite(Date.parse(lastCampaignStartedAt)))) {
+    throw new Error("loop budget campaign pacing timestamp is invalid; refusing to continue on corrupted state");
+  }
+  const consecutiveNoWinCampaigns = value.consecutive_no_win_campaigns === undefined ? 0 : value.consecutive_no_win_campaigns;
+  if (!isCount(consecutiveNoWinCampaigns)) throw new Error("loop budget plateau counter is invalid; refusing to continue on corrupted state");
+  const lastPlateauCampaignId = value.last_plateau_campaign_id === undefined ? null : value.last_plateau_campaign_id;
+  if (lastPlateauCampaignId !== null && (typeof lastPlateauCampaignId !== "string" || !lastPlateauCampaignId || lastPlateauCampaignId.length > 200)) {
+    throw new Error("loop budget plateau campaign identity is invalid; refusing to continue on corrupted state");
+  }
 
   const openCampaign = value.open_campaign ?? null;
   if (openCampaign !== null) {
@@ -140,18 +179,58 @@ export function readOrCreateLoopBudget(file: string, limits: LoopBudgetLimits): 
   }
 
   const phases = normalizePhases(value.phases);
-  return {
+  const hourlyStarts = normalizeHourlyStarts(value.hourly_starts);
+  const budget: LoopBudgetFile = {
     version: 1,
-    max_campaigns: value.max_campaigns as number,
-    max_agent_starts: value.max_agent_starts as number,
-    max_evaluator_runs: value.max_evaluator_runs as number,
+    max_campaigns: limitsChanged ? limits.maxCampaigns : value.max_campaigns as number,
+    max_agent_starts: limitsChanged ? limits.maxAgentStarts : value.max_agent_starts as number,
+    max_evaluator_runs: limitsChanged ? limits.maxEvaluatorRuns : value.max_evaluator_runs as number,
     campaigns: value.campaigns as number,
     agent_starts: value.agent_starts as number,
     evaluator_runs: value.evaluator_runs as number,
     open_campaign: openCampaign,
     wall_ms: wallMs,
+    last_campaign_started_at: lastCampaignStartedAt,
+    consecutive_no_win_campaigns: consecutiveNoWinCampaigns,
+    last_plateau_campaign_id: lastPlateauCampaignId,
+    hourly_starts: hourlyStarts,
     phases,
   };
+  if (limitsChanged) writeLoopBudget(file, budget);
+  return budget;
+}
+
+function normalizeHourlyStarts(raw: unknown): { agents: number[]; evaluators: number[] } {
+  if (raw === undefined) return { agents: [], evaluators: [] };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) throw new Error("loop budget hourly process history is invalid; refusing to continue on corrupted state");
+  const value = raw as { agents?: unknown; evaluators?: unknown };
+  if (Object.keys(value).length !== 2 || !Object.hasOwn(value, "agents") || !Object.hasOwn(value, "evaluators")) {
+    throw new Error("loop budget hourly process history is invalid; refusing to continue on corrupted state");
+  }
+  const normalize = (entries: unknown): number[] => {
+    if (!Array.isArray(entries) || entries.length > 10_000 || entries.some((at) => typeof at !== "number" || !Number.isSafeInteger(at) || at < 0)) {
+      throw new Error("loop budget hourly process history is invalid; refusing to continue on corrupted state");
+    }
+    return [...entries];
+  };
+  return { agents: normalize(value.agents), evaluators: normalize(value.evaluators) };
+}
+
+export function reserveHourlyProcessStart(
+  budget: LoopBudgetFile,
+  kind: CampaignProcessKind,
+  limit: number,
+  nowMs: number,
+): { budget: LoopBudgetFile; waitMs: number } {
+  if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isSafeInteger(nowMs) || nowMs < 0) throw new Error("hourly process limit and timestamp must be positive safe integers");
+  const hourly = budget.hourly_starts ?? { agents: [], evaluators: [] };
+  const key = kind === "agent" ? "agents" : "evaluators";
+  const recent = hourly[key].filter((at) => at > nowMs - 3_600_000).sort((a, b) => a - b);
+  if (recent.length >= limit) {
+    return { budget: { ...budget, hourly_starts: { ...hourly, [key]: recent } }, waitMs: Math.max(1, recent[0]! + 3_600_000 - nowMs) };
+  }
+  recent.push(nowMs);
+  return { budget: { ...budget, hourly_starts: { ...hourly, [key]: recent } }, waitMs: 0 };
 }
 
 function normalizePhases(raw: unknown): Partial<Record<LoopPhase, LoopPhaseSpend>> {

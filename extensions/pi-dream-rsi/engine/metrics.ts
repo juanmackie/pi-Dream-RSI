@@ -121,7 +121,7 @@ export interface QualificationOptions {
   /** Seam for tests and diagnostics: replace the scratch remover to observe cleanup failures. */
   removeScratch?: typeof fs.rmSync;
   /** Durable accounting, called immediately before each qualification process starts. */
-  beforeEvaluatorRun?: () => void;
+  beforeEvaluatorRun?: () => void | Promise<void>;
   /** Remaining evaluator allowance after discovery and earlier loop work. */
   availableEvaluatorRuns?: number;
   /** Run qualification evaluators and gates in disposable OS-contained copies. */
@@ -711,7 +711,7 @@ async function runInstrument(options: {
   scorePath: string;
   timeoutMs: number;
   contract: RunContract;
-  before?: () => void;
+  before?: () => void | Promise<void>;
   signal?: AbortSignal;
   deadlineAt?: number;
   /** Project-relative files replaced with an inert version before measuring. */
@@ -737,7 +737,7 @@ async function runInstrument(options: {
     }
     fs.rmSync(path.join(scratch, ...options.scorePath.split("/")), { force: true });
     const evaluatorPath = options.evaluatorFile;
-    options.before?.();
+    await options.before?.();
     const result = await runShellCommand(`node "${evaluatorPath.replace(/"/g, '""')}"`, {
       cwd: scratch,
       timeoutMs: options.deadlineAt === undefined ? options.timeoutMs : Math.max(1, Math.min(options.timeoutMs, options.deadlineAt - Date.now())),
@@ -792,7 +792,7 @@ async function runGateOnCopy(options: {
   workRoot: string;
   timeoutMs: number;
   contract: RunContract;
-  before?: () => void;
+  before?: () => void | Promise<void>;
   signal?: AbortSignal;
   deadlineAt?: number;
   inert?: string[];
@@ -817,7 +817,7 @@ async function runGateOnCopy(options: {
       const target = path.join(scratch, ...options.replacement.relative.split("/"));
       fs.writeFileSync(target, options.replacement.source, "utf8");
     }
-    options.before?.();
+    await options.before?.();
     const result = await runShellCommand(options.command, {
       cwd: scratch,
       timeoutMs: options.deadlineAt === undefined ? options.timeoutMs : Math.max(1, Math.min(options.timeoutMs, options.deadlineAt - Date.now())),
@@ -937,8 +937,8 @@ export async function qualifyInstrument(
     timeoutMs: plan.wrapperTimeoutMs,
     workloadTimeoutMs: plan.sampleTimeoutMs,
     contract: options.contract,
-    before: () => {
-      options.beforeEvaluatorRun?.();
+    before: async () => {
+      await options.beforeEvaluatorRun?.();
       evaluatorRunsStarted += 1;
     },
     role: "workload",

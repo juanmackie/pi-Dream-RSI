@@ -14,7 +14,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import {
-  ContractNotApprovedError, approveRunContract, contractFile, isProtectedAsset, normalizeRunContract,
+  ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, isProtectedAsset, normalizeRunContract,
   projectFingerprint, readStoredContract, restrictedEnvironment, validateRunContract,
 } from "../extensions/pi-dream-rsi/engine/intake.ts";
 import { pathWithin } from "../extensions/pi-dream-rsi/engine/scope.ts";
@@ -22,6 +22,7 @@ import {
   readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
 } from "../extensions/pi-dream-rsi/engine/budget.ts";
 import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
+import { resolveLoopProposal } from "../extensions/pi-dream-rsi/engine/proposal.ts";
 
 function validContract(overrides = {}) {
   return {
@@ -73,6 +74,8 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
     [{ scope: { protectedAssets: ["/etc/passwd"] } }, /scope\.protectedAssets/],
     [{ budgets: { maxCampaigns: 0 } }, /maxCampaigns must be a positive integer/],
     [{ budgets: { falseAcceptBudget: 0.9 } }, /falseAcceptBudget/],
+    [{ git: { autoCommit: true, branch: "main" } }, /cannot target a default branch/],
+    [{ git: { autoCommit: true, branch: "bad branch" } }, /valid local Git branch/],
   ];
   for (const [patch, expected] of cases) {
     const errors = validateRunContract(validContract(patch));
@@ -82,6 +85,54 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
   }
   assert.throws(() => normalizeRunContract(null), /must be an object/);
 });
+test("new Git-backed proposals default to verified auto-commit while legacy contracts keep their policy", () => {
+  const projectDir = tempProject();
+  try {
+    const withoutGit = resolveLoopProposal({}, projectDir);
+    assert.deepEqual(withoutGit.contract.git, { autoCommit: false, branch: "dream-rsi/improve" });
+    fs.mkdirSync(path.join(projectDir, ".git"));
+    const withGit = resolveLoopProposal({}, projectDir);
+    assert.deepEqual(withGit.contract.git, { autoCommit: true, branch: "dream-rsi/improve" });
+    const legacy = normalizeRunContract(validContract());
+    const resumed = resolveLoopProposal({}, projectDir, legacy);
+    assert.equal(resumed.contract.git, undefined, "legacy contracts remain working-tree-only without adding a new Git policy");
+    const disabled = resolveLoopProposal({ auto_commit: false }, projectDir);
+    assert.equal(disabled.contract.git?.autoCommit, false);
+    const continuous = resolveLoopProposal({ continuous: true }, projectDir);
+    assert.deepEqual(continuous.contract.continuation, { plateauCampaigns: 3, minimumCampaignIntervalMs: 60_000, agentStartsPerHour: 36, evaluatorRunsPerHour: 96 });
+    const customRates = resolveLoopProposal({ continuous: true, agent_starts_per_hour: 12, evaluator_runs_per_hour: 48 }, projectDir);
+    assert.equal(customRates.contract.continuation?.agentStartsPerHour, 12);
+    assert.equal(customRates.contract.continuation?.evaluatorRunsPerHour, 48);
+    assert.throws(() => resolveLoopProposal({ continuous: true, agent_starts_per_hour: 0 }, projectDir), /agent_starts_per_hour/);
+    assert.throws(() => resolveLoopProposal({ continuous: true, evaluator_runs_per_hour: 10001 }, projectDir), /evaluator_runs_per_hour/);
+    const resumedContinuous = resolveLoopProposal({}, projectDir, continuous.contract);
+    assert.deepEqual(resumedContinuous.contract.continuation, continuous.contract.continuation, "saved continuous policy is inherited on reuse");
+    const legacyContinuous = normalizeRunContract({ ...validContract(), continuation: { plateauCampaigns: 3, minimumCampaignIntervalMs: 60_000 } });
+    assert.deepEqual(legacyContinuous.continuation, { plateauCampaigns: 3, minimumCampaignIntervalMs: 60_000 }, "legacy continuous contracts retain their saved shape and use runtime rate defaults");
+    assert.equal(resolveLoopProposal({ continuous: false }, projectDir, continuous.contract).contract.continuation, undefined,
+      "disabling continuous mode is explicit");
+    assert.throws(() => resolveLoopProposal({ continuous: true, plateau_campaigns: 65 }, projectDir), /plateau_campaigns/);
+    fs.rmSync(path.join(projectDir, ".git"), { recursive: true, force: true });
+    assert.throws(() => resolveLoopProposal({ auto_commit: true }, projectDir), /existing Git working tree/);
+    fs.mkdirSync(path.join(projectDir, ".git"));
+    assert.throws(() => resolveLoopProposal({ auto_commit: true, focus: "measure quality", unit: "percent", higher_is_better: true,
+      scope_roots: ["src"], evaluator_bootstrap: { authorized: true, paths: ["src/measure.mjs"] } }, projectDir), /cannot be combined with evaluator bootstrap/);
+    const bootstrapped = resolveLoopProposal({ auto_commit: false, focus: "measure quality", unit: "percent", higher_is_better: true,
+      scope_roots: ["src"], evaluator_bootstrap: { authorized: true, paths: ["src/measure.mjs"] } }, projectDir);
+    assert.equal(bootstrapped.contract.git?.autoCommit, false);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("a saved contract can be proposed with a higher total campaign cap", () => {
+  const projectDir = tempProject();
+  try {
+    const prior = normalizeRunContract(validContract({ budgets: { maxCampaigns: 20, maxAgentStarts: 72, maxEvaluatorRuns: 20, deadlineMs: 120 * 60_000, falseAcceptBudget: 0.1 } }));
+    const proposal = resolveLoopProposal({ max_evaluator_runs: 34 }, projectDir, prior);
+    assert.equal(proposal.contract.budgets.maxEvaluatorRuns, 34);
+    assert.equal(proposal.contract.budgets.maxAgentStarts, prior.budgets.maxAgentStarts);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("normalized contracts drop unused execution mode and model provider fields", () => {
   const contract = normalizeRunContract(validContract({
     execution: { mode: "sandbox", consent: true, envAllowlist: [], allowedCommandCategories: ["test", "benchmark"] },
@@ -171,25 +222,29 @@ test("a stored contract round-trips and a corrupt file fails closed", () => {
   assert.equal(readStoredContract(path.join(projectDir, "absent")), null);
 });
 
-const BUDGET_LIMITS = { maxCampaigns: 3, maxAgentStarts: 30, maxEvaluatorRuns: 60, deadlineMs: 60_000 };
+const BUDGET_LIMITS = { maxCampaigns: 3, maxAgentStarts: 30, maxEvaluatorRuns: 20, deadlineMs: 60_000 };
 
-test("the durable budget charges each phase from the same allowance and refuses to loosen its limits", () => {
+test("an approved budget extension preserves spend and refuses a limit below recorded use", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-budget-"));
   const file = path.join(dir, "budget.json");
   let budget = readOrCreateLoopBudget(file, BUDGET_LIMITS);
-  assert.deepEqual(remainingAllowance(budget), { campaigns: 3, agentStarts: 30, evaluatorRuns: 60 });
+  assert.deepEqual(remainingAllowance(budget), { campaigns: 3, agentStarts: 30, evaluatorRuns: 20 });
 
   // A discovery probe is not billed as a campaign.
-  const probe = { phase: "discovery", agent_starts: 1, evaluator_runs: 2, campaigns: 0, at: new Date().toISOString() };
+  const probe = { phase: "discovery", agent_starts: 1, evaluator_runs: 9, campaigns: 0, at: new Date().toISOString() };
   budget = { ...budget, open_campaign: probe };
   writeLoopBudget(file, budget);
-  budget = settleReservation(readOrCreateLoopBudget(file, BUDGET_LIMITS), probe, { agentStarts: 1, evaluatorRuns: 2 });
+  budget = settleReservation(readOrCreateLoopBudget(file, BUDGET_LIMITS), probe, { agentStarts: 1, evaluatorRuns: 9 });
   writeLoopBudget(file, budget);
   assert.equal(budget.campaigns, 0, "a probe does not consume a campaign");
   assert.equal(budget.agent_starts, 1);
-  assert.deepEqual(budget.phases.discovery, { agent_starts: 1, evaluator_runs: 2, campaigns: 0 });
+  assert.deepEqual(budget.phases.discovery, { agent_starts: 1, evaluator_runs: 9, campaigns: 0 });
 
-  assert.throws(() => readOrCreateLoopBudget(file, { ...BUDGET_LIMITS, maxCampaigns: 9 }), /limits are immutable/);
+  const extended = readOrCreateLoopBudget(file, { ...BUDGET_LIMITS, maxCampaigns: 34, maxAgentStarts: 90, maxEvaluatorRuns: 34 }, { allowIncrease: true });
+  assert.deepEqual([extended.max_campaigns, extended.max_agent_starts, extended.max_evaluator_runs], [34, 90, 34]);
+  assert.deepEqual([extended.campaigns, extended.agent_starts, extended.evaluator_runs], [0, 1, 9]);
+  assert.throws(() => readOrCreateLoopBudget(file, { ...BUDGET_LIMITS, maxEvaluatorRuns: 1 }, { allowIncrease: true }), /may only be increased|below accumulated spend/);
+  assert.throws(() => readOrCreateLoopBudget(file, { ...BUDGET_LIMITS, maxCampaigns: 2 }, { allowIncrease: true }), /may only be increased/);
 });
 
 test("an interrupted campaign reconciliation charges observed starts instead of its full grant", () => {
@@ -283,8 +338,10 @@ test("a second, different objective is refused rather than silently replacing th
     now: () => new Date("2026-10-20T00:00:00.000Z"),
   });
 
-  assert.equal(result.stopReason, "not-approved");
-  assert.match(result.memory.notes.at(-1), /a different run contract is already stored/);
+  assert.equal(result.stopCode, "blocked");
+  assert.equal(result.contract, null, "a refused contract is never reported as recorded");
+  assert.match(result.stopReason, /a different run contract is already stored/i);
+  assert.match(result.memory.notes.at(-1), /a different run contract is already stored/i);
   const stored = readStoredContract(loopRoot);
   assert.equal(stored.contract.outcome.statement, "reduce the wall-clock duration of the declared benchmark command", "the approved objective is not overwritten");
 });
@@ -303,7 +360,7 @@ test("an interrupted discovery phase is reconciled as discovery spend, not as a 
 
   const result = await runLoop({
     projectDir,
-    contract: normalizeRunContract(validContract()),
+    contract: normalizeRunContract(validContract({ budgets: { maxCampaigns: limits.maxCampaigns, maxAgentStarts: limits.maxAgentStarts, maxEvaluatorRuns: limits.maxEvaluatorRuns } })),
     limits,
     now: () => new Date("2026-10-20T00:00:00.000Z"),
   });
@@ -338,8 +395,8 @@ test("resuming under a contract keeps the durable budget and does not renew it",
   );
   assert.throws(
     () => readOrCreateLoopBudget(budgetPath, { ...limits, maxAgentStarts: 8 }),
-    /limits are immutable/,
-    "a resumed run cannot widen its own cap",
+    /immutable without an approved saved contract/,
+    "a resumed run cannot widen its own cap without a replacement approval",
   );
 });
 
@@ -448,6 +505,41 @@ test("a contract's budgets cap the durable spend even when the caller asks for m
   assert.equal(budget.max_evaluator_runs, 3, "the contract's evaluator ceiling wins");
 });
 
+test("a replacement cannot lower a durable cap through per-run limits", async () => {
+  const projectDir = tempProject({ "src/a.js": "export const a = 1;\n", "package.json": "{}\n" });
+  const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
+  fs.mkdirSync(loopRoot, { recursive: true });
+  const oldContract = approveRunContract(projectDir, normalizeRunContract(validContract({ budgets: { maxCampaigns: 2, maxAgentStarts: 10, maxEvaluatorRuns: 20 } })));
+  fs.writeFileSync(contractFile(loopRoot), `${JSON.stringify({ version: 1, ...oldContract })}\n`);
+  const budgetPath = path.join(loopRoot, "budget.json");
+  const initial = readOrCreateLoopBudget(budgetPath, oldContract.contract.budgets);
+  fs.writeFileSync(budgetPath, JSON.stringify({ ...initial, campaigns: 1, agent_starts: 2, evaluator_runs: 9 }));
+  const raised = normalizeRunContract(validContract({ budgets: { maxCampaigns: 2, maxAgentStarts: 10, maxEvaluatorRuns: 34 } }));
+  const result = await runLoop({
+    projectDir, contract: raised,
+    replaceContract: approvalIdentity(oldContract.contract),
+    limits: { maxCampaigns: 2, maxAgentStarts: 10, maxEvaluatorRuns: 15, deadlineMs: 30_000 },
+    now: () => new Date("2026-10-20T00:00:00.000Z"),
+  });
+  const budget = JSON.parse(fs.readFileSync(budgetPath, "utf8"));
+  assert.ok(result.contract, result.stopReason);
+  assert.equal(readStoredContract(loopRoot).contract.budgets.maxEvaluatorRuns, 34);
+  assert.deepEqual([budget.evaluator_runs, budget.max_evaluator_runs], [9, 20]);
+});
+
+test("request limits and the approved contract jointly bound new durable totals", async () => {
+  const projectDir = tempProject({ "src/a.js": "export const a = 1;\n", "package.json": "{}\n" });
+  const contract = normalizeRunContract(validContract({ budgets: { maxCampaigns: 4, maxAgentStarts: 20, maxEvaluatorRuns: 34 } }));
+  const result = await runLoop({
+    projectDir,
+    contract,
+    limits: { maxCampaigns: 2, maxAgentStarts: 10, maxEvaluatorRuns: 15, deadlineMs: 60_000 },
+    now: () => new Date("2026-10-20T00:00:00.000Z"),
+  });
+  const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
+  assert.deepEqual([budget.max_campaigns, budget.max_agent_starts, budget.max_evaluator_runs], [2, 10, 15]);
+});
+
 test("a contract run refuses a second objective even when the wording of the first is reused", async () => {
   const projectDir = tempProject({ "src/a.js": "export const a = 1;\n", "package.json": "{}\n" });
   const loopRoot = path.join(projectDir, ".dream-rsi", "loop");
@@ -463,6 +555,6 @@ test("a contract run refuses a second objective even when the wording of the fir
     limits: { maxCampaigns: 1, maxAgentStarts: 4, maxEvaluatorRuns: 8, deadlineMs: 30_000 },
     now: () => new Date("2026-10-20T00:00:00.000Z"),
   });
-  assert.equal(result.stopReason, "not-approved", "a widened scope is a different contract");
+  assert.equal(result.stopCode, "blocked", "a widened scope is a different contract, not missing consent");
   assert.equal(readStoredContract(loopRoot).contract.scope.roots[0], "src", "the approved scope is not overwritten");
 });

@@ -3,11 +3,76 @@ import { test } from "node:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { execFileSync } from "node:child_process";
 
 import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { normalizeRunContract } from "../extensions/pi-dream-rsi/engine/intake.ts";
+import { recoveryForLoop } from "../extensions/pi-dream-rsi/engine/recovery.ts";
 
 const limits = { maxCampaigns: 6, maxAgentStarts: 72, maxEvaluatorRuns: 200, deadlineMs: 120_000 };
+
+function git(args, cwd) { return execFileSync("git", args, { cwd, encoding: "utf8", windowsHide: true }); }
+function gitContract() {
+  return normalizeRunContract({
+    version: 1,
+    outcome: { statement: "Optimize the fixture workload", unit: "ms", higherIsBetter: false, minimumUsefulGain: "5%", proxyJustification: "The pinned workload measures the approved outcome." },
+    preserved: { gates: [] }, scope: { roots: ["src"], protectedAssets: [] },
+    execution: { consent: true, envAllowlist: [], allowedCommandCategories: ["benchmark"] },
+    budgets: { maxCampaigns: 2, maxAgentStarts: 8, maxEvaluatorRuns: 20, deadlineMs: 120_000, falseAcceptBudget: 0.1 },
+    git: { autoCommit: true, branch: "dream-rsi/improve" },
+  });
+}
+function initializeGitProject(projectDir) {
+  fs.mkdirSync(path.join(projectDir, "src"), { recursive: true });
+  fs.writeFileSync(path.join(projectDir, "package.json"), JSON.stringify({ name: "fixture", scripts: {} }));
+  fs.writeFileSync(path.join(projectDir, "src/work.mjs"), "export const value = 'main';\n");
+  git(["init", "--initial-branch=main"], projectDir);
+  git(["config", "user.name", "Dream RSI Test"], projectDir);
+  git(["config", "user.email", "dream-rsi-test@example.invalid"], projectDir);
+  git(["add", "-A"], projectDir);
+  git(["commit", "-m", "baseline"], projectDir);
+}
+
+test("auto-commit branch switching cannot change the source approved by the operator", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-approved-source-"));
+  const projectDir = path.join(root, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  initializeGitProject(projectDir);
+  git(["switch", "-c", "dream-rsi/improve"], projectDir);
+  fs.writeFileSync(path.join(projectDir, "src/unreviewed.mjs"), "export const value = 'unreviewed-branch';\n");
+  git(["add", "src/unreviewed.mjs"], projectDir);
+  git(["commit", "-m", "different branch source"], projectDir);
+  git(["switch", "main"], projectDir);
+  let reconCalls = 0;
+  try {
+    const result = await runLoop({
+      projectDir, contract: gitContract(), limits, includeLogs: false,
+      collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
+      reconProjectImpl: async () => { reconCalls += 1; return { commands: [], probes: [], graph: [], graphs: {}, files: [], notes: [], blockers: [] }; },
+    });
+    assert.equal(result.stopCode, "blocked");
+    assert.match(result.stopReason, /source changed when selecting the auto-commit branch/i);
+    assert.equal(reconCalls, 0, "no repository command or discovery may run after switching to unreviewed source");
+    assert.equal(fs.existsSync(path.join(projectDir, ".dream-rsi", "loop", "contract.json")), false, "the changed source must not receive a saved approval");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("Git preflight blockers mentioning credentials still give commit recovery guidance", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-index-blocked-"));
+  const projectDir = path.join(root, "project");
+  fs.mkdirSync(projectDir, { recursive: true });
+  initializeGitProject(projectDir);
+  fs.writeFileSync(path.join(projectDir, "credentials.txt"), "operator change\n");
+  try {
+    const result = await runLoop({
+      projectDir, contract: gitContract(), limits, includeLogs: false,
+      collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
+    });
+    assert.equal(result.stopCode, "blocked");
+    assert.ok(result.preflight.checks.some((check) => check.name === "git" && /clean working tree.*credentials\.txt/i.test(check.reason)));
+    assert.equal(recoveryForLoop(result).category, "commit");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 test("a metric without an evaluator is blocked instead of substituting a proxy", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-no-evaluator-"));
@@ -56,7 +121,7 @@ test("a declared failure-count metric uses a discovered failing suite without a 
       projectDir, contract, limits: { ...limits, maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20 }, includeLogs: false,
       collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
       reconProjectImpl: async (options) => {
-        options.beforeProbe?.(command);
+        await options.beforeProbe?.(command);
         return { commands: [command], probes: [{ label: command.label, ok: false, durationMs: 12, timedOut: false, error: "one assertion failed", exitCode: 1, spawnFailed: false }], graph: ["src/work.mjs"], graphs: { [command.label]: ["src/work.mjs"] }, files: [], notes: [], blockers: [] };
       },
       taskProvider: ({ lever }) => {
@@ -99,7 +164,7 @@ test("an explicitly authorized bootstrap creates an in-scope workload before cam
       evaluatorBootstrap: {
         authorized: true, paths: ["package.json", "bench.mjs"],
         run: async (context) => {
-          context.beforeAgentSpawn();
+          await context.beforeAgentSpawn();
           bootstrapCalls += 1;
           assert.ok(context.deadlineMs > 0 && context.deadlineMs <= 120_000);
           fs.writeFileSync(path.join(projectDir, "bench.mjs"), "console.log('pinned workload');\n");
@@ -111,7 +176,7 @@ test("an explicitly authorized bootstrap creates an in-scope workload before cam
         reconCount += 1;
         if (reconCount === 1) return { commands: [], probes: [], graph: [], graphs: {}, files: [], notes: [], blockers: ["no benchmark or custom workload is declared, so no duration or throughput can be measured"] };
         const command = { label: "npm run bench", argv: [process.execPath, path.join(projectDir, "bench.mjs")], declaredArgv: ["npm", "run", "bench"], category: "benchmark", source: "package.json#scripts.bench", shim: false, entry: "bench.mjs" };
-        options.beforeProbe?.(command);
+        await options.beforeProbe?.(command);
         return { commands: [command], probes: [{ label: command.label, ok: true, durationMs: 1, timedOut: false, error: null, exitCode: 0 }], graph: ["bench.mjs"], graphs: { [command.label]: ["bench.mjs"] }, files: [{ path: "bench.mjs", bytes: 20, lines: 1 }], notes: [], blockers: [] };
       },
       taskProvider: ({ lever }) => ({ task: { name: "bootstrap-test", workspace: ".", eval_program: lever.scopeFiles[0] ?? ".", score_program: "node -e 0", score_path: "eval/score.json", higher_is_better: false, evaluator_timeout_ms: 5000, copy_exclude: [] }, verifierInputs: [], gates: [] }),
@@ -133,7 +198,7 @@ test("an explicitly authorized bootstrap creates an in-scope workload before cam
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("bootstrap reports every out-of-scope path and does not run the setup agent", async () => {
+test("bootstrap reports out-of-scope writes without demanding edit access to read-only gates", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-bootstrap-scope-"));
   const projectDir = path.join(root, "project");
   fs.mkdirSync(path.join(projectDir, "src"), { recursive: true });
@@ -151,17 +216,14 @@ test("bootstrap reports every out-of-scope path and does not run the setup agent
     const result = await runLoop({
       projectDir, contract, limits: { ...limits, maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20 }, includeLogs: false,
       collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
-      evaluatorBootstrap: { authorized: true, paths: ["package.json", "scripts/canvas-bench.mjs"], run: async () => { bootstrapCalls += 1; return { validatedPaths: [] }; } },
+      evaluatorBootstrap: { authorized: true, paths: ["package.json", "scripts/canvas-bench.mjs", "tests/gate.mjs"], run: async () => { bootstrapCalls += 1; return { validatedPaths: [] }; } },
       reconProjectImpl: async () => { reconCalls += 1; return { commands: [], probes: [], graph: [], graphs: {}, files: [], notes: [], blockers: ["no benchmark or custom workload is declared, so no duration or throughput can be measured"] }; },
     });
     assert.equal(result.stopCode, "blocked");
     assert.match(result.stopReason, /package\.json/);
     assert.match(result.stopReason, /scripts\/canvas-bench\.mjs/);
-    assert.match(result.stopReason, /tests\/test_mvp_wiring\.py/);
-    assert.match(result.stopReason, /tests\/gate\.mjs/);
-    assert.match(result.stopReason, /tests\/other-gate\.mjs/);
-    assert.match(result.stopReason, /tests\/outside\.mjs/);
-    assert.match(result.stopReason, /tests\/redirection\.mjs/);
+    assert.match(result.stopReason, /tests\/gate\.mjs/, "a gate becomes a write requirement only when setup explicitly plans to edit it");
+    assert.doesNotMatch(result.stopReason, /tests\/test_mvp_wiring\.py|tests\/other-gate\.mjs|tests\/outside\.mjs|tests\/redirection\.mjs/, "read/run requirements must not be treated as planned writes");
     assert.match(result.stopReason, /Next step:/);
     assert.equal(bootstrapCalls, 0);
     assert.equal(reconCalls, 0, "scope incompatibility is found before discovery or saved contract approval");
@@ -204,7 +266,7 @@ test("bootstrap traversal paths are rejected before approval or discovery", asyn
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("gate option assignments are parsed as in-scope file paths", async () => {
+test("read-only gates and evaluator references outside patch scope do not require edit permission", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-gate-option-paths-"));
   const projectDir = path.join(root, "project");
   fs.mkdirSync(path.join(projectDir, "src"), { recursive: true });
@@ -212,21 +274,25 @@ test("gate option assignments are parsed as in-scope file paths", async () => {
   const contract = normalizeRunContract({
     version: 1,
     outcome: { statement: "Measure canvas render time", unit: "ms", higherIsBetter: false, minimumUsefulGain: "5%", proxyJustification: "Render time is the selected metric." },
-    preserved: { gates: ["node --require=./src/setup.js ./src/check.js"] }, scope: { roots: ["src"], protectedAssets: [] },
+    preserved: { gates: ["python -m unittest tests.test_mvp_wiring", "node --require=./tests/setup.js ./tests/check.js"] }, scope: { roots: ["src"], protectedAssets: ["tests", "scripts"] },
     execution: { consent: true, envAllowlist: [], allowedCommandCategories: ["test", "benchmark"] },
     budgets: { maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20, deadlineMs: 120_000, falseAcceptBudget: 0.1 },
   });
   let reconCalls = 0;
   try {
     const result = await runLoop({
-      projectDir, contract, limits: { ...limits, maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20 }, includeLogs: false,
+      projectDir, contract, focus: "Measure src/render.mjs with scripts/measure.mjs and tests/test_mvp_wiring.py", limits: { ...limits, maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20 }, includeLogs: false,
       collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
       reconProjectImpl: async () => { reconCalls += 1; return { commands: [], probes: [], graph: [], graphs: {}, files: [], notes: [], blockers: ["no benchmark or custom workload is declared"] }; },
     });
-    assert.equal(result.stopCode, "blocked", "the missing workload blocks after static scope validation");
-    assert.ok(result.preflight.checks.some((check) => check.name === "scope" && check.status === "passed"));
-    assert.equal(reconCalls, 1, "in-scope gate paths do not block contract approval");
-    assert.ok(result.contract, "the in-scope paths permit contract approval");
+    assert.ok(result.contract, result.stopReason);
+    assert.ok(result.preflight.checks.some((check) => check.name === "scope" && check.status === "passed"), JSON.stringify(result.preflight));
+    assert.equal(reconCalls, 1, "read-only requirements do not block discovery");
+    assert.equal(result.stopCode, "blocked", "the genuinely missing workload still blocks after scope validation");
+    assert.ok(result.preflight.checks.some((check) => check.name === "workload" && check.status === "blocked"));
+    const saved = JSON.parse(fs.readFileSync(path.join(projectDir, ".dream-rsi/loop/contract.json"), "utf8")).contract;
+    assert.deepEqual(saved.scope, contract.scope, "no write permission is added for verification files");
+    assert.deepEqual(saved.preserved.gates, contract.preserved.gates, "all mandatory gates remain intact");
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -248,7 +314,7 @@ test("bootstrap stops at the run deadline without a second discovery pass", asyn
       projectDir, contract, limits: { ...limits, maxCampaigns: 2, maxAgentStarts: 5, maxEvaluatorRuns: 20, deadlineMs: 1_000 }, includeLogs: false,
       collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
       evaluatorBootstrap: { authorized: true, paths: ["package.json", "bench.mjs"], run: async (context) => {
-        context.beforeAgentSpawn();
+        await context.beforeAgentSpawn();
         assert.ok(context.deadlineMs > 0 && context.deadlineMs <= 1_000);
         await new Promise((resolve) => setTimeout(resolve, 1_050));
         return { validatedPaths: ["package.json", "bench.mjs"] };
@@ -312,7 +378,7 @@ test("disabled bootstrap paths do not extend the approved editable scope", async
       evaluatorBootstrap: { authorized: false, paths: ["bench.mjs"], run: async () => { throw new Error("disabled bootstrap must not run"); } },
       reconProjectImpl: async (options) => {
         const command = { label: "npm test", argv: [process.execPath, "-e", "0"], declaredArgv: ["npm", "test"], category: "test", source: "package.json#scripts.test", shim: false, entry: null };
-        options.beforeProbe?.(command);
+        await options.beforeProbe?.(command);
         return { commands: [command], probes: [{ label: command.label, ok: true, durationMs: 1, timedOut: false, error: null, exitCode: 0 }], graph: [], graphs: {}, files: [], notes: [], blockers: ["no benchmark or custom workload is declared, so no duration or throughput can be measured"] };
       },
     });
@@ -348,7 +414,7 @@ test("missing pinned workload is an actionable preflight blocker and all evaluat
       limits, now: () => new Date(), includeLogs: false,
       collectSignalsImpl: async () => ({ weaknesses: [], diagnostics: [] }),
       reconProjectImpl: async (options) => {
-        options.beforeProbe?.({ label: "npm test", argv: ["node", "-e", "0"], declaredArgv: ["node", "-e", "0"], category: "test", source: "package.json#scripts.test", shim: false, entry: null });
+        await options.beforeProbe?.({ label: "npm test", argv: ["node", "-e", "0"], declaredArgv: ["node", "-e", "0"], category: "test", source: "package.json#scripts.test", shim: false, entry: null });
         probeStarts += 1;
         return {
           commands: [{ label: "npm test", argv: ["node", "-e", "0"], declaredArgv: ["node", "-e", "0"], category: "test", source: "package.json#scripts.test", shim: false, entry: null }],
@@ -360,6 +426,8 @@ test("missing pinned workload is an actionable preflight blocker and all evaluat
       runCampaignImpl: async () => { campaigns += 1; throw new Error("campaign must not start"); },
     });
     const report = JSON.parse(fs.readFileSync(result.reportPath, "utf8"));
+    const lastRunPath = path.join(path.dirname(result.reportPath), "last-run.md");
+    const lastRun = fs.readFileSync(lastRunPath, "utf8");
     const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
     assert.equal(result.stopCode, "blocked");
     assert.match(result.stopReason, /no benchmark or custom workload is declared/);
@@ -378,6 +446,11 @@ test("missing pinned workload is an actionable preflight blocker and all evaluat
     assert.equal(report.campaignEvaluatorRuns, 0);
     assert.equal(report.evaluatorRunsByPhase.discovery, 1);
     assert.equal(report.campaigns, budget.campaigns);
+    assert.match(lastRun, /# Dream-RSI last run/);
+    assert.match(lastRun, /Stop: `blocked`/);
+    assert.match(lastRun, /no benchmark or custom workload is declared/);
+    assert.match(lastRun, /## Next action/);
+    assert.match(lastRun, /1 evaluator run\(s\)/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

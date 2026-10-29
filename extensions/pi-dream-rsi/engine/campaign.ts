@@ -7,7 +7,7 @@ import { runAgent, type CommandResult, type EffectiveAgent } from "../agent/runn
 import { EXTENSION_DIR, PACKAGE_DIR } from "../layout.ts";
 import { defaultSearchConfig, experimentSeed, experimentWorkspace, experimentWorldPath, runExperiment, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
 import { CampaignBudget, CampaignLimitError } from "./budget.ts";
-import { buildCandidatePatch, patchConflicts, verifyCandidatePatch, applyCandidatePatch, reconcileCandidatePatch, runCampaignGate, workspaceDigest, WorkspaceDriftDuringApplyError, type CandidatePatch } from "./campaign-patch.ts";
+import { buildCandidatePatch, candidatePatchFingerprint, patchConflicts, verifyCandidatePatch, applyCandidatePatch, reconcileCandidatePatch, runCampaignGate, workspaceDigest, WorkspaceDriftDuringApplyError, type CandidatePatch } from "./campaign-patch.ts";
 import { scoreSeedCopy } from "./score.ts";
 import { absoluteGain } from "./intake.ts";
 import { normalizeTask, scoringFingerprint, type AgentConfig, type TaskConfig } from "./task.ts";
@@ -216,7 +216,7 @@ export interface CampaignRecord {
   noGainCycles: number;
   state: CampaignState;
   pendingConfirmation?: { iteration: number; candidate: Candidate; patch: CandidatePatch[]; patchHash: string; evidenceDir: string; confirmationIdentity: string; targetDigest: string; pairs: number; maxPairs: number };
-  pendingApply?: { iteration: number; candidate: Candidate; patch: CandidatePatch[]; before: number; after: number; transactionId: string };
+  pendingApply?: { iteration: number; candidate: Candidate; patch: CandidatePatch[]; before: number; after: number; transactionId: string; patchHash?: string };
   /** The agent command/model actually used by this campaign's latest child process. */
   effectiveAgent?: EffectiveAgent;
 }
@@ -271,6 +271,8 @@ export interface CampaignOptions {
   baseRoot: string;
   projectDir: string;
   task: TaskConfig;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
   searchConfig?: SearchConfig;
   goal: string;
   scope?: string[];
@@ -292,8 +294,10 @@ export interface CampaignOptions {
   maxEvaluatorRuns?: number;
   signal?: AbortSignal;
   resolveAgent?: CampaignAgentResolver;
-  /** Additional synchronous shared-budget reservation after the campaign reservation, immediately before spawn. */
-  beforeAgentSpawn?: (key: string) => void;
+  /** Additional shared-budget reservation after the campaign reservation, immediately before spawn. */
+  beforeAgentSpawn?: (key: string) => void | Promise<void>;
+  /** Rolling hourly rate reservation for each actual agent or evaluator process start. */
+  beforeProcessRateLimit?: (kind: "agent" | "evaluator", key: string, signal: AbortSignal) => Promise<void>;
   onProgress?: (message: string) => void;
   /** Inner live/dream progress from the isolated engine root, including its cycle and worker attempts. */
   onPhaseProgress?: ProgressObserver;
@@ -354,6 +358,8 @@ export interface CampaignCheckOptions {
   baseRoot: string;
   projectDir: string;
   task: TaskConfig;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
   verifierInputs?: string[];
   gates?: string[];
   /** Preserve failed baseline gates as required candidate gates instead of rejecting preflight. */
@@ -371,7 +377,7 @@ export interface CampaignCheckOptions {
   minimumGain?: number | string;
   maxCycles?: number;
   deadlineMs?: number;
-  beforeEvaluatorSpawn?: (key: string) => void;
+  beforeEvaluatorSpawn?: (key: string) => void | Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -383,6 +389,8 @@ export interface CampaignSeedReadings {
 
 export interface CampaignResumeOptions {
   baseRoot: string;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
   confirmationOnly?: boolean;
   extendLimits?: { agentStarts: number; evaluatorRuns: number; deadlineMs: number };
   projectDir: string;
@@ -390,8 +398,10 @@ export interface CampaignResumeOptions {
   sessionId?: string;
   signal?: AbortSignal;
   resolveAgent?: CampaignAgentResolver;
-  /** Additional synchronous shared-budget reservation after the campaign reservation, immediately before spawn. */
-  beforeAgentSpawn?: (key: string) => void;
+  /** Additional shared-budget reservation after the campaign reservation, immediately before spawn. */
+  beforeAgentSpawn?: (key: string) => void | Promise<void>;
+  /** Rolling hourly rate reservation for each actual agent or evaluator process start. */
+  beforeProcessRateLimit?: (kind: "agent" | "evaluator", key: string, signal: AbortSignal) => Promise<void>;
   onProgress?: (message: string) => void;
   onPhaseProgress?: ProgressObserver;
   onUpdate?: (status: CampaignStatus) => void;
@@ -928,6 +938,7 @@ export async function checkCampaignEvaluator(options: CampaignCheckOptions): Pro
         scratch: path.join(scratchParent, `dream-rsi-check-${crypto.randomUUID()}`),
         logPath,
         evaluatorKey: `check:${index}`,
+        ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
         signal: options.signal,
         onCommand: (result) => { commandCapture.value = result; },
         beforeEvaluatorSpawn: options.beforeEvaluatorSpawn,
@@ -1266,7 +1277,7 @@ function assertPatchBytesUnchanged(patch: CandidatePatch[]): void {
   }
 }
 
-async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver): Promise<{ applied: boolean; pending: boolean }> {
+async function promoteCandidates(record: CampaignRecord, iteration: number, reserve: (kind: "agent" | "evaluator", key: string) => void, signal: AbortSignal, log: (message: string) => void, resolveAgent?: CampaignAgentResolver, evaluatorEnv?: Record<string, string>, evaluatorEnvKeys?: string[]): Promise<{ applied: boolean; pending: boolean }> {
   const noisy = scoresAreNoisy(record);
   const maxCandidates = Math.min(2, record.limits.maxCandidatesPerCycle);
   const candidates = record.pendingConfirmation?.iteration === iteration
@@ -1309,7 +1320,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
       rejectCandidate(record, iteration, candidate.cell, "patch", ["candidate patch was empty or included a protected verifier path"]);
       continue;
     }
-    const patchHash = digest(Buffer.from(JSON.stringify(patch.map((file) => [file.relative, file.kind, file.kind === "write" ? file.afterHash : null]))));
+    const patchHash = candidatePatchFingerprint(patch);
     if (record.decidedPatches?.includes(patchHash)) {
       appendCampaignLedger(record, { kind: "skip", campaignId: record.id, stage: "skip", outcome: "duplicate", patchHash, facts: { iteration, cell: candidate.cell } });
       continue;
@@ -1347,6 +1358,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
     const verification = await verifyCandidatePatch({
       dreamRoot: record.campaignRoot, projectDir: record.projectDir, task: record.task, patch, evidenceDir, signal,
       beforeSpawn: (key) => reserve("evaluator", `${iteration}:${candidate.cell}:${key}`),
+      ...(evaluatorEnv ? { evaluatorEnv, evaluatorEnvKeys } : {}),
       repeats: noisy ? 3 : 1,
       minimumGain: record.minimumGain,
       requireValidBeforeAfter: true,
@@ -1441,7 +1453,7 @@ async function promoteCandidates(record: CampaignRecord, iteration: number, rese
       continue;
     }
     const transactionId = `r${String(iteration).padStart(4, "0")}-${candidate.cell}-${crypto.randomUUID()}`;
-    record.pendingApply = { iteration, candidate, patch, before: verification.before.score, after: verification.after.score, transactionId };
+    record.pendingApply = { iteration, candidate, patch, before: verification.before.score, after: verification.after.score, transactionId, patchHash };
     persist(record);
     assertNotAborted(signal);
     let receipt: ReturnType<typeof applyCandidatePatch>;
@@ -1484,7 +1496,7 @@ async function reconcilePending(record: CampaignRecord): Promise<void> {
   if (receipt.state === "applied") {
     saveApplied(record, pending, { written: receipt.written, backupDir: receipt.backupDir! });
     if (!verifiedLedgerEntries(ledgerFile(record)).some((entry) => entry.kind === "apply" && entry.facts?.transactionId === pending.transactionId)) {
-      appendCampaignLedger(record, { kind: "apply", campaignId: record.id, stage: "apply", outcome: "success", facts: { iteration: pending.iteration, cell: pending.candidate.cell, transactionId: pending.transactionId } });
+      appendCampaignLedger(record, { kind: "apply", campaignId: record.id, stage: "apply", outcome: "success", patchHash: pending.patchHash ?? candidatePatchFingerprint(pending.patch), facts: { iteration: pending.iteration, cell: pending.candidate.cell, transactionId: pending.transactionId } });
     }
     record.currentScore = pending.after;
     record.bestScore = Math.max(record.bestScore, pending.after);
@@ -1497,7 +1509,7 @@ async function reconcilePending(record: CampaignRecord): Promise<void> {
   }
 }
 
-async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "resolveAgent" | "beforeAgentSpawn" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log" | "allowFailingBaselineGates"> & { confirmationOnly?: boolean }): Promise<CampaignResult> {
+async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "signal" | "resolveAgent" | "beforeAgentSpawn" | "beforeProcessRateLimit" | "onProgress" | "onPhaseProgress" | "onUpdate" | "log" | "allowFailingBaselineGates" | "evaluatorEnv" | "evaluatorEnvKeys"> & { confirmationOnly?: boolean }): Promise<CampaignResult> {
   const controller = new AbortController();
   const abort = (): void => controller.abort();
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -1513,7 +1525,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
   const stopFile = path.join(record.campaignRoot, "stop.request");
   fs.rmSync(stopFile, { force: true });
   let limitReason: string | null = null;
-  const reserve = (kind: "agent" | "evaluator", key: string): void => {
+  const reserve = async (kind: "agent" | "evaluator", key: string): Promise<void> => {
     assertNotAborted(signal);
     assertVerifierIdentity(record);
     if (!withinDeadline(record)) {
@@ -1524,9 +1536,10 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
     try {
       budget.reserve(kind, key);
       if (kind === "agent") {
-        options.beforeAgentSpawn?.(key);
+        await options.beforeAgentSpawn?.(key);
         appendCampaignLedger(record, { kind: "agent_start", campaignId: record.id, stage: "attempt", outcome: "reserved" });
       }
+      await options.beforeProcessRateLimit?.(kind, key, signal);
     }
     catch (error) {
       if (error instanceof CampaignLimitError) { limitReason = error.message; controller.abort(); }
@@ -1584,6 +1597,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
         baseRoot: record.baseRoot, projectDir: record.projectDir,
         task: record.task, verifierInputs: record.verifierInputs, gates: record.gates,
         runs: 5,
+        ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
         ...(savedRuns.length > 0 ? { priorRuns: savedRuns } : {}),
         ...(record.identityInputs?.length ? { identityInputs: record.identityInputs } : {}),
         // Keep per-reading logs with the campaign so status can point at the failing run.
@@ -1670,6 +1684,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
           root: record.campaignRoot, projectDir: record.projectDir, targetRoot: record.targetRoot, seedRoot: record.targetRoot,
           task: record.task, cycle: iteration, worldId: `${record.id}:${iteration}`, fingerprint: record.verifierIdentity, baseline: record.currentScore,
           threshold: record.minimumGain, config: record.searchConfig ?? defaultSearchConfig, signal, agent: record.task.agent,
+          ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
           goal: record.goal, scope: record.scope, gates: record.gates ?? [],
           historySummary: campaignMemory(record).slice(-6).map((entry) => `${entry.kind}: ${entry.outcome ?? "recorded"}${entry.facts?.reason ? ` (${entry.facts.reason})` : ""}`).join("\n"),
           priorAgentErrorStreak: priorAgentErrorStreak(record, iteration),
@@ -1687,7 +1702,7 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
       }
       setPhase(record, "promote", iteration, callbacks);
       let promotion: { applied: boolean; pending: boolean };
-      try { promotion = await promoteCandidates(record, iteration, reserve, signal, log, options.resolveAgent); }
+      try { promotion = await promoteCandidates(record, iteration, reserve, signal, log, options.resolveAgent, options.evaluatorEnv, options.evaluatorEnvKeys); }
       catch (error) {
         if (error instanceof CampaignLimitError && limitReason) { record.state = { kind: "complete", reason: limitReason }; break; }
         throw error;
@@ -1818,7 +1833,7 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
   makeBudget(record, true);
   persist(record);
   writeActive(baseRoot, id);
-  const result = execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates });
+  const result = execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, beforeProcessRateLimit: options.beforeProcessRateLimit, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates, evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys });
   releaseStart();
   return await result;
   } catch (error) {
@@ -1852,7 +1867,7 @@ export async function resumeCampaign(options: CampaignResumeOptions): Promise<Ca
     throw new Error("campaign deadline expired; its budget cannot be renewed");
   }
   fs.rmSync(path.join(record.campaignRoot, "stop.request"), { force: true });
-  return execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates, confirmationOnly: options.confirmationOnly });
+  return execute(record, { signal: options.signal, resolveAgent: options.resolveAgent, beforeAgentSpawn: options.beforeAgentSpawn, beforeProcessRateLimit: options.beforeProcessRateLimit, onProgress: options.onProgress, onPhaseProgress: options.onPhaseProgress, onUpdate: options.onUpdate, log: options.log, allowFailingBaselineGates: options.allowFailingBaselineGates, evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys, confirmationOnly: options.confirmationOnly });
 }
 
 /** A 2.x paused tree is not a valid 3.0 experiment; mark it failed with a recovery path. */
@@ -1872,6 +1887,13 @@ export function failPausedV2Campaign(baseRoot: string): string | null {
   const reason = "This paused campaign uses the 2.x format and cannot resume in 3.0. It was marked failed; start a new /dream-rsi loop to continue.";
   writeFileAtomic(recordPath, `${JSON.stringify({ ...record, state: { kind: "failed", reason } }, null, 2)}\n`, true);
   return reason;
+}
+
+/** Lightweight live-campaign reference: validated pointer and record, without ledger or health work. */
+export function readCampaignRef(baseRoot: string): { id: string; campaignRoot: string; state: CampaignRecord["state"] } | null {
+  const root = activeRoot(path.resolve(baseRoot));
+  const record = root ? readRecord(root) : null;
+  return record ? { id: record.id, campaignRoot: record.campaignRoot, state: record.state } : null;
 }
 
 export function readCampaignStatus(baseRoot: string): CampaignStatus | null {

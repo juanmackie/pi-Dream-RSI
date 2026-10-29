@@ -105,7 +105,7 @@ export interface DreamOptions {
   loopRoot: string;
   agent: AgentConfig;
   resolveAgent?: (agent: AgentConfig) => AgentConfig | null;
-  beforeAgentSpawn: (key: string) => void;
+  beforeAgentSpawn: (key: string) => void | Promise<void>;
   log?: (message: string) => void;
   onAgentComplete?: (result: CommandResult) => void;
   signal: AbortSignal;

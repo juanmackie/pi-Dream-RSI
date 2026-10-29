@@ -135,8 +135,10 @@ export interface ExperimentOptions {
   signal: AbortSignal;
   agent: AgentConfig;
   resolveAgent?: (agent: AgentConfig) => AgentConfig | null;
-  beforeAgentSpawn: (key: string) => void;
-  beforeEvaluatorSpawn: (key: string) => void;
+  beforeAgentSpawn: (key: string) => void | Promise<void>;
+  beforeEvaluatorSpawn: (key: string) => void | Promise<void>;
+  evaluatorEnv?: Record<string, string>;
+  evaluatorEnvKeys?: string[];
   maxAgentAttempts?: number;
   maxEvaluatorAttempts?: number;
   log?: (message: string) => void;
@@ -201,8 +203,9 @@ async function evaluateAttempt(options: ExperimentOptions, world: ExperimentWorl
   const evalResult = await runShellCommand(options.task.score_program, {
     cwd: workspace, timeoutMs: options.task.evaluator_timeout_ms,
     logPath: path.join(attempt, "eval.log"), signal: options.signal,
-    beforeSpawn: () => {
-      options.beforeEvaluatorSpawn(`experiment-${options.cycle}-${node.id}`);
+    ...(options.evaluatorEnv ? { envOnly: true, env: options.evaluatorEnv, redactEnvKeys: options.evaluatorEnvKeys ?? [] } : {}),
+    beforeSpawn: async () => {
+      await options.beforeEvaluatorSpawn(`experiment-${options.cycle}-${node.id}`);
       world.evaluatorRuns += 1;
       saveWorld(file, world);
     },
@@ -271,8 +274,8 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   const command = await runAgent({
     agent: options.agent, resolveAgent: options.resolveAgent, cwd: workspace, prompt,
     timeoutMs: options.task.agent_timeout_ms, idleTimeoutMs: Math.min(options.task.agent_timeout_ms, 4 * 60 * 1000), logPath: path.join(attempt, "agent.log"), signal: options.signal,
-    beforeSpawn: () => {
-      options.beforeAgentSpawn(`experiment-${options.cycle}-${node.id}`);
+    beforeSpawn: async () => {
+      await options.beforeAgentSpawn(`experiment-${options.cycle}-${node.id}`);
       world.agentStarts += 1;
       node.cost += 1;
       saveWorld(file, world);

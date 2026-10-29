@@ -117,6 +117,16 @@ export interface RunContract {
     /** Loop-level rare-event allowance for promotions, allocated across the whole run. */
     falseAcceptBudget: number;
   };
+  /** Automatic commits of independently verified wins. Missing means a legacy working-tree-only contract. */
+  git?: { autoCommit: boolean; branch: string };
+  /** Explicit opt-in for budget-bounded continuation with a durable no-win plateau and start interval. */
+  continuation?: {
+    plateauCampaigns: number;
+    minimumCampaignIntervalMs: number;
+    /** Maximum process dispatches in a rolling hour; omitted in legacy contracts. */
+    agentStartsPerHour?: number;
+    evaluatorRunsPerHour?: number;
+  };
   /** Candidate agent; null resolves the active session model at call time. */
   agent?: AgentConfig | null;
 }
@@ -129,13 +139,15 @@ export interface ApprovedContract {
   approvedAt: string;
 }
 
-/** The contract is not honoured; the loop maps this to the `not-approved` stop reason. */
+/** A contract refusal, classified as missing consent or a blocked approval boundary. */
 export class ContractNotApprovedError extends Error {
   readonly reason: string;
-  constructor(reason: string) {
+  readonly kind: "consent" | "contract";
+  constructor(reason: string, kind: "consent" | "contract" = "consent") {
     super(reason);
     this.name = "ContractNotApprovedError";
     this.reason = reason;
+    this.kind = kind;
   }
 }
 
@@ -161,6 +173,12 @@ export function isMinimumGain(value: unknown): value is MinimumGain {
   if (!match) return false;
   const percent = Number(match[1]);
   return Number.isFinite(percent) && percent >= 0 && percent < 100;
+}
+
+function isValidGitBranch(value: string): boolean {
+  if (!value || value.length > 255 || value.startsWith("-") || value.startsWith("/") || value.endsWith("/") || value.endsWith(".")) return false;
+  if (/[\x00-\x20\x7f ~^:?*[\\\\]/.test(value) || value.includes("..") || value.includes("@{") || value.includes("//")) return false;
+  return value.split("/").every((part) => part && !part.startsWith(".") && !part.endsWith(".") && !/\.lock$/i.test(part));
 }
 
 function stringList(value: unknown): string[] | null {
@@ -249,6 +267,28 @@ export function validateRunContract(raw: unknown): string[] {
     }
   }
 
+  if (raw.git !== undefined) {
+    if (!isRecord(raw.git)) errors.push("git must be an object when present");
+    else {
+      if (typeof raw.git.autoCommit !== "boolean") errors.push("git.autoCommit must be a boolean");
+      if (typeof raw.git.branch !== "string" || !isValidGitBranch(raw.git.branch.trim())) {
+        errors.push("git.branch must be a valid local Git branch name");
+      } else if (raw.git.autoCommit === true && ["main", "master", "trunk", "develop"].includes(raw.git.branch.trim().toLowerCase())) {
+        errors.push("git.branch cannot target a default branch for automatic commits");
+      }
+    }
+  }
+
+  if (raw.continuation !== undefined) {
+    if (!isRecord(raw.continuation)) errors.push("continuation must be an object when present");
+    else {
+      if (!positiveInteger(raw.continuation.plateauCampaigns) || raw.continuation.plateauCampaigns > 64) errors.push("continuation.plateauCampaigns must be an integer from 1 to 64");
+      if (!positiveInteger(raw.continuation.minimumCampaignIntervalMs) || raw.continuation.minimumCampaignIntervalMs > 86_400_000 || raw.continuation.minimumCampaignIntervalMs % 1000 !== 0) errors.push("continuation.minimumCampaignIntervalMs must be a whole number of seconds from 1 to 86400");
+      if (raw.continuation.agentStartsPerHour !== undefined && (!positiveInteger(raw.continuation.agentStartsPerHour) || raw.continuation.agentStartsPerHour > 10_000)) errors.push("continuation.agentStartsPerHour must be an integer from 1 to 10000");
+      if (raw.continuation.evaluatorRunsPerHour !== undefined && (!positiveInteger(raw.continuation.evaluatorRunsPerHour) || raw.continuation.evaluatorRunsPerHour > 10_000)) errors.push("continuation.evaluatorRunsPerHour must be an integer from 1 to 10000");
+    }
+  }
+
   if (raw.agent !== undefined && raw.agent !== null) {
     const agent = raw.agent;
     if (!isRecord(agent)) errors.push("agent must be an object when present");
@@ -297,6 +337,8 @@ export function normalizeRunContract(raw: unknown): RunContract {
       deadlineMs: value.budgets.deadlineMs,
       falseAcceptBudget: value.budgets.falseAcceptBudget,
     },
+    ...(value.git ? { git: { autoCommit: value.git.autoCommit, branch: value.git.branch.trim() } } : {}),
+    ...(value.continuation ? { continuation: { ...value.continuation } } : {}),
     ...(value.agent ? { agent: { ...value.agent, args: [...value.agent.args] } } : {}),
   };
 }
@@ -363,9 +405,9 @@ export function approveRunContract(projectDir: string, contract: RunContract): A
 }
 
 /**
- * Environment for probes, instruments and gates: only allowlisted keys, taken
- * from the current process. Everything else (credentials, tokens, session
- * identity, provider keys) is withheld.
+ * Environment for probes, instruments and gates: runtime essentials plus the
+ * explicitly allowlisted keys from the current process. Treat allowlisted values
+ * as sensitive; the process runner redacts them from captured output.
  */
 export function restrictedEnvironment(contract: RunContract, source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
@@ -419,6 +461,11 @@ export function contractIdentity(contract: RunContract): string {
       maxEvaluatorRuns: contract.budgets.maxEvaluatorRuns,
     },
   })).digest("hex").slice(0, 16);
+}
+
+/** Approval identity covers permissions and every setting, not just measurement comparability. */
+export function approvalIdentity(contract: RunContract): string {
+  return crypto.createHash("sha256").update(JSON.stringify(normalizeRunContract(contract))).digest("hex");
 }
 
 /** Durable contract location under the loop's state root. */

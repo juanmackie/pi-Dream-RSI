@@ -11,10 +11,12 @@ import {
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
 import { readLedger } from "./ledger.ts";
+import { readAppliedPatchPostimages } from "./campaign-patch.ts";
+import { AutoCommitError, commitVerifiedChanges, ensureAutoCommitBranch, type AutoCommitReceipt, type PreparedAutoCommitBranch } from "./git.ts";
 import { buildReconInventory, reconProject, timeLikeOutcome, type ReconOptions, type ReconResult } from "./recon.ts";
 import { measureEvaluatorReading, measureWorkload, verifyPostApply, type PostApplyEvaluator } from "./verify.ts";
 import {
-  hasAllowance, readOrCreateLoopBudget, readSavedBudgetCaps, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
+  hasAllowance, readOrCreateLoopBudget, readSavedBudgetCaps, reconcileOpenReservation, remainingAllowance, reserveHourlyProcessStart, settleReservation, writeLoopBudget,
   type LoopBudgetFile, type LoopPhase, type LoopReservation,
 } from "./budget.ts";
 import type { LeverInventory, LeverMetricKind, LeverProposal } from "./levers.ts";
@@ -27,6 +29,7 @@ import {
 import { collectSignals, type SignalsResult } from "./signals.ts";
 import { defaultTask, type TaskConfig } from "./task.ts";
 import { readJson, writeFileAtomic, writeJson } from "./fsutil.ts";
+import { recoveryForLoop } from "./recovery.ts";
 import { phaseIsActive } from "./ownership.ts";
 import { normalizeProjectRelativePath, pathProtected, pathWithin } from "./scope.ts";
 import { defaultSearchConfig, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
@@ -80,6 +83,35 @@ export interface LeverSetupContext {
 /** Fixture and intake integration point: supply a full campaign setup, or reject. */
 export type LeverTaskProvider = (context: LeverSetupContext) => LeverCampaignSetup | { reject: string };
 
+export type CampaignWaitResult = "ready" | "deadline" | "cancelled";
+
+/** Wait for a pacing interval without crossing the run deadline or losing cancellation. */
+export async function waitForCampaignInterval(
+  waitMs: number,
+  deadlineAt: number,
+  signal?: AbortSignal,
+  now: () => number = Date.now,
+  sleep: (ms: number, signal?: AbortSignal) => Promise<void> = (ms, abortSignal) => new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    abortSignal?.addEventListener("abort", finish, { once: true });
+    if (abortSignal?.aborted) finish();
+  }),
+): Promise<CampaignWaitResult> {
+  if (signal?.aborted) return "cancelled";
+  if (now() + Math.max(0, waitMs) >= deadlineAt) return "deadline";
+  if (waitMs > 0) await sleep(waitMs, signal);
+  if (signal?.aborted) return "cancelled";
+  return now() >= deadlineAt ? "deadline" : "ready";
+}
+
 export interface LoopOptions {
   projectDir: string;
   /** Loop state root; defaults to <projectDir>/.dream-rsi/loop and must remain a child of baseRoot. */
@@ -102,7 +134,7 @@ export interface LoopOptions {
   evaluatorBootstrap?: {
     authorized: boolean;
     paths: string[];
-    run: (context: { projectDir: string; contract: RunContract; focus?: string; scopeRoots: string[]; deadlineMs: number; beforeAgentSpawn: () => void; signal?: AbortSignal }) => Promise<{ validatedPaths: string[] }>;
+    run: (context: { projectDir: string; contract: RunContract; focus?: string; scopeRoots: string[]; deadlineMs: number; beforeAgentSpawn: () => void | Promise<void>; signal?: AbortSignal }) => Promise<{ validatedPaths: string[] }>;
   };
   /** How many declared workloads one cold-start recon pass may measure. */
   reconProbes?: number;
@@ -131,6 +163,12 @@ export interface LoopOptions {
   resumeCampaignImpl?: (options: CampaignResumeOptions) => Promise<CampaignResult>;
   /** Test seam replacing the independent post-apply measurement. */
   measureImpl?: (argv: string[], projectDir: string) => Promise<number | null>;
+  /** Test seam replacing the campaign pacing wait. */
+  waitForCampaignIntervalImpl?: typeof waitForCampaignInterval;
+  /** Test seam replacing a rolling-hour process-rate wait. */
+  waitForProcessRateLimitImpl?: typeof waitForCampaignInterval;
+  /** Test seam for process-rate timestamps; production uses the system clock. */
+  processRateLimitNow?: () => number;
   /** Test seam replacing signal collection. */
   collectSignalsImpl?: (options: { projectDir: string; focus?: string; includeLogs?: boolean; sessionDir?: string }) => Promise<Pick<SignalsResult, "weaknesses" | "diagnostics">>;
   /** Test seam replacing manifest probing and source attribution. */
@@ -141,10 +179,10 @@ export interface LoopCampaignRecord extends LoopMemoryRecord {
   campaignRoot: string | null;
 }
 
-export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "stopped";
+export type LoopStopCode = "consent-required" | "budget-exhausted" | "deadline" | "cancelled" | "no-verifiable-lever" | "blocked" | "campaign-failure" | "post-apply-failure" | "commit-failure" | "plateau" | "paused" | "confirmation-pending" | "confirmation-complete" | "completed" | "stopped";
 
 export interface LoopPreflightCheck {
-  name: "contract" | "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
+  name: "contract" | "git" | "metric" | "evaluator" | "workload" | "scope" | "gates" | "budget";
   status: "passed" | "blocked" | "not-checked";
   reason: string;
   remedy?: string;
@@ -177,6 +215,8 @@ export interface LoopResult {
   contract: { fingerprint: string; approvedAt: string } | null;
   /** Independent post-apply verifications recorded by this run. */
   verifications: LoopVerification[];
+  /** Local commits created only after independent post-apply verification passed. */
+  autoCommits: AutoCommitReceipt[];
 }
 
 /**
@@ -894,7 +934,7 @@ function classifyCampaignFailure(reason: string): string {
 }
 
 /** Scope governs writes, not the read/run dependencies of a verifier or gate. */
-function bootstrapWritePlan(contract: RunContract, rawPaths: string[]): { paths: string[]; checks: LoopPreflightCheck[] } {
+export function bootstrapWritePlan(contract: RunContract, rawPaths: string[]): { paths: string[]; checks: LoopPreflightCheck[] } {
   const normalized = rawPaths.map((file) => normalizeProjectRelativePath(file));
   const invalid = rawPaths.filter((_file, index) => normalized[index] === null);
   const paths = [...new Set(normalized.filter((file): file is string => file !== null))];
@@ -992,6 +1032,7 @@ function classifyStop(reason: string): LoopStopCode {
   if (!reason) return "completed";
   if (reason === "not-approved") return "consent-required";
   if (reason === "budget" || reason.includes("allowance exhausted")) return "budget-exhausted";
+  if (reason.startsWith("plateau:")) return "plateau";
   if (reason === "deadline" || reason.startsWith("campaign deadline")) return "deadline";
   if (reason === "cancelled") return "cancelled";
   if (reason === "no verifiable lever") return "no-verifiable-lever";
@@ -1000,6 +1041,7 @@ function classifyStop(reason: string): LoopStopCode {
   if (reason === "confirmation pending") return "confirmation-pending";
   if (reason === "confirmation complete") return "confirmation-complete";
   if (reason.startsWith("post-apply check failed")) return "post-apply-failure";
+  if (reason.startsWith("auto-commit failed")) return "commit-failure";
   if (reason.startsWith("campaign failed") || reason.startsWith("resume failed")) return "campaign-failure";
   return "stopped";
 }
@@ -1034,6 +1076,8 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let memory = readMemory(memoryPath);
   const records: LoopCampaignRecord[] = [];
   const verifications: LoopVerification[] = [];
+  const autoCommits: AutoCommitReceipt[] = [];
+  let autoCommitBranch: PreparedAutoCommitBranch | null = null;
   /** Objective/instrument identity this run compares against. */
   let contractId: string | null = null;
   let evaluatorId: string | null = null;
@@ -1073,15 +1117,55 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     ...options.campaignDefaults,
   };
 
-  const recordOutcome = (record: Omit<LoopMemoryRecord, "kind">, campaignRoot: string | null): void => {
+  const recordOutcome = (record: Omit<LoopMemoryRecord, "kind">, campaignRoot: string | null, completed = true): void => {
     memory = recordCampaignOutcome(memory, { kind: "campaign", ...record });
     writeMemory(memoryPath, memory);
     records.push({ kind: "campaign", ...record, campaignRoot });
+    if (completed && campaignRoot && approved?.contract.continuation && budget) {
+      const campaignId = path.basename(campaignRoot);
+      if (budget.last_plateau_campaign_id !== campaignId) {
+        const consecutive = record.outcome === "win" ? 0 : (budget.consecutive_no_win_campaigns ?? 0) + 1;
+        budget = { ...budget, consecutive_no_win_campaigns: consecutive, last_plateau_campaign_id: campaignId };
+        writeLoopBudget(budgetPath, budget);
+      }
+    }
   };
 
   const addNote = (text: string): void => {
     memory = { ...memory, notes: [...memory.notes, text.slice(0, 220)].slice(-MAX_NOTES) };
     writeMemory(memoryPath, memory);
+  };
+
+  const commitVerifiedCampaign = async (args: { result: CampaignResult; leverId: string; instrument: CapturedInstrument; gain: number }): Promise<AutoCommitReceipt | null> => {
+    const policy = approved?.contract.git;
+    if (!policy?.autoCommit) return null;
+    if (!autoCommitBranch) throw new AutoCommitError("the dedicated auto-commit branch was not prepared");
+    const campaignRoot = args.result.campaignRoot;
+    const ledger = readLedger(path.join(campaignRoot, "history", "ledger.jsonl"));
+    if (ledger.diagnostics.length) throw new AutoCommitError("campaign evidence ledger is invalid; no commit was created");
+    const transactions = ledger.entries
+      .filter((entry) => entry.kind === "apply" && entry.outcome === "success" && entry.campaignId === args.result.id
+        && typeof entry.facts?.transactionId === "string" && typeof entry.patchHash === "string")
+      .map((entry) => ({ transactionId: entry.facts!.transactionId as string, patchHash: entry.patchHash! }));
+    const manifest = readAppliedPatchPostimages({ journalDir: path.join(campaignRoot, "promotion-journal"), transactions, expectedTargetRoot: args.result.targetRoot });
+    const workspacePrefix = path.relative(autoCommitBranch.root, manifest.targetRoot).replace(/\\/g, "/");
+    if (workspacePrefix === ".." || workspacePrefix.startsWith("../") || path.isAbsolute(workspacePrefix)) throw new AutoCommitError("the verified patch target is outside the Git repository");
+    const changes = manifest.changes.map((change) => ({
+      path: [workspacePrefix === "." ? "" : workspacePrefix, change.path].filter(Boolean).join("/"), afterHash: change.afterHash,
+    }));
+    const sortedBaseline = [...args.instrument.baseline].sort((a, b) => a - b);
+    const before = sortedBaseline[Math.floor(sortedBaseline.length / 2)]!;
+    const after = args.instrument.higherIsBetter ? before + args.gain : before - args.gain;
+    const receipt = await commitVerifiedChanges({
+      projectDir, branch: autoCommitBranch.branch, expectedHead: autoCommitBranch.head, changes,
+      campaignId: args.result.id, leverId: args.leverId, unit: args.instrument.unit, before, after,
+      evidencePath: path.relative(autoCommitBranch.root, campaignRoot).replace(/\\/g, "/"), signal: options.signal,
+    });
+    autoCommits.push(receipt);
+    autoCommitBranch = { ...autoCommitBranch, head: receipt.hash };
+    addNote(`auto-committed verified campaign ${args.result.id} as ${receipt.hash} on ${receipt.branch}`);
+    if (receipt.warning) addNote(`auto-commit warning: ${receipt.warning}`);
+    return receipt;
   };
 
   /** Returned-state note only: a blocked invocation must not rewrite records the owner holds. */
@@ -1150,6 +1234,35 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   const onAbort = (): void => setActivity("stopping", "Cancellation requested; waiting for active work to unwind", lease.activity?.campaignId);
   if (leaseHeld) options.signal?.addEventListener("abort", onAbort, { once: true });
   let budget: LoopBudgetFile | null = null;
+  const waitForHourlyProcessStart = async (phase: LoopPhase, process: "agent" | "evaluator", processSignal: AbortSignal | undefined = options.signal): Promise<void> => {
+    const continuation = approved?.contract.continuation;
+    if (!continuation) return;
+    const limit = process === "agent" ? continuation.agentStartsPerHour ?? 36 : continuation.evaluatorRunsPerHour ?? 96;
+    const stoppedForSignal = (): Error => {
+      if (options.signal?.aborted) { stopReason = "cancelled"; return new Error("loop stopped during rolling process-rate wait"); }
+      if (Date.now() >= deadlineAt) { stopReason = "deadline"; return new Error("loop deadline expired during rolling process-rate wait"); }
+      return new Error("campaign stopped during rolling process-rate wait");
+    };
+    while (true) {
+      if (processSignal?.aborted) throw stoppedForSignal();
+      if (Date.now() >= deadlineAt) { stopReason = "deadline"; throw new Error("loop deadline expired during rolling process-rate wait"); }
+      if (!budget) throw new LoopBudgetExhaustedError(`${phase} process`);
+      const spend = process === "agent" ? { agentStarts: 1 } : { evaluatorRuns: 1 };
+      if (!hasAllowance(budget, spend)) throw new LoopBudgetExhaustedError(`${phase} process`);
+      const reserved = reserveHourlyProcessStart(budget, process, limit, options.processRateLimitNow?.() ?? Date.now());
+      if (reserved.waitMs === 0) {
+        budget = reserved.budget;
+        writeLoopBudget(budgetPath, budget);
+        return;
+      }
+      budget = reserved.budget;
+      writeLoopBudget(budgetPath, budget);
+      setActivity(lease.activity?.phase ?? "discovery", `Waiting ${Math.ceil(reserved.waitMs / 1000)}s for the ${process} rolling-hour limit`);
+      const result = await (options.waitForProcessRateLimitImpl ?? waitForCampaignInterval)(reserved.waitMs, deadlineAt, processSignal);
+      if (result === "cancelled") throw stoppedForSignal();
+      if (result === "deadline") { stopReason = "deadline"; throw new Error("loop deadline expired during rolling process-rate wait"); }
+    }
+  };
   const chargeOne = (phase: LoopPhase, process: "agent" | "evaluator"): void => {
     if (!budget) throw new LoopBudgetExhaustedError(`${phase} process`);
     const spend = process === "agent" ? { agentStarts: 1 } : { evaluatorRuns: 1 };
@@ -1208,7 +1321,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           prompt: "Dream-RSI agent liveness probe. Reply with the single word ok. Do not change files.",
           timeoutMs: Math.max(1, Math.min(task.agent_timeout_ms, timeLeft, 4 * 60 * 1000)),
           ...(options.signal ? { signal: options.signal } : {}),
-          beforeSpawn: () => chargeOne("qualification", "agent"),
+          beforeSpawn: async () => { await waitForHourlyProcessStart("qualification", "agent"); chargeOne("qualification", "agent"); },
           logPath: path.join(loopRoot, "liveness", "agent.log"),
         });
       } catch (error) {
@@ -1217,6 +1330,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           addNote(`${error.message}; the run stops here rather than overspending.`);
           return;
         }
+        if (stopReason === "deadline" || stopReason === "cancelled") return;
         throw error;
       }
       if (options.signal?.aborted) { stopReason = "cancelled"; return; }
@@ -1241,8 +1355,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         progress(`loop: agent liveness probe passed (${label})`);
       }
     } finally {
-      try { fs.rmSync(scratch, { recursive: true, force: true }); }
-      catch (e: any) { if (e?.code === "EBUSY" || e?.code === "EPERM") console.error(`EBUSY/EPERM at loop.ts finally scratch remove:`, new Error("EBUSY-site").stack); throw e; }
+      fs.rmSync(scratch, { recursive: true, force: true });
     }
   };
   const resumeSavedCampaign = async (): Promise<void> => {
@@ -1301,6 +1414,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         ...(options.confirmationOnly ? { confirmationOnly: true, ...((confirmationExtension!.agentStarts + confirmationExtension!.evaluatorRuns + confirmationExtension!.deadlineMs > 0) ? { extendLimits: confirmationExtension } : {}) } : {}),
         ...(options.signal ? { signal: options.signal } : {}),
         ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+        beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
         onUpdate: (status) => {
           setActivity("resuming", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
           options.onCampaignUpdate?.(status);
@@ -1328,6 +1442,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     const failed = result.state.kind === "failed";
     const paused = result.state.kind === "paused";
     let postApplyFailure: string | null = null;
+    let autoCommitFailure: string | null = null;
     let verifiedGain: number | undefined;
     if (applied) {
       if (!approved) postApplyFailure = "the saved loop contract is unavailable for independent verification";
@@ -1341,12 +1456,22 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             higherIsBetter: context.instrument.higherIsBetter,
             ...(context.instrument.kind !== "command-duration" ? { kind: context.instrument.kind, ...(context.instrument.evaluator ? { evaluator: context.instrument.evaluator } : {}) } : {}),
             workRoot: path.join(loopRoot, "post-apply"), timeoutMs: context.instrument.timeoutMs,
-            beforeProcess: () => chargeOne("post-apply", "evaluator"),
+            beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
           });
-          if (checked.passed) verifiedGain = checked.gain ?? undefined;
-          else postApplyFailure = checked.reason ?? "the resumed apply did not pass its independent post-apply check";
+          if (checked.passed) {
+            verifiedGain = checked.gain ?? undefined;
+            if (approved.contract.git?.autoCommit) {
+              try {
+                const receipt = await commitVerifiedCampaign({ result, leverId: context.lever.id, instrument: context.instrument, gain: checked.gain ?? 0 });
+                if (receipt?.warning) autoCommitFailure = receipt.warning;
+              } catch (error) {
+                autoCommitFailure = error instanceof Error ? error.message : String(error);
+                addNote(`auto-commit failed: ${autoCommitFailure}`);
+              }
+            }
+          } else postApplyFailure = checked.reason ?? "the resumed apply did not pass its independent post-apply check";
           verifications.push({ leverId: context.lever.id, campaignId: result.id, outcome: "win", passed: checked.passed, reason: checked.reason, at: now().toISOString() });
         } catch (error) {
           postApplyFailure = error instanceof Error ? error.message : String(error);
@@ -1361,13 +1486,14 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       evaluatorRuns: evaluatorDelta, agentStarts: agentDelta, wallMs: 0, at: now().toISOString(),
       ...(verifiedGain === undefined ? {} : { verifiedGain }),
       provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
-    }, result.campaignRoot);
+    }, result.campaignRoot, !paused);
     if (!paused) fs.rmSync(activeContextPath, { force: true });
     if (paused) stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
-    else if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
-    else if (failed) stopReason = classifyCampaignFailure(result.stopReason);
+    else if (postApplyFailure && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = `post-apply check failed: ${postApplyFailure}`;
+    else if (failed && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = classifyCampaignFailure(result.stopReason);
     else if (options.confirmationOnly) stopReason = "confirmation complete";
     else progress(`loop: resumed campaign ${result.id} finished as ${outcome} (${result.stopReason || "no reason"})`);
+    if (autoCommitFailure) stopReason = `auto-commit failed: ${autoCommitFailure}`;
   };
   // Requested limits and approved contract budgets combine into this run's total
   // allowance. Replacement later prevents that allowance from shrinking saved caps.
@@ -1451,12 +1577,26 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
                 || nextBudgets.falseAcceptBudget !== priorBudgets.falseAcceptBudget) {
                 throw new ContractNotApprovedError("Contract replacement may raise durable limits but cannot reduce caps or change the statistical budget.", "contract");
               }
+              if (nextBudgets.maxCampaigns > priorBudgets.maxCampaigns && budget?.campaigns) {
+                throw new ContractNotApprovedError("The campaign cap cannot be increased after campaigns have started because their statistical allowance is already allocated. Keep the saved campaign cap or start a new run before raising it.", "contract");
+              }
               if (budget && (nextBudgets.maxCampaigns < budget.campaigns || nextBudgets.maxAgentStarts < budget.agent_starts || nextBudgets.maxEvaluatorRuns < budget.evaluator_runs)) {
                 throw new ContractNotApprovedError("The raised limits are below spend already recorded; choose caps at or above current spend.", "contract");
               }
             }
           }
           if (!stopReason) {
+            if (contract.git?.autoCommit) {
+              try {
+                autoCommitBranch = await ensureAutoCommitBranch(projectDir, contract.git.branch, options.signal, options.resumeActiveCampaign === true);
+                if (projectFingerprint(projectDir) !== proposed.fingerprint) {
+                  throw new ContractNotApprovedError("Project source changed when selecting the auto-commit branch; review the checked-out source before execution.", "contract");
+                }
+              } catch (error) {
+                if (error instanceof ContractNotApprovedError) throw error;
+                throw new ContractNotApprovedError(`Auto-commit preflight failed: ${error instanceof Error ? error.message : String(error)}`, "contract");
+              }
+            }
             const replacingSavedContract = Boolean(stored && budget && options.replaceContract);
             const next = replacingSavedContract ? {
               ...durableLimits,
@@ -1498,8 +1638,9 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       } catch (error) {
         if (!(error instanceof ContractNotApprovedError)) throw error;
         noteLocally(`not-approved: ${error.reason}`);
-        preflight = { status: "blocked", checks: [{ name: "contract", status: "blocked", reason: error.reason,
-          remedy: error.kind === "contract" ? "Inspect the saved contract and approve an explicit replacement only after checking the objective, scope, gates, permissions, new total caps, and retained spend." : "Approve trusted-local execution before repository commands can run." }] };
+        const gitPreflight = error.reason.startsWith("Auto-commit preflight failed:");
+        preflight = { status: "blocked", checks: [{ name: gitPreflight ? "git" : "contract", status: "blocked", reason: error.reason,
+          remedy: gitPreflight ? "Resolve the Git branch, working-tree, or index blocker, then review and retry the approved contract." : error.kind === "contract" ? "Inspect the saved contract and approve an explicit replacement only after checking the objective, scope, gates, permissions, new total caps, and retained spend." : "Approve trusted-local execution before repository commands can run." }] };
         stopReason = error.kind === "contract" ? `blocked: ${error.reason}` : "not-approved";
       }
     }
@@ -1517,11 +1658,17 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         resumePending = false;
         try { await resumeSavedCampaign(); }
         catch (error) {
-          if (error instanceof LoopBudgetExhaustedError) stopReason = "budget";
-          else stopReason = `resume failed: ${error instanceof Error ? error.message : String(error)}`;
+          if (stopReason !== "deadline" && stopReason !== "cancelled") {
+            if (error instanceof LoopBudgetExhaustedError) stopReason = "budget";
+            else stopReason = `resume failed: ${error instanceof Error ? error.message : String(error)}`;
+          }
           addNote(stopReason);
         }
         if (stopReason) break;
+      }
+      if (approved?.contract.continuation && (budget.consecutive_no_win_campaigns ?? 0) >= approved.contract.continuation.plateauCampaigns) {
+        stopReason = `plateau: ${budget.consecutive_no_win_campaigns} consecutive completed campaigns ended without a verified win`;
+        break;
       }
 
       const activeRecord = readCampaignStatus(baseRoot);
@@ -1551,7 +1698,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         maxProbes: options.reconProbes ?? 3,
         probeTimeoutMs: Math.max(1, Math.min(120_000, deadlineAt - Date.now())),
         ...(options.signal ? { signal: options.signal } : {}),
-        beforeProbe: () => chargeOne("discovery", "evaluator"),
+        beforeProbe: async () => { await waitForHourlyProcessStart("discovery", "evaluator"); chargeOne("discovery", "evaluator"); },
         onProgress: progress,
       });
       try {
@@ -1580,7 +1727,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           if (bootstrapDeadlineMs <= 0) { stopReason = "deadline"; break; }
           setActivity("bootstrap", "Creating the approved measurement harness and pinned workload");
           progress(`loop: bootstrapping pinned workload in approved scope (${requiredPaths.join(", ")})`);
-          const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: () => chargeOne("qualification", "agent"), ...(options.signal ? { signal: options.signal } : {}) });
+          const bootstrap = await options.evaluatorBootstrap.run({ projectDir, contract: approvedContract, ...(options.focus ? { focus: options.focus } : {}), scopeRoots, deadlineMs: bootstrapDeadlineMs, beforeAgentSpawn: async () => { await waitForHourlyProcessStart("qualification", "agent"); chargeOne("qualification", "agent"); }, ...(options.signal ? { signal: options.signal } : {}) });
           const validatedPaths = [...new Set(bootstrap.validatedPaths.map((file) => file.replace(/\\/g, "/").replace(/^\.\//, "")))];
           const invalidPaths = validatedPaths.filter((file) => !requiredPaths.includes(file) || !pathWithin(file, scopeRoots) || pathProtected(file, approvedContract.scope.protectedAssets) || !fs.existsSync(path.resolve(projectDir, file)));
           if (invalidPaths.length > 0 || requiredPaths.some((file) => !validatedPaths.includes(file))) {
@@ -1592,6 +1739,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           recon = await reconProjectImpl(reconOptions());
         }
       } catch (error) {
+        if (stopReason === "deadline" || stopReason === "cancelled") break;
         if (error instanceof LoopBudgetExhaustedError) {
           addNote(`${error.message}; discovery stops before the durable evaluator cap is exceeded.`);
           stopReason = "budget";
@@ -1708,11 +1856,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               availableEvaluatorRuns: remainingAllowance(budget!).evaluatorRuns,
               ...(options.signal ? { signal: options.signal } : {}),
               deadlineAt,
-              beforeEvaluatorRun: () => chargeOne("qualification", "evaluator"),
+              beforeEvaluatorRun: async () => { await waitForHourlyProcessStart("qualification", "evaluator"); chargeOne("qualification", "evaluator"); },
             },
           });
           } catch (error) {
             // Running out of budget is a stop condition, not a defect in the lever.
+            if (stopReason === "deadline" || stopReason === "cancelled") break;
             if (error instanceof LoopBudgetExhaustedError) { stopReason = "budget"; addNote(`${error.message}; the run stops here rather than overspending.`); break; }
             throw error;
           }
@@ -1734,7 +1883,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           gates: setup.gates ?? [],
           projectDir,
           workRoot: path.join(loopRoot, "post-apply"),
-          beforeProcess: () => chargeOne("post-apply", "evaluator"),
+          beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
           ...(options.signal ? { signal: options.signal } : {}),
           ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
         }) : null;
@@ -1755,12 +1904,19 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // not start a campaign on the strength of a probe that finished too late.
         if (Date.now() >= deadlineAt) { stopReason = "deadline"; break; }
 
+        const intervalMs = approved.contract.continuation?.minimumCampaignIntervalMs;
+        const lastStartedAt = budget.last_campaign_started_at ? Date.parse(budget.last_campaign_started_at) : NaN;
+        const waitMs = intervalMs && Number.isFinite(lastStartedAt) ? Math.max(0, lastStartedAt + intervalMs - Date.now()) : 0;
+        const waitResult = await (options.waitForCampaignIntervalImpl ?? waitForCampaignInterval)(waitMs, deadlineAt, options.signal);
+        if (waitResult === "cancelled") { stopReason = "cancelled"; break; }
+        if (waitResult === "deadline") { stopReason = "deadline"; break; }
         const fresh = remainingAllowance(budget);
         const postApplyReserve = instrument ? instrument.gates.length + (instrument.kind === "command-duration" ? 3 : 1) : 0;
         if (fresh.campaigns <= 0 || fresh.agentStarts <= 0 || fresh.evaluatorRuns <= postApplyReserve) { stopReason = "budget"; break; }
         const grantedAgents = Math.min(campaignDefaults.maxAgentStarts, fresh.agentStarts);
         const grantedEvaluators = Math.min(campaignDefaults.maxEvaluatorRuns, fresh.evaluatorRuns - postApplyReserve);
-        const campaignDeadlineMs = Math.max(1_000, Math.min(campaignDefaults.deadlineMs, CAMPAIGN_DEADLINE_MAX_MS, deadlineAt - Date.now()));
+        if (deadlineAt - Date.now() < 1_000) { stopReason = "deadline"; break; }
+        const campaignDeadlineMs = Math.min(campaignDefaults.deadlineMs, CAMPAIGN_DEADLINE_MAX_MS, deadlineAt - Date.now());
         const campaignStartedMs = Date.now();
 
         // Recorded before the campaign so the experiment names the baseline it started from.
@@ -1791,7 +1947,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             setup, plan, instrument, baselineFingerprint,
           } satisfies LoopResumeContext);
         }
-        budget = { ...budget, open_campaign: reserved };
+        budget = {
+          ...budget,
+          open_campaign: reserved,
+          ...(approved.contract.continuation ? { last_campaign_started_at: now().toISOString() } : {}),
+        };
         writeLoopBudget(budgetPath, budget);
         let result: CampaignResult;
         try {
@@ -1813,11 +1973,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(chainedMinimumGain !== undefined ? { minimumGain: chainedMinimumGain } : {}),
             ...(seedReadings ? { seedReadings } : {}),
             ...(campaignIdentityInputs?.length ? { identityInputs: campaignIdentityInputs } : {}),
-            limits: { maxCycles: campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
+            limits: { maxCycles: approved.contract.git?.autoCommit ? 1 : campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
             // The run's rare-event allowance is shared across the campaigns it may confirm.
             confirmationAlpha: approved.contract.budgets.falseAcceptBudget / approved.contract.budgets.maxCampaigns,
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
+            beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
             onUpdate: (status) => {
               setActivity("campaign", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
               const saved = readJson<LoopResumeContext>(activeContextPath);
@@ -1844,6 +2005,13 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             rejectedThisRun.add(lever.id);
             continue;
           }
+          if (stopReason === "deadline" || stopReason === "cancelled") {
+            budget = settleReservation(budget, reserved, { agentStarts: grantedAgents, evaluatorRuns: grantedEvaluators });
+            writeLoopBudget(budgetPath, budget);
+            recordOutcome({ leverId: lever.id, outcome: "error", stopReason: `${stopReason} while waiting for a process-rate slot`.slice(0, 200), evaluatorRuns: grantedEvaluators, agentStarts: grantedAgents, wallMs: Date.now() - campaignStartedMs, at: now().toISOString() }, null);
+            launched = true;
+            break;
+          }
           const message = error instanceof Error ? error.message : String(error);
           stopReason = classifyCampaignFailure(message);
           // A thrown campaign's real spend is unknown, so charge the reserved
@@ -1865,7 +2033,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         }
         const applied = readLedger(path.join(result.campaignRoot, "history", "ledger.jsonl")).entries
           .some((entry) => entry.kind === "apply" && entry.outcome === "success");
-        const cancelled = options.signal?.aborted === true || /stopped by request/i.test(result.stopReason);
+        const cancelled = options.signal?.aborted === true || stopReason === "cancelled" || /stopped by request/i.test(result.stopReason);
         const failed = result.state?.kind === "failed";
         const paused = result.state?.kind === "paused" || result.state?.kind === "running";
         let outcome: LoopMemoryRecord["outcome"];
@@ -1881,7 +2049,12 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // instrument moved; this proves the resulting tree agrees with it.
         let verifiedGain: number | undefined;
         let postApplyFailure: string | null = null;
-        if (applied) {
+        let autoCommitFailure: string | null = null;
+        if (applied && (stopReason === "deadline" || stopReason === "cancelled")) {
+          postApplyFailure = `independent verification did not run because the loop reached ${stopReason}`;
+          verifications.push({ leverId: lever.id, campaignId: result.id, outcome, passed: false, reason: postApplyFailure, at: now().toISOString() });
+        }
+        if (applied && !postApplyFailure) {
           if (!instrument) {
             postApplyFailure = "the applied change had no independent instrument to verify it against";
           }
@@ -1905,15 +2078,17 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             } : {}),
             workRoot: path.join(loopRoot, "post-apply"),
             timeoutMs: instrument.timeoutMs,
-            beforeProcess: () => chargeOne("post-apply", "evaluator"),
+            beforeProcess: async () => { await waitForHourlyProcessStart("post-apply", "evaluator"); chargeOne("post-apply", "evaluator"); },
             ...(options.signal ? { signal: options.signal } : {}),
             ...(options.measureImpl ? { measureImpl: options.measureImpl } : {}),
           });
           } catch (error) {
-            if (!(error instanceof LoopBudgetExhaustedError)) throw error;
+            if (!(error instanceof LoopBudgetExhaustedError) && stopReason !== "deadline" && stopReason !== "cancelled") throw error;
             // The change is already on disk but cannot be checked: say so instead of
             // recording an unverified win or losing the event.
-            postApplyFailure = `the durable budget could not fund verification of the applied change: ${error.message}`;
+            postApplyFailure = stopReason === "deadline" || stopReason === "cancelled"
+              ? `verification stopped because the loop reached ${stopReason}`
+              : `the durable budget could not fund verification of the applied change: ${error instanceof Error ? error.message : String(error)}`;
             verifications.push({ leverId: lever.id, campaignId: result.id, outcome, passed: false, reason: postApplyFailure, at: now().toISOString() });
             addNote(postApplyFailure);
             recordOutcome({
@@ -1922,9 +2097,18 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               wallMs: Date.now() - campaignStartedMs, at: now().toISOString(),
               provenance: { ...(contractId ? { contractId } : {}), ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), strategyClass: lever.sourceKind },
             }, result.campaignRoot);
-            stopReason = `post-apply check failed: ${postApplyFailure}`;
+            if (stopReason !== "deadline" && stopReason !== "cancelled") stopReason = `post-apply check failed: ${postApplyFailure}`;
             launched = true;
             break;
+          }
+          if (postApply.passed && approved.contract.git?.autoCommit) {
+            try {
+              const receipt = await commitVerifiedCampaign({ result, leverId: lever.id, instrument, gain: postApply.gain ?? 0 });
+              if (receipt?.warning) autoCommitFailure = receipt.warning;
+            } catch (error) {
+              autoCommitFailure = error instanceof Error ? error.message : String(error);
+              addNote(`auto-commit failed: ${autoCommitFailure}`);
+            }
           }
           verifications.push({
             leverId: lever.id,
@@ -1960,11 +2144,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             strategyClass: lever.sourceKind,
             ...(lastCampaignId ? { parentCampaign: lastCampaignId.slice(0, 200) } : {}),
           },
-        }, result.campaignRoot);
+        }, result.campaignRoot, !paused);
         // Keep the frozen instrument and loop context while a paused campaign awaits
         // confirmation or an interrupted campaign needs a safe resume.
         if (!paused) fs.rmSync(activeContextPath, { force: true });
-        if (!paused) try {
+        if (!paused && !stopReason) try {
           const worlds: ExperimentWorld[] = [];
           const campaignsDir = path.join(baseRoot, "campaigns");
           for (const campaign of fs.readdirSync(campaignsDir, { withFileTypes: true })) {
@@ -1984,7 +2168,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           const adopted = await maybeDream({
             projectDir, loopRoot, agent: setup.task.agent, resolveAgent: options.resolveAgent,
             signal: options.signal ?? new AbortController().signal, worlds, incumbent,
-            beforeAgentSpawn: () => chargeOne("dream", "agent"),
+            beforeAgentSpawn: async () => { await waitForHourlyProcessStart("dream", "agent"); chargeOne("dream", "agent"); },
           });
           if (JSON.stringify(adopted) !== JSON.stringify(incumbent)) addNote(`dream adopted search config ${JSON.stringify(adopted)}`);
         } catch (error) {
@@ -2002,7 +2186,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // recorded above, but a failing campaign must not be followed by another one. A lever-level
         // preflight rejection also arrives as a failed state; it is recorded as "rejected" above and
         // must not halt an unattended run that still has other levers to screen.
-        if (failed && !cancelled && outcome !== "rejected") {
+        if (failed && !cancelled && !stopReason && outcome !== "rejected") {
           stopReason = classifyCampaignFailure(result.stopReason);
         }
         if (cancelled) stopReason = "cancelled";
@@ -2011,6 +2195,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         // build later experiments on an unverified baseline.
         if (postApplyFailure) stopReason = `post-apply check failed: ${postApplyFailure}`;
         if (paused) stopReason = result.pendingConfirmation ? "confirmation pending" : "paused";
+        if (autoCommitFailure) stopReason = `auto-commit failed: ${autoCommitFailure}`;
         break; // re-rank before the next campaign
       }
       if (stopReason) break;
@@ -2047,6 +2232,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
 
   const stopCode = classifyStop(stopReason);
   const reportPath = path.join(loopRoot, "latest-report.json");
+  const lastRunPath = path.join(loopRoot, "last-run.md");
   const spentPhases = budget?.phases ?? {};
   const evaluatorRunsByPhase = Object.fromEntries(Object.entries(spentPhases).map(([phase, spend]) => [
     phase, Math.max(0, (spend?.evaluator_runs ?? 0) - (runStartPhases[phase as LoopPhase]?.evaluator_runs ?? 0)),
@@ -2070,15 +2256,68 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     memento: mementoNotes(memory),
     contract: approved ? { fingerprint: approved.fingerprint, approvedAt: approved.approvedAt } : null,
     verifications,
+    autoCommits,
   };
+  const reportAt = now().toISOString();
+  const lastWin = [...records].reverse().find((record) => record.outcome === "win");
+  const hourStart = Date.now() - 3_600_000;
+  const rollingProcessLimits = approved?.contract.continuation ? {
+    agentStartsPerHour: approved.contract.continuation.agentStartsPerHour ?? 36,
+    evaluatorRunsPerHour: approved.contract.continuation.evaluatorRunsPerHour ?? 96,
+    activeAgentStarts: (budget?.hourly_starts?.agents ?? []).filter((at) => at > hourStart).length,
+    activeEvaluatorRuns: (budget?.hourly_starts?.evaluators ?? []).filter((at) => at > hourStart).length,
+  } : null;
   try {
-    writeJson(reportPath, { version: 1, at: now().toISOString(), stopCode, stopReason: stopReason.slice(0, 1000), preflight, campaigns: result.campaigns, wins: result.wins,
+    writeJson(reportPath, { version: 1, at: reportAt, stopCode, stopReason: stopReason.slice(0, 1000), preflight, campaigns: result.campaigns, wins: result.wins,
+      lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
       evaluatorRuns: result.evaluatorRuns, preflightEvaluatorRuns, campaignEvaluatorRuns, agentStarts: result.agentStarts,
       evaluatorRunsByPhase,
+      rollingProcessLimits,
       agentStartsByPhase: Object.fromEntries(Object.entries(spentPhases).map(([phase, spend]) => [phase, Math.max(0, (spend?.agent_starts ?? 0) - (runStartPhases[phase as LoopPhase]?.agent_starts ?? 0))])),
-      verifications: verifications.map(({ campaignId, outcome, passed, at }) => ({ campaignId, outcome, passed, at })) });
+      verifications: verifications.map(({ campaignId, outcome, passed, at }) => ({ campaignId, outcome, passed, at })),
+      autoCommits });
   } catch (error) {
     memory.notes.push(`run report could not be saved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000));
+  }
+  try {
+    const oneLine = (value: string, limit = 1000): string => value.replace(/[\r\n\t]+/g, " ").replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, " ").slice(0, limit);
+    const recovery = recoveryForLoop({ stopCode, stopReason, preflight });
+    const blocked = preflight.checks.filter((check) => check.status === "blocked");
+    const recentAttempts = records.slice(-20);
+    const dreamDecisions = memory.notes.filter((note) => note.startsWith("dream adopted search config ")).slice(-10);
+    const caps = budget
+      ? `${budget.campaigns}/${budget.max_campaigns} campaigns, ${budget.agent_starts}/${budget.max_agent_starts} agent starts, ${budget.evaluator_runs}/${budget.max_evaluator_runs} evaluator runs used`
+      : "durable budget unavailable";
+    const lines = [
+      "# Dream-RSI last run",
+      "",
+      `- At: ${reportAt}`,
+      `- Stop: \`${stopCode}\` — ${oneLine(stopReason)}`,
+      `- Activity: ${result.campaigns} campaign(s), ${result.wins} verified win(s), ${result.agentStarts} agent start(s), ${result.evaluatorRuns} evaluator run(s) (${preflightEvaluatorRuns} preflight, ${campaignEvaluatorRuns} campaign).`,
+      `- Durable allowance: ${caps}.`,
+      ...(approved?.contract.continuation ? [`- Continuous policy: ${budget?.consecutive_no_win_campaigns ?? 0}/${approved.contract.continuation.plateauCampaigns} consecutive no-win campaign(s); minimum ${Math.ceil(approved.contract.continuation.minimumCampaignIntervalMs / 1000)} second(s) between starts${budget?.last_campaign_started_at ? `; last start ${oneLine(budget.last_campaign_started_at, 40)}` : ""}.`, `- Rolling hourly limits: ${rollingProcessLimits!.activeAgentStarts}/${rollingProcessLimits!.agentStartsPerHour} agent starts and ${rollingProcessLimits!.activeEvaluatorRuns}/${rollingProcessLimits!.evaluatorRunsPerHour} evaluator runs in the current hour.`] : []),
+      `- Last verified win: ${lastWin ? `${oneLine(lastWin.leverId, 120)}${lastWin.verifiedGain === undefined ? "" : ` (${lastWin.verifiedGain} ${oneLine(approved?.contract.outcome.unit ?? "units", 40)} gain)`}` : "none in this run"}.`,
+      "",
+      "## Blockers",
+      ...(blocked.length ? blocked.map((check) => `- ${oneLine(check.name, 80)}: ${oneLine(check.reason)}${check.remedy ? ` Next step: ${oneLine(check.remedy)}` : ""}`) : ["- No preflight blocker recorded."]),
+      "",
+      "## Attempt timeline",
+      ...(records.length > recentAttempts.length ? [`- Showing the latest ${recentAttempts.length} of ${records.length} recorded attempts.`] : []),
+      ...(recentAttempts.length ? recentAttempts.map((record) => `- ${oneLine(record.at, 80)} — ${oneLine(record.outcome, 40)} · lever ${oneLine(record.leverId, 100)} · ${record.agentStarts} agent start(s), ${record.evaluatorRuns} evaluator run(s), ${record.wallMs} ms${typeof record.verifiedGain === "number" ? ` · verified gain ${record.verifiedGain} ${oneLine(approved?.contract.outcome.unit ?? "units", 40)}` : ""}.`) : ["- No campaign attempts recorded."]),
+      "",
+      "## Dream decisions",
+      ...(dreamDecisions.length ? dreamDecisions.map((decision) => `- ${oneLine(decision, 300)}`) : ["- No search configuration was promoted during this run."]),
+      "",
+      "## Verified commits",
+      ...(autoCommits.length ? autoCommits.map((receipt) => `- ${oneLine(receipt.hash, 80)} on ${oneLine(receipt.branch, 120)} (${receipt.files.length} file(s)).`) : ["- None recorded in this run."]),
+      "",
+      `## Next action\n${oneLine(recovery.next_step)}`,
+      "",
+      `Machine-readable report: ${path.basename(reportPath)}`,
+    ];
+    writeFileAtomic(lastRunPath, `${lines.join("\n")}\n`);
+  } catch (error) {
+    memory.notes.push(`last-run summary could not be saved: ${error instanceof Error ? error.message : String(error)}`.slice(0, 1000));
   }
   return result;
 }
