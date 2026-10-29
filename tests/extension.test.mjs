@@ -500,6 +500,7 @@ test("status, watch and its shortcut follow the live loop target before a campai
   fs.writeFileSync(path.join(caller.dreamRoot, "loop/status.json"), JSON.stringify({
     version: 1, state: "stopped", updatedAt: "2026-10-29T00:00:00.000Z", branch: "dream-rsi/improve",
     branchTip: "0123456789abcdef0123456789abcdef01234567",
+    effectiveAgent: { command: "pi-bolt", model: "anthropic/claude-sonnet", modelSource: "saved" },
   }));
   const {context,harness} = await boot(caller);
   const tool = harness.tools.get("dream_rsi_loop");
@@ -521,6 +522,7 @@ test("status, watch and its shortcut follow the live loop target before a campai
     const other = await tool.execute("caller-status", {action:"status",project_dir:caller.projectDir},undefined,undefined,context);
     assert.equal(other.details.activity,null,"an explicit project must not inherit another target's activity");
     assert.match(other.content[0].text, /Latest recorded RSI branch tip: 0123456789abcdef0123456789abcdef01234567 on dream-rsi\/improve/);
+    assert.match(other.content[0].text, /Latest child agent: command "pi-bolt", model "anthropic\/claude-sonnet" \(saved\)\./);
     fs.writeFileSync(path.join(caller.dreamRoot, "loop/status.json"), JSON.stringify({
       version: 1, state: "running\ninjected", updatedAt: "2026-10-29T00:00:00.000Z\ninjected",
       branch: "dream-rsi/improve\ninjected", branchTip: "0123456789abcdef0123456789abcdef01234567",
@@ -528,6 +530,14 @@ test("status, watch and its shortcut follow the live loop target before a campai
     const malformedStatus = await tool.execute("caller-malformed-status", { action: "status", project_dir: caller.projectDir }, undefined, undefined, context);
     assert.match(malformedStatus.content[0].text, /on dream-rsi\/improve injected \(observed unknown time; status unknown\)/);
     assert.doesNotMatch(malformedStatus.content[0].text, /\ninjected/);
+    for (const invalidSnapshot of [
+      { version: 99, effectiveAgent: { command: "bogus", model: 17, modelSource: "session" } },
+      { version: 1, effectiveAgent: { command: "bogus", model: 17, modelSource: "session" } },
+    ]) {
+      fs.writeFileSync(path.join(caller.dreamRoot, "loop/status.json"), JSON.stringify(invalidSnapshot));
+      const invalid = await tool.execute("caller-invalid-agent", { action: "status", project_dir: caller.projectDir }, undefined, undefined, context);
+      assert.doesNotMatch(invalid.content[0].text, /Latest child agent:/, "unsupported or inconsistent agent metadata must not be reported as fact");
+    }
     await harness.commands.get("dream-rsi").handler("watch",context);
     assert.ok(harness.injectedMessages.at(-1).message.content.includes(`Project: ${target.projectDir}`));
     await harness.shortcuts.get("ctrl+shift+d").handler(context);

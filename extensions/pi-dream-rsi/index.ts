@@ -599,14 +599,28 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const lastRunPath = path.join(loopRoot, "last-run.md");
         lines.push(`Machine-readable live status: ${statusPath}`);
         try {
-          const status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as { version?: number; state?: string; updatedAt?: string; branch?: string | null; branchTip?: string | null };
-          if (status.version === 1 && typeof status.state === "string" && typeof status.updatedAt === "string" && typeof status.branch === "string") {
-            const branch = status.branch.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 120);
-            const timestamp = Date.parse(status.updatedAt);
-            const observedAt = Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : "unknown time";
-            const state = ["running", "stopping", "stopped", "failed"].includes(status.state) ? status.state : "unknown";
-            const tip = typeof status.branchTip === "string" && /^[a-f0-9]{40,64}$/i.test(status.branchTip) ? status.branchTip : "not available";
-            lines.push(`Latest recorded RSI branch tip: ${tip} on ${branch} (observed ${observedAt}; status ${state}).`);
+          const status = JSON.parse(fs.readFileSync(statusPath, "utf8")) as { version?: number; state?: string; updatedAt?: string; branch?: string | null; branchTip?: string | null; effectiveAgent?: { command?: string; model?: string | null; modelSource?: string } | null };
+          if (status.version === 1) {
+            if (typeof status.state === "string" && typeof status.updatedAt === "string" && typeof status.branch === "string") {
+              const branch = status.branch.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 120);
+              const timestamp = Date.parse(status.updatedAt);
+              const observedAt = Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : "unknown time";
+              const state = ["running", "stopping", "stopped", "failed"].includes(status.state) ? status.state : "unknown";
+              const tip = typeof status.branchTip === "string" && /^[a-f0-9]{40,64}$/i.test(status.branchTip) ? status.branchTip : "not available";
+              lines.push(`Latest recorded RSI branch tip: ${tip} on ${branch} (observed ${observedAt}; status ${state}).`);
+            }
+            const effectiveAgent = status.effectiveAgent;
+            if (effectiveAgent && typeof effectiveAgent.command === "string" && effectiveAgent.command.trim()) {
+              const source = effectiveAgent.modelSource;
+              const rawModel = effectiveAgent.model;
+              const childDefault = source === "child-default" && rawModel === null;
+              const configuredModel = (source === "session" || source === "saved") && typeof rawModel === "string" && rawModel.trim().length > 0;
+              if (childDefault || configuredModel) {
+                const command = effectiveAgent.command.replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 200);
+                const model = childDefault ? "child default" : (rawModel as string).replace(/[\x00-\x1f\x7f]/g, " ").trim().slice(0, 120);
+                if (command && model) lines.push(`Latest child agent: command "${command}", model "${model}" (${source}).`);
+              }
+            }
           }
         } catch { /* report the status path even when its snapshot is absent or unreadable */ }
         if (fs.existsSync(reportPath)) {

@@ -658,6 +658,10 @@ test("a resumed confirmation commits only after its independent post-apply check
       resumeCampaignImpl: async (options) => {
         const recordPath = path.join(artifacts.campaignRoot, "campaign.json");
         const record = JSON.parse(fs.readFileSync(recordPath, "utf8"));
+        const effectiveAgent = { command: "pi-bolt", model: "openai/gpt-6.1-sol", modelSource: "saved" };
+        options.onUpdate({ id: record.id, state: { kind: "running", phase: "confirm" }, effectiveAgent });
+        assert.deepEqual(JSON.parse(fs.readFileSync(path.join(artifacts.loopRoot, "status.json"), "utf8")).effectiveAgent, effectiveAgent,
+          "live confirmation status records the actual child agent");
         const transactionId = "resume-verified-apply";
         applyCandidatePatch({ seedRoot: record.targetRoot, patch: record.pendingConfirmation.patch,
           journalDir: path.join(artifacts.campaignRoot, "promotion-journal"), transactionId });
@@ -671,6 +675,8 @@ test("a resumed confirmation commits only after its independent post-apply check
     });
 
     assert.equal(result.stopCode, "confirmation-complete", result.stopReason);
+    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(artifacts.loopRoot, "status.json"), "utf8")).effectiveAgent,
+      { command: "pi-bolt", model: "openai/gpt-6.1-sol", modelSource: "saved" }, "terminal confirmation status retains the actual child agent");
     assert.equal(JSON.parse(fs.readFileSync(loopBudgetPath, "utf8")).consecutive_no_win_campaigns, 0,
       "saved confirmation recovery runs despite a reached plateau and a verified win clears the streak");
     assert.equal(result.autoCommits.length, 1, "the resumed verified win produces one local receipt");
@@ -796,6 +802,9 @@ test("dream adopts a replay winner, charges its agent, and the next campaign sna
     assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "search-config.json"), "utf8")), adopted);
     const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8"));
     assert.deepEqual(budget.phases.dream, { agent_starts: 1, evaluator_runs: 0, campaigns: 0 }, "the dream agent is charged before spawn");
+    const liveStatus = JSON.parse(fs.readFileSync(path.join(loopRoot, "status.json"), "utf8"));
+    assert.deepEqual(liveStatus.effectiveAgent, { command: process.execPath, model: null, modelSource: "child-default" },
+      "the latest child-agent command and default model remain observable after the dream step");
     assert.equal(fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8").trim().split(/\r?\n/).length, 1,
       "the actual replay decision is durably recorded");
     const lastRun = fs.readFileSync(path.join(loopRoot, "last-run.md"), "utf8");

@@ -34,7 +34,7 @@ import { phaseIsActive } from "./ownership.ts";
 import { normalizeProjectRelativePath, pathProtected, pathWithin } from "./scope.ts";
 import { defaultSearchConfig, type ExperimentWorld, type SearchConfig } from "./experiment.ts";
 import { maybeDream, validateSearchConfig } from "./dream.ts";
-import { copyWorkspace, runAgent } from "../agent/runner.ts";
+import { copyWorkspace, runAgent, type EffectiveAgent } from "../agent/runner.ts";
 
 /**
  * The unattended loop: one iteration = recon, ranked lever, synthesized or
@@ -1214,6 +1214,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   };
   let activityWriteWarning = false;
   let lastActivityWriteMs = 0;
+  let latestEffectiveAgent: EffectiveAgent | null = null;
   let budget: LoopBudgetFile | null = null;
   const statusPath = path.join(loopRoot, "status.json");
   const persistActivity = (always: boolean): void => {
@@ -1233,6 +1234,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         updatedAt: lease.activity.updatedAt,
         branch: approved?.contract.git?.branch ?? null,
         branchTip: autoCommitBranch?.head ?? null,
+        effectiveAgent: latestEffectiveAgent,
         budget: budget ? {
           campaigns: budget.campaigns, maxCampaigns: budget.max_campaigns,
           agentStarts: budget.agent_starts, maxAgentStarts: budget.max_agent_starts,
@@ -1358,6 +1360,10 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       }
       if (options.signal?.aborted) { stopReason = "cancelled"; return; }
       const effective = result.effectiveAgent;
+      if (effective) {
+        latestEffectiveAgent = effective;
+        persistActivity(true);
+      }
       const label = `command "${effective?.command ?? task.agent.command}" model "${effective?.model ?? "child default"}"`;
       const detail = result.spawnError
         ? result.spawnError
@@ -1439,7 +1445,9 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
         beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
         onUpdate: (status) => {
+          if (status.effectiveAgent) latestEffectiveAgent = status.effectiveAgent;
           setActivity("resuming", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
+          if (status.effectiveAgent) persistActivity(true);
           options.onCampaignUpdate?.(status);
         },
         ...(options.onPhaseProgress ? { onPhaseProgress: options.onPhaseProgress } : {}),
@@ -2005,7 +2013,9 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(options.resolveAgent ? { resolveAgent: options.resolveAgent } : {}),
             beforeProcessRateLimit: async (kind, _key, signal) => waitForHourlyProcessStart("campaign", kind, signal),
             onUpdate: (status) => {
+              if (status.effectiveAgent) latestEffectiveAgent = status.effectiveAgent;
               setActivity("campaign", `Campaign ${status.id}: ${status.state.kind}${status.state.kind === "running" ? ` / ${status.state.phase}` : ""}`, status.id, true);
+              if (status.effectiveAgent) persistActivity(true);
               const saved = readJson<LoopResumeContext>(activeContextPath);
               if (saved && saved.version === 1) writeJson(activeContextPath, { ...saved, campaignId: status.id });
               if (budget?.open_campaign?.phase === "campaign") {
@@ -2194,6 +2204,11 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             projectDir, loopRoot, agent: setup.task.agent, resolveAgent: options.resolveAgent,
             signal: options.signal ?? new AbortController().signal, worlds, incumbent,
             beforeAgentSpawn: async () => { await waitForHourlyProcessStart("dream", "agent"); chargeOne("dream", "agent"); },
+            onAgentComplete: (agentResult) => {
+              if (!agentResult.effectiveAgent) return;
+              latestEffectiveAgent = agentResult.effectiveAgent;
+              persistActivity(true);
+            },
           });
           if (JSON.stringify(adopted) !== JSON.stringify(incumbent)) addNote(`dream adopted search config ${JSON.stringify(adopted)}`);
         } catch (error) {
@@ -2267,6 +2282,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           startedAt: leaseStartedAt,
           branch: approved?.contract.git?.branch ?? null,
           branchTip: autoCommitBranch?.head ?? null,
+          effectiveAgent: latestEffectiveAgent,
           lastVerifiedCommit: autoCommits.at(-1)?.hash ?? null,
           lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
           budget: budget ? {

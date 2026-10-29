@@ -463,6 +463,9 @@ test("verified multi-file wins continue on the dedicated local auto-commit branc
     assert.equal(status.stopCode, run.result.stopCode);
     assert.equal(status.branch, "dream-rsi/improve");
     assert.equal(status.branchTip, receipt.hash);
+    assert.match(status.effectiveAgent.command, /(?:^|[\\/])node(?:\.exe)?$/i);
+    assert.equal(status.effectiveAgent.model, null);
+    assert.equal(status.effectiveAgent.modelSource, "child-default");
     assert.equal(status.lastVerifiedCommit, receipt.hash);
     assert.equal(status.budget.agentStarts, run.result.agentStarts);
     assert.equal(status.budget.evaluatorRuns, run.result.evaluatorRuns);
