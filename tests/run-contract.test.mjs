@@ -17,12 +17,13 @@ import {
   ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, isProtectedAsset, normalizeRunContract,
   projectFingerprint, readStoredContract, restrictedEnvironment, validateRunContract,
 } from "../extensions/pi-dream-rsi/engine/intake.ts";
-import { pathWithin } from "../extensions/pi-dream-rsi/engine/scope.ts";
+import { constitutionProtectedAssets, pathWithin } from "../extensions/pi-dream-rsi/engine/scope.ts";
 import {
   readOrCreateLoopBudget, reconcileOpenReservation, remainingAllowance, settleReservation, writeLoopBudget,
 } from "../extensions/pi-dream-rsi/engine/budget.ts";
-import { runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
+import { bootstrapWritePlan, runLoop } from "../extensions/pi-dream-rsi/engine/loop.ts";
 import { resolveLoopProposal } from "../extensions/pi-dream-rsi/engine/proposal.ts";
+import { readLoopSettingsFile } from "../extensions/pi-dream-rsi/engine/settings.ts";
 
 function validContract(overrides = {}) {
   return {
@@ -76,6 +77,8 @@ test("a contract is rejected for every fact the loop needs to stay inside its bo
     [{ budgets: { falseAcceptBudget: 0.9 } }, /falseAcceptBudget/],
     [{ git: { autoCommit: true, branch: "main" } }, /cannot target a default branch/],
     [{ git: { autoCommit: true, branch: "bad branch" } }, /valid local Git branch/],
+    [{ git: { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "later" } }, /commitPolicy/],
+    [{ git: { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } }, /must match autoCommit/],
   ];
   for (const [patch, expected] of cases) {
     const errors = validateRunContract(validContract(patch));
@@ -98,6 +101,15 @@ test("new Git-backed proposals default to verified auto-commit while legacy cont
     assert.equal(resumed.contract.git, undefined, "legacy contracts remain working-tree-only without adding a new Git policy");
     const disabled = resolveLoopProposal({ auto_commit: false }, projectDir);
     assert.equal(disabled.contract.git?.autoCommit, false);
+    const perChange = resolveLoopProposal({ commit_policy: "commit-per-accepted-change" }, projectDir);
+    assert.deepEqual(perChange.contract.git, { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "commit-per-accepted-change" });
+    const squash = resolveLoopProposal({ commit_policy: "squash-per-campaign" }, projectDir);
+    assert.deepEqual(squash.contract.git, { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" });
+    assert.equal(resolveLoopProposal({}, projectDir, squash.contract).contract.git?.commitPolicy, "squash-per-campaign",
+      "the saved policy is inherited on resume/reuse");
+    const noCommit = resolveLoopProposal({ commit_policy: "no-commit" }, projectDir);
+    assert.deepEqual(noCommit.contract.git, { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "no-commit" });
+    assert.throws(() => resolveLoopProposal({ auto_commit: true, commit_policy: "no-commit" }, projectDir), /conflict/);
     const continuous = resolveLoopProposal({ continuous: true }, projectDir);
     assert.deepEqual(continuous.contract.continuation, { plateauCampaigns: 3, minimumCampaignIntervalMs: 60_000, agentStartsPerHour: 36, evaluatorRunsPerHour: 96 });
     const customRates = resolveLoopProposal({ continuous: true, agent_starts_per_hour: 12, evaluator_runs_per_hour: 48 }, projectDir);
@@ -121,6 +133,23 @@ test("new Git-backed proposals default to verified auto-commit while legacy cont
       scope_roots: ["src"], evaluator_bootstrap: { authorized: true, paths: ["src/measure.mjs"] } }, projectDir);
     assert.equal(bootstrapped.contract.git?.autoCommit, false);
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
+test("commit policies survive settings-envelope import and invalid combinations fail closed", () => {
+  const dir = tempProject();
+  try {
+    const file = path.join(dir, "settings.json");
+    const contract = normalizeRunContract(validContract({ git: { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } }));
+    fs.writeFileSync(file, JSON.stringify({ version: 1, contract }));
+    const allowed = ["focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "protected_assets", "gates",
+      "max_campaigns", "max_agent_starts", "max_evaluator_runs", "false_accept_budget", "deadline_minutes", "auto_commit", "commit_branch", "commit_policy", "env_allowlist", "command_categories"];
+    const settings = readLoopSettingsFile(file, dir, allowed);
+    assert.equal(settings.commit_policy, "squash-per-campaign");
+    assert.equal(settings.auto_commit, true);
+    const invalid = { ...contract, git: { autoCommit: false, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } };
+    fs.writeFileSync(file, JSON.stringify({ version: 1, contract: invalid }));
+    assert.throws(() => readLoopSettingsFile(file, dir, allowed), /must match autoCommit/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a saved contract can be proposed with a higher total campaign cap", () => {
@@ -202,6 +231,30 @@ test("scope and protected-asset checks are exact about paths", () => {
 
   const open = normalizeRunContract(validContract({ scope: { roots: [] } }));
   assert.equal(pathWithin("anything/at/all.js", open.scope.roots), true, "no declared roots means the whole workspace is editable");
+});
+
+test("self-host contracts protect immutable verifier and patch-application files", () => {
+  const projectDir = tempProject({
+    "package.json": JSON.stringify({ name: "pi-dream-rsi" }),
+    "extensions/pi-dream-rsi/engine/verify.ts": "export {};\n",
+    "extensions/pi-dream-rsi/engine/campaign-patch.ts": "export {};\n",
+  });
+  const protectedFiles = ["extensions/pi-dream-rsi/engine/verify.ts", "extensions/pi-dream-rsi/engine/campaign-patch.ts", "docs/constitution.md"];
+  try {
+    assert.deepEqual(constitutionProtectedAssets(projectDir), protectedFiles);
+    const direct = normalizeRunContract(validContract({ scope: { roots: ["."] } }));
+    const approved = approveRunContract(projectDir, direct);
+    assert.notEqual(approvalIdentity(approved.contract), approvalIdentity(direct), "adding immutable scope requires the explicit contract-replacement path");
+    const proposal = resolveLoopProposal({}, projectDir, direct);
+    for (const file of protectedFiles) {
+      assert.ok(approved.contract.scope.protectedAssets.includes(file), `${file} is enforced for direct contracts`);
+      assert.ok(proposal.contract.scope.protectedAssets.includes(file), `${file} appears in reviewed proposals`);
+      assert.ok(bootstrapWritePlan(approved.contract, [file]).checks.some((check) => check.status === "blocked"), `${file} cannot be created by bootstrap`);
+    }
+    const ordinary = tempProject({ "package.json": JSON.stringify({ name: "unrelated-project" }) });
+    try { assert.deepEqual(constitutionProtectedAssets(ordinary), [], "the self-host rule does not constrain unrelated repositories"); }
+    finally { fs.rmSync(ordinary, { recursive: true, force: true }); }
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });
 
 test("a stored contract round-trips and a corrupt file fails closed", () => {

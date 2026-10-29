@@ -16,7 +16,7 @@ import { pathProtected, pathWithin } from "./engine/scope.ts";
 import { phaseIsActive } from "./engine/ownership.ts";
 import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { mementoNotes, readMemory } from "./engine/search.ts";
-import { approvalIdentity, normalizeRunContract, readStoredContract } from "./engine/intake.ts";
+import { approvalIdentity, effectiveCommitPolicy, normalizeRunContract, readStoredContract } from "./engine/intake.ts";
 import { measurementHarnessInstructions } from "./engine/harness.ts";
 import { resolveLoopProposal, proposalReview, proposalIdentity, type LoopProposal } from "./engine/proposal.ts";
 import { discoverMeasurementOptions } from "./engine/recon.ts";
@@ -68,7 +68,8 @@ const loopParams = {
     approve_proposal: { type: "boolean", description: "Explicit approval of the reviewed proposal_id for a headless prepared start. Separate from host consent, setup authorization, and contract replacement." },
     replace_contract: { type: "boolean", description: "Explicitly authorize replacing a different saved run contract. Review objective, scope, gates, permissions, and any increased caps first. Replacement preserves spend, may only raise caps, and keeps one backup; refuses unsettled campaigns." },
     focus: { type: "string", description: "Improvement goal. Defaults to reducing declared workload wall-clock time without changing results." },
-    auto_commit: { type: "boolean", description: "Commit only independently verified wins on a dedicated branch. Defaults on for new Git projects; legacy contracts keep their saved policy." },
+    auto_commit: { type: "boolean", description: "Legacy shorthand for commit_policy: true selects per-accepted-change, false selects no-commit." },
+    commit_policy: { type: "string", enum: ["commit-per-accepted-change", "squash-per-campaign", "no-commit"], description: "Verified commit policy. Defaults to per-accepted-change for new Git projects; no-commit keeps changes in the working tree." },
     commit_branch: { type: "string", description: "Dedicated local branch for verified auto-commits. Defaults to dream-rsi/improve; main/default branches are refused." },
     continuous: { type: "boolean", description: "Opt in to budget-bounded continuation, a no-win plateau, campaign pacing, and rolling hourly process limits. Resume across days only by explicit action=resume." },
     plateau_campaigns: { type: "integer", minimum: 1, maximum: 64, description: "Continuous-mode stop threshold for consecutive campaigns without a verified win; defaults to 3." },
@@ -482,7 +483,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         : []),
       ...(result.autoCommits.length > 0
         ? result.autoCommits.flatMap((receipt) => [`  auto-commit: ${receipt.hash} on ${receipt.branch} (${receipt.files.length} file(s))`, ...(receipt.warning ? [`  commit warning: ${receipt.warning}`] : [])])
-        : contract.git?.autoCommit ? [`  auto-commit branch: ${contract.git.branch}; no verified win was committed this run`] : []),
+        : contract.git ? [`  commit policy: ${effectiveCommitPolicy(contract.git)}${contract.git.autoCommit ? ` on ${contract.git.branch}` : ""}; no verified win was committed this run`] : []),
     ];
     try {
       const budget = JSON.parse(fs.readFileSync(result.budgetPath, "utf8")) as { campaigns?: number; max_campaigns?: number; agent_starts?: number; max_agent_starts?: number; evaluator_runs?: number; max_evaluator_runs?: number };
@@ -589,7 +590,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           const stored = readStoredContract(loopRoot);
           approvedAt = stored?.approvedAt;
           lines.push(stored
-            ? `Run contract: "${stored.contract.outcome.statement}" (${stored.contract.outcome.unit}, ${stored.contract.outcome.higherIsBetter ? "higher" : "lower"} is better), approved ${stored.approvedAt}; auto-commit ${stored.contract.git?.autoCommit ? `on ${stored.contract.git.branch}` : "off"}.`
+            ? `Run contract: "${stored.contract.outcome.statement}" (${stored.contract.outcome.unit}, ${stored.contract.outcome.higherIsBetter ? "higher" : "lower"} is better), approved ${stored.approvedAt}; commit policy ${effectiveCommitPolicy(stored.contract.git)}${stored.contract.git?.autoCommit ? ` on ${stored.contract.git.branch}` : ""}.`
             : "No run contract stored for this project; the next start requires explicit consent and objective details.");
         } catch { lines.push("The stored run contract is unreadable; the next start fails closed."); }
         try { lines.push(`Recorded loop history (not live progress):\n${mementoNotes(readMemory(memoryPath))}`); }
@@ -811,13 +812,19 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const setupHarness = tokens.includes("--setup-harness");
         const replaceContract = tokens.includes("--replace-contract");
         const autoCommitFlag = tokens.includes("--auto-commit") ? true : tokens.includes("--no-auto-commit") ? false : undefined;
+        const commitPolicyIndex = tokens.indexOf("--commit-policy");
+        const commitPolicyFlag = commitPolicyIndex >= 0 ? tokens[commitPolicyIndex + 1] : undefined;
+        if (commitPolicyIndex >= 0 && (!commitPolicyFlag || commitPolicyFlag.startsWith("--"))) {
+          report("--commit-policy needs commit-per-accepted-change, squash-per-campaign, or no-commit.", "error");
+          return;
+        }
         const configIndex = tokens.indexOf("--config");
         const configFile = configIndex >= 0 ? tokens[configIndex + 1] : undefined;
         if (configIndex >= 0 && (!configFile || configFile.startsWith("--"))) {
           report("--config needs a settings file path.", "error");
           return;
         }
-        const ignored = configIndex >= 0 ? ["--config", configFile!] : [];
+        const ignored = [...(configIndex >= 0 ? ["--config", configFile!] : []), ...(commitPolicyIndex >= 0 ? ["--commit-policy", commitPolicyFlag!] : [])];
         const focus = tokens.filter((token) => !["--consent", "--no-logs", "--setup-harness", "--replace-contract", "--auto-commit", "--no-auto-commit", ...ignored].includes(token)).join(" ");
         let settings: Record<string, unknown> = {};
         if (configFile) {
@@ -825,6 +832,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           catch (error) { report(`Loop settings file is invalid: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
         }
         if (autoCommitFlag !== undefined) settings.auto_commit = autoCommitFlag;
+        if (commitPolicyFlag !== undefined) settings.commit_policy = commitPolicyFlag;
         const sessionId = ctx.sessionManager.getSessionId();
         const currentSlot = activeLoopRuns.get(sessionId);
         if (currentSlot) {
@@ -1066,7 +1074,7 @@ function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
     "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
-    "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--setup-harness] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
+    "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
@@ -1076,7 +1084,7 @@ function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
     { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
-    { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--setup-harness] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
+    { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },
     { value: "stop", label: "stop", description: "Stop the active campaign" },

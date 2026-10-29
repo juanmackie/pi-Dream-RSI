@@ -1,5 +1,6 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { isCommitPolicy } from "./intake.ts";
 
 /** Fields a settings file may not set: they are actions or approvals, not configuration. */
 const FORBIDDEN_KEYS = new Set(["action", "consent", "replace_contract", "project_dir", "include_logs", "preparation_id", "proposal_id", "approve_proposal"]);
@@ -112,10 +113,13 @@ function contractSettings(contract: Record<string, unknown>): Record<string, unk
   if (contract.git !== undefined) {
     if (!isRecord(contract.git)) throw new Error("contract settings git must be an object");
     const git = contract.git;
-    assertKeys(git, ["autoCommit", "branch"], "git");
+    assertKeys(git, ["autoCommit", "branch", "commitPolicy"], "git");
     if (typeof git.autoCommit !== "boolean" || typeof git.branch !== "string" || !git.branch.trim()) throw new Error("contract settings git must set boolean autoCommit and a non-empty branch");
+    if (git.commitPolicy !== undefined && !isCommitPolicy(git.commitPolicy)) throw new Error("contract settings git.commitPolicy is invalid");
+    if (git.commitPolicy !== undefined && git.autoCommit !== (git.commitPolicy !== "no-commit")) throw new Error("contract settings git.commitPolicy must match autoCommit");
     settings.auto_commit = git.autoCommit;
     settings.commit_branch = git.branch;
+    if (git.commitPolicy !== undefined) settings.commit_policy = git.commitPolicy;
   }
   if (contract.execution !== undefined) {
     if (!isRecord(contract.execution)) throw new Error("contract settings execution must be an object");

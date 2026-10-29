@@ -16,6 +16,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import type { AgentConfig } from "./task.ts";
+import { constitutionProtectedAssets } from "./scope.ts";
 
 /** What kind of command a repository declares; the contract lists the categories it allows. */
 export const COMMAND_CATEGORIES = ["test", "benchmark", "build", "custom"] as const;
@@ -32,6 +33,13 @@ const FINGERPRINT_MAX_FILES = 4000;
 const FINGERPRINT_MAX_BYTES = 32 * 1024 * 1024;
 /** A file larger than this contributes its size and a digest, not a full read into the walk. */
 const FINGERPRINT_LARGE_FILE = 4 * 1024 * 1024;
+
+export const COMMIT_POLICIES = ["commit-per-accepted-change", "squash-per-campaign", "no-commit"] as const;
+export type CommitPolicy = (typeof COMMIT_POLICIES)[number];
+
+export function isCommitPolicy(value: unknown): value is CommitPolicy {
+  return typeof value === "string" && COMMIT_POLICIES.includes(value as CommitPolicy);
+}
 
 export type MinimumGain = number | `${number}%`;
 
@@ -117,8 +125,8 @@ export interface RunContract {
     /** Loop-level rare-event allowance for promotions, allocated across the whole run. */
     falseAcceptBudget: number;
   };
-  /** Automatic commits of independently verified wins. Missing means a legacy working-tree-only contract. */
-  git?: { autoCommit: boolean; branch: string };
+  /** Verified local commit settings. Within git, a missing commitPolicy maps autoCommit to its legacy per-change/no-commit behavior. */
+  git?: { autoCommit: boolean; branch: string; commitPolicy?: CommitPolicy };
   /** Explicit opt-in for budget-bounded continuation with a durable no-win plateau and start interval. */
   continuation?: {
     plateauCampaigns: number;
@@ -271,6 +279,9 @@ export function validateRunContract(raw: unknown): string[] {
     if (!isRecord(raw.git)) errors.push("git must be an object when present");
     else {
       if (typeof raw.git.autoCommit !== "boolean") errors.push("git.autoCommit must be a boolean");
+      if (raw.git.commitPolicy !== undefined && !isCommitPolicy(raw.git.commitPolicy)) errors.push(`git.commitPolicy must be one of ${COMMIT_POLICIES.join(", ")}`);
+      else if (typeof raw.git.autoCommit === "boolean" && raw.git.commitPolicy !== undefined
+        && raw.git.autoCommit !== (raw.git.commitPolicy !== "no-commit")) errors.push("git.commitPolicy must match autoCommit");
       if (typeof raw.git.branch !== "string" || !isValidGitBranch(raw.git.branch.trim())) {
         errors.push("git.branch must be a valid local Git branch name");
       } else if (raw.git.autoCommit === true && ["main", "master", "trunk", "develop"].includes(raw.git.branch.trim().toLowerCase())) {
@@ -337,7 +348,7 @@ export function normalizeRunContract(raw: unknown): RunContract {
       deadlineMs: value.budgets.deadlineMs,
       falseAcceptBudget: value.budgets.falseAcceptBudget,
     },
-    ...(value.git ? { git: { autoCommit: value.git.autoCommit, branch: value.git.branch.trim() } } : {}),
+    ...(value.git ? { git: { autoCommit: value.git.autoCommit, branch: value.git.branch.trim(), ...(value.git.commitPolicy ? { commitPolicy: value.git.commitPolicy } : {}) } } : {}),
     ...(value.continuation ? { continuation: { ...value.continuation } } : {}),
     ...(value.agent ? { agent: { ...value.agent, args: [...value.agent.args] } } : {}),
   };
@@ -393,15 +404,20 @@ export function approveRunContract(projectDir: string, contract: RunContract): A
   if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
     throw new ContractNotApprovedError(`project directory does not exist: ${projectDir}`);
   }
-  if (!contract.execution.consent) {
+  const normalized = normalizeRunContract(contract);
+  const addedProtection = constitutionProtectedAssets(projectDir).filter((asset) => !normalized.scope.protectedAssets.includes(asset));
+  const approvedContract = addedProtection.length === 0
+    ? normalized
+    : normalizeRunContract({ ...normalized, scope: { ...normalized.scope, protectedAssets: [...normalized.scope.protectedAssets, ...addedProtection] } });
+  if (!approvedContract.execution.consent) {
     throw new ContractNotApprovedError(
       "trusted-local execution was not approved for this repository; discovered commands run on this host with host access, so the operator must approve that risk once before any probe runs",
     );
   }
-  if (contract.execution.allowedCommandCategories.length === 0) {
+  if (approvedContract.execution.allowedCommandCategories.length === 0) {
     throw new ContractNotApprovedError("no command categories are approved, so no workload can be run");
   }
-  return { contract, fingerprint: projectFingerprint(projectDir), approvedAt: new Date().toISOString() };
+  return { contract: approvedContract, fingerprint: projectFingerprint(projectDir), approvedAt: new Date().toISOString() };
 }
 
 /**
@@ -464,6 +480,10 @@ export function contractIdentity(contract: RunContract): string {
 }
 
 /** Approval identity covers permissions and every setting, not just measurement comparability. */
+export function effectiveCommitPolicy(git: RunContract["git"]): CommitPolicy {
+  return git?.commitPolicy ?? (git?.autoCommit ? "commit-per-accepted-change" : "no-commit");
+}
+
 export function approvalIdentity(contract: RunContract): string {
   return crypto.createHash("sha256").update(JSON.stringify(normalizeRunContract(contract))).digest("hex");
 }

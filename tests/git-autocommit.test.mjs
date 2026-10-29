@@ -194,7 +194,9 @@ test("auto-commit refuses concurrent or altered changes without creating a commi
   const original = "verified improvement\n";
   fs.writeFileSync(path.join(project.root, "solution.txt"), original);
   const altered = "concurrent edit\n";
+  const unrelated = "operator note\n";
   fs.writeFileSync(path.join(project.root, "solution.txt"), altered);
+  fs.writeFileSync(path.join(project.root, "operator-notes.txt"), unrelated);
   await assert.rejects(commitVerifiedChanges({
     projectDir: project.root, branch, expectedHead: head,
     changes: [{ path: "solution.txt", afterHash: hash(original) }],
@@ -203,4 +205,6 @@ test("auto-commit refuses concurrent or altered changes without creating a commi
   }), /postimage changed/i);
   assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: project.root, encoding: "utf8" }).trim(), head);
   assert.equal(execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: project.root, encoding: "utf8" }).trim(), "");
+  assert.equal(fs.readFileSync(path.join(project.root, "solution.txt"), "utf8"), altered, "the conflicting postimage remains untouched");
+  assert.equal(fs.readFileSync(path.join(project.root, "operator-notes.txt"), "utf8"), unrelated, "an unrelated user change remains untouched");
 });

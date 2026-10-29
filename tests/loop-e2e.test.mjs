@@ -330,7 +330,7 @@ function runSpecCommand(spec, cwd) {
 }
 
 /** One trusted-local contract run on a fresh clone, with no supplied winning patch. */
-async function executeFixture(spec, fixtureDir, { limits, campaignDefaults, autoCommit = false } = {}) {
+async function executeFixture(spec, fixtureDir, { limits, campaignDefaults, autoCommit = false, commitPolicy } = {}) {
   const sourceDir = path.join(fixtureDir, "source");
   buildFixtureRepo(sourceDir, spec);
   const cloneDir = cloneFixture(sourceDir, path.join(fixtureDir, "clone"));
@@ -349,7 +349,10 @@ async function executeFixture(spec, fixtureDir, { limits, campaignDefaults, auto
     scope: { roots: scopeRoots, protectedAssets: ["package.json", "e2e-agent.mjs", "dream-e2e-score.mjs", ...targets.filter((file) => /(^|\/)test(s)?(\/|\.)/.test(file))] },
     execution: { mode: "trusted-local", consent: true, envAllowlist: [], allowedCommandCategories: ["test", "build", "custom"] },
     models: { providers: ["local"] },
-    ...(autoCommit ? { git: { autoCommit: true, branch: "dream-rsi/improve" } } : {}),
+    ...(autoCommit || commitPolicy ? { git: {
+      autoCommit: commitPolicy ? commitPolicy !== "no-commit" : true, branch: "dream-rsi/improve",
+      ...(commitPolicy ? { commitPolicy } : {}),
+    } } : {}),
     budgets: { maxCampaigns: limits?.maxCampaigns ?? 1, maxAgentStarts: limits?.maxAgentStarts ?? 36,
       maxEvaluatorRuns: limits?.maxEvaluatorRuns ?? 100, deadlineMs: limits?.deadlineMs ?? 1_800_000, falseAcceptBudget: 0.1 },
     agent: { command: process.execPath, args: [path.join(cloneDir, "e2e-agent.mjs")], prompt_via: "stdin", model: spec.agentModel ?? null, thinking: null,
@@ -445,7 +448,7 @@ test(`loop wins on fresh clones of the npm fixes fixture (${REPEATS} repeats)`, 
 
 test("verified multi-file wins continue on the dedicated local auto-commit branch", async (t) => {
   await withFixtureDir("multifix-autocommit", async (dir) => {
-    const run = await executeFixture(FIXTURES.multifix, dir, { autoCommit: true });
+    const run = await executeFixture(FIXTURES.multifix, dir, { commitPolicy: "commit-per-accepted-change" });
     assertVerifiedWin(FIXTURES.multifix, run);
     assert.equal(run.result.autoCommits.length, 1, "one verified campaign produces one local commit");
     const receipt = run.result.autoCommits[0];
@@ -470,6 +473,24 @@ test("verified multi-file wins continue on the dedicated local auto-commit branc
     assert.equal(status.budget.agentStarts, run.result.agentStarts);
     assert.equal(status.budget.evaluatorRuns, run.result.evaluatorRuns);
     reportCosts(t, "multifix auto-commit (npm, two files)", [{ agentStarts: run.result.agentStarts, evaluatorRuns: run.result.evaluatorRuns, wallMs: run.wallMs }]);
+  });
+});
+
+test("squash-per-campaign commits the verified campaign and no-commit leaves it in the working tree", async () => {
+  await withFixtureDir("multifix-squash", async (dir) => {
+    const run = await executeFixture(FIXTURES.multifix, dir, { commitPolicy: "squash-per-campaign" });
+    assertVerifiedWin(FIXTURES.multifix, run);
+    assert.equal(run.result.autoCommits.length, 1);
+    assert.deepEqual(run.result.autoCommits[0].files, ["src/alpha.js", "src/core/beta.js"]);
+    assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "dream-rsi/improve");
+    assert.equal(execFileSync("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "");
+  });
+  await withFixtureDir("multifix-no-commit", async (dir) => {
+    const run = await executeFixture(FIXTURES.multifix, dir, { commitPolicy: "no-commit" });
+    assertVerifiedWin(FIXTURES.multifix, run);
+    assert.equal(run.result.autoCommits.length, 0);
+    assert.equal(execFileSync("git", ["branch", "--show-current"], { cwd: run.cloneDir, encoding: "utf8" }).trim(), "main");
+    assert.match(execFileSync("git", ["status", "--porcelain"], { cwd: run.cloneDir, encoding: "utf8" }), /src\/alpha\.js|src\/core\/beta\.js/);
   });
 });
 

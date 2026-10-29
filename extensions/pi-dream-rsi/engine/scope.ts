@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import * as path from "node:path";
 
 function normalizeRelativePath(value: string, allowRoot: boolean): string | null {
@@ -13,6 +14,28 @@ function normalizeRelativePath(value: string, allowRoot: boolean): string | null
 export function normalizeProjectRelativePath(relative: string): string | null {
   if (typeof relative !== "string" || !relative.trim() || relative.endsWith("/") || relative.endsWith("\\")) return null;
   return normalizeRelativePath(relative, false);
+}
+
+const IMMUTABLE_SELF_HOST_ASSETS = [
+  "extensions/pi-dream-rsi/engine/verify.ts",
+  "extensions/pi-dream-rsi/engine/campaign-patch.ts",
+  "docs/constitution.md",
+] as const;
+
+/** Self-host verifier assets that a loop contract must keep outside the editable surface. */
+export function constitutionProtectedAssets(projectDir: string): string[] {
+  const marker = fs.existsSync(path.join(projectDir, "extensions", "pi-dream-rsi", "index.ts"));
+  let packageMatch = false;
+  const packageFile = path.join(projectDir, "package.json");
+  try {
+    const stat = fs.lstatSync(packageFile);
+    if (stat.isFile() && !stat.isSymbolicLink() && stat.size <= 64 * 1024) {
+      const metadata: unknown = JSON.parse(fs.readFileSync(packageFile, "utf8"));
+      packageMatch = typeof metadata === "object" && metadata !== null && !Array.isArray(metadata)
+        && (metadata as { name?: unknown }).name === "pi-dream-rsi";
+    }
+  } catch { /* The source marker still identifies the self-host project. */ }
+  return marker || packageMatch ? [...IMMUTABLE_SELF_HOST_ASSETS] : [];
 }
 
 /** True when a project-relative path is within one of the declared roots. */

@@ -88,6 +88,7 @@ test("registers assessment and loop tools with the v3 command surface", async ()
     const loop = harness.tools.get("dream_rsi_loop");
     assert.deepEqual(loop.parameters.properties.action.enum, ["prepare", "start", "status", "stop", "resume", "confirm"]);
     assert.equal(loop.parameters.properties.include_logs.type, "boolean", "the loop retains its session-log privacy opt-out");
+    assert.deepEqual(loop.parameters.properties.commit_policy.enum, ["commit-per-accepted-change", "squash-per-campaign", "no-commit"]);
     assert.deepEqual(loop.parameters.properties.evaluator_bootstrap.required, ["authorized", "paths"], "bootstrap requires explicit authorization and an exact path allowlist");
     assert.equal(loop.parameters.additionalProperties, false);
     const resources = await harness.handlers.get("resources_discover")({ cwd: project.projectDir, reason: "startup" }, null);
@@ -1674,6 +1675,19 @@ process.stdin.resume(); process.stdin.on("end", () => {
   assert.match(result.content[0].text, /bootstrap failed/i);
   assert.equal(fs.readFileSync(path.join(target, "check.mjs"), "utf8"), "// concurrent user edit\n");
   assert.equal(fs.existsSync(path.join(target, "measure.mjs")), false, "the first new setup file is rolled back");
+});
+
+test("commit-policy command flag is explicit and does not become part of the objective", async (t) => {
+  const project = makeProject();
+  t.after(project.cleanup);
+  const { context, harness } = await boot(project);
+  context.hasUI = false;
+  await harness.commands.get("dream-rsi").handler("loop reduce runtime --commit-policy no-commit --no-logs", context);
+  const message = harness.sentMessages.at(-1).content;
+  const request = JSON.parse(message.slice(message.indexOf("{")));
+  assert.equal(request.proposed_settings.commit_policy, "no-commit");
+  assert.doesNotMatch(JSON.stringify(harness.sentMessages), /focused on: reduce runtime --commit-policy/);
+  assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "policy review does not bypass trusted-local consent");
 });
 
 test("the setup-harness command flag is explicit and does not become part of the objective", async (t) => {

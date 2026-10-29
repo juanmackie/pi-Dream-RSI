@@ -1,10 +1,11 @@
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { approvalIdentity, projectFingerprint, normalizeRunContract, type RunContract } from "./intake.ts";
+import { approvalIdentity, isCommitPolicy, projectFingerprint, normalizeRunContract, type CommitPolicy, type RunContract } from "./intake.ts";
 import { withMeasurementHarness } from "./harness.ts";
 import { defaultTask, isTaskTimeout, type AgentConfig, type TaskConfig } from "./task.ts";
 import { bootstrapWritePlan, type LoopLimits } from "./loop.ts";
+import { constitutionProtectedAssets } from "./scope.ts";
 
 export interface LoopProposal {
   contract: RunContract;
@@ -45,6 +46,11 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
   }
   if (params.replace_contract !== undefined && typeof params.replace_contract !== "boolean") throw new Error("replace_contract must be a boolean");
   if (params.auto_commit !== undefined && typeof params.auto_commit !== "boolean") throw new Error("auto_commit must be a boolean");
+  if (params.commit_policy !== undefined && !isCommitPolicy(params.commit_policy)) {
+    throw new Error("commit_policy must be commit-per-accepted-change, squash-per-campaign, or no-commit");
+  }
+  if (params.commit_policy !== undefined && params.auto_commit !== undefined
+    && params.auto_commit !== (params.commit_policy !== "no-commit")) throw new Error("auto_commit conflicts with commit_policy");
   if (params.continuous !== undefined && typeof params.continuous !== "boolean") throw new Error("continuous must be a boolean");
   if (params.commit_branch !== undefined && (typeof params.commit_branch !== "string" || !params.commit_branch.trim() || params.commit_branch.length > 255)) throw new Error("commit_branch must be a non-empty local branch name of at most 255 characters");
   if (params.focus !== undefined && (typeof params.focus !== "string" || !params.focus.trim())) throw new Error("focus requires an explicit improvement goal (a non-empty sentence)");
@@ -122,16 +128,22 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
     agentStartsPerHour: readLimit("agent_starts_per_hour", prior?.continuation?.agentStartsPerHour ?? 36, 10_000),
     evaluatorRunsPerHour: readLimit("evaluator_runs_per_hour", prior?.continuation?.evaluatorRunsPerHour ?? 96, 10_000),
   } : undefined;
-  const gitPolicy = params.auto_commit !== undefined || params.commit_branch !== undefined || prior?.git || !prior
+  const inheritedCommitPolicy = prior?.git?.commitPolicy;
+  const commitPolicy: CommitPolicy = params.commit_policy
+    ?? (params.auto_commit === undefined ? inheritedCommitPolicy : params.auto_commit ? "commit-per-accepted-change" : "no-commit")
+    ?? ((prior?.git?.autoCommit ?? (!prior && hasGitMetadata(projectDir))) ? "commit-per-accepted-change" : "no-commit");
+  const gitPolicy = params.auto_commit !== undefined || params.commit_policy !== undefined || params.commit_branch !== undefined || prior?.git || !prior
     ? {
-      autoCommit: params.auto_commit ?? prior?.git?.autoCommit ?? (prior ? false : hasGitMetadata(projectDir)),
+      autoCommit: commitPolicy !== "no-commit",
       branch: (params.commit_branch ?? prior?.git?.branch ?? DEFAULT_COMMIT_BRANCH).trim(),
+      ...(params.commit_policy !== undefined || inheritedCommitPolicy ? { commitPolicy } : {}),
     }
     : undefined;
   if (gitPolicy?.autoCommit && !hasGitMetadata(projectDir)) throw new Error("auto_commit requires a project inside an existing Git working tree");
   if (gitPolicy?.autoCommit && params.evaluator_bootstrap?.authorized) {
     throw new Error("auto_commit cannot be combined with evaluator bootstrap in v1 because setup writes are not campaign patches; set auto_commit: false or create and qualify setup files before enabling auto-commit");
   }
+  const protectedAssets = [...new Set([...list("protected_assets", prior?.scope.protectedAssets ?? []), ...constitutionProtectedAssets(projectDir)])];
   const contract = normalizeRunContract({
     version: 1,
     outcome: {
@@ -144,7 +156,7 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
       ...(evaluator === undefined ? {} : { evaluator }),
     },
     preserved: { gates: list("gates", prior?.preserved.gates ?? []) },
-    scope: { roots: list("scope_roots", prior?.scope.roots ?? []), protectedAssets: list("protected_assets", prior?.scope.protectedAssets ?? []) },
+    scope: { roots: list("scope_roots", prior?.scope.roots ?? []), protectedAssets },
     execution: { consent: params.consent === true, envAllowlist: list("env_allowlist", prior?.execution.envAllowlist ?? []), allowedCommandCategories: list("command_categories", prior?.execution.allowedCommandCategories ?? ["test", "benchmark", "build", "custom"]) },
     budgets: { ...limits, falseAcceptBudget },
     ...(gitPolicy ? { git: gitPolicy } : {}),

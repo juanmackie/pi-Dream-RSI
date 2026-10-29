@@ -7,7 +7,7 @@ import {
   type CampaignOptions, type CampaignRecord, type CampaignResumeOptions, type CampaignResult, type CampaignSeedReadings,
 } from "./campaign.ts";
 import {
-  ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, contractIdentity, projectFingerprint, readStoredContract, validateRunContract,
+  ContractNotApprovedError, approvalIdentity, approveRunContract, contractFile, contractIdentity, effectiveCommitPolicy, projectFingerprint, readStoredContract, validateRunContract,
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
 import { readLedger } from "./ledger.ts";
@@ -1139,7 +1139,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
 
   const commitVerifiedCampaign = async (args: { result: CampaignResult; leverId: string; instrument: CapturedInstrument; gain: number }): Promise<AutoCommitReceipt | null> => {
     const policy = approved?.contract.git;
-    if (!policy?.autoCommit) return null;
+    if (effectiveCommitPolicy(policy) === "no-commit") return null;
     if (!autoCommitBranch) throw new AutoCommitError("the dedicated auto-commit branch was not prepared");
     const campaignRoot = args.result.campaignRoot;
     const ledger = readLedger(path.join(campaignRoot, "history", "ledger.jsonl"));
@@ -1493,7 +1493,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           });
           if (checked.passed) {
             verifiedGain = checked.gain ?? undefined;
-            if (approved.contract.git?.autoCommit) {
+            if (effectiveCommitPolicy(approved.contract.git) !== "no-commit") {
               try {
                 const receipt = await commitVerifiedCampaign({ result, leverId: context.lever.id, instrument: context.instrument, gain: checked.gain ?? 0 });
                 if (receipt?.warning) autoCommitFailure = receipt.warning;
@@ -1589,7 +1589,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           throw new ContractNotApprovedError(`A different run contract is already stored for this project: "${stored.contract.outcome.statement}". Requested objective: "${contract.outcome.statement}". Inspect both boundaries, then explicitly authorize replace_contract=true or --replace-contract. Consent alone does not replace a contract; replacement can only raise caps and retains all recorded spend.`, "contract");
         }
         const rawBootstrapPaths = options.evaluatorBootstrap?.authorized ? options.evaluatorBootstrap.paths : [];
-        const { checks: staticChecks } = bootstrapWritePlan(contract, rawBootstrapPaths);
+        const { checks: staticChecks } = bootstrapWritePlan(proposed.contract, rawBootstrapPaths);
         if (contract.execution.consent && staticChecks.length > 0) {
           preflight = { status: "blocked", checks: staticChecks };
           stopReason = `blocked: ${staticChecks.map((check) => `${check.reason} Next step: ${check.remedy}`).join(" ")}`;
@@ -1618,7 +1618,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             }
           }
           if (!stopReason) {
-            if (contract.git?.autoCommit) {
+            if (contract.git && effectiveCommitPolicy(contract.git) !== "no-commit") {
               try {
                 autoCommitBranch = await ensureAutoCommitBranch(projectDir, contract.git.branch, options.signal, options.resumeActiveCampaign === true);
                 if (projectFingerprint(projectDir) !== proposed.fingerprint) {
@@ -2006,7 +2006,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             ...(chainedMinimumGain !== undefined ? { minimumGain: chainedMinimumGain } : {}),
             ...(seedReadings ? { seedReadings } : {}),
             ...(campaignIdentityInputs?.length ? { identityInputs: campaignIdentityInputs } : {}),
-            limits: { maxCycles: approved.contract.git?.autoCommit ? 1 : campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
+            limits: { maxCycles: effectiveCommitPolicy(approved.contract.git) === "commit-per-accepted-change" ? 1 : campaignDefaults.maxCycles, maxAgentStarts: grantedAgents, maxEvaluatorRuns: grantedEvaluators, deadlineMs: campaignDeadlineMs },
             // The run's rare-event allowance is shared across the campaigns it may confirm.
             confirmationAlpha: approved.contract.budgets.falseAcceptBudget / approved.contract.budgets.maxCampaigns,
             ...(options.signal ? { signal: options.signal } : {}),
@@ -2136,7 +2136,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             launched = true;
             break;
           }
-          if (postApply.passed && approved.contract.git?.autoCommit) {
+          if (postApply.passed && effectiveCommitPolicy(approved.contract.git) !== "no-commit") {
             try {
               const receipt = await commitVerifiedCampaign({ result, leverId: lever.id, instrument, gain: postApply.gain ?? 0 });
               if (receipt?.warning) autoCommitFailure = receipt.warning;
