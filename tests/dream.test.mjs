@@ -4,7 +4,7 @@ import * as path from "node:path";
 import test from "node:test";
 import { jump, makeProject } from "./fixtures.mjs";
 
-const { replayWorld, worldValue, chooseSearchConfig, maybeDream } = await jump("engine/dream.ts");
+const { replayWorld, worldValue, composeSearchConfig, validateSearchConfig, maybeDream } = await jump("engine/dream.ts");
 const { defaultSearchConfig } = await jump("engine/experiment.ts");
 
 test("replay reveals only recorded branch and refinement nodes", () => {
@@ -51,12 +51,64 @@ test("world value rewards normalized gain and penalizes unnecessary rounds", () 
   assert.equal(worldValue(world, { best: 20, revealed: ["n1", "n2"], coverage: 1, rounds: 2 }), 0.97);
 });
 
-test("config adoption requires both coverage and a strict score margin", () => {
+test("meta proposals accept only the bounded SearchConfig data schema", () => {
+  assert.deepEqual(validateSearchConfig(defaultSearchConfig), defaultSearchConfig);
+  assert.equal(validateSearchConfig({ ...defaultSearchConfig, policyCode: "process.exit(1)" }), null);
+  assert.equal(validateSearchConfig({ ...defaultSearchConfig, batchSize: 100 }), null);
+});
+
+test("contrastive compose blocks single-probe adoption and lucky best-run selection", () => {
+  const incumbent = defaultSearchConfig;
+  const stable = { ...incumbent, patience: 2 };
+  const lucky = { ...incumbent, batchSize: 3 };
+  const probes = (scores) => scores.map((score, index) => ({ worldId: `probe-${index + 1}`, score, coverage: 1 }));
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: probes([50, 50, 50]) },
+    { config: stable, probes: probes([55, 55, 55]) },
+    { config: lucky, probes: probes([95, 49, 49]) },
+  ], incumbent), stable, "a spectacular best run cannot outweigh two regressions");
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: probes([50]) },
+    { config: stable, probes: probes([95]) },
+  ], incumbent), incumbent, "one probe is not enough");
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: probes([50, 50, 50]) },
+    { config: stable, probes: probes([55, 49, 55]) },
+  ], incumbent), incumbent, "one inconsistent probe blocks adoption");
+});
+
+test("compose honors the strict margin boundary and ranks by worst-probe improvement", () => {
+  const incumbent = defaultSearchConfig;
+  const smallWorst = { ...incumbent, patience: 2 };
+  const largerMean = { ...incumbent, batchSize: 3 };
+  const probes = (scores) => scores.map((score, index) => ({ worldId: `probe-${index + 1}`, score, coverage: 1 }));
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: probes([0.97, 0.97, 0.97]) },
+    { config: smallWorst, probes: probes([0.98, 0.98, 0.98]) },
+  ], incumbent), incumbent, "a nominal 0.01 improvement is not strictly above the margin");
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: probes([0, 0, 0]) },
+    { config: smallWorst, probes: probes([0.2, 0.2, 0.2]) },
+    { config: largerMean, probes: probes([0.5, 0.5, 0.15]) },
+  ], incumbent), smallWorst, "the higher mean cannot outweigh a lower worst-probe margin");
+});
+
+test("contrastive compose requires the configured number of unique, covered probes", () => {
   const incumbent = defaultSearchConfig;
   const winner = { ...incumbent, patience: 2 };
-  assert.equal(chooseSearchConfig([{ config: winner, score: 0.5, coverage: 0.8 }, { config: incumbent, score: 0.48, coverage: 1 }], incumbent).patience, 2);
-  assert.deepEqual(chooseSearchConfig([{ config: winner, score: 0.5, coverage: 0.59 }, { config: incumbent, score: 0.48, coverage: 1 }], incumbent), incumbent);
-  assert.deepEqual(chooseSearchConfig([{ config: winner, score: 0.49, coverage: 1 }, { config: incumbent, score: 0.48, coverage: 1 }], incumbent), incumbent);
+  const probes = [1, 2, 3].map((id) => ({ worldId: `probe-${id}`, score: 1, coverage: 1 }));
+  const candidate = [1, 2, 3].map((id) => ({ worldId: `probe-${id}`, score: 2, coverage: 1 }));
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes }, { config: winner, probes: candidate },
+  ], incumbent, 4), incumbent, "a higher configured k cannot be met by three probes");
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes: [...probes, probes[0]] },
+    { config: winner, probes: [...candidate, candidate[0]] },
+  ], incumbent), winner, "duplicate identities do not inflate evidence count");
+  assert.deepEqual(composeSearchConfig([
+    { config: incumbent, probes },
+    { config: winner, probes: candidate.map((probe, index) => ({ ...probe, coverage: index === 0 ? 0.59 : 1 })) },
+  ], incumbent), incumbent, "low replay coverage blocks adoption");
 });
 
 function dreamWorld(cycle) {
@@ -75,11 +127,81 @@ test("malformed dream-agent output is ignored and the dream attempt is charged",
   let charges = 0;
   const incumbent = { ...defaultSearchConfig };
   const result = await maybeDream({ projectDir: project.projectDir, loopRoot: path.join(project.dreamRoot, "loop"),
-    agent: { ...project.task.agent, args: [agent] }, signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2)], incumbent,
+    agent: { ...project.task.agent, args: [agent] }, signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2), dreamWorld(3)], incumbent,
     beforeAgentSpawn: () => { charges += 1; } });
   assert.deepEqual(result, incumbent);
   assert.equal(charges, 1, "the agent start is charged before it is spawned");
   assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop", "search-config.json")), false);
+});
+
+test("dream requires three fresh world probes and does not reuse consumed probes", async (t) => {
+  const project = makeProject();
+  t.after(project.cleanup);
+  const agent = path.join(project.projectDir, "dream-agent.mjs");
+  fs.writeFileSync(agent, `import { writeFileSync } from "node:fs"; process.stdin.resume(); process.stdin.on("end", () => writeFileSync("configs.json", JSON.stringify({ configs: [] })));`);
+  const loopRoot = path.join(project.dreamRoot, "loop");
+  let charges = 0;
+  const options = { projectDir: project.projectDir, loopRoot, agent: { ...project.task.agent, args: [agent] },
+    signal: new AbortController().signal, beforeAgentSpawn: () => { charges += 1; } };
+  const incumbent = { ...defaultSearchConfig };
+  assert.deepEqual(await maybeDream({ ...options, worlds: [dreamWorld(1), dreamWorld(2)], incumbent }), incumbent);
+  assert.equal(charges, 0, "two worlds cannot trigger a meta proposal");
+  await maybeDream({ ...options, worlds: [dreamWorld(1), dreamWorld(2), dreamWorld(3)], incumbent });
+  assert.equal(charges, 1);
+  await maybeDream({ ...options, worlds: [1, 2, 3, 4, 5, 6].map(dreamWorld), incumbent });
+  assert.equal(charges, 2, "three fresh worlds can form a new probe set");
+  await maybeDream({ ...options, worlds: [1, 2, 3, 4, 5, 6, 7].map(dreamWorld), incumbent });
+  assert.equal(charges, 2, "a later run cannot reuse probes consumed by any earlier dream");
+  const records = fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8").trim().split(/\r?\n/).map((line) => JSON.parse(line));
+  assert.deepEqual(records.map((record) => record.worldIds), [
+    ["campaign:1", "campaign:2", "campaign:3"], ["campaign:4", "campaign:5", "campaign:6"],
+  ]);
+  assert.equal(records[0].minProbes, 3);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "dream-state.json"), "utf8")).consumedWorldIds,
+    ["campaign:1", "campaign:2", "campaign:3", "campaign:4", "campaign:5", "campaign:6"]);
+});
+
+test("corrupt probe state blocks proposals and failed config persistence consumes the probes", async (t) => {
+  const project = makeProject();
+  t.after(project.cleanup);
+  const agent = path.join(project.projectDir, "dream-agent.mjs");
+  fs.writeFileSync(agent, `import { writeFileSync } from "node:fs"; process.stdin.resume(); process.stdin.on("end", () => writeFileSync("configs.json", JSON.stringify({ configs: [] })));`);
+  const loopRoot = path.join(project.dreamRoot, "loop");
+  const options = { projectDir: project.projectDir, loopRoot, agent: { ...project.task.agent, args: [agent] },
+    signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2), dreamWorld(3)], incumbent: { ...defaultSearchConfig } };
+  let charges = 0;
+  options.beforeAgentSpawn = () => { charges += 1; };
+  fs.mkdirSync(loopRoot, { recursive: true });
+  fs.writeFileSync(path.join(loopRoot, "dream-state.json"), "{broken");
+  assert.deepEqual(await maybeDream(options), options.incumbent);
+  assert.equal(charges, 0, "corrupt state fails closed before proposal dispatch");
+  fs.rmSync(path.join(loopRoot, "dream-state.json"));
+  fs.mkdirSync(path.join(loopRoot, "search-config.json"));
+  await assert.rejects(maybeDream(options));
+  assert.equal(charges, 1);
+  const state = JSON.parse(fs.readFileSync(path.join(loopRoot, "dream-state.json"), "utf8"));
+  assert.deepEqual(state.consumedWorldIds, ["campaign:1", "campaign:2", "campaign:3"]);
+  assert.deepEqual(await maybeDream(options), options.incumbent);
+  assert.equal(charges, 1, "a failed config write cannot replay consumed evidence");
+});
+
+test("failure to persist consumed probes prevents config promotion and blocks retries", async (t) => {
+  const project = makeProject();
+  t.after(project.cleanup);
+  const agent = path.join(project.projectDir, "dream-agent.mjs");
+  fs.writeFileSync(agent, `import { mkdirSync, writeFileSync } from "node:fs"; process.stdin.resume(); process.stdin.on("end", () => { writeFileSync("configs.json", JSON.stringify({ configs: [] })); mkdirSync("../dream-state.json"); });`);
+  const loopRoot = path.join(project.dreamRoot, "loop");
+  let charges = 0;
+  const incumbent = { ...defaultSearchConfig };
+  const options = { projectDir: project.projectDir, loopRoot, agent: { ...project.task.agent, args: [agent] },
+    signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2), dreamWorld(3)], incumbent,
+    beforeAgentSpawn: () => { charges += 1; } };
+  await assert.rejects(maybeDream(options));
+  assert.equal(charges, 1);
+  assert.equal(fs.existsSync(path.join(loopRoot, "search-config.json")), false, "config cannot be promoted without persisted probe state");
+  assert.equal(fs.existsSync(path.join(loopRoot, "dreams.jsonl")), false);
+  assert.deepEqual(await maybeDream(options), incumbent, "the corrupt state blocks retries");
+  assert.equal(charges, 1);
 });
 
 test("a completed dream durably saves the replay-selected config and consumed world ids", async (t) => {
@@ -90,8 +212,8 @@ test("a completed dream durably saves the replay-selected config and consumed wo
   const loopRoot = path.join(project.dreamRoot, "loop");
   const incumbent = { ...defaultSearchConfig };
   const selected = await maybeDream({ projectDir: project.projectDir, loopRoot, agent: { ...project.task.agent, args: [agent] },
-    signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2)], incumbent, beforeAgentSpawn: () => {} });
+    signal: new AbortController().signal, worlds: [dreamWorld(1), dreamWorld(2), dreamWorld(3)], incumbent, beforeAgentSpawn: () => {} });
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "search-config.json"), "utf8")), selected);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "dream-state.json"), "utf8")).worldIds, ["campaign:1", "campaign:2"]);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(loopRoot, "dream-state.json"), "utf8")).worldIds, ["campaign:1", "campaign:2", "campaign:3"]);
   assert.equal(fs.readFileSync(path.join(loopRoot, "dreams.jsonl"), "utf8").trim().split(/\r?\n/).length, 1);
 });

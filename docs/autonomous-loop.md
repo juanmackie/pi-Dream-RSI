@@ -100,7 +100,7 @@ During a campaign the loop reads the agent's JSON output. A run that ends with a
 
 Each campaign uses a bounded hill climb with a fixed, qualified metric. Attempts run in isolated workspaces; the campaign confirms candidate gains, runs correctness gates and adversarial review, then applies an accepted patch. The loop checks the applied result independently before it starts another campaign.
 
-Completed experiments are recorded as worlds. When enough eligible worlds exist, the dream step can ask an agent for bounded search-config proposals. Deterministic replay scores each proposal using only recorded branch and refinement attempts. The incumbent remains a candidate, and only a challenger with sufficient coverage and a clear score margin is adopted. Dream output is configuration data; it does not provide executable policy code.
+Completed experiments are recorded as worlds. When at least three fresh, eligible worlds exist, the dream step can ask an agent for bounded search-config proposals. Deterministic replay probes each proposal and the incumbent on the same worlds. Adoption requires at least 0.6 coverage and a score margin above 0.01 on every probe; compose chooses from the per-world contrast vector, not the single best run. Probe IDs are flushed before the search config is promoted and cannot be reused after an ordinary process restart. Power-loss durability depends on the platform filesystem; directory entries are not fsynced on Windows. Dream output is bounded configuration data; it does not provide executable policy code.
 
 ## Command-owned preparation
 

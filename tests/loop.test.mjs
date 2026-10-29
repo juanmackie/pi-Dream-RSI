@@ -822,18 +822,20 @@ test("dream adopts a replay winner, charges its agent, and the next campaign sna
     const worldFor = (id, cycle) => ({
       version: 1, worldId: id, cycle, status: "complete", fingerprint: `fingerprint-${id}`,
       config: defaultSearchConfig, baseline: 1, threshold: 0.1, rounds: 1, agentStarts: 3, evaluatorRuns: 3, stopped: "round limit",
-      nodes: [1.1, 1.2, 1.3].map((score, index) => ({ id: `n${index + 1}`, parent: null, kind: "branch", round: 1,
+      nodes: [1.1, 1.2, 1.3, 1.3].map((score, index) => ({ id: `n${index + 1}`, parent: null, kind: "branch", round: 1,
         seq: index + 1, stage: "done", score, valid: true, failClass: "ok", timedOut: false, cost: 1, retries: 1 })),
     });
-    const priorWorldRoot = path.join(fixture.projectDir, ".dream-rsi", "campaigns", "prior", "cycles", "c0001");
-    fs.mkdirSync(priorWorldRoot, { recursive: true });
-    fs.writeFileSync(path.join(priorWorldRoot, "world.json"), JSON.stringify(worldFor("prior", 0)));
+    for (const [id, cycle] of [["prior-1", 1], ["prior-2", 2]]) {
+      const priorWorldRoot = path.join(fixture.projectDir, ".dream-rsi", "campaigns", id, "cycles", `c${String(cycle).padStart(4, "0")}`);
+      fs.mkdirSync(priorWorldRoot, { recursive: true });
+      fs.writeFileSync(path.join(priorWorldRoot, "world.json"), JSON.stringify(worldFor(id, cycle)));
+    }
     const impl = async (options) => {
       const result = await stub.impl(options);
       if (stub.calls.length === 1) {
         const cycleRoot = path.join(result.campaignRoot, "cycles", "c0001");
         fs.mkdirSync(cycleRoot, { recursive: true });
-        fs.writeFileSync(path.join(cycleRoot, "world.json"), JSON.stringify(worldFor(result.id, 1)));
+        fs.writeFileSync(path.join(cycleRoot, "world.json"), JSON.stringify(worldFor(result.id, 3)));
       }
       return result;
     };

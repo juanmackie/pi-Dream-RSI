@@ -11,6 +11,9 @@ export const DREAM_BETA1 = 0.02;
 export const DREAM_BETA2 = 0.01;
 export const DREAM_MIN_MARGIN = 0.01;
 export const DREAM_MIN_COVERAGE = 0.6;
+export const DREAM_MIN_PROBES = 3;
+export const DREAM_MAX_PROBES = 12;
+export const DREAM_MAX_CONSUMED_PROBES = 100_000;
 
 export interface ReplayResult {
   best: number;
@@ -76,15 +79,75 @@ export function scoreSearchConfig(worlds: ExperimentWorld[], config: SearchConfi
     coverage: results.reduce((sum, result) => sum + result.coverage, 0) / results.length };
 }
 
-export interface ScoredConfig { config: SearchConfig; score: number; coverage: number; }
+export interface ProbeScore { worldId: string; score: number; coverage: number; }
+export interface ProbedConfig { config: SearchConfig; probes: ProbeScore[]; }
 
-/** Pick the best eligible challenger; incumbent wins ties and low-coverage contests. */
-export function chooseSearchConfig(candidates: ScoredConfig[], incumbent: SearchConfig): SearchConfig {
+function compareStrings(a: string, b: string): number { return a < b ? -1 : a > b ? 1 : 0; }
+
+function consistentProbeDelta(before: ProbeScore, after: ProbeScore): number | null {
+  const delta = after.score - before.score;
+  if (![before.score, before.coverage, after.score, after.coverage, delta].every(Number.isFinite)
+    || before.coverage < DREAM_MIN_COVERAGE || after.coverage < DREAM_MIN_COVERAGE
+    || before.coverage > 1 || after.coverage > 1
+    || after.score <= before.score + DREAM_MIN_MARGIN || delta <= DREAM_MIN_MARGIN) return null;
+  return delta;
+}
+
+function uniqueProbeScores(probes: ProbeScore[]): Map<string, ProbeScore> {
+  const unique = new Map<string, ProbeScore>();
+  for (const probe of probes) {
+    if (typeof probe.worldId === "string" && probe.worldId.length > 0 && !unique.has(probe.worldId)) unique.set(probe.worldId, probe);
+  }
+  return unique;
+}
+
+/** Compose from per-world contrasts; a high aggregate or single lucky run cannot promote a config. */
+export function composeSearchConfig(candidates: ProbedConfig[], incumbent: SearchConfig, minProbes = DREAM_MIN_PROBES): SearchConfig {
+  if (!Number.isSafeInteger(minProbes) || minProbes < DREAM_MIN_PROBES || minProbes > DREAM_MAX_PROBES) return incumbent;
   const current = candidates.find((candidate) => JSON.stringify(candidate.config) === JSON.stringify(incumbent));
   if (!current) return incumbent;
-  const winner = candidates.filter((candidate) => candidate.coverage >= DREAM_MIN_COVERAGE)
-    .sort((a, b) => b.score - a.score)[0];
-  return winner && winner.score > current.score + DREAM_MIN_MARGIN ? winner.config : incumbent;
+  const baseline = uniqueProbeScores(current.probes);
+  if (baseline.size < minProbes) return incumbent;
+  const ids = [...baseline.keys()];
+  const challengers = candidates.flatMap((candidate) => {
+    if (JSON.stringify(candidate.config) === JSON.stringify(incumbent)) return [];
+    const scores = uniqueProbeScores(candidate.probes);
+    if (scores.size !== baseline.size || ids.some((id) => !scores.has(id))) return [];
+    const deltas = ids.map((id) => consistentProbeDelta(baseline.get(id)!, scores.get(id)!) ?? Number.NEGATIVE_INFINITY);
+    if (deltas.length < minProbes || deltas.some((delta) => delta <= DREAM_MIN_MARGIN)) return [];
+    return [{ config: candidate.config, worstDelta: Math.min(...deltas), meanDelta: deltas.reduce((sum, delta) => sum + delta, 0) / deltas.length }];
+  });
+  challengers.sort((a, b) => b.worstDelta - a.worstDelta || b.meanDelta - a.meanDelta
+    || compareStrings(JSON.stringify(a.config), JSON.stringify(b.config)));
+  return challengers[0]?.config ?? incumbent;
+}
+
+function scoreConfigProbes(worlds: ExperimentWorld[], config: SearchConfig): ProbeScore[] {
+  return worlds.map((world) => ({
+    worldId: world.worldId ?? `${world.fingerprint}:${world.cycle}`,
+    ...scoreSearchConfig([world], config),
+  }));
+}
+
+function readConsumedWorldIds(file: string): string[] | null {
+  if (!fs.existsSync(file)) return [];
+  let value: unknown;
+  try { value = JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const state = value as { worldIds?: unknown; consumedWorldIds?: unknown };
+  const ids = Object.hasOwn(state, "consumedWorldIds") ? state.consumedWorldIds : state.worldIds;
+  return Array.isArray(ids) && ids.length <= DREAM_MAX_CONSUMED_PROBES
+    && ids.every((id) => typeof id === "string" && id.length > 0 && id.length <= 500) ? ids : null;
+}
+
+function uniqueConfigs(configs: SearchConfig[]): SearchConfig[] {
+  const seen = new Set<string>();
+  return configs.filter((config) => {
+    const key = JSON.stringify(config);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 export function validateSearchConfig(value: unknown): SearchConfig | null {
@@ -111,14 +174,35 @@ export interface DreamOptions {
   signal: AbortSignal;
   worlds?: ExperimentWorld[];
   incumbent?: SearchConfig;
+  /** Independent recorded worlds required for a consistent contrast; never below the safe default. */
+  minProbes?: number;
 }
 
 export async function maybeDream(options: DreamOptions): Promise<SearchConfig> {
   const incumbent = options.incumbent ?? readJson<SearchConfig>(path.join(options.loopRoot, "search-config.json")) ?? defaultSearchConfig;
-  const worlds = (options.worlds ?? []).filter((world) => world.status === "complete" && validNodes(world).length >= 3);
+  const minProbes = options.minProbes ?? DREAM_MIN_PROBES;
+  if (!Number.isSafeInteger(minProbes) || minProbes < DREAM_MIN_PROBES || minProbes > DREAM_MAX_PROBES) {
+    options.log?.(`[dream] minProbes must be between ${DREAM_MIN_PROBES} and ${DREAM_MAX_PROBES}; retaining the incumbent`);
+    return incumbent;
+  }
+  const priorConsumed = readConsumedWorldIds(path.join(options.loopRoot, "dream-state.json"));
+  if (!priorConsumed) {
+    options.log?.("[dream] consumed-probe state is corrupt; retaining the incumbent");
+    return incumbent;
+  }
+  if (priorConsumed.length >= DREAM_MAX_CONSUMED_PROBES) return incumbent;
+  const consumed = new Set(priorConsumed);
+  const seen = new Set<string>();
+  const worlds = (options.worlds ?? []).filter((world) => {
+    if (world.status !== "complete" || validNodes(world).length < 3) return false;
+    const id = world.worldId ?? `${world.fingerprint}:${world.cycle}`;
+    if (id.length === 0 || id.length > 500 || consumed.has(id) || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  }).sort((a, b) => compareStrings(a.worldId ?? `${a.fingerprint}:${a.cycle}`, b.worldId ?? `${b.fingerprint}:${b.cycle}`))
+    .slice(0, DREAM_MAX_PROBES);
+  if (worlds.length < minProbes) return incumbent;
   const worldIds = worlds.map((world) => world.worldId ?? `${world.fingerprint}:${world.cycle}`);
-  const priorDream = readJson<{ worldIds?: string[] }>(path.join(options.loopRoot, "dream-state.json"));
-  if (worlds.length < 2 || worldIds.every((id) => priorDream?.worldIds?.includes(id))) return incumbent;
   const scratch = path.join(options.loopRoot, "dream-work");
   fs.mkdirSync(scratch, { recursive: true });
   const proposalFile = path.join(scratch, "configs.json");
@@ -126,7 +210,7 @@ export async function maybeDream(options: DreamOptions): Promise<SearchConfig> {
   const promptFile = path.join(scratch, "DREAM.md");
   const traces = worlds.slice(-12).map((world) => ({ cycle: world.cycle, config: world.config, baseline: world.baseline, threshold: world.threshold,
     rounds: world.rounds, nodes: world.nodes.map(({ id, parent, kind, round, score, valid, timedOut, cost }) => ({ id, parent, kind, round, score, valid, timedOut, cost })) }));
-  writeFileAtomic(promptFile, `Propose up to four search configs as JSON in ${proposalFile}. Schema: {"configs":[{"version":1,"batchSize":1-4,"exploreShare":0-1,"refineTop":1-3,"maxRounds":1-6,"patience":1-3}]}. Incumbent: ${JSON.stringify(incumbent)}. Objective: mean replay value; beta1=${DREAM_BETA1}, beta2=${DREAM_BETA2}. Traces:\n${JSON.stringify(traces, null, 2)}\n`);
+  writeFileAtomic(promptFile, `Propose up to four SearchConfig data values as JSON in ${proposalFile}; do not propose executable policy code. Schema: {"configs":[{"version":1,"batchSize":1-4,"exploreShare":0-1,"refineTop":1-3,"maxRounds":1-6,"patience":1-3}]}. Incumbent: ${JSON.stringify(incumbent)}. The host probes each config on the same ${worlds.length} distinct worlds and composes from the per-world score vector. Adoption requires at least ${minProbes} probes with consistent positive direction and coverage >= ${DREAM_MIN_COVERAGE}; one best-looking run cannot decide. Objective per world: replay value; beta1=${DREAM_BETA1}, beta2=${DREAM_BETA2}. Traces:\n${JSON.stringify(traces, null, 2)}\n`);
   const result = await runAgent({ agent: options.agent, resolveAgent: options.resolveAgent, cwd: scratch, prompt: fs.readFileSync(promptFile, "utf8"),
     timeoutMs: 120_000, logPath: path.join(scratch, "agent.log"), signal: options.signal,
     beforeSpawn: () => options.beforeAgentSpawn("dream-config"), onComplete: options.onAgentComplete });
@@ -138,13 +222,23 @@ export async function maybeDream(options: DreamOptions): Promise<SearchConfig> {
   try { parsed = JSON.parse(fs.readFileSync(proposalFile, "utf8")); } catch { return incumbent; }
   const proposed = parsed && typeof parsed === "object" && !Array.isArray(parsed) && Array.isArray((parsed as Record<string, unknown>).configs)
     ? (parsed as { configs: unknown[] }).configs.slice(0, 4).flatMap((value) => { const config = validateSearchConfig(value); return config ? [config] : []; }) : [];
-  const configs = [incumbent, ...proposed, ...neighbors(incumbent)];
-  const scored = configs.map((config) => ({ config, ...scoreSearchConfig(worlds, config) }));
-  const adopted = chooseSearchConfig(scored, incumbent);
+  const configs = uniqueConfigs([incumbent, ...proposed, ...neighbors(incumbent)]);
+  const probed = configs.map((config) => ({ config, probes: scoreConfigProbes(worlds, config) }));
+  const adopted = composeSearchConfig(probed, incumbent, minProbes);
+  const baseline = probed.find((candidate) => JSON.stringify(candidate.config) === JSON.stringify(incumbent))!;
+  const candidates = probed.map((candidate) => ({
+    config: candidate.config,
+    probes: candidate.probes.map((probe, index) => ({ ...probe, incumbentScore: baseline.probes[index]!.score,
+      delta: probe.score - baseline.probes[index]!.score })),
+    consistentProbes: candidate.probes.filter((probe, index) => consistentProbeDelta(baseline.probes[index]!, probe) !== null).length,
+  }));
   fs.mkdirSync(options.loopRoot, { recursive: true });
+  writeFileAtomic(path.join(options.loopRoot, "dream-state.json"), `${JSON.stringify({
+    worldIds,
+    consumedWorldIds: [...consumed, ...worldIds].slice(-DREAM_MAX_CONSUMED_PROBES),
+  }, null, 2)}\n`, true);
   writeJson(path.join(options.loopRoot, "search-config.json"), adopted);
-  fs.appendFileSync(path.join(options.loopRoot, "dreams.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), worldIds: worlds.map((world) => world.cycle), incumbent, candidates: scored, adopted })}\n`);
-  writeJson(path.join(options.loopRoot, "dream-state.json"), { worldIds });
+  fs.appendFileSync(path.join(options.loopRoot, "dreams.jsonl"), `${JSON.stringify({ at: new Date().toISOString(), worldIds, minProbes, incumbent, candidates, adopted })}\n`);
   return adopted;
 }
 
