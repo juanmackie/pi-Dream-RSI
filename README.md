@@ -54,6 +54,7 @@ Default durable limits are 6 campaigns, 72 agent starts, 200 evaluator runs, and
 
 ## Commands
 
+- `/dream-rsi auto [--consent] <goal>` starts a separate trusted-local one-repository loop. It requires a declared measure command, correctness check, scope, experiment caps, dedicated branch, and provider-side hard cap. Use only repositories you trust; the mode is not a sandbox. `/dream-rsi auto resume`, `off`, and `status` resume, stop at a run boundary, or inspect durable state. See [trusted-local auto experiments](docs/autoresearch.md).
 - `/dream-rsi assess [goal]` reads project signals and ranks improvement opportunities.
 - `/dream-rsi loop [goal] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]` prepares a natural-language goal in chat, then starts the guarded loop. Explicit config/setup commands start directly; without a goal, the command retains saved-setup reuse or declared-workload discovery.
 - `/dream-rsi evolve [goal] [same flags as loop]` runs the same guarded loop with the existing continuous continuation switched on. It adds no new budget, consent, gate, or commit behavior; the durable caps, no-win plateau, start interval, and explicit stop/resume rules still apply.

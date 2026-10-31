@@ -433,7 +433,7 @@ export function approveRunContract(projectDir: string, contract: RunContract): A
  * explicitly allowlisted keys from the current process. Treat allowlisted values
  * as sensitive; the process runner redacts them from captured output.
  */
-export function restrictedEnvironment(contract: RunContract, source: NodeJS.ProcessEnv = process.env): Record<string, string> {
+export function restrictedEnvironment(contract: Pick<RunContract, "execution">, source: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const env: Record<string, string> = {};
   // Path resolution and the Windows command interpreter are needed to start any
   // process at all, and neither carries a secret. Without them an empty allowlist

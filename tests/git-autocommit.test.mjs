@@ -35,6 +35,15 @@ test("auto-commit rejects a configured default branch from any remote", async (t
   execFileSync("git", ["fetch", "upstream"], { cwd: project.root, stdio: "ignore" });
   execFileSync("git", ["remote", "set-head", "upstream", "stable"], { cwd: project.root });
   await assert.rejects(ensureAutoCommitBranch(project.root, "stable"), /configured default branch/i);
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: project.root, encoding: "utf8" }).trim();
+  const changed = "must not land on default branch\\n";
+  fs.writeFileSync(path.join(project.root, "solution.txt"), changed);
+  await assert.rejects(commitVerifiedChanges({
+    projectDir: project.root, branch: "main", expectedHead: head,
+    changes: [{ path: "solution.txt", afterHash: hash(changed) }], campaignId: "default-branch",
+    leverId: "fixture", unit: "ms", before: 10, after: 9, evidencePath: ".dream-rsi/fixture",
+  }), /default branch/i);
+  assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: project.root, encoding: "utf8" }).trim(), head);
 });
 
 test("auto-commit preparation selects only a clean, non-default feature branch", async (t) => {
@@ -65,6 +74,13 @@ test("auto-commit commits only verified postimages with structured evidence", as
   assert.equal(execFileSync("git", ["show", "-s", "--format=%s", commit.hash], { cwd: project.root, encoding: "utf8" }).trim(), "Dream-RSI: verified improvement (campaign-123)");
   assert.match(execFileSync("git", ["show", "-s", "--format=%B", commit.hash], { cwd: project.root, encoding: "utf8" }), /Metric: 100 -> 80 ms[\s\S]*Lever: lever-abc[\s\S]*Evidence: \.dream-rsi\/campaigns\/campaign-123/);
   assert.deepEqual(execFileSync("git", ["diff", "--name-only", "HEAD^", "HEAD"], { cwd: project.root, encoding: "utf8" }).trim().split(/\r?\n/), ["solution.txt"]);
+  const recoveredAfterCrash = await commitVerifiedChanges({
+    projectDir: project.root, branch, expectedHead: head,
+    changes: [{ path: "solution.txt", afterHash: hash(content) }],
+    campaignId: "campaign-123", leverId: "lever-abc", unit: "ms", before: 100, after: 80,
+    evidencePath: ".dream-rsi/campaigns/campaign-123",
+  });
+  assert.deepEqual(recoveredAfterCrash, commit, "a crash after local commit creation is recovered from the exact committed postimage");
   const recovered = await commitVerifiedChanges({
     projectDir: project.root, branch, expectedHead: commit.hash,
     changes: [{ path: "solution.txt", afterHash: hash(content) }],
@@ -72,6 +88,21 @@ test("auto-commit commits only verified postimages with structured evidence", as
     evidencePath: ".dream-rsi/campaigns/campaign-123",
   });
   assert.deepEqual(recovered, commit, "a resumed verified campaign recognizes its already-created commit");
+});
+
+test("auto-commit resumes an interrupted staging step only when staged postimages match", async (t) => {
+  const project = makeGitProject(); t.after(project.cleanup);
+  const { branch, head } = await ensureAutoCommitBranch(project.root, "dream-rsi/improve");
+  const content = "verified after interrupted staging\n";
+  fs.writeFileSync(path.join(project.root, "solution.txt"), content);
+  execFileSync("git", ["add", "--", "solution.txt"], { cwd: project.root });
+  const receipt = await commitVerifiedChanges({
+    projectDir: project.root, branch, expectedHead: head,
+    changes: [{ path: "solution.txt", afterHash: hash(content) }], campaignId: "staged-recovery",
+    leverId: "fixture", unit: "ms", before: 10, after: 8, evidencePath: ".dream-rsi/fixture",
+  });
+  assert.equal(execFileSync("git", ["rev-parse", "HEAD"], { cwd: project.root, encoding: "utf8" }).trim(), receipt.hash);
+  assert.equal(execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: project.root, encoding: "utf8" }).trim(), "");
 });
 
 test("auto-commit preserves verified delete-plus-add renames as two explicit paths", async (t) => {

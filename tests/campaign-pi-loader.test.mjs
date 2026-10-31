@@ -12,7 +12,7 @@ import { REPO } from "./fixtures.mjs";
 const smokeScript = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "campaign-pi-loader-smoke.mjs");
 const execFileAsync = promisify(execFile);
 
-test("Pi loads the v3 loop and status tool without the removed improve tool", async () => {
+test("Pi loads the auto and v3 loop tools without the removed improve tool", async () => {
   const isolatedAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "dream-rsi-pi-loader-"));
   try {
     const child = await execFileAsync(process.execPath, [smokeScript], {
@@ -20,7 +20,7 @@ test("Pi loads the v3 loop and status tool without the removed improve tool", as
       env: { ...process.env, PI_CODING_AGENT_DIR: isolatedAgentDir, JITI_FS_CACHE: "false" },
     });
     const smoke = JSON.parse(child.stdout.trim().split(/\r?\n/).at(-1));
-    assert.deepEqual(smoke.tools, ["dream_rsi_loop", "dream_rsi_signals"]);
+    assert.deepEqual(smoke.tools, ["dream_rsi_auto_init", "dream_rsi_auto_log", "dream_rsi_auto_run", "dream_rsi_auto_status", "dream_rsi_loop", "dream_rsi_signals"]);
     assert.match(smoke.status, /No loop state yet/);
     assert.equal(smoke.campaign, null);
   } catch (error) {

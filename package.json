@@ -49,6 +49,7 @@
     "eval/bench.mjs",
     "eval/scenarios.json",
     "docs/autonomous-loop.md",
+    "docs/autoresearch.md",
     "docs/continuous-magnitude.md",
     "docs/method.md",
     "docs/adr",

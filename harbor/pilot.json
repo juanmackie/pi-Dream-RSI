@@ -1,0 +1,59 @@
+{
+  "schemaVersion": 1,
+  "study": "dream-rsi-pilot",
+  "status": "design-only",
+  "frozen": true,
+  "repositoryCount": 6,
+  "split": { "development": 3, "heldOut": 3 },
+  "minimumLanguages": 5,
+  "experimentsPerRepository": 5,
+  "negativeControl": { "attempts": 5, "maximumCommits": 0 },
+  "replay": { "requiredRate": 1, "requireCleanCheckout": true },
+  "evaluatorCvMaximum": { "wallClock": 0.05, "deterministic": 0.01 },
+  "budgetUsdMaximum": 1500,
+  "pass": { "heldOutRepositoriesWithVerified2xWin": 1, "maximumCorrectnessRegressions": 0 },
+  "repositories": [
+    {
+      "id": "afs-uptick",
+      "split": "development",
+      "language": "TypeScript",
+      "sha": "403647d9fc79ea4772801bd7aa5093c4f4f47a32",
+      "source": "../../AFS-Uptick-text-agent - The Bitter Lesson"
+    },
+    {
+      "id": "allyouneediswheel",
+      "split": "development",
+      "language": "Python",
+      "sha": "3bf367f3f176b54993e25ad66525d798f4a23780",
+      "source": "../../AllYouNeedIsWheel_moomoo"
+    },
+    {
+      "id": "hermes-widget",
+      "split": "development",
+      "language": "Kotlin",
+      "sha": "8eb425712388bf213f310df04bf72212792402e2",
+      "source": "../../Hermes_blink"
+    },
+    {
+      "id": "agent-zero-conversation-intelligence",
+      "split": "held-out",
+      "language": "Python",
+      "sha": "2fc42720e99684617b30a615396d195059dab304",
+      "source": "../../agent_zero_CONVERSATION_INTELLIGENCE"
+    },
+    {
+      "id": "prompt-paul-chrome-extension",
+      "split": "held-out",
+      "language": "JavaScript",
+      "sha": "ad80f20542f393ca433992cdaf50d0accad8dac9",
+      "source": "../../Chromeext_PromptPaul"
+    },
+    {
+      "id": "skills-greenskeeper",
+      "split": "held-out",
+      "language": "Bash",
+      "sha": "cc03261e9d2570047c459c55ecd881bc481ef7cb",
+      "source": "../../Skill Janitor/skills-janitor"
+    }
+  ]
+}

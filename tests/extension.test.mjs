@@ -83,8 +83,26 @@ test("registers assessment and loop tools with the v3 command surface", async ()
   const project = makeProject();
   try {
     const { context, harness } = await boot(project);
-    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_signals", "dream_rsi_loop"]);
+    assert.deepEqual([...harness.tools.keys()], ["dream_rsi_auto_init", "dream_rsi_auto_run", "dream_rsi_auto_log", "dream_rsi_auto_status", "dream_rsi_signals", "dream_rsi_loop"]);
     assert.deepEqual([...harness.commands.keys()], ["dream-rsi"]);
+    const autoInit = harness.tools.get("dream_rsi_auto_init");
+    assert.equal(autoInit.parameters.properties.consent.type, "boolean");
+    assert.equal(autoInit.parameters.properties.providerCap.type, "number");
+    assert.equal(autoInit.parameters.additionalProperties, false);
+    const noConsent = await autoInit.execute("auto-no-consent", { consent: true }, undefined, undefined, context);
+    assert.match(noConsent.content[0].text, /consent must be granted by \/dream-rsi auto/i);
+    await harness.commands.get("dream-rsi").handler("auto --consent reduce runtime", context);
+    assert.match(harness.sentMessages.at(-1).content, /Set up Dream-RSI auto for reduce runtime/);
+    const otherProject = makeProject();
+    try {
+      const unauthorizedTarget = await autoInit.execute("other-repository", {
+        consent: true, goal: "reduce runtime", metric: "runtime", unit: "ms", higherIsBetter: false,
+        command: "node -e 'console.log(1)'", checks: "node -e 'process.exit(0)'", scope: ["src"], minimumGain: 1,
+        maxExperiments: 2, maxConsecutiveDiscards: 2, providerCap: 10, branch: "dream-rsi/auto", project_dir: otherProject.projectDir,
+      }, undefined, undefined, context);
+      assert.match(unauthorizedTarget.content[0].text, /consent is bound to a different repository/);
+      assert.equal(fs.existsSync(path.join(otherProject.projectDir, ".dream-rsi", "auto")), false);
+    } finally { otherProject.cleanup(); }
     const loop = harness.tools.get("dream_rsi_loop");
     assert.deepEqual(loop.parameters.properties.action.enum, ["prepare", "start", "status", "stop", "resume", "confirm"]);
     assert.equal(loop.parameters.properties.include_logs.type, "boolean", "the loop retains its session-log privacy opt-out");

@@ -24,6 +24,7 @@ import { buildProjectCard, projectCardSummary, readProjectCard } from "./engine/
 import { recovery, recoveryForLoop } from "./engine/recovery.ts";
 import { readLoopSettingsFile } from "./engine/settings.ts";
 import { RSI_DAILY_CAPS } from "./engine/budget.ts";
+import { autoLogTail, autoProviderRetryCount, initAuto, logAuto, recordAutoProviderOutcome, refreshAutoPrompt, runAuto, statusAuto, stopAuto, type AutoInput } from "./engine/auto.ts";
 import { preparationMessage, preparedSettingsError, type LoopPreparation } from "./engine/preparation.ts";
 import { collectSignals } from "./engine/signals.ts";
 import { MAX_TASK_TIMEOUT_MS, type TaskConfig } from "./engine/task.ts";
@@ -116,6 +117,7 @@ const loopParams = {
 
 export default function dreamRsi(pi: ExtensionAPI): void {
   const modes = new Map<string, boolean>();
+  const autoConsentSessions = new Map<string, string>();
   const dashboards = new Map<string, Dashboard>();
   const closingSessions = new Set<string>();
   /** One running or reserved loop per session; the controller aborts the run. */
@@ -499,6 +501,74 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     lines.push(`  recovery: ${next.category} — ${next.next_step}`);
     return { content: [{ type: "text", text: lines.join("\n") }], details: { loop: result, recovery: next } };
   };
+
+  // -- trusted-local auto tools --------------------------------------------
+
+  const autoInitParams = {
+    type: "object", properties: {
+      goal: { type: "string" }, metric: { type: "string" }, unit: { type: "string" }, higherIsBetter: { type: "boolean" },
+      command: { type: "string" }, checks: { type: "string" }, scope: { type: "array", items: { type: "string" } },
+      protectedAssets: { type: "array", items: { type: "string" } }, minimumGain: { type: ["number", "string"] },
+      maxExperiments: { type: "integer", minimum: 1, maximum: 1000 }, maxConsecutiveDiscards: { type: "integer", minimum: 1, maximum: 1000 },
+      providerCap: { type: "number", exclusiveMinimum: 0, description: "Operator-declared provider hard cap; the provider must enforce this independently." },
+      consent: { type: "boolean", description: "Must be true after explicit trusted-local operator consent; repository commands run on this host." },
+      branch: { type: "string" }, project_dir: { type: "string" },
+    }, required: ["consent", "goal", "metric", "unit", "higherIsBetter", "command", "checks", "scope", "minimumGain", "maxExperiments", "maxConsecutiveDiscards", "providerCap"], additionalProperties: false,
+  };
+  const autoProject = (params: any, ctx: ExtensionContext): string => {
+    const project = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
+    if (!project) throw new Error("project_dir must name an existing local project directory");
+    return fs.realpathSync(project);
+  };
+  const requireAutoConsent = (params: any, ctx: ExtensionContext): string => {
+    const approvedProject = autoConsentSessions.get(ctx.sessionManager.getSessionId());
+    if (!approvedProject) throw new Error("trusted-local auto consent must be granted by /dream-rsi auto in this pi session");
+    const project = autoProject(params, ctx);
+    if (approvedProject !== project) throw new Error("trusted-local auto consent is bound to a different repository; approve /dream-rsi auto from that repository's directory");
+    return project;
+  };
+  pi.registerTool({
+    name: "dream_rsi_auto_init", label: "Dream-RSI Auto Init",
+    description: "Qualify and initialize a trusted-local, one-repository set-and-forget experiment session. Commands run on this host; never use on an untrusted repository.",
+    promptSnippet: "Initialize Dream-RSI auto only after the operator approved this trusted-local repository and reviewed the goal, numeric metric command, correctness check, scope, caps, and dedicated branch.",
+    parameters: autoInitParams,
+    async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext): Promise<any> {
+      try {
+        const project = requireAutoConsent(params, ctx);
+        const result = await initAuto(project, params as AutoInput);
+        return { content: [{ type: "text", text: `Auto session initialized on ${result.config.branch}. Baseline ${result.config.baseline} ${result.config.unit}; CV ${(result.config.cv * 100).toFixed(2)}%; experiment cap ${result.config.maxExperiments}; declared provider cap ${result.config.providerCap} (not enforced by Dream-RSI). Read .dream-rsi/auto/prompt.md and call dream_rsi_auto_run, then dream_rsi_auto_log after each experiment.` }], details: result };
+      } catch (error) { return { content: [{ type: "text", text: `Auto initialization refused: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
+    },
+  });
+  pi.registerTool({
+    name: "dream_rsi_auto_run", label: "Dream-RSI Auto Run",
+    description: "Measure one already-edited experiment. It does not commit changes.",
+    promptSnippet: "Call once after one hypothesis edit, and always call dream_rsi_auto_log to keep or discard it before the next experiment.",
+    parameters: { type: "object", properties: { project_dir: { type: "string" } }, additionalProperties: false },
+    async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext): Promise<any> {
+      try { const project = requireAutoConsent(params, ctx); const result = await runAuto(project); return { content: [{ type: "text", text: `Run ${result.id}: ${result.metric}; changed paths: ${result.paths.join(", ") || "none"}. No commit was made; call dream_rsi_auto_log.` }], details: result }; }
+      catch (error) { return { content: [{ type: "text", text: `Auto run refused: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
+    },
+  });
+  pi.registerTool({
+    name: "dream_rsi_auto_log", label: "Dream-RSI Auto Log",
+    description: "Check and either commit a verified improvement or discard a failed/non-improving experiment; appends the durable run log.",
+    promptSnippet: "Log every run with a concise description and hypothesis. A failed correctness check is discarded and does not by itself stop the loop.",
+    parameters: { type: "object", properties: { description: { type: "string" }, hypothesis: { type: "string" }, status: { type: "string", enum: ["keep", "discard"] }, project_dir: { type: "string" }, }, required: ["description"], additionalProperties: false },
+    async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext): Promise<any> {
+      try { const project = requireAutoConsent(params, ctx); const result = await logAuto(project, params); if (statusAuto(project).state === "stopped") autoConsentSessions.delete(ctx.sessionManager.getSessionId()); return { content: [{ type: "text", text: `Experiment ${result.status}: metric ${result.metric}; best ${result.best}${result.commit ? `; commit ${result.commit}` : ""}.` }], details: result }; }
+      catch (error) { return { content: [{ type: "text", text: `Auto log refused: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
+    },
+  });
+  pi.registerTool({
+    name: "dream_rsi_auto_status", label: "Dream-RSI Auto Status", description: "Read the auto session config and append-only log. This tool writes nothing.",
+    promptSnippet: "Use for a read-only auto-session status check; do not modify state files by hand.",
+    parameters: { type: "object", properties: { project_dir: { type: "string" } }, additionalProperties: false },
+    async execute(_id: string, params: any, _signal: AbortSignal | undefined, _onUpdate: unknown, ctx: ExtensionContext): Promise<any> {
+      try { const result = statusAuto(autoProject(params, ctx)); return { content: [{ type: "text", text: `Auto ${result.state}: ${result.runs}/${result.config.maxExperiments} experiments; best ${result.best} ${result.config.unit}; confidence ${(result.confidence * 100).toFixed(1)}%; declared provider cap ${result.providerCap} (not enforced); branch ${result.branch}; next: ${result.next}.` }], details: result }; }
+      catch (error) { return { content: [{ type: "text", text: `Auto status unavailable: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
+    },
+  });
 
   // -- tools ---------------------------------------------------------------
 
@@ -995,6 +1065,46 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           .finally(release);
         return;
       }
+      if (verb === "auto") {
+        const parts = rest.trim().split(/\s+/).filter(Boolean);
+        const subcommand = parts[0];
+        const control = subcommand === "status" || subcommand === "off" || subcommand === "resume";
+        const goalParts = control ? parts.slice(1) : parts;
+        try {
+          if (subcommand === "status") {
+            const result = statusAuto(autoProject({}, ctx));
+            report(`Auto ${result.state}${result.config.stopRequested ? " (stopping at boundary)" : ""}: ${result.runs}/${result.config.maxExperiments} experiments; best ${result.best} ${result.config.unit}; confirmation confidence ${(result.confidence * 100).toFixed(1)}%; declared provider cap ${result.providerCap} (not enforced); branch ${result.branch}; next: ${result.next}.`);
+            return;
+          }
+          if (subcommand === "off") {
+            const project = autoProject({}, ctx);
+            stopAuto(project);
+            if (statusAuto(project).state === "stopped" && autoConsentSessions.get(ctx.sessionManager.getSessionId()) === project) autoConsentSessions.delete(ctx.sessionManager.getSessionId());
+            report("Auto stop requested. The current run may finish; log it to preserve evidence. No new run will start.");
+            return;
+          }
+          if (subcommand === "resume") {
+            const project = autoProject({}, ctx);
+            const status = statusAuto(project);
+            if (status.state !== "active") { report(`Auto session ${status.state}: ${status.config.stopReason ?? status.next}; review it before resuming.`, "error"); return; }
+            refreshAutoPrompt(project);
+            autoConsentSessions.set(ctx.sessionManager.getSessionId(), project);
+            const prompt = fs.readFileSync(path.join(project, ".dream-rsi", "auto", "prompt.md"), "utf8").slice(0, 12_000);
+            const log = autoLogTail(project);
+            sendWhenReady(`Resume the existing trusted-local Dream-RSI auto session. Read its state; do not reinitialize, alter its metric/command/checks/scope, or exceed its caps. First inspect the dedicated branch with git log and call dream_rsi_auto_status. If a run is pending, log it before proposing another experiment. If no run is pending, propose exactly one new hypothesis and use dream_rsi_auto_run then dream_rsi_auto_log. Stop after the recorded cap or any branch/scope/configuration refusal.\n\nSaved prompt:\n${prompt}\n\nLog tail:\n${log}`);
+            report("Resuming from the saved prompt and log tail. The existing goal, branch, and caps remain in force.");
+            return;
+          }
+          let consent = goalParts.includes("--consent");
+          const goal = goalParts.filter((item) => item !== "--consent").join(" ");
+          if (!consent && ctx.hasUI) consent = await ctx.ui.confirm("Dream-RSI trusted-local auto", "This mode runs your declared measurement and check commands on this host with your access. Use only a repository you trust. Configure and verify a provider-side hard cap before initialization. Start the reviewed auto-session setup?");
+          if (!consent) { report("Auto not started: explicitly approve trusted-local execution with /dream-rsi auto --consent <goal>.", "error"); return; }
+          autoConsentSessions.set(ctx.sessionManager.getSessionId(), autoProject({}, ctx));
+          sendWhenReady(`Set up Dream-RSI auto for ${goal || "the operator's stated objective"}. Before initialization, confirm the objective, numeric metric and unit/direction, one numeric measurement command, one passing correctness command, editable scope, minimum gain, experiment and discard caps, provider-side hard cap, and a dedicated branch. Do not invent an evaluator or provider cap; ask for missing values. Read plans/set-and-forget-rsi.md and follow its trusted-local restrictions. The operator explicitly approved host execution. Once the complete contract is reviewed, call dream_rsi_auto_init with consent=true. Then run one hypothesis at a time with dream_rsi_auto_run followed by dream_rsi_auto_log. Never push, merge, touch out-of-scope paths, or claim magnitude.`);
+          report("Auto setup requested. Review its complete contract before init; provider-side cap is not enforced by Dream-RSI.");
+        } catch (error) { report(`Auto action refused: ${error instanceof Error ? error.message : String(error)}`, "error"); }
+        return;
+      }
       if (verb === "improve" || verb === "start") {
         report(`${verb} was removed in 3.0. Use /dream-rsi loop.`);
         return;
@@ -1077,6 +1187,23 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   pi.registerShortcut("ctrl+shift+d", { description: "Watch the Dream-RSI campaign", handler: async (ctx) => {
     await watchLoop(ctx);
   } });
+  pi.on("agent_end", async (event, ctx) => {
+    const project = autoConsentSessions.get(ctx.sessionManager.getSessionId());
+    if (!project) return;
+    const messages = event.messages as Array<{ role?: string; stopReason?: string; errorMessage?: string }>;
+    const providerError = [...messages].reverse().find((message) => message.role === "assistant" && (message.stopReason === "error" || !!message.errorMessage));
+    recordAutoProviderOutcome(project, providerError ?? null);
+  });
+  pi.on("agent_before_settle", async (event, ctx) => {
+    const project = autoConsentSessions.get(ctx.sessionManager.getSessionId());
+    if (event.outcome !== "error" || !project) return;
+    const retries = autoProviderRetryCount(project);
+    if (retries === null) return;
+    return { entries: [...event.entries, {
+      type: "custom_message" as const, customType: "dream-rsi/auto-provider-retry", display: false,
+      content: `A transient provider error occurred. Continue this auto session within its existing contract (transient failure ${retries} of 3). Read .dream-rsi/auto/prompt.md and the log tail, inspect status, and first resolve any pending run. Do not repeat a command whose result is unknown. Do not change the metric, scope, branch, or caps.`,
+    }], continue: true };
+  });
   pi.on("input", async (event, ctx) => {
     if (event.source !== "extension" && explicitlyRequestsImprovement(event.text)) setMode(ctx, true);
     return { action: "continue" };
@@ -1100,6 +1227,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     dashboards.get(id)?.dispose();
     dashboards.delete(id);
     modes.delete(id);
+    autoConsentSessions.delete(id);
   });
 }
 /**
@@ -1112,6 +1240,7 @@ function normalizePathArg(value: string): string {
 function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
+    "  /dream-rsi auto [--consent] <goal> | auto resume | auto off | auto status  run or inspect trusted-local one-repository experiments",
     "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
     "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
     "  /dream-rsi evolve [what you want] [same flags as loop]  magnitude-ranked continuous mode (budget, plateau and stop rules still apply)",
@@ -1123,6 +1252,7 @@ function renderCommandHelp(): string {
 function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
+    { value: "auto", label: "auto [--consent] <goal> | resume | off | status", description: "Run one trusted-local auto experiment at a time" },
     { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
     { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
     { value: "evolve", label: "evolve [what you want] [loop flags]", description: "Magnitude-ranked continuous mode; continuation, plateau and stop rules still apply" },

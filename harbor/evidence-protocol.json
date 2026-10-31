@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "study": "dream-rsi-evidence-track",
+  "status": "optional-design-only",
+  "claim": {
+    "heldOutRepositories": 6,
+    "verifiedTwoXRepositoriesMinimum": 4,
+    "heldOutCampaigns": 60,
+    "verifiedWinRateMinimum": 0.3,
+    "magnitudeWinRateMinimum": 0.15,
+    "medianRatioMinimum": 1.5,
+    "ratioCiLower95ExclusiveMinimum": 1.15,
+    "correctnessRegressionsMaximum": 0,
+    "negativeControlCommitsMaximum": 0,
+    "cleanCheckoutReplayRate": 1,
+    "crashRecoveries": { "passed": 12, "required": 12 },
+    "evaluatorCvMaximum": 0.05,
+    "tokensPerHeldOutVerifiedWinMaximum": 250000,
+    "usdPerHeldOutVerifiedWinMaximum": 30
+  },
+  "denominators": {
+    "pilotOverlapAllowed": false,
+    "treatmentRepositories": 16,
+    "developmentRepositories": 10,
+    "heldOutRepositories": 6,
+    "campaignsPerTreatmentRepository": 10,
+    "developmentCampaigns": 100,
+    "heldOutCampaigns": 60,
+    "negativeControlRepositories": 4,
+    "campaignsPerNegativeControl": 10,
+    "negativeControlCampaigns": 40,
+    "developmentControlRepositories": 10,
+    "campaignsPerDevelopmentControlArm": 5,
+    "placeboCampaigns": 50,
+    "textbookCampaigns": 50,
+    "shuffledMetricCampaigns": 50,
+    "aaPairedSequences": 60,
+    "redTeamClasses": 12,
+    "redTeamRepeatsPerClass": 3
+  },
+  "caps": { "tokensPerTreatmentRepository": 750000, "usdPerTreatmentRepository": 90, "totalUsd": 15000 },
+  "killConditions": [
+    "primary endpoint misses any declared threshold after the full budget",
+    "any correctness regression or negative-control/placebo commit",
+    "any clean-checkout replay failure",
+    "cost exceeds twice a per-repository cap or the total $15000 evidence budget",
+    "fewer than four of six held-out repositories have a verified 2x win",
+    "any red-team success"
+  ],
+  "controlIsolation": {
+    "controlsShareTreatmentWorktree": false,
+    "controlsMayCommit": false,
+    "negativeControlHeadroom": 0,
+    "treatmentScopeFrozenBeforeHeldOut": true,
+    "heldOutRepositoriesRemainSealedUntilFreeze": true
+  },
+  "execution": "Not authorized by this protocol file. Requires a separately approved plan and explicit operator execution."
+}

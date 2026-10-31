@@ -208,14 +208,16 @@ export async function commitVerifiedChanges(options: VerifiedCommitOptions): Pro
   const root = await repoRoot(options.projectDir, options.signal);
   const exec = (args: string[], allowFailure = false) => git(root, args, allowFailure, options.signal);
   if ((await exec(["branch", "--show-current"])).stdout.trim() !== options.branch) throw new AutoCommitError("the dedicated auto-commit branch changed during verification");
+  await assertNotDefaultBranch(root, options.branch, options.signal);
   const head = await currentHead(root, options.signal);
-  if (head !== options.expectedHead) throw new AutoCommitError("the auto-commit branch advanced during verification; no commit was created");
-  await ensureEmptyIndex(root, options.signal);
   const changes = options.changes.map((change) => ({ ...change, path: relativePath(change.path) }));
   if (!changes.length || new Set(changes.map((change) => change.path)).size !== changes.length) throw new AutoCommitError("verified patch has no files or contains duplicate paths");
   if (changes.some((change) => change.afterHash !== null && !SHA256.test(change.afterHash))) throw new AutoCommitError("verified patch has an invalid postimage digest");
   const expectedPaths = changes.map((change) => change.path).sort();
+  const preStaged = parseNames((await exec(["diff", "--cached", "--no-renames", "--name-only", "-z", "HEAD"])).stdout);
+  if (preStaged.some((file) => !expectedPaths.includes(file))) throw new AutoCommitError("Git index contains a staged path outside the verified patch");
   const changed = await changedPaths(root, options.signal);
+  if (changed.length > 0 && head !== options.expectedHead) throw new AutoCommitError("the auto-commit branch advanced during verification; no new commit was created");
   const gitObjects = new Map<string, string>();
   const expectedModes = new Map<string, string>();
   for (const change of changes) {
@@ -239,7 +241,9 @@ export async function commitVerifiedChanges(options: VerifiedCommitOptions): Pro
       const [mode, kind, objectId] = record.slice(0, tab).split(" ");
       if (kind === "blob") committedObjects.set(record.slice(tab + 1).replace(/\\/g, "/"), `${mode}:${objectId}`);
     }
-    const matches = subject === `Dream-RSI: verified improvement (${cleanCommitText(options.campaignId, 80)})`
+    const parent = (await exec(["rev-parse", "--verify", `${head}^`], true)).stdout.trim();
+    const matches = (parent === options.expectedHead || head === options.expectedHead)
+      && subject === `Dream-RSI: verified improvement (${cleanCommitText(options.campaignId, 80)})`
       && JSON.stringify(committedNames) === JSON.stringify(expectedPaths)
       && changes.every((change) => change.afterHash === null
         ? !committedObjects.has(change.path)
@@ -248,6 +252,24 @@ export async function commitVerifiedChanges(options: VerifiedCommitOptions): Pro
     throw new AutoCommitError("the verified patch is not a new working-tree change, and HEAD is not its recorded auto-commit");
   }
   if (JSON.stringify(changed) !== JSON.stringify(expectedPaths)) throw new AutoCommitError("working-tree changes do not exactly match the verified patch; no commit was created");
+  if (preStaged.length) {
+    const stagedBefore = await exec(["ls-files", "--stage", "-z", "--", ...expectedPaths.map((file) => `:(literal)${file}`)]);
+    const stagedObjects = new Map<string, string>();
+    for (const record of stagedBefore.stdout.split("\0").filter(Boolean)) {
+      const tab = record.indexOf("\t");
+      if (tab < 0) throw new AutoCommitError("the interrupted Git index could not be validated");
+      const [mode, objectId, stage] = record.slice(0, tab).split(" ");
+      if (stage !== "0") throw new AutoCommitError("the interrupted Git index contains an unresolved merge entry");
+      stagedObjects.set(record.slice(tab + 1).replace(/\\/g, "/"), `${mode}:${objectId}`);
+    }
+    for (const change of changes) {
+      if (!preStaged.includes(change.path)) continue;
+      const indexed = stagedObjects.get(change.path);
+      if (change.afterHash === null ? indexed !== undefined : indexed !== `${expectedModes.get(change.path)}:${gitObjects.get(change.path)}`) {
+        throw new AutoCommitError(`the interrupted staged postimage does not match the verified patch: ${change.path}`);
+      }
+    }
+  }
   const addArgs = ["add", "--all", "--", ...expectedPaths.map((file) => `:(literal)${file}`)];
   await exec(addArgs);
   const staged = parseNames((await exec(["diff", "--cached", "--no-renames", "--name-only", "-z", "HEAD"])).stdout);
