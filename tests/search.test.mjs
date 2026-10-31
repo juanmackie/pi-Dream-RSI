@@ -140,7 +140,16 @@ test("utility allocation ranks measured gain per confirmation run, and stale exp
   assert.equal(isCurrentExperiment(record, { contractId: "other-contract" }), true);
   assert.equal(isCurrentExperiment({ ...record, provenance: undefined }, { contractId: "current" }), true,
     "legacy records without provenance stay comparable");
+  assert.equal(isCurrentExperiment({ ...record, evidenceLinked: false }, { contractId: "current" }), false,
+    "a new outcome without a readable evidence ledger cannot steer the next allocation");
+  assert.equal(isCurrentExperiment({ ...record, provenance: undefined, evidenceLinked: true }, { contractId: "current" }), true);
   assert.equal(isCurrentExperiment({ ...record, provenance: { evaluatorId: "e1" } }, { evaluatorId: "e2" }), false);
+});
+
+test("an outcome without readable evidence cannot alter attempt demotion", () => {
+  const memory = recordCampaignOutcome(emptyMemory(), record("alpha", "no-win", { evidenceLinked: false }));
+  assert.equal(memory.leverStats.alpha, undefined, "unlinked observations do not alter allocation totals");
+  assert.deepEqual(attemptsFromMemory(memory), [], "unlinked observations are not fed back into recon allocation");
 });
 
 test("a win only accrues measured gain when it carries a positive verified gain", () => {

@@ -301,8 +301,38 @@ test("loop ranks contract-bounded recon levers and accounts for campaign spend",
     );
 
     assert.ok(result.records.some((record) => record.outcome === "no-win"), "the scripted campaign's unverified no-win outcome is recorded");
+    const lessonRoot = path.join(fixture.projectDir, ".dream-rsi", "memory");
+    const lessonFiles = fs.readdirSync(lessonRoot).filter((name) => name.endsWith(".jsonl"));
+    assert.equal(lessonFiles.length, 1, "a completed campaign persists one profile-scoped lesson library");
+    const lessons = fs.readFileSync(path.join(lessonRoot, lessonFiles[0]), "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(lessons.length, 1);
+    assert.equal(lessons[0].record.outcome, "no-win");
+    assert.equal(lessons[0].evidence.ledgerEntries, 1);
+    const ledgerBytes = fs.readFileSync(path.join(lessonRoot, "..", "campaigns", "stub-1", "history", "ledger.jsonl"));
+    assert.equal(lessons[0].evidence.ledgerHash, createHash("sha256").update(ledgerBytes).digest("hex"), "the persisted reference hashes the campaign's actual ledger bytes");
+    assert.equal(lessons[0].evidence.campaignId, "stub-1");
     assert.equal(result.records.some((record) => record.outcome === "rejected"), false, "no lever needed a screening rejection: the command lever had discovered scope");
     assert.ok(messages.some((message) => /campaign stub-1 finished as no-win/.test(message)));
+  } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
+});
+
+test("the next allocation replays only prior lessons from the same approved library", async () => {
+  const fixture = fixtureProject();
+  try {
+    const stub = stubCampaign();
+    const result = await runLoop({ projectDir: fixture.projectDir, sessionDir: fixture.sessionDir,
+      limits: baseLimits({ maxCampaigns: 2 }), runCampaignImpl: stub.impl, now: () => NOW });
+    assert.equal(stub.calls.length, 2, "the loop uses only its two-campaign durable allowance");
+    const firstLever = result.records[0].leverId;
+    const rankedEvidenceCount = result.ranking.reduce((total, row) => total + row.campaigns, 0);
+    assert.equal(rankedEvidenceCount, 1, "the second selection sees the first completed lesson, not its own later result");
+    assert.equal(result.ranking.find((row) => row.id === firstLever).campaigns, 1);
+    const lessonRoot = path.join(fixture.projectDir, ".dream-rsi", "memory");
+    const lessons = fs.readFileSync(path.join(lessonRoot, fs.readdirSync(lessonRoot).find((name) => name.endsWith(".jsonl"))), "utf8")
+      .trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(lessons.length, 2, "both completed campaigns append to the same scoped library");
+    assert.deepEqual(lessons.map((lesson) => lesson.sequence), [1, 2]);
+    assert.ok(lessons.every((lesson) => lesson.evidence.ledgerHash.length === 64));
   } finally { fs.rmSync(fixture.dir, { recursive: true, force: true }); }
 });
 

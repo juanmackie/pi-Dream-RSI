@@ -17,6 +17,7 @@ import type { ProgressObserver } from "./progress.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
 import { parseThreshold, resolveThreshold, planTest } from "./measure.ts";
 import { appendLedgerRecord, readLedger, ledgerHealth, type LedgerAgentRole, type LedgerEntry, type LedgerRecord } from "./ledger.ts";
+import type { CampaignType } from "./levers.ts";
 
 export type CampaignAgentResolver = (savedAgent: AgentConfig) => AgentConfig | null;
 
@@ -187,6 +188,10 @@ export interface CampaignRecord {
   searchConfig: SearchConfig;
   mechanism?: string;
   parentCampaignId?: string;
+  /** Search ambition the caller selected, kept for review and resume. */
+  campaignType?: CampaignType;
+  /** Plain-language search instruction derived from the magnitude estimate. */
+  strategy?: string;
   minimumGain: number;
   requestedMinimumGain?: number | string;
   /** Per-promotion false-accept allowance assigned by the caller (see MeasurementPlan). */
@@ -249,6 +254,9 @@ export interface CampaignStatus {
   check?: { qualified: boolean; runs: CampaignCheckRun[]; diagnoses: string[]; reportPath: string | null };
   /** The agent command/model actually used by this campaign's latest child process. */
   effectiveAgent?: EffectiveAgent;
+  /** Search ambition and strategy selected when the campaign was created. */
+  campaignType?: CampaignType;
+  strategy?: string;
 }
 
 export interface CampaignRejection {
@@ -306,6 +314,9 @@ export interface CampaignOptions {
   /** Research decision and predecessor that selected this campaign. */
   mechanism?: string;
   parentCampaignId?: string;
+  /** Search ambition for this campaign; it steers the candidate prompt and never a gate. */
+  campaignType?: CampaignType;
+  strategy?: string;
 }
 
 export interface CampaignCheckRun {
@@ -526,6 +537,8 @@ function statusOf(record: CampaignRecord): CampaignStatus {
     ...(record.pendingConfirmation ? { pendingConfirmation: { iteration: record.pendingConfirmation.iteration, cell: record.pendingConfirmation.candidate.cell, pairs: record.pendingConfirmation.pairs, maxPairs: record.pendingConfirmation.maxPairs } } : {}),
     ...(checkStatusOf(record) ? { check: checkStatusOf(record)! } : {}),
     ...(record.effectiveAgent ? { effectiveAgent: record.effectiveAgent } : {}),
+    ...(record.campaignType ? { campaignType: record.campaignType } : {}),
+    ...(record.strategy ? { strategy: record.strategy } : {}),
   };
 }
 function emit(record: CampaignRecord, options: Pick<CampaignOptions, "onProgress" | "onUpdate">): void {
@@ -1686,6 +1699,8 @@ async function execute(record: CampaignRecord, options: Pick<CampaignOptions, "s
           threshold: record.minimumGain, config: record.searchConfig ?? defaultSearchConfig, signal, agent: record.task.agent,
           ...(options.evaluatorEnv ? { evaluatorEnv: options.evaluatorEnv, evaluatorEnvKeys: options.evaluatorEnvKeys } : {}),
           goal: record.goal, scope: record.scope, gates: record.gates ?? [],
+          ...(record.campaignType ? { campaignType: record.campaignType } : {}),
+          ...(record.strategy ? { strategy: record.strategy } : {}),
           historySummary: campaignMemory(record).slice(-6).map((entry) => `${entry.kind}: ${entry.outcome ?? "recorded"}${entry.facts?.reason ? ` (${entry.facts.reason})` : ""}`).join("\n"),
           priorAgentErrorStreak: priorAgentErrorStreak(record, iteration),
           resolveAgent: options.resolveAgent,
@@ -1823,6 +1838,8 @@ export async function runCampaign(options: CampaignOptions): Promise<CampaignRes
     taskFingerprint: scoringFingerprint(scopedTask), searchConfig: options.searchConfig ?? defaultSearchConfig, minimumGain, requestedMinimumGain: options.minimumGain ?? 0,
     ...(options.mechanism ? { mechanism: options.mechanism.slice(0, 100) } : {}),
     ...(options.parentCampaignId ? { parentCampaignId: options.parentCampaignId.slice(0, 80) } : {}),
+    ...(options.campaignType ? { campaignType: options.campaignType } : {}),
+    ...(options.strategy ? { strategy: options.strategy.slice(0, 600) } : {}),
     minimumGainSource, baselineScores: [], limits, startedAt: new Date(started).toISOString(), deadlineAt: new Date(started + limits.deadlineMs).toISOString(),
     ...(options.allowFailingBaselineGates === true ? { allowFailingBaselineGates: true } : {}),
     ...(options.confirmationAlpha === undefined ? {} : { confirmationAlpha: options.confirmationAlpha }),

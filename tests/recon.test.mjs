@@ -268,6 +268,66 @@ test("matching usage signals rank the measured lever and remain visible as evide
   assert.ok(ranked.reasons.some((reason) => /ranking multiplier 2\.00/.test(reason)));
 });
 
+test("magnitude ranking prefers an algorithmic hot path over a faster trivial workload", async () => {
+  const dir = project({
+    "package.json": `${JSON.stringify({
+      name: "magnitude-fixture", private: true, type: "module",
+      scripts: { "bench:hot": "node bench-hot.mjs", "bench:trivial": "node bench-trivial.mjs" },
+    }, null, 2)}\n`,
+    "bench-hot.mjs": 'import { run } from "./src/hot.mjs";\nrun();\n',
+    "bench-trivial.mjs": 'import { run } from "./src/trivial.mjs";\nrun();\n',
+    "src/hot.mjs": `export function run(items) {
+  let total = 0;
+  for (const item of items) {
+    for (const value of item) total += value;
+  }
+  return total;
+}
+`,
+    "src/trivial.mjs": "export const run = (items) => items.length;\n",
+  });
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract, maxProbes: 2,
+    probeImpl: async (command) => ({
+      label: command.label, ok: true, timedOut: false, error: null,
+      durationMs: command.label === "npm run bench:hot" ? 1200 : 1500,
+    }),
+  });
+  const inventory = buildReconInventory({ contract: runContract, recon });
+  assert.equal(inventory.levers.length, 2, "both measured workloads produce levers");
+  const [first, second] = inventory.levers;
+  assert.deepEqual(first.scopeFiles, ["src/hot.mjs"], "the algorithmic workload ranks first");
+  assert.equal(first.magnitude.campaignType, "algorithmic");
+  assert.deepEqual(second.scopeFiles, ["src/trivial.mjs"]);
+  assert.equal(second.magnitude.campaignType, "local-hill");
+  assert.ok(first.magnitude.expectedGainMultiplier > second.magnitude.expectedGainMultiplier);
+  assert.ok(first.reasons.some((reason) => /magnitude: algorithmic/.test(reason)), "the ranking reason is visible");
+  assert.ok(recon.projectCard, "recon attaches the advisory project card");
+  assert.ok(recon.projectDir, "recon attaches the project directory used for scope magnitude");
+});
+
+test("a lever without a magnitude estimate still ranks with its original score", async () => {
+  const dir = project(NODE_PROJECT);
+  const runContract = contract();
+  const recon = await reconProject({
+    projectDir: dir, contract: runContract,
+    probeImpl: async (command) => ({ label: command.label, ok: true, durationMs: 1200, timedOut: false, error: null }),
+  });
+  // A recon result from before the magnitude fields existed has no project directory,
+  // so ranking must leave the lever untouched instead of inventing a factor.
+  const legacy = { ...recon };
+  delete legacy.projectDir;
+  delete legacy.projectCard;
+  const ranked = buildReconInventory({ contract: runContract, recon }).levers[0];
+  const withoutMagnitude = buildReconInventory({ contract: runContract, recon: legacy }).levers[0];
+  assert.equal(withoutMagnitude.magnitude, undefined, "the optional field stays absent");
+  assert.equal(withoutMagnitude.score, withoutMagnitude.estimates.expectedGain * withoutMagnitude.estimates.readiness / Math.pow(withoutMagnitude.estimates.costSeconds, 0.25),
+    "the legacy score formula is unchanged");
+  assert.ok(withoutMagnitude.reasons.every((reason) => !reason.startsWith("magnitude:")), "no magnitude reason is fabricated");
+  assert.notEqual(withoutMagnitude.score, ranked.score, "the newer path applies the magnitude factor");
+});
+
 test("a workload whose measured code is all outside the approved scope is rejected with the reason", async () => {
   const dir = project({
     ...NODE_PROJECT,

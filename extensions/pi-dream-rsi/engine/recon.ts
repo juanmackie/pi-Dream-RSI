@@ -17,11 +17,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 import { runShellCommand } from "../agent/runner.ts";
+import { buildProjectCard, magnitudeForScope, type ProjectCard } from "./fingerprint.ts";
 import {
   restrictedEnvironment, type CommandCategory, type RunContract, type RunContractScoreEvaluator,
 } from "./intake.ts";
-import type { LeverAttempt, LeverInventory, LeverProposal } from "./levers.ts";
+import type { LeverAttempt, LeverInventory, LeverMagnitude, LeverProposal } from "./levers.ts";
 import { attemptDemotion, leverId } from "./levers.ts";
+import { magnitudeLabel, magnitudeUtility } from "./magnitude.ts";
 import { pathWithin } from "./scope.ts";
 import type { SignalsResult } from "./signals.ts";
 
@@ -127,6 +129,10 @@ export interface ReconResult {
   notes: string[];
   /** Why a declared command was not usable; reported instead of silently skipped. */
   blockers: string[];
+  /** Absolute project directory, present when recon ran against a real tree. */
+  projectDir?: string;
+  /** Advisory project card for magnitude ranking; it grants no scope and runs no command. */
+  projectCard?: ProjectCard;
 }
 
 export interface ReconOptions {
@@ -649,7 +655,19 @@ export async function reconProject(options: ReconOptions): Promise<ReconResult> 
   }
   if (truncated) notes.push(`the import graph reached the ${MAX_GRAPH_FILES}-file cap; later candidates may be incomplete.`);
 
-  return { commands: discovered.commands, probes, graph: [...graph].sort(), graphs, files, notes, blockers };
+  // The card is advisory ranking evidence. A failure to build it must not stop a
+  // run that already has a measurable workload.
+  let projectCard: ProjectCard | undefined;
+  try { projectCard = buildProjectCard(projectDir); }
+  catch (error) {
+    notes.push(`the project card could not be built (${error instanceof Error ? error.message : String(error)}); ranking continues without it.`);
+  }
+
+  return {
+    commands: discovered.commands, probes, graph: [...graph].sort(), graphs, files, notes, blockers,
+    projectDir,
+    ...(projectCard ? { projectCard } : {}),
+  };
 }
 
 export interface ReconInventoryOptions {
@@ -783,6 +801,37 @@ function scoreEvaluatorLever(options: {
 
 
 /**
+ * Multiply each lever's base score by its log-utility magnitude estimate.
+ *
+ * The factor orders search only. It never changes what counts as a win: metric
+ * qualification, gates, review, and the independent post-apply check still decide
+ * promotion. Scopes are cached because several levers often share one workload.
+ */
+function rankByMagnitude(levers: LeverProposal[], recon: ReconResult): LeverProposal[] {
+  const projectDir = recon.projectDir;
+  if (!projectDir || levers.length === 0) return levers;
+  const cache = new Map<string, LeverMagnitude>();
+  return levers.map((lever) => {
+    const key = lever.scopeFiles.join("\u0000");
+    let magnitude = cache.get(key);
+    if (magnitude === undefined) {
+      magnitude = magnitudeForScope(projectDir, lever.scopeFiles, recon.projectCard ?? null);
+      cache.set(key, magnitude);
+    }
+    const factor = Math.max(0.05, magnitudeUtility(magnitude));
+    return {
+      ...lever,
+      magnitude,
+      score: lever.score * factor,
+      reasons: [
+        ...lever.reasons,
+        `magnitude: ${magnitudeLabel(magnitude)}; ${magnitude.rationale[0] ?? "no structural signal"}`,
+      ],
+    };
+  });
+}
+
+/**
  * Turn recon evidence into ranked levers. A declared score evaluator becomes the
  * only instrument because it measures the approved outcome directly; otherwise the
  * measured workload with the largest attributable duration becomes a duration
@@ -794,12 +843,21 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   const { contract, recon } = options;
   const attempts = options.attempts ?? [];
   const attemptByLever = new Map(attempts.map((attempt) => [attempt.leverId, attempt]));
-  const levers: LeverProposal[] = [];
+  let levers: LeverProposal[] = [];
   const rejected: LeverInventory["rejected"] = [];
   const diagnostics: string[] = [...recon.notes];
   const passingTests = recon.commands.filter((command) => command.category === "test" && recon.probes.some((probe) => probe.label === command.label && probe.ok));
   const gates = passingTests.map((command) => command.label);
   if (gates.length > 0) diagnostics.push(`Declared test gates: ${gates.join(", ")}.`);
+  if (recon.projectCard) {
+    const card = recon.projectCard;
+    const languages = card.languages.slice(0, 3).map((entry) => `${entry.name} ${Math.round(entry.share * 100)}%`).join(", ");
+    diagnostics.push(`Project card (advisory): ${languages || "no recognized source language"}; ${card.testRunners.length} test runner(s), ${card.benchmarkCommands.length} declared benchmark(s).`);
+    if (card.magnitudeCandidates.length > 0) {
+      diagnostics.push(`Project card magnitude candidates: ${card.magnitudeCandidates.slice(0, 3).map((candidate) =>
+        `${candidate.campaignType} ~${candidate.expectedGainMultiplier}x at ${Math.round(candidate.confidence * 100)}% (${candidate.path})`).join("; ")}.`);
+    }
+  }
 
   // A declared score evaluator fixes what the number means and its direction.
   // Other measurements can be diagnostics, but cannot replace it on failure.
@@ -934,8 +992,9 @@ export function buildReconInventory(options: ReconInventoryOptions): LeverInvent
   if (contract.outcome.evaluator) {
     for (const lever of levers) rejected.push({ id: lever.id, sourceKind: lever.sourceKind, readiness: 0,
       reason: `The declared evaluator is authoritative; ${lever.metricKind} is an alternate measurement and cannot be used as a proxy fallback if that evaluator fails qualification.` });
-    return { levers: scoreLever ? [scoreLever] : [], rejected, diagnostics };
+    return { levers: scoreLever ? rankByMagnitude([scoreLever], recon) : [], rejected, diagnostics };
   }
+  levers = rankByMagnitude(levers, recon);
   levers.sort((a, b) => b.score - a.score || b.estimates.expectedGain - a.estimates.expectedGain || a.id.localeCompare(b.id));
   return { levers, rejected, diagnostics };
 }

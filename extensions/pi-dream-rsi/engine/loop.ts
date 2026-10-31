@@ -11,6 +11,8 @@ import {
   restrictedEnvironment, type ApprovedContract, type RunContract,
 } from "./intake.ts";
 import { readLedger } from "./ledger.ts";
+import { appendLesson, lessonProfile, readLessons, replayLessonPrefix } from "./lessons.ts";
+import { projectCardSummary, writeProjectCard, type ProjectCard } from "./fingerprint.ts";
 import { readAppliedPatchPostimages } from "./campaign-patch.ts";
 import { AutoCommitError, commitVerifiedChanges, ensureAutoCommitBranch, type AutoCommitReceipt, type PreparedAutoCommitBranch } from "./git.ts";
 import { buildReconInventory, reconProject, timeLikeOutcome, type ReconOptions, type ReconResult } from "./recon.ts";
@@ -209,6 +211,8 @@ export interface LoopResult {
   budgetPath: string;
   memory: LoopMemory;
   inventory: LeverInventory | null;
+  /** Advisory project card used to rank this run, when recon built one. */
+  projectCard: ProjectCard | null;
   ranking: LeverRankingEntry[];
   records: LoopCampaignRecord[];
   /** Bounded fresh-context digest for the next run. */
@@ -666,21 +670,23 @@ function recoverBudgetExtension(loopRoot: string): void {
  * instrument. Legacy records without provenance stay comparable, so an upgrade
  * does not silently forget a project's history.
  */
-function comparableMemory(memory: LoopMemory, current: { contractId: string | null; evaluatorId: string | null }): LoopMemory {
+function comparableMemory(memory: LoopMemory, current: { contractId: string | null; evaluatorId: string | null; baselineFingerprint?: string }): LoopMemory {
   const latest = new Map<string, LoopMemoryRecord>();
-  for (const record of memory.outcomes) latest.set(record.leverId, record);
+  for (const record of memory.outcomes) if (record.evidenceLinked !== false) latest.set(record.leverId, record);
   const leverStats: LoopMemory["leverStats"] = {};
   for (const [id, stats] of Object.entries(memory.leverStats)) {
     const record = latest.get(id);
     if (record && !isCurrentExperiment(record, {
       ...(current.contractId ? { contractId: current.contractId } : {}),
       ...(current.evaluatorId ? { evaluatorId: current.evaluatorId } : {}),
+      ...(current.baselineFingerprint ? { baselineFingerprint: current.baselineFingerprint } : {}),
     })) continue;
     leverStats[id] = stats;
   }
-  const outcomes = memory.outcomes.filter((record) => isCurrentExperiment(record, {
+  const outcomes = memory.outcomes.filter((record) => record.evidenceLinked !== false && isCurrentExperiment(record, {
     ...(current.contractId ? { contractId: current.contractId } : {}),
     ...(current.evaluatorId ? { evaluatorId: current.evaluatorId } : {}),
+    ...(current.baselineFingerprint ? { baselineFingerprint: current.baselineFingerprint } : {}),
   }));
   return { ...memory, leverStats, outcomes };
 }
@@ -1129,6 +1135,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
   let lastCampaignId: string | null = null;
   let ranking: LeverRankingEntry[] = [];
   let inventory: LeverInventory | null = null;
+  let projectCard: ProjectCard | null = null;
   let stopReason = "";
   const runController = new AbortController();
   const runSignal = runController.signal;
@@ -1185,8 +1192,34 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     ...options.campaignDefaults,
   };
 
+  const currentLessonProfile = () => approved && contractId ? lessonProfile({
+    benchmark: contractId,
+    executor: latestEffectiveAgent ?? approved.contract.agent,
+    mode: approved.contract.mode ?? "legacy",
+    budget: { approved: approved.contract.budgets, durable: budget && {
+      campaigns: budget.max_campaigns, agentStarts: budget.max_agent_starts,
+      evaluatorRuns: budget.max_evaluator_runs,
+    }, rsiDaily: approved.contract.mode === "rsi" ? RSI_DAILY_CAPS : null },
+    seed: null,
+  }) : null;
+
   const recordOutcome = (record: Omit<LoopMemoryRecord, "kind">, campaignRoot: string | null, completed = true): void => {
-    memory = recordCampaignOutcome(memory, { kind: "campaign", ...record });
+    let evidenceLinked = false;
+    const outcomeRecord: LoopMemoryRecord = { kind: "campaign", ...record, evidenceLinked };
+    const profile = currentLessonProfile();
+    if (completed && campaignRoot && profile) {
+      const ledger = readLedger(path.join(campaignRoot, "history", "ledger.jsonl"));
+      const campaignId = path.basename(campaignRoot);
+      if (!ledger.diagnostics.length && ledger.fileHash && ledger.entries.length > 0
+        && ledger.entries.some((entry) => entry.campaignId === campaignId)) {
+        appendLesson(path.join(baseRoot, "memory"), profile, outcomeRecord, {
+          campaignId, ledgerHash: ledger.fileHash, ledgerEntries: ledger.entries.length,
+        });
+        evidenceLinked = true;
+        outcomeRecord.evidenceLinked = true;
+      }
+    }
+    memory = recordCampaignOutcome(memory, outcomeRecord);
     writeMemory(memoryPath, memory);
     records.push({ kind: "campaign", ...record, campaignRoot });
     if (completed && campaignRoot && approved?.contract.continuation && budget) {
@@ -1623,7 +1656,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       leverId: context.lever.id, outcome, stopReason: reason.slice(0, 200),
       evaluatorRuns: evaluatorDelta, agentStarts: agentDelta, wallMs: 0, at: now().toISOString(),
       ...(verifiedGain === undefined ? {} : { verifiedGain }),
-      provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
+      provenance: { contractId: context.contractId, ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: context.baselineFingerprint, mechanism: context.lever.mechanism.slice(0, 200), strategyClass: context.lever.sourceKind },
     }, result.campaignRoot, !paused);
     if (!paused) fs.rmSync(activeContextPath, { force: true });
     if (paused && stopReason !== "deadline" && stopReason !== "cancelled") stopReason = options.confirmationOnly ? "confirmation pending" : "paused";
@@ -1937,6 +1970,13 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         }
         throw error;
       }
+      if (recon.projectCard) {
+        projectCard = recon.projectCard;
+        try { writeProjectCard(projectDir, projectCard); }
+        catch (error) {
+          addNote(`project card could not be saved: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       const sessionSignals = await collectSignalsImpl({
         projectDir,
         ...(options.focus ? { focus: options.focus } : {}),
@@ -1944,13 +1984,20 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
         ...(options.sessionDir ? { sessionDir: options.sessionDir } : {}),
       });
       const usageSignals = sessionSignals.weaknesses.filter((weakness) => weakness.evidence.some((item) => item.source === "session"));
-      inventory = buildReconInventory({ contract: approved.contract, recon, attempts: attemptsFromMemory(memory), signals: usageSignals });
+      // Experiments measured under another objective or another instrument are not
+      // comparable; they stay in the durable history but do not steer this run.
+      const baselineFingerprint = projectFingerprint(projectDir);
+      const profile = currentLessonProfile();
+      const lessons = profile ? readLessons(path.join(baseRoot, "memory"), profile) : [];
+      // Both recon demotion and UCB allocation replay the same profile-scoped prefix.
+      // Unscoped memory is a one-way fallback until this profile has linked evidence.
+      const comparable = lessons.length
+        ? replayLessonPrefix(lessons, Number.POSITIVE_INFINITY, { baselineFingerprint })
+        : comparableMemory(memory, { contractId, evaluatorId, baselineFingerprint });
+      inventory = buildReconInventory({ contract: approved.contract, recon, attempts: attemptsFromMemory(comparable), signals: usageSignals });
       preflight = buildLoopPreflight(approved.contract, recon, inventory, options.focus, options.evaluatorBootstrap?.authorized ? options.evaluatorBootstrap.paths : []);
       evidenceCount = recon.probes.length;
       for (const blocker of recon.blockers) addNote(`recon blocker: ${blocker}`);
-      // Experiments measured under another objective or another instrument are not
-      // comparable; they stay in the durable history but do not steer this run.
-      const comparable = comparableMemory(memory, { contractId, evaluatorId });
       const selection = ucbSelect(inventory.levers, comparable, { strategy: "utility" });
       ranking = selection.ranking;
       progress(`loop: ${inventory.levers.length} lever(s) ranked from ${evidenceCount} measured or recorded signal(s); top candidate ${selection.selected?.id ?? "none"}`);
@@ -2147,6 +2194,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
             goal: setup.goal ?? lever.goal,
             scope: setup.scope ?? [...lever.scopeFiles],
             mechanism: lever.mechanism,
+            ...(lever.magnitude ? { campaignType: lever.magnitude.campaignType, strategy: lever.magnitude.rationale[0] } : {}),
             ...(lastCampaignId ? { parentCampaignId: lastCampaignId } : {}),
             verifierInputs: setup.verifierInputs,
             gates: setup.gates ?? [],
@@ -2287,7 +2335,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
               leverId: lever.id, outcome: "no-win", stopReason: postApplyFailure.slice(0, 200),
               evaluatorRuns: result.evaluatorRuns, agentStarts: result.agentStarts,
               wallMs: Date.now() - campaignStartedMs, at: now().toISOString(),
-              provenance: { ...(contractId ? { contractId } : {}), ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: projectFingerprint(projectDir), strategyClass: lever.sourceKind },
+              provenance: { ...(contractId ? { contractId } : {}), ...(evaluatorId ? { evaluatorId } : {}), baselineFingerprint: baselineFingerprint ?? projectFingerprint(projectDir), strategyClass: lever.sourceKind },
             }, result.campaignRoot);
             if (stopReason !== "deadline" && stopReason !== "cancelled") stopReason = `post-apply check failed: ${postApplyFailure}`;
             launched = true;
@@ -2453,6 +2501,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
           branch: approved?.contract.mode !== "rsi" ? approved?.contract.git?.branch ?? null : null,
           branchTip: autoCommitBranch?.head ?? null,
           effectiveAgent: latestEffectiveAgent,
+          projectCard,
           lastVerifiedCommit: autoCommits.at(-1)?.hash ?? null,
           lastWin: lastWin ? { leverId: lastWin.leverId, verifiedGain: lastWin.verifiedGain ?? null, unit: approved?.contract.outcome.unit ?? null } : null,
           budget: displayedBudget ? {
@@ -2500,6 +2549,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
     budgetPath,
     memory,
     inventory,
+    projectCard,
     ranking,
     records,
     memento: mementoNotes(memory),
@@ -2522,6 +2572,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       evaluatorRuns: result.evaluatorRuns, preflightEvaluatorRuns, campaignEvaluatorRuns, agentStarts: result.agentStarts,
       evaluatorRunsByPhase,
       rollingProcessLimits,
+      projectCard,
       budget: outputBudget ? {
         lifetime: { campaigns: outputBudget.campaigns, agentStarts: outputBudget.agent_starts, evaluatorRuns: outputBudget.evaluator_runs,
           tokens: outputBudget.tokens_used ?? null, wallMs: outputBudget.wall_ms ?? 0 },
@@ -2560,6 +2611,7 @@ export async function runLoop(options: LoopOptions): Promise<LoopResult> {
       "",
       "## Blockers",
       ...(blocked.length ? blocked.map((check) => `- ${oneLine(check.name, 80)}: ${oneLine(check.reason)}${check.remedy ? ` Next step: ${oneLine(check.remedy)}` : ""}`) : ["- No preflight blocker recorded."]),
+      ...(projectCard ? ["", "## Project card (advisory)", ...projectCardSummary(projectCard).map((line) => `- ${oneLine(line.trim(), 300)}`)] : []),
       "",
       "## Attempt timeline",
       ...(records.length > recentAttempts.length ? [`- Showing the latest ${recentAttempts.length} of ${records.length} recorded attempts.`] : []),

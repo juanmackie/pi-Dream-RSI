@@ -1,6 +1,6 @@
 # pi-dream-rsi
 
-Dream-RSI is a pi extension that assesses local projects and runs a verifier-driven improvement loop with durable hard budgets. Continuous continuation is opt-in, plateau-bounded, paced by a minimum interval between campaign starts, and resumes only on an explicit operator action.
+Dream-RSI is a pi extension that assesses local projects and runs a verifier-driven improvement loop with durable hard budgets. Continuous continuation is opt-in, plateau-bounded, paced by a minimum interval between campaign starts, and resumes only on an explicit operator action. A durable project card and a conservative magnitude estimate order the search toward larger bets; they never replace the evaluator, gates, or independent post-apply check.
 
 ## Use it
 
@@ -36,6 +36,8 @@ Setup creates a pinned measurement script and correctness check in `.dream-rsi-h
 
 The loop finds measurable levers, qualifies its metric, runs isolated experiments, and applies only changes that pass confirmation, correctness gates, review, and an independent post-apply check. The loop stops when it reaches its budget, cannot find a verifiable lever, or its agent stops working.
 
+Recon also writes a durable project card to `.dream-rsi/project-card.json` and estimates the structural magnitude of each lever's editable scope. Magnitude changes ranking only: a high-multiplier, low-confidence algorithmic or systemic bet can outrank a small local gain, but promotion still requires the same measured result and gates. The card is advisory evidence; it runs no project command and grants no scope.
+
 Its dream step uses completed experiment worlds to compare bounded search configurations through deterministic replay. An agent may propose configuration data; the loop never executes agent-written code as its search policy. This changes how the loop searches, not model weights.
 
 ## What it can and cannot promise
@@ -54,6 +56,7 @@ Default durable limits are 6 campaigns, 72 agent starts, 200 evaluator runs, and
 
 - `/dream-rsi assess [goal]` reads project signals and ranks improvement opportunities.
 - `/dream-rsi loop [goal] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]` prepares a natural-language goal in chat, then starts the guarded loop. Explicit config/setup commands start directly; without a goal, the command retains saved-setup reuse or declared-workload discovery.
+- `/dream-rsi evolve [goal] [same flags as loop]` runs the same guarded loop with the existing continuous continuation switched on. It adds no new budget, consent, gate, or commit behavior; the durable caps, no-win plateau, start interval, and explicit stop/resume rules still apply.
 - `/dream-rsi status` shows the saved objective, durable budget, latest blocker, and campaign state, including before a campaign exists. `watch`, `stop`, and `resume` inspect or control campaigns.
 
 A different saved objective needs a separate replacement approval. Interactive sessions offer a summary and full inspection. In headless use with reviewed config/setup settings, `--replace-contract` is explicit replacement authorization; execution consent is still required. During goal preparation, that flag requests a replacement review rather than approving a proposal that does not yet exist. Omitted settings keep the saved scope, gates, and permissions, so use the tool to specify new boundaries when changing domains. Replacement preserves cumulative budgets and one previous approval. See [changing a saved objective](docs/autonomous-loop.md#changing-a-saved-objective).
@@ -72,7 +75,7 @@ The file uses the `dream_rsi_loop` field names and cannot set consent or replace
 
 Invalid preparation settings can be corrected up to three times on the same handoff; no command or durable budget is started just for those corrections. Recovery reports the blocker category and next action, with no blind automatic retries. Engine blockers keep their durable evidence and budget; they do not silently restart.
 
-State lives in `<project>/.dream-rsi/`. Each completed run writes `loop/last-run.md` for operators and `loop/latest-report.json` for tools. A new Git-backed contract defaults to local commits for independently verified wins on `dream-rsi/improve`; the loop never pushes or commits to a default branch. The loop continues through its approved campaign budget until a declared stop condition. See [autonomous-loop.md](docs/autonomous-loop.md) for the clean-tree requirement, opt-out, recovery, and verification details.
+State lives in `<project>/.dream-rsi/`. Recon writes `.dream-rsi/project-card.json`; each completed run writes `loop/last-run.md` for operators and `loop/latest-report.json` for tools. A new Git-backed contract defaults to local commits for independently verified wins on `dream-rsi/improve`; the loop never pushes or commits to a default branch. The loop continues through its approved campaign budget until a declared stop condition. See [autonomous-loop.md](docs/autonomous-loop.md) for the clean-tree requirement, opt-out, recovery, and verification details, and [continuous-magnitude.md](docs/continuous-magnitude.md) for the project card, magnitude rules, and the scope of `evolve`.
 
 ## Development
 

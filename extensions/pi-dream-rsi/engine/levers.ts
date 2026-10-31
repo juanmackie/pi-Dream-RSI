@@ -4,6 +4,25 @@ import type { SignalEvidence, SignalWeakness } from "./signals.ts";
 /** Metric families synthesized from contract-bounded recon evidence. */
 export type LeverMetricKind = "command-duration" | "command-success" | "suite-failures" | "score" | "unmeasurable";
 
+/**
+ * How a campaign seeks a gain, from cheapest to most ambitious.
+ *
+ * The type is a search instruction, not a promise: every candidate still has to
+ * pass the same metric qualification, gates, review, and post-apply check.
+ */
+export const CAMPAIGN_TYPES = ["local-hill", "structural", "algorithmic", "systemic", "dependency"] as const;
+export type CampaignType = (typeof CAMPAIGN_TYPES)[number];
+
+/** The declared search ambition for one lever, with its evidence. */
+export interface LeverMagnitude {
+  campaignType: CampaignType;
+  /** Estimated best-case multiplier over the current measured value; at least 1. */
+  expectedGainMultiplier: number;
+  /** Confidence that the estimated magnitude is reachable; 0..1. */
+  confidence: number;
+  rationale: string[];
+}
+
 /** Where a recon proposal came from. */
 export type LeverSourceKind = SignalWeakness["kind"] | "recon-command";
 
@@ -40,6 +59,8 @@ export interface LeverProposal {
   score: number;
   evidence: SignalEvidence[];
   reasons: string[];
+  /** Present when the lever was ranked with a magnitude estimate. */
+  magnitude?: LeverMagnitude;
   command?: LeverCommand;
 }
 

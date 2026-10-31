@@ -8,6 +8,7 @@ import { writeFileAtomic, writeJson } from "./fsutil.ts";
 import { workspaceDigest } from "./campaign-patch.ts";
 import { progressFromWorld, type ProgressObserver } from "./progress.ts";
 import { loadPrompt, renderPrompt } from "./prompt.ts";
+import type { CampaignType } from "./levers.ts";
 
 export interface SearchConfig {
   version: 1;
@@ -129,6 +130,9 @@ export interface ExperimentOptions {
   goal?: string;
   scope?: string[];
   gates?: string[];
+  /** Search ambition selected by the lever; it steers the prompt and never a gate. */
+  campaignType?: CampaignType;
+  strategy?: string;
   historySummary?: string;
   /** Trailing non-editing agent errors from earlier cycles, so the breaker spans the campaign. */
   priorAgentErrorStreak?: number;
@@ -256,8 +260,10 @@ async function runAttempt(options: ExperimentOptions, world: ExperimentWorld, no
   fs.rmSync(proposal, { force: true });
   fs.rmSync(workspaceProposal, { force: true });
   const problem = options.task.problem_file ? readText(path.resolve(options.projectDir, options.task.problem_file)) : "";
+  const ambition = options.campaignType ?? "local-hill";
+  const strategy = options.strategy?.trim();
   const prompt = renderPrompt(loadPrompt("discovery-agent.md"), {
-    candidate_brief: `Goal: ${options.goal ?? options.task.name}\nEvaluator: ${options.task.score_program}\nMetric: ${options.task.score_field} (${options.task.higher_is_better ? "higher" : "lower"} is better)\nCorrectness gates: ${(options.gates ?? []).join(" | ") || "none"}`,
+    candidate_brief: `Goal: ${options.goal ?? options.task.name}\nSearch ambition: ${ambition}${strategy ? ` — ${strategy}` : ""}\nEvaluator: ${options.task.score_program}\nMetric: ${options.task.score_field} (${options.task.higher_is_better ? "higher" : "lower"} is better)\nCorrectness gates: ${(options.gates ?? []).join(" | ") || "none"}`,
     parent_summary: `${summary(world, node)}\n${options.historySummary ?? "No earlier campaign notes."}`,
     attempt_budget: "One agent attempt. The host evaluates only after a workspace edit and a proposal.",
     scope_files: (options.scope ?? ["."]).join(", "),

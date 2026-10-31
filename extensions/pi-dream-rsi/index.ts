@@ -20,6 +20,7 @@ import { approvalIdentity, effectiveCommitPolicy, normalizeRunContract, readStor
 import { measurementHarnessInstructions } from "./engine/harness.ts";
 import { resolveLoopProposal, proposalReview, proposalIdentity, type LoopProposal } from "./engine/proposal.ts";
 import { discoverMeasurementOptions } from "./engine/recon.ts";
+import { buildProjectCard, projectCardSummary, readProjectCard } from "./engine/fingerprint.ts";
 import { recovery, recoveryForLoop } from "./engine/recovery.ts";
 import { readLoopSettingsFile } from "./engine/settings.ts";
 import { RSI_DAILY_CAPS } from "./engine/budget.ts";
@@ -479,6 +480,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
       `  preflight: ${result.preflight.status}${result.preflight.checks.length ? ` — ${result.preflight.checks.filter((check) => check.status === "blocked").length} blocker(s), ${result.preflight.checks.length} check(s)` : " — not run"}`,
       ...result.preflight.checks.map((check) => `    ${check.status}: ${check.name} — ${check.reason}${check.remedy ? ` Next step: ${check.remedy}` : ""}`),
       `  levers ranked: ${result.inventory?.levers.length ?? 0}; memory: ${result.memoryPath}`,
+      ...(result.projectCard?.magnitudeCandidates.length
+        ? [`  magnitude candidates: ${result.projectCard.magnitudeCandidates.slice(0, 3).map((candidate) => `${candidate.campaignType} ~${candidate.expectedGainMultiplier}x at ${Math.round(candidate.confidence * 100)}% (${candidate.path})`).join("; ")}`]
+        : []),
       ...(result.contract ? [`  trusted-local contract recorded ${result.contract.fingerprint.slice(0, 12)} (${result.contract.approvedAt}); this is consent/settings, not campaign readiness`] : []),
       ...(result.verifications.length > 0
         ? [`  independent post-apply checks: ${result.verifications.filter((check) => check.passed).length}/${result.verifications.length} passed`]
@@ -552,7 +556,13 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           const proposal = resolveLoopProposal({ ...params, ...(request && params.preparation_id !== undefined ? { focus: request.focus, include_logs: request.include_logs && params.include_logs !== false } : {}), consent: false }, projectDir, stored?.contract, Object.keys(loopParams.properties));
           const proposal_id = proposalIdentity(projectDir, proposal, stored?.contract);
           const measurementOptions = discoverMeasurementOptions(projectDir, proposal.contract);
-          return { content: [{ type: "text", text: `Proposal ID: ${proposal_id}\nProposed settings (not approved; no commands run; reuse settings and supply action/approval controls separately):\n${proposalReview(proposal)}\nMeasurement options (source hints, not qualified):\n${JSON.stringify(measurementOptions, null, 2)}` }], details: { proposal, proposal_id, measurementOptions } };
+          // The card is read-only evidence for ranking and review. It is not written
+          // during prepare, and it does not qualify an instrument or grant scope.
+          let projectCard = null;
+          try { projectCard = buildProjectCard(projectDir); }
+          catch { /* prepare still returns the reviewed proposal when the card cannot be built */ }
+          const cardLines = projectCard ? projectCardSummary(projectCard).join("\n") : "Project card unavailable for this directory.";
+          return { content: [{ type: "text", text: `Proposal ID: ${proposal_id}\nProposed settings (not approved; no commands run; reuse settings and supply action/approval controls separately):\n${proposalReview(proposal)}\nProject card (advisory; no project command was run):\n${cardLines}\nMeasurement options (source hints, not qualified):\n${JSON.stringify(measurementOptions, null, 2)}` }], details: { proposal, proposal_id, measurementOptions, projectCard } };
         } catch (error) { return { content: [{ type: "text", text: `Proposal is invalid: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
       }
       if (action === "status") {
@@ -615,6 +625,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         } catch { lines.push("The stored run contract is unreadable; the next start fails closed."); }
         try { lines.push(`Recorded loop history (not live progress):\n${mementoNotes(readMemory(memoryPath))}`); }
         catch { lines.push("Loop memory is unreadable; the next start fails closed."); }
+        const projectCard = readProjectCard(projectDir);
+        if (projectCard) lines.push(...projectCardSummary(projectCard));
         const reportPath = path.join(loopRoot, "latest-report.json");
         const statusPath = path.join(loopRoot, "status.json");
         const lastRunPath = path.join(loopRoot, "last-run.md");
@@ -800,7 +812,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
   // -- command -------------------------------------------------------------
 
   pi.registerCommand("dream-rsi", {
-    description: "Dream-RSI: assess | loop | watch | status | stop | resume",
+    description: "Dream-RSI: assess | loop | evolve | watch | status | stop | resume",
     getArgumentCompletions: commandCompletions,
     async handler(args, ctx) {
       const root = dreamRoot(ctx);
@@ -826,7 +838,10 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         sendWhenReady(`/skill:dream-rsi-assess ${rest}`.trim());
         return;
       }
-      if (verb === "loop") {
+      if (verb === "loop" || verb === "evolve") {
+        // Continuous magnitude mode is the same safety machinery with continuation
+        // switched on; it is an additional surface, not a replacement for loop.
+        const evolve = verb === "evolve";
         const tokens = (rest.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map(token => token.replace(/^(["'])([\s\S]*)\1$/, "$2"));
         const explicitConsent = tokens.includes("--consent");
         const includeLogs = !tokens.includes("--no-logs");
@@ -856,6 +871,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (autoCommitFlag !== undefined) settings.auto_commit = autoCommitFlag;
         if (commitPolicyFlag !== undefined) settings.commit_policy = commitPolicyFlag;
         if (rsiMode) settings.rsi_mode = true;
+        if (evolve) settings.continuous = true;
         const sessionId = ctx.sessionManager.getSessionId();
         const currentSlot = activeLoopRuns.get(sessionId);
         if (currentSlot) {
@@ -896,8 +912,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         if (!consent) sessionPhase(ctx, slot, "awaiting-consent", "consent", "Waiting for trusted-local execution consent");
         if (!consent && ctx.hasUI) {
           consent = await ctx.ui.confirm(
-            "Dream-RSI unattended loop",
-            `This runs repository commands on this host with your access and spends the configured agent and evaluator budget.${setupHarness ? " Setup will author a two-file measurement harness (.dream-rsi-harness/measure and check, in this project's language) for the lower-is-better runtime metric (ms), then qualify it before experiments." : ""} Start the loop?`,
+            evolve ? "Dream-RSI continuous evolution" : "Dream-RSI unattended loop",
+            `This runs repository commands on this host with your access and spends the configured agent and evaluator budget.${evolve ? " Continuous mode keeps starting campaigns until the approved budget, no-win plateau, or a stop rule ends the run." : ""}${setupHarness ? " Setup will author a two-file measurement harness (.dream-rsi-harness/measure and check, in this project's language) for the lower-is-better runtime metric (ms), then qualify it before experiments." : ""} Start ${evolve ? "continuous evolution" : "the loop"}?`,
           );
           if (!consent) {
             release();
@@ -1098,6 +1114,7 @@ function renderCommandHelp(): string {
     "Dream-RSI · arXiv 2609.14858",
     "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
     "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
+    "  /dream-rsi evolve [what you want] [same flags as loop]  magnitude-ranked continuous mode (budget, plateau and stop rules still apply)",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
@@ -1108,6 +1125,7 @@ function commandCompletions(prefix: string) {
   const choices = [
     { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
     { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
+    { value: "evolve", label: "evolve [what you want] [loop flags]", description: "Magnitude-ranked continuous mode; continuation, plateau and stop rules still apply" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },
     { value: "stop", label: "stop", description: "Stop the active campaign" },
@@ -1119,7 +1137,7 @@ function commandCompletions(prefix: string) {
 
 function explicitlyRequestsImprovement(text: string): boolean {
   const input = text.trim();
-  if (/^\/dream-rsi\s+(assess|status|watch|stop|resume|loop|help|\?)\b/i.test(input)) return false;
+  if (/^\/dream-rsi\s+(assess|status|watch|stop|resume|loop|evolve|help|\?)\b/i.test(input)) return false;
   if (/\b(assess|evaluate|what should|how does|why does|suggest|recommend)\b.{0,100}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
   if (/\b(what|how|why|should|could|can)\b.{0,80}\b(improve|improvement|optimi[sz]e|optimization)\b/i.test(input)) return false;
   return (

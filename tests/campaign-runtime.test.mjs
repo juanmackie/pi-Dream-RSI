@@ -34,6 +34,45 @@ test("a paused 2.x campaign is marked failed with the 3.0 restart path", () => {
   } finally { fs.rmSync(project.dir, { recursive: true, force: true }); }
 });
 
+test("a campaign record without magnitude fields still reads, and the new fields stay optional", async () => {
+  const project = makeProject();
+  try {
+    const { readCampaignStatus } = await jump("engine/campaign.ts");
+    const id = "bbbbbbbbbbbbbbbb";
+    const campaignRoot = path.join(project.dreamRoot, "campaigns", id);
+    fs.mkdirSync(campaignRoot, { recursive: true });
+    fs.writeFileSync(path.join(project.dreamRoot, "campaigns", "active.json"), JSON.stringify({ id }));
+    const limits = { maxCycles: 1, maxAgentStarts: 2, maxEvaluatorRuns: 4, deadlineMs: 60_000, plateauCycles: 1, maxCandidatesPerCycle: 2 };
+    const record = {
+      version: 1, id, baseRoot: project.dreamRoot, campaignRoot,
+      projectDir: project.projectDir, targetRoot: project.projectDir,
+      goal: "Improve the fixture", task: project.task, scope: ["solution.py"],
+      verifierInputs: [], verifierIdentity: "identity", taskFingerprint: "fingerprint",
+      searchConfig: { version: 1, batchSize: 2, exploreShare: 0.5, refineTop: 1, maxRounds: 3, patience: 1 },
+      minimumGain: 1, limits,
+      startedAt: "2026-10-31T00:00:00.000Z", deadlineAt: "2026-10-31T00:01:00.000Z",
+      completedCycles: [], currentScore: 1, bestScore: 1, noGainCycles: 0,
+      state: { kind: "complete", reason: "done" },
+    };
+    const recordPath = path.join(campaignRoot, "campaign.json");
+    fs.writeFileSync(recordPath, JSON.stringify(record));
+    fs.writeFileSync(path.join(campaignRoot, "campaign-processes.json"), JSON.stringify({
+      version: 1, agent_limit: limits.maxAgentStarts, evaluator_limit: limits.maxEvaluatorRuns,
+      agent_starts: 0, evaluator_runs: 0, last_start: null,
+    }));
+
+    const legacy = readCampaignStatus(project.dreamRoot);
+    assert.equal(legacy?.id, id);
+    assert.equal(legacy?.campaignType, undefined, "an older record stays readable without the new field");
+    assert.equal(legacy?.strategy, undefined);
+
+    fs.writeFileSync(recordPath, JSON.stringify({ ...record, campaignType: "algorithmic", strategy: "Replace the nested scan with an index." }));
+    const typed = readCampaignStatus(project.dreamRoot);
+    assert.equal(typed?.campaignType, "algorithmic");
+    assert.equal(typed?.strategy, "Replace the nested scan with an index.");
+  } finally { project.cleanup(); }
+});
+
 test("campaign retention prunes only workspaces older than the two newest terminal campaigns", () => {
   const project = makeProject();
   try {

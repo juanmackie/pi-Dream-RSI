@@ -17,6 +17,7 @@ test("npm package includes user docs but excludes internal remediation artifacts
   assert.ok(pack && Array.isArray(pack.files), "npm returns the package file manifest");
   const paths = new Set(pack.files.map((file) => file.path));
   assert.ok(paths.has("docs/autonomous-loop.md"));
+  assert.ok(paths.has("docs/continuous-magnitude.md"));
   assert.ok(paths.has("docs/method.md"));
   assert.equal([...paths].some((file) => file.startsWith("docs/reports/")), false,
     "internal remediation reports and patches must not ship to npm");

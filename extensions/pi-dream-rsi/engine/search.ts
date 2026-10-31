@@ -19,6 +19,8 @@ export interface LeverStats {
   wallMs: number;
   lastOutcome: string | null;
   lastAt: string | null;
+  /** False when the latest new outcome had no readable campaign ledger. */
+  lastEvidenceLinked?: boolean;
   /** Sum of independently verified gains, in the objective's units. Absent in legacy memory. */
   gain?: number;
   /** Sum of the evaluator runs those gains cost, for gain-per-cost allocation. */
@@ -55,6 +57,8 @@ export interface LoopMemoryRecord {
   at: string;
   /** Independently measured gain for a win, in the objective's units. */
   verifiedGain?: number;
+  /** False when this new record lacked a verifiable ledger; absent means legacy history. */
+  evidenceLinked?: boolean;
   provenance?: ExperimentProvenance;
 }
 
@@ -121,6 +125,7 @@ export function readMemory(file: string): LoopMemory {
       || stats.wins > stats.campaigns
       || !(stats.lastOutcome === null || (typeof stats.lastOutcome === "string" && MEMORY_OUTCOMES.has(stats.lastOutcome)))
       || !(stats.lastAt === null || typeof stats.lastAt === "string")
+      || (stats.lastEvidenceLinked !== undefined && typeof stats.lastEvidenceLinked !== "boolean")
       || !(stats.gain === undefined || (typeof stats.gain === "number" && Number.isFinite(stats.gain) && stats.gain >= 0))
       || !(stats.gainCostRuns === undefined || isCount(stats.gainCostRuns))) {
       throw new Error("loop memory contains an invalid lever stats entry; refusing to continue on corrupted state");
@@ -136,6 +141,7 @@ export function readMemory(file: string): LoopMemory {
       || typeof entry.at !== "string" || entry.at.length === 0
       || (entry.stopReason !== undefined && (typeof entry.stopReason !== "string" || entry.stopReason.length > 1000))
       || (entry.verifiedGain !== undefined && (typeof entry.verifiedGain !== "number" || !Number.isFinite(entry.verifiedGain)))
+      || (entry.evidenceLinked !== undefined && typeof entry.evidenceLinked !== "boolean")
       || !validProvenance(entry.provenance)) {
       throw new Error("loop memory contains an invalid outcome record; refusing to continue on corrupted state");
     }
@@ -145,6 +151,7 @@ export function readMemory(file: string): LoopMemory {
 
 /** True when a record belongs to the current baseline, objective and instrument. */
 export function isCurrentExperiment(record: LoopMemoryRecord, current: { contractId?: string; evaluatorId?: string; baselineFingerprint?: string }): boolean {
+  if (record.evidenceLinked === false) return false;
   const provenance = record.provenance;
   if (!provenance) return true; // legacy memory predates provenance; keep it comparable
   if (current.contractId !== undefined && provenance.contractId !== undefined && provenance.contractId !== current.contractId) return false;
@@ -161,6 +168,9 @@ export function writeMemory(file: string, memory: LoopMemory): void {
 
 /** Pure updater: fold one campaign outcome into memory with bounded history. */
 export function recordCampaignOutcome(memory: LoopMemory, record: LoopMemoryRecord): LoopMemory {
+  if (record.evidenceLinked === false) {
+    return { ...memory, outcomes: [...memory.outcomes, record].slice(-MAX_OUTCOMES), notes: memory.notes.slice(-MAX_NOTES) };
+  }
   const prior = memory.leverStats[record.leverId] ?? {
     campaigns: 0, wins: 0, evaluatorRuns: 0, agentStarts: 0, wallMs: 0, lastOutcome: null, lastAt: null,
   };
@@ -175,6 +185,7 @@ export function recordCampaignOutcome(memory: LoopMemory, record: LoopMemoryReco
     wallMs: prior.wallMs + record.wallMs,
     lastOutcome: record.outcome,
     lastAt: record.at,
+    lastEvidenceLinked: true,
     gain: (prior.gain ?? 0) + gained,
     gainCostRuns: (prior.gainCostRuns ?? 0) + (gained > 0 ? record.evaluatorRuns : 0),
   };
@@ -190,6 +201,7 @@ export function recordCampaignOutcome(memory: LoopMemory, record: LoopMemoryReco
 export function attemptsFromMemory(memory: LoopMemory): LeverAttempt[] {
   const attempts: LeverAttempt[] = [];
   for (const [leverId, stats] of Object.entries(memory.leverStats)) {
+    if (stats.lastEvidenceLinked === false) continue;
     if (stats.lastOutcome === "win" || stats.lastOutcome === "no-win" || stats.lastOutcome === "error" || stats.lastOutcome === "rejected") {
       attempts.push({ leverId, outcome: stats.lastOutcome });
     }
