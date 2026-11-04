@@ -32,7 +32,7 @@ The Dream-RSI loop will proceed with the settled settings.
 - Both parallel directions: running loops + improving mechanisms
 
 ## STOP
-- Pivoting to a different goal
+- Pivoting to a different objective
 - Decreasing caps
 - Moving away from the stated North Star
 
