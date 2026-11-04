@@ -30,7 +30,9 @@ function validNodes(world: Pick<ExperimentWorld, "nodes">): ExperimentNode[] {
 
 /** Replay a config against recorded nodes only; unrecorded actions reduce coverage. */
 export function replayWorld(world: ExperimentWorld, config: SearchConfig): ReplayResult {
-  const recorded = world.nodes.filter((node) => node.stage === "done").sort((a, b) => a.seq - b.seq);
+  const recorded = world.nodes
+    .filter((node) => node.stage === "done")
+    .sort((a, b) => a.seq - b.seq);
   const revealed = new Set<string>();
   const done: ExperimentNode[] = [];
   let best = world.baseline;
@@ -56,9 +58,7 @@ export function replayWorld(world: ExperimentWorld, config: SearchConfig): Repla
     }
     noGainRounds = best > previousBest && best - previousBest >= world.threshold ? 0 : noGainRounds + 1;
   }
-  const coverage = Math.max(recorded.length, requestedActions) === 0
-    ? 0
-    : revealed.size / Math.max(recorded.length, requestedActions);
+  const coverage = recorded.length > 0 ? revealed.size / recorded.length : 1;
   return { best, revealed: [...revealed], coverage, rounds };
 }
 
@@ -114,11 +114,12 @@ export function composeSearchConfig(candidates: ProbedConfig[], incumbent: Searc
     const scores = uniqueProbeScores(candidate.probes);
     if (scores.size !== baseline.size || ids.some((id) => !scores.has(id))) return [];
     const deltas = ids.map((id) => consistentProbeDelta(baseline.get(id)!, scores.get(id)!) ?? Number.NEGATIVE_INFINITY);
+    // Strict: require all probes to have positive margin above minimum
     if (deltas.length < minProbes || deltas.some((delta) => delta <= DREAM_MIN_MARGIN)) return [];
     return [{ config: candidate.config, worstDelta: Math.min(...deltas), meanDelta: deltas.reduce((sum, delta) => sum + delta, 0) / deltas.length }];
   });
-  challengers.sort((a, b) => b.worstDelta - a.worstDelta || b.meanDelta - a.meanDelta
-    || compareStrings(JSON.stringify(a.config), JSON.stringify(b.config)));
+  // Sort by worst probe delta first (conservative), then mean delta, then config string
+  challengers.sort((a, b) => b.worstDelta - a.worstDelta || b.meanDelta - a.meanDelta || compareStrings(JSON.stringify(a.config), JSON.stringify(b.config)));
   return challengers[0]?.config ?? incumbent;
 }
 
@@ -208,7 +209,10 @@ export async function maybeDream(options: DreamOptions): Promise<SearchConfig> {
   const proposalFile = path.join(scratch, "configs.json");
   fs.rmSync(proposalFile, { force: true });
   const promptFile = path.join(scratch, "DREAM.md");
-  const traces = worlds.slice(-12).map((world) => ({ cycle: world.cycle, config: world.config, baseline: world.baseline, threshold: world.threshold,
+  const freshWorlds = (worlds.filter((w) => w.status === "complete" && validNodes(w).length >= 3)
+    .sort((a, b) => (b.cycle ?? 0) - (a.cycle ?? 0)) // newest first
+    .slice(0, 12));
+  const traces = freshWorlds.map((world) => ({ cycle: world.cycle, config: world.config, baseline: world.baseline, threshold: world.threshold,
     rounds: world.rounds, nodes: world.nodes.map(({ id, parent, kind, round, score, valid, timedOut, cost }) => ({ id, parent, kind, round, score, valid, timedOut, cost })) }));
   writeFileAtomic(promptFile, `Propose up to four SearchConfig data values as JSON in ${proposalFile}; do not propose executable policy code. Schema: {"configs":[{"version":1,"batchSize":1-4,"exploreShare":0-1,"refineTop":1-3,"maxRounds":1-6,"patience":1-3}]}. Incumbent: ${JSON.stringify(incumbent)}. The host probes each config on the same ${worlds.length} distinct worlds and composes from the per-world score vector. Adoption requires at least ${minProbes} probes with consistent positive direction and coverage >= ${DREAM_MIN_COVERAGE}; one best-looking run cannot decide. Objective per world: replay value; beta1=${DREAM_BETA1}, beta2=${DREAM_BETA2}. Traces:\n${JSON.stringify(traces, null, 2)}\n`);
   const result = await runAgent({ agent: options.agent, resolveAgent: options.resolveAgent, cwd: scratch, prompt: fs.readFileSync(promptFile, "utf8"),
