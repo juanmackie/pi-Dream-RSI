@@ -12,7 +12,7 @@ export function recovery(category: RecoveryCategory) {
     cancelled: "Inspect status. Resume an interrupted campaign or saved confirmation only when requested; a cancelled preparation needs a new user command.",
     "search-exhausted": "No eligible verified lever remains. Inspect recorded evidence; do not fabricate a metric or repeat an unchanged attempt.",
     continuation: "Inspect status and continue the saved confirmation with action=confirm, or resume an interrupted campaign with action=resume. Reuse saved evidence and remaining budget; do not start another search.",
-    plateau: "The approved no-win plateau was reached. Review the attempt timeline and verified evidence before explicitly changing the approved goal or plateau policy; budget and counters are not reset.",
+    plateau: "The approved no-win plateau was reached. Review the attempt timeline and verified evidence before explicitly changing the approved objective or plateau policy; budget and counters are not reset.",
     completed: "No instrument repair is indicated. Review the verified working-tree changes and recorded evidence.",
   };
   return { category, next_step: guidance[category], automatic_retries: 0 };

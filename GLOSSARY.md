@@ -8,6 +8,10 @@ Dream-RSI runs measured experiments within an approved project boundary. These t
 The agreed objective, metric, correctness requirements, editable scope, execution permissions, and budget for an improvement loop.
 _Avoid_: Task prompt, consent flag
 
+**Loop objective**:
+The measurable improvement one Dream-RSI loop pursues, passed to the tool as `objective` (`focus` is a legacy alias) and stored as the run contract's outcome statement. It is not a pi session goal or goal focus: the loop neither reads nor requires a focused session goal.
+_Avoid_: Pi goal, session goal focus, agenda
+
 **Editable scope**:
 The files that approved candidates or setup work may change. Existing verification dependencies can be read or run without belonging to editable scope.
 _Avoid_: Read allowlist, verifier access list

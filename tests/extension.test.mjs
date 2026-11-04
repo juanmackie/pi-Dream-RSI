@@ -132,7 +132,8 @@ test("a natural-language loop command owns preparation without writing loop stat
   assert.equal(message.options.expandPromptTemplates, true);
   assert.equal(message.options.deliverAs, "followUp", "busy sessions queue preparation, not an engine run");
   const request = JSON.parse(message.content.slice(message.content.indexOf("{")));
-  assert.equal(request.focus, "reduce startup time");
+  assert.equal(request.objective, "reduce startup time");
+  assert.equal(request.focus, undefined, "the handoff names the loop objective, not the legacy tool alias");
   assert.equal(request.include_logs, false);
   assert.equal(request.project_dir, project.projectDir);
   assert.equal(request.consent, true);
@@ -164,7 +165,7 @@ test("prepared settings use the guarded tool path and reach a local campaign", a
   const message = harness.sentMessages.at(-1).content;
   const request = JSON.parse(message.slice(message.indexOf("{")));
   const tool = harness.tools.get("dream_rsi_loop");
-  const discovered = await tool.execute("find-instrument", { action: "prepare", focus: request.focus, unit: "points", higher_is_better: true }, undefined, undefined, context);
+  const discovered = await tool.execute("find-instrument", { action: "prepare", objective: request.objective, unit: "points", higher_is_better: true }, undefined, undefined, context);
   const existing = discovered.details.measurementOptions.scripts.find(script => script.source === "scripts/measure.mjs");
   assert.ok(existing, "standalone evaluator is visible without a manifest benchmark");
   assert.equal(existing.outputHint, "stdout-json");
@@ -192,7 +193,7 @@ test("prepared settings use the guarded tool path and reach a local campaign", a
   assert.equal(fs.existsSync(path.join(project.dreamRoot, "loop")), false, "a disabled setup cannot trigger default discovery");
   const prepared = {
     action: "start", consent: true, preparation_id: request.preparation_id,
-    focus: request.focus, unit: "points", higher_is_better: true,
+    objective: request.objective, unit: "points", higher_is_better: true,
     evaluator: { argv: [process.execPath, "scripts/measure.mjs"], output: "stdout-json", inputs: ["scripts/measure.mjs"] },
     scope_roots: ["src"], gates: ["node scripts/check.mjs"], protected_assets: ["scripts"],
     include_logs: true, agent_command: process.execPath, agent_args: [path.join(project.projectDir, "noop-agent.mjs")],
@@ -214,7 +215,7 @@ test("prepared settings use the guarded tool path and reach a local campaign", a
   assert.equal(result.details.loop.campaigns, 1, result.content[0].text);
   assert.equal(result.details.loop.wins, 0, "a no-op fixture cannot fabricate a win");
   const saved = JSON.parse(fs.readFileSync(path.join(project.dreamRoot, "loop/contract.json"), "utf8")).contract;
-  assert.equal(saved.outcome.statement, request.focus);
+  assert.equal(saved.outcome.statement, request.objective);
   assert.deepEqual(saved.scope.roots, ["src"]);
   const status = await tool.execute("finished", { action: "status" }, undefined, undefined, context);
   assert.equal(status.details.activity, null, "the handoff releases its slot after engine work finishes");
@@ -255,7 +256,7 @@ test("headless config consent preserves complete settings in a cancellable hando
   assert.match(message, /^\/skill:dream-rsi-loop/);
   const request = JSON.parse(message.slice(message.indexOf("{")));
   assert.deepEqual(request.proposed_settings, settings);
-  assert.equal(request.focus, settings.focus);
+  assert.equal(request.objective, settings.focus);
   assert.equal(request.consent, false);
   assert.equal(request.include_logs, false);
   assert.equal(request.replacement_requested, true);
@@ -333,7 +334,7 @@ test("a branch change during prepared replacement approval cancels startup", asy
   context.ui.select = () => new Promise(resolve => { answer = resolve; });
   const running = harness.tools.get("dream_rsi_loop").execute("prepared-approval", {
     action: "start", consent: true, preparation_id: request.preparation_id,
-    focus: request.focus, unit: "ms", higher_is_better: false,
+    objective: request.objective, unit: "ms", higher_is_better: false,
     scope_roots: contract.scope.roots, protected_assets: contract.scope.protectedAssets,
     gates: contract.preserved.gates, command_categories: contract.execution.allowedCommandCategories,
   }, undefined, undefined, context);
@@ -681,7 +682,7 @@ test("a changed goal does not inherit the previous evaluator or proxy justificat
   assert.equal(saved.outcome.statement, "Optimize design generation");
   assert.equal(saved.outcome.evaluator, undefined, "the old instrument is not reused for a different objective");
   assert.equal(saved.outcome.proxyJustification, undefined, "the old proxy justification does not authorize a new objective");
-  assert.match(changed.content[0].text, /goal changed, so the previous evaluator and proxy justification are not inherited/i);
+  assert.match(changed.content[0].text, /objective changed, so the previous evaluator and proxy justification are not inherited/i);
   assert.ok(changed.details.loop.preflight.status === "blocked", "without an instrument the run blocks instead of guessing");
   assert.equal(changed.details.loop.inventory?.levers.some(lever => lever.metricKind === "score"), false, "no score lever can be built from the dropped instrument");
   assert.equal(changed.details.loop.campaigns, 0);
@@ -1477,7 +1478,7 @@ test("authorized extension bootstrap creates and executes its pinned benchmark b
   }, undefined, undefined, context);
   const loop = result.details.loop;
   const parameterSchema = harness.tools.get("dream_rsi_loop").parameters.properties;
-  for (const key of ["action", "consent", "focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "gates", "command_categories", "agent_command", "agent_args", "evaluator_bootstrap", "max_campaigns", "max_agent_starts", "max_evaluator_runs", "deadline_minutes"]) {
+  for (const key of ["action", "consent", "objective", "focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "gates", "command_categories", "agent_command", "agent_args", "evaluator_bootstrap", "max_campaigns", "max_agent_starts", "max_evaluator_runs", "deadline_minutes"]) {
     assert.ok(key in parameterSchema, `integration input uses a registered parameter: ${key}`);
   }
   assert.equal(fs.existsSync(path.join(project.projectDir, "bench.mjs")), true, result.content[0].text);
@@ -1620,7 +1621,8 @@ test("harness setup refuses ambiguous metrics, conflicting setup, protected file
   for (const [extra, expected] of [
     [{}, /unit and higher_is_better/],
     [{ setup_harness: "yes" }, /must be a boolean/],
-    [{ focus: "", unit: "percent", higher_is_better: true }, /explicit improvement goal/],
+    [{ focus: "", unit: "percent", higher_is_better: true }, /explicit improvement statement/],
+    [{ objective: "", unit: "percent", higher_is_better: true }, /non-empty sentence/],
     [{ unit: "percent", higher_is_better: true, evaluator: { argv: ["node", "score.mjs"], output: "stdout-json" } }, /cannot combine/i],
     [{ unit: "percent", higher_is_better: true, evaluator_bootstrap: { authorized: true, paths: ["x.mjs"] } }, /cannot combine/i],
     [{ unit: "percent", higher_is_better: true, protected_assets: [".dream-rsi-harness"] }, /protected/i],

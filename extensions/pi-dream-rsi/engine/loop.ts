@@ -1022,7 +1022,7 @@ function buildLoopPreflight(contract: RunContract, recon: ReconResult, inventory
     const reason = pinnedRequest
       ? `No executable ${pinnedRequest} was discovered; ${workloadBlockers[0] ?? "no runnable benchmark or custom workload is available"}.`
       : workloadBlockers[0] ?? "No executable workload was found for the approved metric.";
-    blocker("workload", reason, `Declare and pin the requested workload and its evaluator${focus ? ` for “${focus.slice(0, 140)}”` : ""}. Use /dream-rsi loop <goal> to prepare and review the evaluator, scope and gates. For automation, supply evaluator.argv/output/inputs, unit and higher_is_better directly with dream_rsi_loop or a reviewed --config file. Preparation is not approval or qualification. Existing verification files need no edit permission; if setup must create or change files, approve its exact in-scope write plan.`);
+    blocker("workload", reason, `Declare and pin the requested workload and its evaluator${focus ? ` for “${focus.slice(0, 140)}”` : ""}. Use /dream-rsi loop <objective> to prepare and review the evaluator, scope and gates. For automation, supply evaluator.argv/output/inputs, unit and higher_is_better directly with dream_rsi_loop or a reviewed --config file. Preparation is not approval or qualification. Existing verification files need no edit permission; if setup must create or change files, approve its exact in-scope write plan.`);
   }
 
   const writeChecks = bootstrapWritePlan(contract, bootstrapPaths).checks;

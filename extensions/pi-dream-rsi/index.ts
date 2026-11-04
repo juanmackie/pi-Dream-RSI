@@ -18,7 +18,7 @@ import { progressSummary, type ProgressSnapshot } from "./engine/progress.ts";
 import { mementoNotes, readMemory } from "./engine/search.ts";
 import { approvalIdentity, effectiveCommitPolicy, normalizeRunContract, readStoredContract } from "./engine/intake.ts";
 import { measurementHarnessInstructions } from "./engine/harness.ts";
-import { resolveLoopProposal, proposalReview, proposalIdentity, type LoopProposal } from "./engine/proposal.ts";
+import { canonicalLoopObjective, resolveLoopProposal, proposalReview, proposalIdentity, type LoopProposal } from "./engine/proposal.ts";
 import { discoverMeasurementOptions } from "./engine/recon.ts";
 import { buildProjectCard, projectCardSummary, readProjectCard } from "./engine/fingerprint.ts";
 import { recovery, recoveryForLoop } from "./engine/recovery.ts";
@@ -53,7 +53,8 @@ interface LoopRunSlot {
 const signalsParams = {
   type: "object",
   properties: {
-    focus: { type: "string", description: "Optional plain-language intent used to rank matching evidence." },
+    objective: { type: "string", description: "Optional plain-language improvement objective used to rank matching evidence. This is the loop's target, not a pi session goal." },
+    focus: { type: "string", description: "Legacy alias for objective." },
     include_logs: { type: "boolean", description: "Read bounded local session aggregates. Defaults to true; false skips all session-file access." },
   },
   additionalProperties: false,
@@ -70,7 +71,8 @@ const loopParams = {
     proposal_id: { type: "string", description: "Digest of the exact settings and source returned by action=prepare. A stale digest is rejected before execution." },
     approve_proposal: { type: "boolean", description: "Explicit approval of the reviewed proposal_id for a headless prepared start. Separate from host consent, setup authorization, and contract replacement." },
     replace_contract: { type: "boolean", description: "Explicitly authorize replacing a different saved run contract. Review objective, scope, gates, permissions, and any increased caps first. Replacement preserves spend, may only raise caps, and keeps one backup; refuses unsettled campaigns." },
-    focus: { type: "string", description: "Improvement goal. Defaults to reducing declared workload wall-clock time without changing results." },
+    objective: { type: "string", description: "Improvement objective the loop pursues. Defaults to reducing declared workload wall-clock time without changing results. This is not a pi session goal and needs no goal focus." },
+    focus: { type: "string", description: "Legacy alias for objective." },
     auto_commit: { type: "boolean", description: "Legacy shorthand for commit_policy: true selects per-accepted-change, false selects no-commit." },
     commit_policy: { type: "string", enum: ["commit-per-accepted-change", "squash-per-campaign", "no-commit"], description: "Verified commit policy. Defaults to per-accepted-change for new Git projects; no-commit keeps changes in the working tree." },
     commit_branch: { type: "string", description: "Dedicated local branch for verified auto-commits. Defaults to dream-rsi/improve; main/default branches are refused." },
@@ -84,7 +86,7 @@ const loopParams = {
     higher_is_better: { type: "boolean", description: "Metric direction; defaults to false without an evaluator." },
     minimum_gain: { type: ["number", "string"], description: "Minimum useful gain, default 5%." },
     false_accept_budget: { type: "number", description: "Statistical promotion budget, greater than 0 and below 0.5; immutable after approval. Default 0.1." },
-    proxy_justification: { type: "string", description: "Why a proxy metric represents the stated goal." },
+    proxy_justification: { type: "string", description: "Why a proxy metric represents the stated objective." },
     evaluator: { type: "object", properties: {
       argv: { type: "array", items: { type: "string" } },
       output: { type: "string", enum: ["score-json", "stdout-number", "stdout-json"] },
@@ -508,12 +510,14 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     description: "Read bounded, privacy-filtered project signals for lever assessment. The tool is free and read-only.",
     promptSnippet: "Read project signals and rank evidence for an improvement intent. This tool does not run project commands or change files.",
     promptGuidelines: [
-      "For dream_rsi_signals, pass the user's plain-language improvement intent as focus when available.",
+      "For dream_rsi_signals, pass the user's plain-language improvement intent as objective when available; focus is only a legacy alias and has nothing to do with pi session goal focus.",
       "For dream_rsi_signals, report only returned aggregates and diagnostics. Do not repeat raw commands, paths, errors, commit subjects or campaign text.",
       "For dream_rsi_signals, use include_logs=false when the user disables session-log analysis.",
     ],
     parameters: signalsParams,
     async execute(_id, params: any, _signal, _onUpdate, ctx): Promise<any> {
+      try { params = canonicalLoopObjective(params); }
+      catch (error) { return { content: [{ type: "text", text: `signals settings are invalid: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false } }; }
       const includeLogs = params.include_logs !== false && activeLoopRuns.get(ctx.sessionManager.getSessionId())?.preparation?.include_logs !== false;
       const result = await collectSignals({
         projectDir: ctx.cwd,
@@ -538,12 +542,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
     promptGuidelines: [
       "For dream_rsi_loop, use action=start when the user asks for autonomous improvement and pass consent=true after the user accepts trusted-local execution.",
       "For dream_rsi_loop, without an evaluator the default objective is to reduce declared workload wall-clock time without changing results. With an evaluator, require the user to declare its unit and score direction.",
+      "For dream_rsi_loop, objective is the loop's improvement target only. It does not create, select, or require a pi session goal or /goal-focus; a session goal and a loop objective are independent.",
       "For dream_rsi_loop, set the durable caps explicitly when the user names a budget; defaults are 6 campaigns, 72 agent starts, 200 evaluator runs and 120 minutes.",
       "For dream_rsi_loop, never edit .dream-rsi/loop by hand; action=status reports the durable budget, lever memory and the active campaign.",
       "For dream_rsi_loop, report the final stop reason, campaigns and verified wins, spend against the caps, and the memory path. Stop reasons include budget, deadline, blocked, cancelled, and no verifiable lever.",
     ],
     parameters: loopParams,
     async execute(_id: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: ExtensionContext): Promise<any> {
+      try { params = canonicalLoopObjective(params); }
+      catch (error) { return { content: [{ type: "text", text: `loop settings are invalid: ${error instanceof Error ? error.message : String(error)}` }], details: { ok: false, retryableProposal: true, recovery: recovery("configuration") } }; }
       const action = typeof params.action === "string" ? params.action : "";
       if (action === "prepare") {
         const projectDir = resolveCampaignProjectDir(params.project_dir, ctx.cwd);
@@ -552,8 +559,8 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           const stored = readStoredContract(path.join(projectDir, ".dream-rsi/loop"));
           const request = activeLoopRuns.get(ctx.sessionManager.getSessionId())?.preparation;
           if (params.preparation_id !== undefined && (!request || request.preparation_id !== params.preparation_id)) throw new Error("loop preparation expired or was cancelled");
-          if (request && params.preparation_id !== undefined && (projectDir !== request.project_dir || (params.focus !== undefined && params.focus !== request.focus))) throw new Error("prepared proposal must keep the command's project and goal");
-          const proposal = resolveLoopProposal({ ...params, ...(request && params.preparation_id !== undefined ? { focus: request.focus, include_logs: request.include_logs && params.include_logs !== false } : {}), consent: false }, projectDir, stored?.contract, Object.keys(loopParams.properties));
+          if (request && params.preparation_id !== undefined && (projectDir !== request.project_dir || (params.focus !== undefined && params.focus !== request.objective))) throw new Error("prepared proposal must keep the command's project and objective");
+          const proposal = resolveLoopProposal({ ...params, ...(request && params.preparation_id !== undefined ? { focus: request.objective, include_logs: request.include_logs && params.include_logs !== false } : {}), consent: false }, projectDir, stored?.contract, Object.keys(loopParams.properties));
           const proposal_id = proposalIdentity(projectDir, proposal, stored?.contract);
           const measurementOptions = discoverMeasurementOptions(projectDir, proposal.contract);
           // The card is read-only evidence for ranking and review. It is not written
@@ -778,15 +785,15 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         }
         if (params.consent !== true) return { content: [{ type: "text", text: "Prepared settings require consent=true after trusted-local authorization through the command or chat." }], details: { ok: false } };
         const projectDir = resolveCampaignProjectDir(params.project_dir ?? request.project_dir, ctx.cwd);
-        if (projectDir !== request.project_dir || (params.focus !== undefined && params.focus !== request.focus)) {
-          return { content: [{ type: "text", text: "Prepared settings must keep the command's project and goal. Start a new command to change them." }], details: { ok: false } };
+        if (projectDir !== request.project_dir || (params.focus !== undefined && params.focus !== request.objective)) {
+          return { content: [{ type: "text", text: "Prepared settings must keep the command's project and objective. Start a new command to change them." }], details: { ok: false } };
         }
         const error = preparedSettingsError(params);
         if (error) return preparationFailure(ctx, preparing!, error);
         // Claim synchronously before any await, but keep the request attached so
         // tree changes can still cancel startup while replacement approval is open.
         preparing!.preparationClaimed = true;
-        const resolved = { ...params, project_dir: request.project_dir, focus: request.focus, include_logs: request.include_logs && params.include_logs !== false };
+        const resolved = { ...params, project_dir: request.project_dir, focus: request.objective, include_logs: request.include_logs && params.include_logs !== false };
         try {
           const result = await startLoop(resolved, ctx, signalForLoopRun(signal, preparing!), onUpdate);
           if (result.details?.retryableProposal && !preparing!.controller.signal.aborted && !closingSessions.has(sessionId)) return preparationFailure(ctx, preparing!, result.content[0].text);
@@ -865,8 +872,9 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         const focus = tokens.filter((token) => !["--consent", "--no-logs", "--setup-harness", "--replace-contract", "--auto-commit", "--no-auto-commit", "--rsi-mode", ...ignored].includes(token)).join(" ");
         let settings: Record<string, unknown> = {};
         if (configFile) {
-          try { settings = readLoopSettingsFile(configFile, ctx.cwd, Object.keys(loopParams.properties)); }
-          catch (error) { report(`Loop settings file is invalid: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
+          try {
+            settings = canonicalLoopObjective(readLoopSettingsFile(configFile, ctx.cwd, Object.keys(loopParams.properties)));
+          } catch (error) { report(`Loop settings file is invalid: ${error instanceof Error ? error.message : String(error)}`, "error"); return; }
         }
         if (autoCommitFlag !== undefined) settings.auto_commit = autoCommitFlag;
         if (commitPolicyFlag !== undefined) settings.commit_policy = commitPolicyFlag;
@@ -895,7 +903,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
         // Bind preparation to this branch before the first consent await. An answer
         // from an abandoned branch must not create a new valid handoff afterward.
         if (needsPreparation) slot.preparation = {
-          preparation_id: crypto.randomUUID(), project_dir: slot.projectDir, focus,
+          preparation_id: crypto.randomUUID(), project_dir: slot.projectDir, objective: focus,
           consent: false, include_logs: includeLogs, replacement_requested: replaceContract,
           ...(Object.keys(settings).length || setupHarness ? { proposed_settings: { ...settings, ...(setupHarness ? { setup_harness: true, unit: "ms", higher_is_better: false } : {}), ...(focus ? { focus } : {}) } } : {}),
         };
@@ -929,7 +937,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
               const proposed = resolveLoopProposal({ ...proposedSettings, consent: false }, slot.projectDir, saved?.contract, Object.keys(loopParams.properties));
               slot.preparation = {
                 preparation_id: crypto.randomUUID(), project_dir: slot.projectDir,
-                focus: proposed.contract.outcome.statement, consent: false, include_logs: includeLogs,
+                objective: proposed.contract.outcome.statement, consent: false, include_logs: includeLogs,
                 replacement_requested: replaceContract, proposed_settings: proposedSettings,
               };
             } catch (error) {
@@ -1050,7 +1058,7 @@ export default function dreamRsi(pi: ExtensionAPI): void {
           sendWhenReady("Resume the saved Dream-RSI loop using dream_rsi_loop with action=resume.");
           report(interrupted
             ? "Recovering the interrupted Dream-RSI campaign through its guarded resume path."
-            : "Resuming the paused Dream-RSI campaign with its saved goal and remaining budget.");
+            : "Resuming the paused Dream-RSI campaign with its saved objective and remaining budget.");
         } else {
           report("No paused campaign is available to resume.", "error");
         }
@@ -1112,9 +1120,10 @@ function normalizePathArg(value: string): string {
 function renderCommandHelp(): string {
   return [
     "Dream-RSI · arXiv 2609.14858",
-    "  /dream-rsi assess [what you want] [--no-logs]  rank project levers (read-only)",
-    "  /dream-rsi loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
-    "  /dream-rsi evolve [what you want] [same flags as loop]  magnitude-ranked continuous mode (budget, plateau and stop rules still apply)",
+    "  /dream-rsi assess [objective] [--no-logs]  rank project levers (read-only)",
+    "  /dream-rsi loop [objective] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <settings.json>]  prepare and run a bounded loop",
+    "  /dream-rsi evolve [objective] [same flags as loop]  magnitude-ranked continuous mode (budget, plateau and stop rules still apply)",
+    "  A loop objective is the improvement target of this loop; it is not a pi session goal.",
     "  /dream-rsi watch  open the campaign dashboard · Ctrl+Shift+D",
     "  /dream-rsi status | stop | resume  inspect or control the campaign",
   ].join("\n");
@@ -1123,9 +1132,9 @@ function renderCommandHelp(): string {
 function commandCompletions(prefix: string) {
   const query = prefix.trimStart().replace(/\s+/g, " ");
   const choices = [
-    { value: "assess", label: "assess [what you want] [--no-logs]", description: "Rank project levers without changing files" },
-    { value: "loop", label: "loop [what you want] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a goal in chat, or start directly with reviewed config/setup settings" },
-    { value: "evolve", label: "evolve [what you want] [loop flags]", description: "Magnitude-ranked continuous mode; continuation, plateau and stop rules still apply" },
+    { value: "assess", label: "assess [objective] [--no-logs]", description: "Rank project levers without changing files" },
+    { value: "loop", label: "loop [objective] [--consent] [--no-logs] [--rsi-mode] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]", description: "Prepare a loop objective in chat, or start directly with reviewed config/setup settings" },
+    { value: "evolve", label: "evolve [objective] [loop flags]", description: "Magnitude-ranked continuous mode; continuation, plateau and stop rules still apply" },
     { value: "watch", label: "watch", description: "Open the campaign dashboard" },
     { value: "status", label: "status", description: "Inspect campaign state" },
     { value: "stop", label: "stop", description: "Stop the active campaign" },
@@ -1182,7 +1191,7 @@ function renderCampaignStatus(campaign: CampaignStatus | Awaited<ReturnType<type
   const activeIteration = state.kind === "running" || state.kind === "paused" ? state.iteration : null;
   const lines = [
     `Improvement campaign: ${state.kind}${state.kind === "running" || state.kind === "paused" ? ` (${state.phase})` : ""}`,
-    `  goal: ${campaign.goal}`,
+    `  objective: ${campaign.goal}`,
     `  target: ${campaign.projectDir}${campaign.scope.length ? ` [${campaign.scope.join(", ")}]` : ""}`,
     `  cycles: ${cycle}/${campaign.limits.maxCycles}${activeIteration === null ? "" : `; working on ${activeIteration}`}; no-gain cycles: ${campaign.noGainCycles}`,
     `  verified best: ${campaign.bestScore}`,

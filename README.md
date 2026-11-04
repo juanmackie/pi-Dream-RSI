@@ -10,7 +10,7 @@ Use assessment to inspect opportunities without running project commands:
 /dream-rsi assess "make the parser faster"
 ```
 
-Start with the goal. After trusted-local consent, the command prepares the loop in the current chat: the agent reads the project, proposes an evaluator, scope, and gates, then calls the guarded engine with complete settings. You do not need to write a config file:
+Start with the objective. After trusted-local consent, the command prepares the loop in the current chat: the agent reads the project, proposes an evaluator, scope, and gates, then calls the guarded engine with complete settings. You do not need to write a config file:
 
 ```text
 /dream-rsi loop "reduce benchmark time without changing results"
@@ -24,7 +24,7 @@ In a non-interactive session, pass `--consent` to accept consent in the command:
 
 ## Five-minute example
 
-[The deterministic verified-loop example](examples/verified-loop/README.md) is a small Node project with a declared benchmark and exact-output test. Copy it to a disposable Git repository, run its checks, and start Dream-RSI with one goal command. Its baseline and deterministic fixture-agent acceptance test make the workflow reproducible without promising that an arbitrary repository will improve. The fixture test verifies the measurement → correctness/review → independent post-apply check → local branch commit path.
+[The deterministic verified-loop example](examples/verified-loop/README.md) is a small Node project with a declared benchmark and exact-output test. Copy it to a disposable Git repository, run its checks, and start Dream-RSI with one objective command. Its baseline and deterministic fixture-agent acceptance test make the workflow reproducible without promising that an arbitrary repository will improve. The fixture test verifies the measurement → correctness/review → independent post-apply check → local branch commit path.
 
 If a new runtime-optimization session has no measurement harness, authorize setup before experiments:
 
@@ -32,7 +32,7 @@ If a new runtime-optimization session has no measurement harness, authorize setu
 /dream-rsi loop "reduce parser runtime without changing results" --setup-harness --no-auto-commit
 ```
 
-Setup creates a pinned measurement script and correctness check in `.dream-rsi-harness/`, then qualifies them before search. It uses the same durable budget. In Git projects, setup cannot run in the same contract as auto-commit: use `--no-auto-commit`, put the qualified harness in a clean Git baseline, then separately review a replacement that enables auto-commit. For a non-runtime metric, use `dream_rsi_loop` with `setup_harness: true`, an explicit goal, unit, and direction. See [measurement harness setup](docs/autonomous-loop.md#measurement-harness-setup).
+Setup creates a pinned measurement script and correctness check in `.dream-rsi-harness/`, then qualifies them before search. It uses the same durable budget. In Git projects, setup cannot run in the same contract as auto-commit: use `--no-auto-commit`, put the qualified harness in a clean Git baseline, then separately review a replacement that enables auto-commit. For a non-runtime metric, use `dream_rsi_loop` with `setup_harness: true`, an explicit `objective`, unit, and direction. See [measurement harness setup](docs/autonomous-loop.md#measurement-harness-setup).
 
 The loop finds measurable levers, qualifies its metric, runs isolated experiments, and applies only changes that pass confirmation, correctness gates, review, and an independent post-apply check. The loop stops when it reaches its budget, cannot find a verifiable lever, or its agent stops working.
 
@@ -54,12 +54,12 @@ Default durable limits are 6 campaigns, 72 agent starts, 200 evaluator runs, and
 
 ## Commands
 
-- `/dream-rsi assess [goal]` reads project signals and ranks improvement opportunities.
-- `/dream-rsi loop [goal] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]` prepares a natural-language goal in chat, then starts the guarded loop. Explicit config/setup commands start directly; without a goal, the command retains saved-setup reuse or declared-workload discovery.
-- `/dream-rsi evolve [goal] [same flags as loop]` runs the same guarded loop with the existing continuous continuation switched on. It adds no new budget, consent, gate, or commit behavior; the durable caps, no-win plateau, start interval, and explicit stop/resume rules still apply.
+- `/dream-rsi assess [objective]` reads project signals and ranks improvement opportunities.
+- `/dream-rsi loop [objective] [--consent] [--no-logs] [--setup-harness] [--commit-policy <mode>] [--auto-commit|--no-auto-commit] [--replace-contract] [--config <file>]` prepares a natural-language objective in chat, then starts the guarded loop. Explicit config/setup commands start directly; without an objective, the command retains saved-setup reuse or declared-workload discovery.
+- `/dream-rsi evolve [objective] [same flags as loop]` runs the same guarded loop with the existing continuous continuation switched on. It adds no new budget, consent, gate, or commit behavior; the durable caps, no-win plateau, start interval, and explicit stop/resume rules still apply.
 - `/dream-rsi status` shows the saved objective, durable budget, latest blocker, and campaign state, including before a campaign exists. `watch`, `stop`, and `resume` inspect or control campaigns.
 
-A different saved objective needs a separate replacement approval. Interactive sessions offer a summary and full inspection. In headless use with reviewed config/setup settings, `--replace-contract` is explicit replacement authorization; execution consent is still required. During goal preparation, that flag requests a replacement review rather than approving a proposal that does not yet exist. Omitted settings keep the saved scope, gates, and permissions, so use the tool to specify new boundaries when changing domains. Replacement preserves cumulative budgets and one previous approval. See [changing a saved objective](docs/autonomous-loop.md#changing-a-saved-objective).
+A different saved objective needs a separate replacement approval. Interactive sessions offer a summary and full inspection. In headless use with reviewed config/setup settings, `--replace-contract` is explicit replacement authorization; execution consent is still required. During objective preparation, that flag requests a replacement review rather than approving a proposal that does not yet exist. Omitted settings keep the saved scope, gates, and permissions, so use the tool to specify new boundaries when changing domains. Replacement preserves cumulative budgets and one previous approval. See [changing a saved objective](docs/autonomous-loop.md#changing-a-saved-objective).
 
 The preparation workflow prefers an existing evaluator and proposes harness setup only when needed. Its read-only `dream_rsi_loop` `action: "prepare"` resolves the same settings that execution validates and returns instrument suggestions plus a `proposal_id`. New scope, metric choices, and setup writes still need approval. Prepared headless execution uses `approve_proposal: true` with the reviewed digest; changed settings or source require review again. `status` shows preparation before a campaign exists; `stop` invalidates its queued handoff. Preparation uses the current chat model and its normal session cost; spawned setup agents and qualification use the durable loop budget.
 

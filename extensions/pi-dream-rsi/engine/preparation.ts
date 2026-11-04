@@ -2,7 +2,8 @@
 export interface LoopPreparation {
   preparation_id: string;
   project_dir: string;
-  focus: string;
+  /** The loop objective; distinct from any pi session goal. */
+  objective: string;
   include_logs: boolean;
   consent: boolean;
   /** A request to review replacement, never approval of settings not yet seen. */
@@ -15,7 +16,7 @@ export interface LoopPreparation {
 export function preparationMessage(request: LoopPreparation): string {
   return [
     "/skill:dream-rsi-loop",
-    "Prepare the requested loop in this session, then return complete settings through dream_rsi_loop with action=start and the preparation_id below.",
+    "Prepare the requested loop objective in this session, then return complete settings through dream_rsi_loop with action=start and the preparation_id below. The objective is the loop's improvement target; it is not a pi session goal and needs no goal focus.",
     request.consent
       ? "Trusted-local consent was given through the command."
       : "Ask the user for explicit trusted-local consent first: repository code runs on this host with host access. Only after the user confirms, call dream_rsi_loop with consent=true and the complete prepared settings.",

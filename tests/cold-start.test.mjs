@@ -427,7 +427,7 @@ test("cold start: command preparation continues automatically through an indepen
   const message = harness.sentMessages.at(-1).content;
   const preparation = JSON.parse(message.slice(message.indexOf("{")));
   const settings = {
-    preparation_id: preparation.preparation_id, focus: preparation.focus, include_logs: false,
+    preparation_id: preparation.preparation_id, objective: preparation.objective, include_logs: false,
     unit: contract.outcome.unit, higher_is_better: contract.outcome.higherIsBetter,
     minimum_gain: contract.outcome.minimumUsefulGain, evaluator: contract.outcome.evaluator,
     scope_roots: contract.scope.roots, protected_assets: contract.scope.protectedAssets, gates: contract.preserved.gates,

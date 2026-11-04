@@ -37,10 +37,23 @@ function assertKeys(value: Record<string, unknown>, allowed: readonly string[], 
   if (unknown.length) throw new Error(`${label} has unknown keys: ${unknown.join(", ")}`);
 }
 
+/**
+ * `objective` is the public name for the improvement target. `focus` stays a
+ * legacy alias for saved settings and older callers; a disagreement fails closed.
+ */
+export function canonicalLoopObjective(params: Record<string, any>): Record<string, any> {
+  if (params.objective === undefined) return params;
+  if (typeof params.objective !== "string" || !params.objective.trim()) throw new Error("objective must be a non-empty sentence describing the improvement the loop should pursue");
+  if (params.focus !== undefined && params.focus !== params.objective) throw new Error("objective and focus disagree; focus is a legacy alias, so supply only objective");
+  const { objective, ...rest } = params;
+  return { ...rest, focus: objective.trim() };
+}
+
 /** Resolve every entry path without writing state, running commands, or granting approval. */
 export function resolveLoopProposal(raw: Record<string, any>, projectDir: string, prior?: RunContract, allowedKeys?: readonly string[]): LoopProposal {
-  if (allowedKeys) assertKeys(raw, allowedKeys, "loop settings");
-  let params = structuredClone(raw);
+  const canonical = canonicalLoopObjective(raw);
+  if (allowedKeys) assertKeys(canonical, allowedKeys, "loop settings");
+  let params = structuredClone(canonical);
   for (const key of ["consent", "include_logs", "approve_proposal"] as const) {
     if (params[key] !== undefined && typeof params[key] !== "boolean") throw new Error(`${key} must be a boolean`);
   }
@@ -56,7 +69,7 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
   if (prior?.mode === "rsi" && params.rsi_mode === false) throw new Error("RSI mode cannot be disabled without a new accounting boundary; retain its daily and lifetime totals");
   const rsiMode = params.rsi_mode ?? prior?.mode === "rsi";
   if (params.commit_branch !== undefined && (typeof params.commit_branch !== "string" || !params.commit_branch.trim() || params.commit_branch.length > 255)) throw new Error("commit_branch must be a non-empty local branch name of at most 255 characters");
-  if (params.focus !== undefined && (typeof params.focus !== "string" || !params.focus.trim())) throw new Error("focus requires an explicit improvement goal (a non-empty sentence)");
+  if (params.focus !== undefined && (typeof params.focus !== "string" || !params.focus.trim())) throw new Error("objective requires an explicit improvement statement (a non-empty sentence describing the result to pursue)");
   if (params.evaluator !== undefined) {
     if (!params.evaluator || typeof params.evaluator !== "object" || Array.isArray(params.evaluator)) throw new Error("evaluator must be an object");
     assertKeys(params.evaluator, ["argv", "output", "inputs"], "evaluator");
@@ -93,7 +106,7 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
   const notices: string[] = [];
   if (changed && params.proxy_justification === undefined && evaluator === undefined) {
     const dropped = [prior.outcome.evaluator ? "evaluator" : null, prior.outcome.proxyJustification ? "proxy justification" : null].filter(Boolean);
-    if (dropped.length) notices.push(`The goal changed, so the previous ${dropped.join(" and ")} ${dropped.length > 1 ? "are" : "is"} not inherited. Supply the instrument for the new goal.`);
+    if (dropped.length) notices.push(`The objective changed, so the previous ${dropped.join(" and ")} ${dropped.length > 1 ? "are" : "is"} not inherited. Supply the instrument for the new objective.`);
   }
   const falseAcceptBudget = params.false_accept_budget ?? prior?.budgets.falseAcceptBudget ?? 0.10;
   if (prior && falseAcceptBudget !== prior.budgets.falseAcceptBudget) throw new Error("A saved contract exists. Keep its false_accept_budget; replacement preserves the statistical budget.");
@@ -184,8 +197,13 @@ export function resolveLoopProposal(raw: Record<string, any>, projectDir: string
   const execution = { agent: taskDefaults.agent ?? contract.agent ?? defaults.agent,
     agent_timeout_ms: taskDefaults.agent_timeout_ms ?? defaults.agent_timeout_ms,
     evaluator_timeout_ms: taskDefaults.evaluator_timeout_ms ?? { policy: "qualified-workload-derived" as const, maximum_ms: 3_605_000 } };
-  const settings = structuredClone(raw);
+  const settings = structuredClone(canonical);
   for (const key of ["action", "consent", "preparation_id", "proposal_id", "approve_proposal", "replace_contract"]) delete settings[key];
+  // Reviewed settings use the public name; the engine and saved contract keep `focus`.
+  if (settings.focus !== undefined) {
+    settings.objective = settings.focus;
+    delete settings.focus;
+  }
   return { contract, settings, params, limits, taskDefaults, notices, setup, execution,
     campaignDefaults: { maxCycles: 2, maxAgentStarts: 18, maxEvaluatorRuns: 48, deadlineMs: 60 * 60 * 1000 } };
 }

@@ -83,7 +83,7 @@ export function withMeasurementHarness(params: Record<string, any>, projectDir: 
     protected_assets: params.protected_assets === undefined ? saved?.scope.protectedAssets : params.protected_assets,
   };
   if (params.evaluator !== undefined || params.evaluator_bootstrap !== undefined) throw new Error("cannot combine setup_harness with evaluator or evaluator_bootstrap; supply the existing evaluator directly instead");
-  if (typeof params.focus !== "string" || !params.focus.trim()) throw new Error("setup_harness requires an explicit improvement goal in focus");
+  if (typeof params.focus !== "string" || !params.focus.trim()) throw new Error("setup_harness requires an explicit objective");
   if (typeof params.unit !== "string" || !params.unit.trim() || typeof params.higher_is_better !== "boolean") throw new Error("unit and higher_is_better are required for measurement harness setup; choose the metric before authoring its evaluator");
   for (const key of ["scope_roots", "protected_assets", "gates"]) {
     if (params[key] !== undefined && (!Array.isArray(params[key]) || params[key].some((entry: unknown) => typeof entry !== "string" || !entry.trim()))) throw new Error(`${key} must be an array of non-empty strings`);
@@ -120,7 +120,7 @@ export function measurementHarnessInstructions(language: HarnessLanguage): strin
     ? "Import the project with `sys.path.insert(0, str(Path(__file__).resolve().parents[1] / \"src\"))` (or the directory the package actually lives in), or run the existing local project command through `subprocess`."
     : "Import the implementation with paths relative to the harness files, or run the existing local project command.";
   return [
-    "Create a measurement harness for the approved goal before optimization begins.",
+    "Create a measurement harness for the approved objective before optimization begins.",
     `Write exactly two ${language === "python" ? "Python" : "Node"} files: ${measure} (evaluator) and ${check} (correctness check).`,
     "Read the measured implementation and existing tests. Use fixed, deterministic inputs and independently known expected results; label synthetic inputs as synthetic.",
     `${measure} must execute the actual project behavior and print exactly one JSON object: {"score": <finite number in the approved unit>, "valid": true}.`,

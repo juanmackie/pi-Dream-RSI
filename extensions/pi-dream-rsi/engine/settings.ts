@@ -9,7 +9,7 @@ const MAX_CONFIG_BYTES = 64 * 1024;
 /**
  * Load contract settings for the `/dream-rsi loop --config <file>` command.
  *
- * The command line can carry only a goal, which is not enough to declare an
+ * The command line can carry only an objective, which is not enough to declare an
  * evaluator, scope and gates. A small JSON file uses the same field names as the
  * `dream_rsi_loop` tool, so an assessment or handoff can propose settings that the
  * operator reviews and applies with the same validation and replacement approval.
@@ -68,7 +68,7 @@ function contractSettings(contract: Record<string, unknown>): Record<string, unk
   const settings: Record<string, unknown> = {};
   if (contract.mode === "rsi") settings.rsi_mode = true;
   const fields: Array<[string, unknown]> = [
-    ["focus", outcome.statement], ["unit", outcome.unit], ["higher_is_better", outcome.higherIsBetter],
+    ["objective", outcome.statement], ["unit", outcome.unit], ["higher_is_better", outcome.higherIsBetter],
     ["minimum_gain", outcome.minimumUsefulGain], ["proxy_justification", outcome.proxyJustification],
     ["evaluator", outcome.evaluator], ["scope_roots", scope.roots], ["protected_assets", scope.protectedAssets],
     ["gates", preserved.gates],

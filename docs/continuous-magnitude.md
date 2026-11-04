@@ -147,7 +147,7 @@ search ambition. They steer the candidate prompt; they are not gates.
 ### Deferred work
 
 - A long-running controller or daemon with periodic re-assessment.
-- Automatic goal synthesis from the card and history.
+- Automatic objective synthesis from the card and history.
 - Multi-campaign orchestration with a shared queue.
 - Plateau escalation from `local-hill` to a higher campaign type.
 - Held-out and stress variants for high-stakes magnitude claims.

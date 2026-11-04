@@ -299,6 +299,22 @@ test("a rejected legacy-to-RSI contract replacement does not persist an accounti
   } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
 });
 
+test("objective is the public loop target and focus remains a legacy alias", () => {
+  const projectDir = tempProject();
+  try {
+    const base = { unit: "ms", higher_is_better: false, scope_roots: ["src"], gates: [], protected_assets: [] };
+    const objective = resolveLoopProposal({ ...base, objective: "Reduce hydraulic sizing wall-clock time" }, projectDir);
+    assert.equal(objective.contract.outcome.statement, "Reduce hydraulic sizing wall-clock time");
+    assert.equal(objective.params.focus, "Reduce hydraulic sizing wall-clock time", "the engine keeps its internal focus field");
+    assert.equal(objective.settings.objective, "Reduce hydraulic sizing wall-clock time", "the reviewed settings use the public name");
+    const alias = resolveLoopProposal({ ...base, focus: "Reduce hydraulic sizing wall-clock time" }, projectDir);
+    assert.equal(alias.contract.outcome.statement, objective.contract.outcome.statement);
+    assert.throws(() => resolveLoopProposal({ ...base, objective: "Reduce runtime", focus: "Improve accuracy" }, projectDir), /disagree/);
+    assert.throws(() => resolveLoopProposal({ ...base, objective: "  " }, projectDir), /non-empty sentence/);
+    assert.throws(() => resolveLoopProposal({ ...base, objective: 7 }, projectDir), /non-empty sentence/);
+  } finally { fs.rmSync(projectDir, { recursive: true, force: true }); }
+});
+
 test("new Git-backed proposals default to verified auto-commit while legacy contracts keep their policy", () => {
   const projectDir = tempProject();
   try {
@@ -359,7 +375,7 @@ test("commit policies survive settings-envelope import and invalid combinations 
     const file = path.join(dir, "settings.json");
     const contract = normalizeRunContract(validContract({ git: { autoCommit: true, branch: "dream-rsi/improve", commitPolicy: "squash-per-campaign" } }));
     fs.writeFileSync(file, JSON.stringify({ version: 1, contract }));
-    const allowed = ["focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "protected_assets", "gates",
+    const allowed = ["objective", "focus", "unit", "higher_is_better", "minimum_gain", "scope_roots", "protected_assets", "gates",
       "max_campaigns", "max_agent_starts", "max_evaluator_runs", "false_accept_budget", "deadline_minutes", "auto_commit", "commit_branch", "commit_policy", "rsi_mode", "env_allowlist", "command_categories"];
     const settings = readLoopSettingsFile(file, dir, allowed);
     assert.equal(settings.commit_policy, "squash-per-campaign");

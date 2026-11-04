@@ -9,4 +9,4 @@ Use [dream-rsi-assess](../dream-rsi-assess/SKILL.md) for read-only project asses
 
 Use `/dream-rsi status`, `watch`, `stop`, and `resume` to inspect or control a saved loop. Use `dream_rsi_loop` with `action: "confirm"` when status reports pending confirmation; this spends only remaining durable budget and reuses saved paired evidence. Start improvement through `/dream-rsi loop`. Use `/dream-rsi evolve` for the same guarded loop with continuous continuation switched on; it adds no new budget, consent, gate, or commit behavior.
 
-Use `dream_rsi_signals` for bounded, read-only evidence. Pass the user's goal as `focus`. Set `include_logs` to false when requested. Report sanitized aggregates only.
+Use `dream_rsi_signals` for bounded, read-only evidence. Pass the user's improvement objective as `objective`; `focus` is only a legacy alias. A loop objective is not a pi session goal and does not require `/goal-focus`. Set `include_logs` to false when requested. Report sanitized aggregates only.
